@@ -6,13 +6,19 @@ from pathlib import Path
 import hashlib
 import json
 import os
+import sqlite3
 import threading
 from typing import Mapping
 import tempfile
 import unittest
 from unittest.mock import patch
 
-from axiom.autonomous import AutonomousResearchProcessor, _rolling_window_rows
+from axiom.autonomous import (
+    AutonomousResearchError,
+    AutonomousResearchProcessor,
+    _rolling_overlap_key,
+    _rolling_window_rows,
+)
 from axiom.auto_canary import AutonomousCanaryWorker
 from axiom.canary import CanaryService, CredentialStore, credential_fingerprint
 from axiom.canary_positions import CanaryPositionManager, list_positions
@@ -27,7 +33,15 @@ from axiom.rolling_portfolio import (
     default_rolling_admission_policy,
     evaluate_rolling_selection,
 )
+from axiom.backtest.prediction import (
+    PRICE_PROXY_RESEARCH,
+    RECORDED_BOOK_REPLAY,
+    run_prediction_research_mode,
+    run_prediction_research_mode as _run_prediction_research_mode,
+)
 from axiom.experiment_plan import normalize_market_scope
+from axiom.domain import Fill, MarketType, ResolvedContract, SettlementState, Side
+from axiom.portfolio import OrderRequest, Portfolio
 from axiom.storage import AxiomStore
 
 
@@ -363,6 +377,202 @@ def _value(item: object, key: str) -> object:
     return item[key] if isinstance(item, dict) else getattr(item, key)
 
 
+
+def _raw_application_strategy(
+    strategy_version_id: str = "sv-raw-integration",
+    *,
+    market_id: str = "market-raw-integration",
+) -> dict[str, object]:
+    strategy_document = {
+        "version": 1,
+        "strategy_id": strategy_version_id,
+        "market_type": "prediction",
+        "family": "probability_mispricing",
+        "parameters": {"threshold": 0.05},
+        "operations": [],
+        "probability_model": "fixture-model-v1",
+        "resolution_aware": True,
+        "resolution_inputs": ["settlement"],
+    }
+    dataset_id = "raw-market-fixture"
+    dataset_version = "v1"
+    dataset_selector = {
+        "dataset_id": dataset_id,
+        "dataset_version": dataset_version,
+        "source_type": "HISTORICAL",
+    }
+    market_scope = normalize_market_scope(
+        {
+            "schema_version": "1",
+            "mode": "EXACT_MARKETS",
+            "instrument": "POLYMARKET",
+            "categories": [],
+            "market_ids": [market_id],
+            "filters": {},
+            "regime_restrictions": {},
+            "provenance": "canonical",
+        }
+    )
+    dataset_provenance = {
+        "dataset_id": dataset_id,
+        "dataset_version": dataset_version,
+        "source_type": "HISTORICAL",
+        "time_split": "train-validation-holdout",
+        "row_manifest": f"{dataset_id}:{dataset_version}",
+    }
+    dataset_attestation = {
+        "dataset_id": dataset_id,
+        "dataset_version": dataset_version,
+        "status": "CURRENT",
+        "policy_version": "v1",
+        "attestation_hash": "sha256:raw-market-fixture-attestation",
+    }
+    return {
+        "strategy_version_id": strategy_version_id,
+        "strategy_id": strategy_version_id,
+        "version": "1",
+        "strategy_hash": f"sha256:{strategy_version_id}",
+        "config_hash": f"config:{strategy_version_id}",
+        "candidate_id": f"candidate-{strategy_version_id}",
+        "research_trial_id": f"trial-{strategy_version_id}",
+        "dataset_id": dataset_id,
+        "dataset_version": dataset_version,
+        "dataset_selector": dataset_selector,
+        "dataset_provenance": dataset_provenance,
+        "dataset_attestation": dataset_attestation,
+        "market_scope": market_scope.as_dict(),
+        "market_scope_hash": market_scope.scope_hash,
+        "market_scope_version": market_scope.scope_version,
+        "strategy_document": strategy_document,
+        "model_document": {"probability": 0.80},
+        "provenance": {
+            "source": "rolling-raw-fixture",
+            "candidate_id": f"candidate-{strategy_version_id}",
+            "research_trial_id": f"trial-{strategy_version_id}",
+            "dataset_id": dataset_id,
+            "dataset_version": dataset_version,
+            "dataset_selector": dataset_selector,
+            "dataset_provenance": dataset_provenance,
+            "market_scope": market_scope.as_dict(),
+            "market_scope_hash": market_scope.scope_hash,
+            "market_scope_version": market_scope.scope_version,
+        },
+        "frozen": True,
+        "paper_only": True,
+    }
+
+
+def _raw_application_row(
+    index: int,
+    yes_price: float,
+    *,
+    market_id: str = "market-raw-integration",
+    model_probability: float = 0.80,
+    book: bool = False,
+) -> dict[str, object]:
+    timestamp = NOW - timedelta(days=7 - index)
+    row: dict[str, object] = {
+        "market_id": market_id,
+        "timestamp": timestamp,
+        "model_probability": model_probability,
+        "yes_mid": yes_price,
+        "yes_ask": yes_price,
+        "yes_bid": yes_price,
+        "no_mid": 1.0 - yes_price,
+        "no_ask": 1.0 - yes_price,
+        "no_bid": 1.0 - yes_price,
+        "liquidity": 1000.0,
+        "settlement": "open",
+    }
+    if book:
+        row.update(
+            {
+                "source_type": "HISTORICAL",
+                "source_timestamp": timestamp,
+                "source_snapshot_id": f"raw-source-{market_id}-{index}",
+                "order_book": {
+                    "timestamp": timestamp.isoformat(),
+                    "bids": [[yes_price, 1000.0]],
+                    "asks": [[yes_price, 1000.0]],
+                    "token_id": f"yes-{market_id}",
+                },
+                "no_order_book": {
+                    "timestamp": timestamp.isoformat(),
+                    "bids": [[1.0 - yes_price, 1000.0]],
+                    "asks": [[1.0 - yes_price, 1000.0]],
+                    "token_id": f"no-{market_id}",
+                },
+            }
+        )
+    return row
+
+def _actual_ledger_row(position_count: int) -> dict[str, object]:
+    start = NOW - timedelta(days=7)
+    positions = [
+        {
+            "market_id": f"actual-ledger-market-{index:02d}",
+            "quantity": "1",
+        }
+        for index in range(position_count)
+    ]
+    accounting: dict[str, object] = {
+        "accounting_available": True,
+        "accounting_complete": True,
+        "accounting_partial": False,
+        "initial_cash": "10.00",
+        "cash": "11.00",
+        "equity": "11.00",
+        "realized_pnl": "1.00",
+        "unrealized_pnl": "0.00",
+        "net_pnl": "1.00",
+        "fees": "0.00",
+        "costs": "0.00",
+        "allocated_capital": "10.00",
+        "capital_at_risk": "10.00",
+        "open_positions": positions,
+        "opening_fills": 0,
+        "closing_fills": 0,
+        "partial_closing_fills": 0,
+        "completed_round_trips": 1,
+        "drawdown": "0.00",
+        "reliability": "1.00",
+        "_available_from": start,
+        "_available_through": NOW,
+    }
+    return {
+        "market_id": "actual-ledger-account",
+        "timestamp": NOW.isoformat(),
+        "_rolling_accounting": accounting,
+    }
+def _canonical_simulation_evaluation(
+    run_id: str,
+    *,
+    open_positions: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    accounting = dict(_actual_ledger_row(0)["_rolling_accounting"])  # type: ignore[index]
+    accounting["open_positions"] = list(open_positions or ())
+    accounting["accounting_available"] = True
+    accounting["accounting_complete"] = True
+    accounting["accounting_partial"] = False
+    return {
+        "evaluation_version": "rolling-evaluation:v2",
+        "evaluation_run_id": run_id,
+        "source_digest": f"source:{run_id}",
+        "portfolio_accounting": accounting,
+        "evaluation": {
+            "evaluation_kind": "CANONICAL_SIMULATION",
+            "evaluator_invoked": True,
+            "evaluator_completed": True,
+            "evaluated_observations": 3,
+            "signal_count": 3,
+            "diagnostic_summary_count": 0,
+            "evaluator_name": "acceptance-fixture",
+            "evaluator_error": None,
+            "evaluator_prerequisite": None,
+        },
+    }
+
+
 class RollingPortfolioAcceptanceTests(unittest.TestCase):
     def setUp(self) -> None:
         self._execution_profile = patch.dict(
@@ -374,6 +584,1041 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.path = Path(self._tmp.name)
+    def test_settled_market_guards_normalize_whitespace_and_type_variant_ids(self) -> None:
+        portfolio = Portfolio(10.0)
+        portfolio.resolve(
+            ResolvedContract(
+                "42",
+                SettlementState.RESOLVED_YES,
+                NOW,
+                "acceptance fixture",
+            )
+        )
+
+        with self.assertRaises(ValueError):
+            portfolio.submit_order(
+                OrderRequest(
+                    "42",
+                    Side.BUY,
+                    1.0,
+                    MarketType.PREDICTION,
+                    market_id=" 42 ",
+                    outcome="yes",
+                )
+            )
+
+        def settled_fill(market_id: object, order_id: str) -> Fill:
+            return Fill(
+                timestamp=NOW,
+                market_type=MarketType.PREDICTION,
+                symbol="42",
+                side=Side.BUY,
+                quantity=1.0,
+                price=0.5,
+                fees=0.0,
+                slippage=0.0,
+                strategy_id="acceptance",
+                order_id=order_id,
+                market_id=market_id,  # type: ignore[arg-type]
+                metadata={"outcome": "yes"},
+            )
+
+        with self.assertRaises(ValueError):
+            portfolio.apply_fill(settled_fill(" 42 ", "settled-apply"))
+        with self.assertRaises(ValueError):
+            portfolio.record_fill(settled_fill(42, "settled-record"))
+
+        position = portfolio.record_fill(settled_fill("unresolved-market", "unresolved"))
+        self.assertEqual(position.quantity, 1.0)
+    def test_resolution_matches_normalized_prediction_market_position_ids(self) -> None:
+        portfolio = Portfolio(10.0)
+        request = OrderRequest(
+            "yes-token",
+            Side.BUY,
+            1.0,
+            MarketType.PREDICTION,
+            market_id=" 42 ",
+            outcome="yes",
+        )
+        fill = portfolio.execute_order(request, timestamp=NOW, price=0.40, order_id="position")
+        self.assertIsNotNone(fill)
+        position = portfolio.get_position("yes-token", outcome="yes")
+        self.assertIsNotNone(position)
+        assert position is not None
+        self.assertEqual(position.market_id, "42")
+
+        payout = portfolio.resolve(
+            ResolvedContract(42, SettlementState.RESOLVED_YES, NOW, "acceptance fixture"),  # type: ignore[arg-type]
+        )
+        self.assertAlmostEqual(payout, 1.0)
+        self.assertEqual(position.quantity, 0.0)
+
+    def test_filled_order_id_retry_after_resolution_is_idempotent(self) -> None:
+        portfolio = Portfolio(10.0)
+        request = OrderRequest(
+            "yes-token",
+            Side.BUY,
+            1.0,
+            MarketType.PREDICTION,
+            market_id="42",
+            outcome="yes",
+        )
+        fill = portfolio.execute_order(request, timestamp=NOW, price=0.40, order_id="filled")
+        self.assertIsNotNone(fill)
+        portfolio.resolve(
+            ResolvedContract(" 42 ", SettlementState.RESOLVED_YES, NOW, "acceptance fixture"),
+        )
+
+        retry = portfolio.execute_order(request, timestamp=NOW, price=0.40, order_id="filled")
+        self.assertIsNone(retry)
+        self.assertEqual(portfolio.orders["filled"].status, "filled")
+        self.assertEqual(len(portfolio.fills), 1)
+
+    def test_open_buy_retry_after_resolution_is_terminal_and_non_executable(self) -> None:
+        portfolio = Portfolio(10.0)
+        request = OrderRequest(
+            "yes-token",
+            Side.BUY,
+            1.0,
+            MarketType.PREDICTION,
+            market_id="42",
+            outcome="yes",
+        )
+        order = portfolio.submit_order(request, order_id="open")
+        portfolio.resolve(
+            ResolvedContract(" 42 ", SettlementState.RESOLVED_NO, NOW, "acceptance fixture"),
+        )
+
+        retry = portfolio.execute_order(request, timestamp=NOW, price=0.40, order_id="open")
+        self.assertIsNone(retry)
+        self.assertEqual(order.status, "cancelled")
+        self.assertEqual(order.remaining_quantity, 0.0)
+        self.assertEqual(portfolio.fills, [])
+
+
+    def _refresh_raw_historical(
+        self,
+        store: AxiomStore,
+        rows: list[dict[str, object]],
+        *,
+        strategy_version_id: str = "sv-raw-integration",
+    ) -> tuple[AutonomousResearchProcessor, dict[str, object], Mapping[str, object]]:
+        strategy = _raw_application_strategy(strategy_version_id)
+        store.save_admission_policy(_policy().as_dict())
+        processor = AutonomousResearchProcessor(store, clock=lambda: NOW)
+        with patch.object(
+            processor,
+            "_rolling_strategy_documents",
+            return_value=(strategy,),
+        ), patch.object(
+            processor,
+            "_load_rolling_historical_dataset",
+            return_value=list(rows),
+        ):
+            state = processor.refresh_rolling_evidence(now=NOW)
+        return processor, strategy, state
+
+    def _refresh_raw_replay(
+        self,
+        store: AxiomStore,
+        rows: list[dict[str, object]],
+        *,
+        strategy_version_id: str = "sv-raw-replay",
+    ) -> tuple[AutonomousResearchProcessor, dict[str, object], Mapping[str, object]]:
+        strategy = _raw_application_strategy(strategy_version_id)
+        store.save_admission_policy(_policy().as_dict())
+        for index, row in enumerate(rows):
+            timestamp = row.get("timestamp")
+            market_id = str(row.get("market_id", "")).strip()
+            if not isinstance(timestamp, datetime) or not market_id:
+                raise AssertionError("replay fixture requires market and timestamp")
+            store.save_polymarket_snapshot(
+                f"raw-replay-{market_id}-{index}",
+                market_id,
+                timestamp,
+                timestamp,
+                dict(row),
+                quality=PRICE_PROXY_RESEARCH,
+                source_type="HISTORICAL",
+            )
+        processor = AutonomousResearchProcessor(store, clock=lambda: NOW)
+        with patch.object(
+            processor,
+            "_rolling_strategy_documents",
+            return_value=(strategy,),
+        ), patch.object(
+            processor,
+            "_load_rolling_historical_dataset",
+            return_value=[],
+        ):
+            state = processor.refresh_rolling_evidence(now=NOW)
+        return processor, strategy, state
+
+
+    def test_public_refresh_routes_unbound_price_rows_to_price_proxy(self) -> None:
+        raw_rows = [
+            _raw_application_row(0, 0.40),
+            _raw_application_row(1, 0.40),
+            _raw_application_row(2, 0.60),
+        ]
+        with self._store("raw-price-routing.sqlite3") as store:
+            with patch(
+                "axiom.autonomous.run_prediction_research_mode",
+                wraps=run_prediction_research_mode,
+            ) as evaluator:
+                _processor, strategy, state = self._refresh_raw_historical(store, raw_rows)
+            historical_calls = [
+                call
+                for call in evaluator.call_args_list
+                if call.kwargs.get("mode") == PRICE_PROXY_RESEARCH
+            ]
+            self.assertTrue(historical_calls)
+            self.assertFalse(
+                any(
+                    call.kwargs.get("mode") == RECORDED_BOOK_REPLAY
+                    for call in historical_calls
+                )
+            )
+            stored = store.list_strategy_evidence_windows(
+                strategy["strategy_version_id"],
+                limit=64,
+            )
+            produced = [
+                item
+                for item in state["evidence_windows"]
+                if item["strategy_version_id"] == strategy["strategy_version_id"]
+                and item.get("evaluation_version") == "rolling-evaluation:v2"
+            ]
+            self.assertTrue(produced)
+            evidence = next(
+                item
+                for item in stored
+                if item["evidence_window_id"] == produced[0]["evidence_window_id"]
+            )
+            self.assertEqual(
+                evidence["source_class"],
+                produced[0]["source_class"],
+            )
+            self.assertEqual(
+                evidence["requested_days"],
+                produced[0]["requested_days"],
+            )
+            self.assertNotIn("strategy_version_id", raw_rows[0])
+            self.assertEqual(evidence["strategy_version_id"], strategy["strategy_version_id"])
+            self.assertEqual(evidence["candidate_id"], strategy["candidate_id"])
+            self.assertEqual(evidence["research_trial_id"], strategy["research_trial_id"])
+            for key in (
+                "evaluation_run_id",
+                "evaluation_version",
+                "supersedes_evidence_id",
+                "loaded_rows",
+                "valid_input_rows",
+                "evaluator_invoked",
+                "evaluator_completed",
+                "evaluated_observations",
+                "signal_count",
+                "diagnostic_summary_count",
+                "evaluator_name",
+                "evaluator_error",
+                "evaluator_prerequisite",
+            ):
+                self.assertIn(key, evidence)
+            self.assertTrue(evidence["evaluator_invoked"])
+            self.assertTrue(evidence["evaluator_completed"])
+            self.assertEqual(evidence["loaded_rows"], 3)
+            self.assertEqual(evidence["valid_input_rows"], 3)
+            self.assertEqual(evidence["evaluated_observations"], 3)
+            self.assertEqual(evidence["signal_count"], 3)
+            self.assertEqual(evidence["diagnostic_summary_count"], 0)
+            self.assertIsNone(evidence["evaluator_error"])
+            self.assertGreater(Decimal(str(evidence["realized_pnl"])), Decimal("0"))
+    def test_live_price_proxy_rows_persist_as_canonical_simulation(self) -> None:
+        strategy = _raw_application_strategy()
+        class EmptyEvidenceStore:
+            def list_strategy_evidence_windows(
+                self,
+                *,
+                strategy_version_id: str,
+                limit: int,
+            ) -> list[dict[str, object]]:
+                del strategy_version_id, limit
+                return []
+
+        processor = AutonomousResearchProcessor.__new__(AutonomousResearchProcessor)
+        processor.store = EmptyEvidenceStore()
+        evidence = processor._rolling_evidence_record(
+            strategy,
+            [
+                _raw_application_row(0, 0.40),
+                _raw_application_row(1, 0.40),
+                _raw_application_row(2, 0.60),
+            ],
+            "LIVE",
+            7,
+            NOW,
+        )
+        self.assertIsNotNone(evidence)
+        assert evidence is not None
+        self.assertEqual(evidence["evaluation_kind"], "CANONICAL_SIMULATION")
+        self.assertTrue(evidence["evaluator_invoked"])
+        self.assertTrue(evidence["evaluator_completed"])
+        self.assertTrue(evidence["accounting_available"])
+        model = RollingEvidence.from_mapping(evidence)
+        self.assertEqual(model.evaluation_kind, "CANONICAL_SIMULATION")
+    def test_canonical_simulation_open_positions_over_storage_bound_fails_closed(self) -> None:
+        strategy = _raw_application_strategy()
+        class EmptyEvidenceStore:
+            def list_strategy_evidence_windows(
+                self,
+                *,
+                strategy_version_id: str,
+                limit: int,
+            ) -> list[dict[str, object]]:
+                del strategy_version_id, limit
+                return []
+
+        processor = AutonomousResearchProcessor.__new__(AutonomousResearchProcessor)
+        processor.store = EmptyEvidenceStore()
+        positions = [
+            {"market_id": f"canonical-market-{index:02d}", "quantity": "1"}
+            for index in range(33)
+        ]
+        evidence = processor._rolling_evidence_record(
+            strategy,
+            [
+                _raw_application_row(0, 0.40),
+                _raw_application_row(1, 0.40),
+                _raw_application_row(2, 0.60),
+            ],
+            "HISTORICAL",
+            7,
+            NOW,
+            _canonical_simulation_evaluation(
+                "canonical-over-bound",
+                open_positions=positions,
+            ),
+        )
+        self.assertIsNotNone(evidence)
+        assert evidence is not None
+        self.assertFalse(evidence["accounting_available"])
+        self.assertFalse(evidence["accounting_complete"])
+        self.assertTrue(evidence["accounting_partial"])
+        self.assertEqual(
+            evidence["accounting_unavailable_reason"],
+            "ACCOUNTING_OPEN_POSITIONS_LIMIT_EXCEEDED",
+        )
+        self.assertEqual(evidence["positions"], 0)
+        self.assertEqual(evidence["open_positions"], [])
+        self.assertEqual(evidence["portfolio_accounting"]["open_positions"], [])
+        model = RollingEvidence.from_mapping(evidence)
+        self.assertEqual(model.portfolio_accounting["open_positions"], ())
+
+
+
+    def test_public_refresh_routes_timestamped_books_to_recorded_replay(self) -> None:
+        raw_rows = [
+            _raw_application_row(0, 0.40, book=True),
+            _raw_application_row(1, 0.60, book=True),
+            _raw_application_row(2, 0.60, book=True),
+        ]
+        with self._store("raw-book-routing.sqlite3") as store:
+            with patch(
+                "axiom.autonomous.run_prediction_research_mode",
+                wraps=run_prediction_research_mode,
+            ) as evaluator:
+                _processor, strategy, state = self._refresh_raw_historical(store, raw_rows)
+            historical_calls = [
+                call
+                for call in evaluator.call_args_list
+                if call.kwargs.get("mode") == RECORDED_BOOK_REPLAY
+            ]
+            self.assertTrue(historical_calls)
+            stored = store.list_strategy_evidence_windows(
+                strategy["strategy_version_id"],
+                limit=64,
+            )
+            produced = [
+                item
+                for item in state["evidence_windows"]
+                if item["strategy_version_id"] == strategy["strategy_version_id"]
+                and item.get("evaluation_version") == "rolling-evaluation:v2"
+            ]
+            self.assertTrue(produced)
+            evidence = next(
+                item
+                for item in stored
+                if item["evidence_window_id"] == produced[0]["evidence_window_id"]
+            )
+            self.assertEqual(
+                evidence["source_class"],
+                produced[0]["source_class"],
+            )
+            self.assertEqual(
+                evidence["requested_days"],
+                produced[0]["requested_days"],
+            )
+            self.assertTrue(evidence["evaluator_invoked"])
+            self.assertTrue(evidence["evaluator_completed"])
+            self.assertEqual(evidence["loaded_rows"], 3)
+            self.assertEqual(evidence["valid_input_rows"], 3)
+            self.assertEqual(evidence["evaluated_observations"], 3)
+            self.assertEqual(evidence["signal_count"], 3)
+            self.assertGreater(Decimal(str(evidence["realized_pnl"])), Decimal("0"))
+
+    def test_public_refresh_replay_without_books_never_uses_price_proxy(self) -> None:
+        raw_rows = [
+            _raw_application_row(0, 0.40),
+            _raw_application_row(1, 0.60),
+        ]
+        with self._store("raw-replay-without-books.sqlite3") as store:
+            with patch(
+                "axiom.autonomous.run_prediction_research_mode",
+                wraps=run_prediction_research_mode,
+            ) as evaluator:
+                _processor, strategy, state = self._refresh_raw_replay(store, raw_rows)
+            proxy_calls = [
+                call
+                for call in evaluator.call_args_list
+                if call.kwargs.get("mode") == PRICE_PROXY_RESEARCH
+            ]
+            replay_calls = [
+                call
+                for call in evaluator.call_args_list
+                if call.kwargs.get("mode") == RECORDED_BOOK_REPLAY
+            ]
+            self.assertEqual(proxy_calls, [])
+            self.assertEqual(replay_calls, [])
+            self.assertEqual(state["evidence_windows"], [])
+            self.assertTrue(
+                any(
+                    item.get("source_class") == "REPLAY"
+                    and item.get("reason") == "REPLAY_BOOK_REQUIRED"
+                    for item in state["pending"]
+                )
+            )
+            blockers = store.list_rolling_evidence_blockers(limit=64)
+            self.assertTrue(
+                any(
+                    item.get("source_class") == "REPLAY"
+                    and item.get("blocker") == "REPLAY_BOOK_REQUIRED"
+                    for item in blockers
+                )
+            )
+            stored = store.list_strategy_evidence_windows(
+                strategy["strategy_version_id"],
+                limit=64,
+            )
+            self.assertEqual(stored, [])
+
+    def test_public_refresh_requires_nested_evaluator_status(self) -> None:
+        raw_rows = [
+            _raw_application_row(0, 0.40),
+            _raw_application_row(1, 0.60),
+        ]
+
+        def without_nested_status(*args: object, **kwargs: object) -> object:
+            result = _run_prediction_research_mode(*args, **kwargs)
+            result.metrics.pop("evaluation", None)
+            return result
+
+        with self._store("raw-missing-evaluator-status.sqlite3") as store:
+            with patch(
+                "axiom.autonomous.run_prediction_research_mode",
+                side_effect=without_nested_status,
+            ):
+                _processor, strategy, _state = self._refresh_raw_historical(store, raw_rows)
+            evidence = next(
+                item
+                for item in store.list_strategy_evidence_windows(
+                    strategy["strategy_version_id"],
+                    limit=64,
+                )
+                if item["requested_days"] == 7
+            )
+            self.assertFalse(evidence["evaluator_completed"])
+            self.assertFalse(evidence["accounting_available"])
+            self.assertEqual(evidence["evaluator_prerequisite"], "EVALUATOR_STATUS_REQUIRED")
+            self.assertIsNone(evidence["realized_pnl"])
+            self.assertIsNone(evidence["unrealized_pnl"])
+
+    def test_public_refresh_invalid_evaluator_counts_cannot_aid_admission(self) -> None:
+        raw_rows = [
+            _raw_application_row(0, 0.40),
+            _raw_application_row(1, 0.60),
+        ]
+
+        def fractional_count(*args: object, **kwargs: object) -> object:
+            result = _run_prediction_research_mode(*args, **kwargs)
+            evaluation = result.metrics["evaluation"]
+            evaluation["evaluated_observations"] = 1.5
+            return result
+
+        with self._store("raw-invalid-evaluator-count.sqlite3") as store:
+            with patch(
+                "axiom.autonomous.run_prediction_research_mode",
+                side_effect=fractional_count,
+            ):
+                _processor, strategy, _state = self._refresh_raw_historical(store, raw_rows)
+            evidence = next(
+                item
+                for item in store.list_strategy_evidence_windows(
+                    strategy["strategy_version_id"],
+                    limit=64,
+                )
+                if item["requested_days"] == 7
+            )
+            self.assertFalse(evidence["evaluator_completed"])
+            self.assertFalse(evidence["accounting_available"])
+            self.assertEqual(evidence["evaluated_observations"], 0)
+            self.assertEqual(evidence["accounting_unavailable_reason"], "EVALUATOR_COUNT_METRIC_INVALID")
+            self.assertFalse(evidence["admitted"])
+
+    def test_public_refresh_overlap_excludes_rejected_market_rows(self) -> None:
+        valid = _raw_application_row(0, 0.40, market_id="market-raw-integration")
+        rejected = _raw_application_row(1, 0.60, market_id="foreign-market")
+        rejected.update(
+            {
+                "strategy_hash": "sha256:foreign",
+                "strategy_version_id": "sv-foreign",
+                "research_trial_id": "trial-foreign",
+                "candidate_id": "candidate-foreign",
+            }
+        )
+        with self._store("raw-overlap-rejections.sqlite3") as store:
+            _processor, strategy, _state = self._refresh_raw_historical(
+                store,
+                [valid, rejected],
+            )
+            evidence = next(
+                item
+                for item in store.list_strategy_evidence_windows(
+                    strategy["strategy_version_id"],
+                    limit=64,
+                )
+                if item["requested_days"] == 7
+                and item.get("requested_source_class") == "HISTORICAL"
+            )
+            self.assertEqual(evidence["valid_input_rows"], 1)
+            self.assertEqual(evidence["overlap_key"], _rolling_overlap_key([valid]))
+            self.assertNotEqual(
+                evidence["overlap_key"],
+                _rolling_overlap_key([valid, rejected]),
+            )
+
+    def test_public_refresh_rejects_malformed_and_conflicting_raw_provenance(self) -> None:
+        conflict = _raw_application_row(0, 0.40)
+        conflict.update(
+            {
+                "strategy_hash": "sha256:foreign",
+                "strategy_version_id": "sv-foreign",
+                "research_trial_id": "trial-foreign",
+                "candidate_id": "candidate-foreign",
+            }
+        )
+        malformed = _raw_application_row(1, 0.40)
+        malformed.update(
+            {
+                "strategy_hash": "sha256:sv-raw-integration",
+                "strategy_version_id": "sv-raw-integration",
+                "research_trial_id": "trial-sv-raw-integration",
+                "candidate_id": "candidate-sv-raw-integration",
+                "timestamp": "malformed-timestamp",
+            }
+        )
+        with self._store("raw-rejections.sqlite3") as store:
+            _processor, strategy, state = self._refresh_raw_historical(
+                store,
+                [conflict, malformed],
+            )
+            reasons = {
+                str(item.get("reason"))
+                for item in state["pending"]
+                if item.get("source_class") == "HISTORICAL"
+            }
+            self.assertIn("SOURCE_BINDING_CONFLICT", reasons)
+            self.assertIn("SOURCE_TIMESTAMP_UNPARSEABLE", reasons)
+            self.assertEqual(
+                store.list_strategy_evidence_windows(
+                    strategy["strategy_version_id"],
+                    limit=64,
+                ),
+                [],
+            )
+
+    def test_public_refresh_evaluator_failure_keeps_zero_observations_and_null_pnl(self) -> None:
+        raw_rows = [
+            _raw_application_row(0, 0.40),
+            _raw_application_row(1, 0.40),
+        ]
+        with self._store("raw-evaluator-failure.sqlite3") as store:
+            with patch(
+                "axiom.autonomous.run_prediction_research_mode",
+                side_effect=RuntimeError("fixture evaluator exploded"),
+            ):
+                _processor, strategy, _state = self._refresh_raw_historical(store, raw_rows)
+            stored = store.list_strategy_evidence_windows(
+                strategy["strategy_version_id"],
+                limit=64,
+            )
+            evidence = next(
+                item
+                for item in stored
+                if item["source_class"] == "HISTORICAL"
+                and item["requested_days"] == 7
+            )
+            self.assertTrue(evidence["evaluator_invoked"])
+            self.assertFalse(evidence["evaluator_completed"])
+            self.assertEqual(evidence["evaluated_observations"], 0)
+            self.assertEqual(evidence["signal_count"], 0)
+            self.assertEqual(evidence["loaded_rows"], 2)
+            self.assertEqual(evidence["valid_input_rows"], 2)
+            self.assertEqual(evidence["diagnostic_summary_count"], 1)
+            self.assertIsNone(evidence["evaluator_name"])
+            self.assertEqual(evidence["evaluator_error"], "fixture evaluator exploded")
+            self.assertIsNone(evidence["realized_pnl"])
+            self.assertIsNone(evidence["unrealized_pnl"])
+            self.assertFalse(evidence["accounting_available"])
+
+    def test_public_refresh_corrected_result_has_new_version_and_predecessor_link(self) -> None:
+        initial_rows = [
+            _raw_application_row(0, 0.40),
+            _raw_application_row(1, 0.40),
+        ]
+        corrected_rows = [
+            _raw_application_row(0, 0.40),
+            _raw_application_row(1, 0.40),
+            _raw_application_row(2, 0.60),
+        ]
+        with self._store("raw-version-linkage.sqlite3") as store:
+            strategy = _raw_application_strategy()
+            store.save_admission_policy(_policy().as_dict())
+            processor = AutonomousResearchProcessor(store, clock=lambda: NOW)
+            with patch.object(
+                processor,
+                "_rolling_strategy_documents",
+                return_value=(strategy,),
+            ), patch.object(
+                processor,
+                "_load_rolling_historical_dataset",
+                side_effect=[initial_rows, corrected_rows],
+            ), patch(
+                "axiom.autonomous.run_prediction_research_mode",
+                side_effect=RuntimeError("fixture evaluator exploded"),
+            ):
+                processor.refresh_rolling_evidence(now=NOW)
+                with patch(
+                    "axiom.autonomous.run_prediction_research_mode",
+                    wraps=run_prediction_research_mode,
+                ):
+                    processor.refresh_rolling_evidence(now=NOW + timedelta(hours=1))
+            stored = [
+                item
+                for item in store.list_strategy_evidence_windows(
+                    strategy["strategy_version_id"],
+                    limit=64,
+                )
+                if item["source_class"] == "HISTORICAL"
+                and item["requested_days"] == 7
+            ]
+            diagnostic = next(item for item in stored if not item["evaluator_completed"])
+            corrected = next(item for item in stored if item["evaluator_completed"])
+            self.assertNotEqual(
+                diagnostic["evaluation_run_id"],
+                corrected["evaluation_run_id"],
+            )
+            self.assertNotEqual(
+                diagnostic["evaluation_version"],
+                corrected["evaluation_version"],
+            )
+            self.assertEqual(
+                corrected["supersedes_evidence_id"],
+                diagnostic["evidence_window_id"],
+            )
+            self.assertEqual(corrected["evaluated_observations"], 2)
+            self.assertEqual(corrected["valid_input_rows"], 2)
+    def test_public_refresh_predecessor_lookup_failure_blocks_correction(self) -> None:
+        initial_rows = [
+            _raw_application_row(0, 0.40),
+            _raw_application_row(1, 0.40),
+        ]
+        corrected_rows = [
+            _raw_application_row(0, 0.40),
+            _raw_application_row(1, 0.40),
+            _raw_application_row(2, 0.60),
+        ]
+        with self._store("raw-predecessor-lookup-failure.sqlite3") as store:
+            strategy = _raw_application_strategy()
+            store.save_admission_policy(_policy().as_dict())
+            processor = AutonomousResearchProcessor(store, clock=lambda: NOW)
+            with patch.object(
+                processor,
+                "_rolling_strategy_documents",
+                return_value=(strategy,),
+            ), patch.object(
+                processor,
+                "_load_rolling_historical_dataset",
+                side_effect=[initial_rows, corrected_rows],
+            ):
+                processor.refresh_rolling_evidence(now=NOW)
+                initial_stored = store.list_strategy_evidence_windows(
+                    strategy["strategy_version_id"],
+                    limit=64,
+                )
+                initial_ids = {
+                    str(item["evidence_window_id"])
+                    for item in initial_stored
+                    if item.get("evaluation_version") == "rolling-evaluation:v2"
+                }
+                self.assertTrue(initial_ids)
+                with patch.object(
+                    store,
+                    "list_strategy_evidence_windows",
+                    side_effect=RuntimeError("fixture predecessor listing unavailable"),
+                ):
+                    state = processor.refresh_rolling_evidence(
+                        now=NOW + timedelta(hours=1)
+                    )
+
+            stored = store.list_strategy_evidence_windows(
+                strategy["strategy_version_id"],
+                limit=64,
+            )
+            stored_ids = {
+                str(item["evidence_window_id"])
+                for item in stored
+                if item.get("evaluation_version") == "rolling-evaluation:v2"
+            }
+            self.assertEqual(stored_ids, initial_ids)
+
+            pending = [
+                item
+                for item in state["pending"]
+                if item.get("source_class") == "HISTORICAL"
+                and item.get("reason") == "PREDECESSOR_LOOKUP_UNAVAILABLE"
+            ]
+            self.assertTrue(pending)
+            self.assertTrue(all(item.get("status") == "BLOCKED" for item in pending))
+            self.assertEqual(state["status"], "SCHEDULED")
+            blockers = store.list_rolling_evidence_blockers(limit=64)
+            matching_blockers = [
+                item
+                for item in blockers
+                if item.get("source_class") == "HISTORICAL"
+                and item.get("blocker") == "PREDECESSOR_LOOKUP_UNAVAILABLE"
+            ]
+            self.assertTrue(matching_blockers)
+            self.assertTrue(
+                any(
+                    (
+                        item.get("payload")
+                        if isinstance(item.get("payload"), Mapping)
+                        else {}
+                    ).get("retryable")
+                    is True
+                    and (
+                        item.get("payload")
+                        if isinstance(item.get("payload"), Mapping)
+                        else {}
+                    ).get("non_retryable")
+                    is False
+                    and (
+                        item.get("payload")
+                        if isinstance(item.get("payload"), Mapping)
+                        else {}
+                    ).get("terminal")
+                    is False
+                    and (
+                        item.get("payload")
+                        if isinstance(item.get("payload"), Mapping)
+                        else {}
+                    ).get("next_attempt_at")
+                    for item in matching_blockers
+                )
+            )
+    def test_rolling_evidence_missing_predecessor_lister_blocks_retryably(self) -> None:
+        strategy = _raw_application_strategy("sv-missing-predecessor-lister")
+        rows = [
+            _raw_application_row(0, 0.40),
+            _raw_application_row(1, 0.40),
+            _raw_application_row(2, 0.60),
+        ]
+
+        class MissingListerStore:
+            pass
+
+        processor = AutonomousResearchProcessor.__new__(AutonomousResearchProcessor)
+        processor.store = MissingListerStore()
+        with self.assertRaises(AutonomousResearchError) as raised:
+            processor._rolling_evidence_record(
+                strategy,
+                rows,
+                "HISTORICAL",
+                7,
+                NOW,
+                _canonical_simulation_evaluation("missing-lister"),
+            )
+        self.assertEqual(raised.exception.reason, "PREDECESSOR_LOOKUP_UNAVAILABLE")
+
+    def test_rolling_evidence_sqlite_predecessor_lister_failure_blocks_retryably(self) -> None:
+        strategy = _raw_application_strategy("sv-sqlite-predecessor-lister")
+        rows = [
+            _raw_application_row(0, 0.40),
+            _raw_application_row(1, 0.40),
+            _raw_application_row(2, 0.60),
+        ]
+
+        class SqliteFailureStore:
+            def list_strategy_evidence_windows(
+                self,
+                *,
+                strategy_version_id: str,
+                limit: int,
+            ) -> list[dict[str, object]]:
+                del strategy_version_id, limit
+                raise sqlite3.OperationalError("database is locked")
+
+        processor = AutonomousResearchProcessor.__new__(AutonomousResearchProcessor)
+        processor.store = SqliteFailureStore()
+        with self.assertRaises(AutonomousResearchError) as raised:
+            processor._rolling_evidence_record(
+                strategy,
+                rows,
+                "HISTORICAL",
+                7,
+                NOW,
+                _canonical_simulation_evaluation("sqlite-lister"),
+            )
+        self.assertEqual(raised.exception.reason, "PREDECESSOR_LOOKUP_UNAVAILABLE")
+
+    def test_rolling_evidence_malformed_predecessor_listing_blocks_retryably(self) -> None:
+        strategy = _raw_application_strategy("sv-malformed-predecessor-lister")
+        rows = [
+            _raw_application_row(0, 0.40),
+            _raw_application_row(1, 0.40),
+            _raw_application_row(2, 0.60),
+        ]
+
+        class MalformedListerStore:
+            def __init__(self, result: object) -> None:
+                self.result = result
+
+            def list_strategy_evidence_windows(
+                self,
+                *,
+                strategy_version_id: str,
+                limit: int,
+            ) -> object:
+                del strategy_version_id, limit
+                return self.result
+
+        malformed_results = (
+            None,
+            {"evidence_window_id": "not-a-list"},
+            "not-a-list",
+            [object()],
+        )
+        for index, result in enumerate(malformed_results):
+            with self.subTest(index=index):
+                processor = AutonomousResearchProcessor.__new__(
+                    AutonomousResearchProcessor
+                )
+                processor.store = MalformedListerStore(result)
+                with self.assertRaises(AutonomousResearchError) as raised:
+                    processor._rolling_evidence_record(
+                        strategy,
+                        rows,
+                        "HISTORICAL",
+                        7,
+                        NOW,
+                        _canonical_simulation_evaluation(f"malformed-lister-{index}"),
+                    )
+                self.assertEqual(
+                    raised.exception.reason,
+                    "PREDECESSOR_LOOKUP_UNAVAILABLE",
+                )
+
+    def test_predecessor_head_uses_available_order_not_created_order(self) -> None:
+        strategy = _raw_application_strategy("sv-predecessor-order")
+        rows = [
+            _raw_application_row(0, 0.40),
+            _raw_application_row(1, 0.40),
+            _raw_application_row(2, 0.60),
+        ]
+
+        class EvidenceStore:
+            def __init__(self, records: list[dict[str, object]]) -> None:
+                self.records = records
+
+            def list_strategy_evidence_windows(
+                self,
+                *,
+                strategy_version_id: str,
+                limit: int,
+            ) -> list[dict[str, object]]:
+                del strategy_version_id, limit
+                return list(self.records)
+
+        older_available = _evidence(
+            strategy["strategy_version_id"],
+            "created-newer",
+            available_from=(NOW - timedelta(days=3)).isoformat(),
+            available_through=(NOW - timedelta(days=2)).isoformat(),
+            actual_coverage_seconds=86400,
+            created_at=(NOW + timedelta(days=7)).isoformat(),
+        )
+        newer_available = _evidence(
+            strategy["strategy_version_id"],
+            "available-newer",
+            available_from=(NOW - timedelta(days=3)).isoformat(),
+            available_through=(NOW - timedelta(days=1)).isoformat(),
+            actual_coverage_seconds=2 * 86400,
+            created_at=(NOW - timedelta(days=7)).isoformat(),
+        )
+        processor = AutonomousResearchProcessor.__new__(AutonomousResearchProcessor)
+        processor.store = EvidenceStore([older_available, newer_available])
+        correction = processor._rolling_evidence_record(
+            strategy,
+            rows,
+            "HISTORICAL",
+            7,
+            NOW,
+            _canonical_simulation_evaluation("available-order"),
+        )
+        self.assertIsNotNone(correction)
+        assert correction is not None
+        self.assertEqual(correction["supersedes_evidence_id"], "available-newer")
+
+    def test_same_endpoint_correction_supersedes_active_latest_predecessor(self) -> None:
+        strategy = _raw_application_strategy()
+        rows = [
+            _raw_application_row(0, 0.40),
+            _raw_application_row(1, 0.40),
+            _raw_application_row(2, 0.60),
+        ]
+
+        class EvidenceStore:
+            def __init__(self) -> None:
+                self.records: list[dict[str, object]] = []
+
+            def list_strategy_evidence_windows(
+                self,
+                *,
+                strategy_version_id: str,
+                limit: int,
+            ) -> list[dict[str, object]]:
+                del strategy_version_id, limit
+                return list(self.records)
+
+        store = EvidenceStore()
+        processor = AutonomousResearchProcessor.__new__(AutonomousResearchProcessor)
+        processor.store = store
+
+        first = processor._rolling_evidence_record(
+            strategy,
+            rows,
+            "HISTORICAL",
+            7,
+            NOW,
+            _canonical_simulation_evaluation("same-endpoint-run-1"),
+        )
+        self.assertIsNotNone(first)
+        assert first is not None
+        store.records.append(first)
+
+        second = processor._rolling_evidence_record(
+            strategy,
+            rows,
+            "HISTORICAL",
+            7,
+            NOW,
+            _canonical_simulation_evaluation("same-endpoint-run-2"),
+        )
+        self.assertIsNotNone(second)
+        assert second is not None
+        self.assertEqual(
+            second["supersedes_evidence_id"],
+            first["evidence_window_id"],
+        )
+        store.records.append(second)
+
+        third = processor._rolling_evidence_record(
+            strategy,
+            rows,
+            "HISTORICAL",
+            7,
+            NOW,
+            _canonical_simulation_evaluation("same-endpoint-run-3"),
+        )
+        self.assertIsNotNone(third)
+        assert third is not None
+        self.assertEqual(
+            third["supersedes_evidence_id"],
+            second["evidence_window_id"],
+        )
+
+
+    def test_actual_ledger_open_positions_at_storage_bound_persist(self) -> None:
+        strategy_id = "sv-actual-ledger-bound"
+        strategy = _strategy(strategy_id)
+        with self._store("actual-ledger-bound.sqlite3") as store:
+            store.save_strategy_version(strategy)
+            processor = AutonomousResearchProcessor(store, clock=lambda: NOW)
+            record = processor._rolling_evidence_record(
+                strategy,
+                [_actual_ledger_row(32)],
+                "PAPER",
+                7,
+                NOW,
+            )
+            self.assertIsNotNone(record)
+            assert record is not None
+            self.assertTrue(record["accounting_available"])
+            self.assertTrue(record["accounting_complete"])
+            self.assertFalse(record["accounting_partial"])
+            self.assertFalse(record["evaluator_invoked"])
+            self.assertFalse(record["evaluator_completed"])
+            self.assertEqual(len(record["open_positions"]), 32)
+            store.save_strategy_evidence_window(record)
+            stored = store.list_strategy_evidence_windows(strategy_id, limit=64)
+            self.assertEqual(len(stored), 1)
+            self.assertEqual(len(stored[0]["open_positions"]), 32)
+            self.assertTrue(stored[0]["accounting_available"])
+            self.assertTrue(stored[0]["accounting_complete"])
+
+    def test_actual_ledger_open_positions_over_storage_bound_is_unavailable(self) -> None:
+        strategy_id = "sv-actual-ledger-over-bound"
+        strategy = _strategy(strategy_id)
+        with self._store("actual-ledger-over-bound.sqlite3") as store:
+            store.save_strategy_version(strategy)
+            processor = AutonomousResearchProcessor(store, clock=lambda: NOW)
+            record = processor._rolling_evidence_record(
+                strategy,
+                [_actual_ledger_row(33)],
+                "PAPER",
+                7,
+                NOW,
+            )
+            self.assertIsNotNone(record)
+            assert record is not None
+            self.assertFalse(record["accounting_available"])
+            self.assertFalse(record["accounting_complete"])
+            self.assertTrue(record["accounting_partial"])
+            self.assertFalse(record["evaluator_invoked"])
+            self.assertFalse(record["evaluator_completed"])
+            self.assertEqual(record["accounting_unavailable_reason"], "ACCOUNTING_OPEN_POSITIONS_LIMIT_EXCEEDED")
+            self.assertEqual(record["open_positions"], [])
+            self.assertEqual(record["portfolio_accounting"]["open_positions"], [])
+            store.save_strategy_evidence_window(record)
+            stored = store.list_strategy_evidence_windows(strategy_id, limit=64)
+            self.assertEqual(len(stored), 1)
+            self.assertFalse(stored[0]["accounting_available"])
+            self.assertFalse(stored[0]["accounting_complete"])
+            self.assertTrue(stored[0]["accounting_partial"])
+            self.assertEqual(
+                stored[0]["accounting_unavailable_reason"],
+                "ACCOUNTING_OPEN_POSITIONS_LIMIT_EXCEEDED",
+            )
+            self.assertEqual(stored[0]["open_positions"], [])
 
     def _store(self, name: str = "acceptance.sqlite3") -> AxiomStore:
         return AxiomStore(str(self.path / name))

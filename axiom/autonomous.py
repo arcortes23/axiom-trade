@@ -10,6 +10,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 import hashlib
+import inspect
 import json
 import math
 import re
@@ -36,13 +37,14 @@ from .mutations import DeterministicMutationEngine, ExperimentBudget
 from .research_bus import DurableResearchBus, ResearchBusPermissionError, ResearchQueueItem, ResearchQueueStatus
 from .robustness import bootstrap_confidence_interval, minimum_sample_check, neighboring_parameter_stability
 
-from .storage import AxiomStore
+from .storage import AxiomStore, _PAPER_POSITION_PROJECTION_LIMIT
 from .data_quality import evaluate_prediction_data_quality, persisted_quality_fields
 from .strategy import StrategyDefinition, load_strategy
 from .rolling_portfolio import (
     RollingAdmissionPolicy,
     RollingEvidence,
     RollingSelection,
+    _latest_windows,
     default_rolling_admission_policy,
     evaluate_rolling_selection,
     REASON_EXTERNAL_OBLIGATIONS_EXCEED_BUDGET,
@@ -95,6 +97,9 @@ _MAX_ROLLING_HERMES_IDS = 32
 _MAX_ROLLING_HERMES_PAYLOAD_BYTES = 16_383
 _MAX_ROLLING_HERMES_ID_LENGTH = 4_096
 _MAX_ROLLING_STATE_ITEMS = 32
+
+_ROLLING_OPEN_POSITIONS_LIMIT = _PAPER_POSITION_PROJECTION_LIMIT
+_ROLLING_OPEN_POSITIONS_LIMIT_REASON = "ACCOUNTING_OPEN_POSITIONS_LIMIT_EXCEEDED"
 _MAX_ROLLING_STATE_ID_LENGTH = 256
 _MAX_ROLLING_STATE_PAYLOAD_BYTES = 60_000
 _ROLLING_STATE_RESULT_KEYS = (
@@ -102,6 +107,10 @@ _ROLLING_STATE_RESULT_KEYS = (
     "research_trial_id",
     "candidate_id",
     "evidence_window_id",
+    "evaluation_run_id",
+    "evaluation_version",
+    "evaluation_kind",
+    "supersedes_evidence_id",
     "source_class",
     "requested_days",
     "status",
@@ -109,6 +118,16 @@ _ROLLING_STATE_RESULT_KEYS = (
     "next_job",
     "actual_coverage_seconds",
     "observation_completeness",
+    "loaded_rows",
+    "valid_input_rows",
+    "evaluator_invoked",
+    "evaluator_completed",
+    "evaluated_observations",
+    "signal_count",
+    "diagnostic_summary_count",
+    "evaluator_name",
+    "evaluator_error",
+    "evaluator_prerequisite",
     "realized_pnl",
     "unrealized_pnl",
     "fees",
@@ -164,6 +183,7 @@ _ROLLING_IMMUTABLE_SOURCE_BLOCKERS = frozenset(
         "PAPER_SPEC_BINDING_MISMATCH",
         "PAPER_IDENTITY_UNPROVEN",
         "PRICE_PROXY_ACCOUNTING_UNAVAILABLE",
+        "REPLAY_BOOK_REQUIRED",
     }
 )
 _ROLLING_PAPER_IDENTITY_MAX_DEPTH = 8
@@ -600,6 +620,281 @@ def _rolling_number(value: Any, default: Decimal = Decimal("0")) -> Decimal:
         return default
     return parsed if parsed.is_finite() else default
 
+
+
+def _rolling_strict_count(
+    value: Any,
+    name: str,
+    *,
+    default: int | None = None,
+) -> int | None:
+    """Parse a count without accepting truncation or non-finite values."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a non-negative integer")
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{name} must be a non-negative integer") from exc
+    if not parsed.is_finite() or parsed < 0 or parsed != parsed.to_integral_value():
+        raise ValueError(f"{name} must be a non-negative integer")
+    return int(parsed)
+
+
+_ROLLING_CANONICAL_ACCOUNTING_FIELDS = (
+    "accounting_available",
+    "initial_cash",
+    "cash",
+    "equity",
+    "realized_pnl",
+    "unrealized_pnl",
+    "net_pnl",
+    "fees",
+    "costs",
+    "allocated_capital",
+    "capital_at_risk",
+    "open_positions",
+    "opening_fills",
+    "closing_fills",
+    "partial_closing_fills",
+    "completed_round_trips",
+)
+_ROLLING_CANONICAL_MONETARY_FIELDS = (
+    "initial_cash",
+    "cash",
+    "equity",
+    "realized_pnl",
+    "unrealized_pnl",
+    "net_pnl",
+    "fees",
+    "costs",
+    "allocated_capital",
+    "capital_at_risk",
+)
+
+
+def _rolling_canonical_accounting_complete(value: Any) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    if any(value.get(name) is None for name in _ROLLING_CANONICAL_ACCOUNTING_FIELDS):
+        return False
+    for name in _ROLLING_CANONICAL_MONETARY_FIELDS:
+        item = value.get(name)
+        if isinstance(item, bool):
+            return False
+        try:
+            parsed = Decimal(str(item))
+        except (InvalidOperation, TypeError, ValueError, OverflowError):
+            return False
+        if not parsed.is_finite():
+            return False
+    return True
+
+
+def _rolling_actual_ledger_accounting(
+    projected: Sequence[tuple[Mapping[str, Any], Mapping[str, Any]]],
+    *,
+    available_from: datetime,
+    available_through: datetime,
+) -> dict[str, Any]:
+    """Build the canonical accounting document from exact PAPER ledgers.
+
+    This path is observed accounting, not simulation output.  It therefore
+    carries an explicit ACTUAL_LEDGER kind at its caller and never fabricates
+    evaluator status.  A resolved-bet ledger may omit portfolio cash fields;
+    in that narrow exact-ledger projection, allocated capital and net PnL
+    define the isolated account view deterministically.
+    """
+    unavailable: dict[str, Any] = {
+        "accounting_available": False,
+        "accounting_complete": False,
+        "accounting_partial": True,
+        "initial_cash": None,
+        "cash": None,
+        "equity": None,
+        "realized_pnl": None,
+        "unrealized_pnl": None,
+        "net_pnl": None,
+        "fees": None,
+        "costs": None,
+        "allocated_capital": None,
+        "capital_at_risk": None,
+        "open_positions": [],
+        "opening_fills": 0,
+        "closing_fills": 0,
+        "partial_closing_fills": 0,
+        "completed_round_trips": 0,
+        "available_from": available_from.isoformat(),
+        "available_through": available_through.isoformat(),
+    }
+    def unavailable_result(reason: str | None = None) -> dict[str, Any]:
+        result = dict(unavailable)
+        if reason:
+            result["accounting_unavailable_reason"] = reason
+        return result
+    docs = [
+        dict(accounting)
+        for row, accounting in projected
+        if isinstance(row, Mapping)
+        and not row.get("_rolling_partial")
+        and isinstance(accounting, Mapping)
+    ]
+    if not docs or len(docs) != len(projected):
+        return unavailable_result()
+    if any(
+        doc.get("accounting_available") is False
+        or doc.get("accounting_complete") is False
+        or doc.get("accounting_partial") is True
+        for doc in docs
+    ):
+        return unavailable_result()
+
+    def decimal_value(value: Any) -> Decimal | None:
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            parsed = Decimal(str(value))
+        except (InvalidOperation, TypeError, ValueError, OverflowError):
+            return None
+        return parsed if parsed.is_finite() else None
+
+    def required_sum(name: str, *aliases: str) -> Decimal | None:
+        values: list[Decimal] = []
+        for doc in docs:
+            raw = next(
+                (doc.get(key) for key in (name,) + aliases if doc.get(key) is not None),
+                None,
+            )
+            parsed = decimal_value(raw)
+            if parsed is None:
+                return None
+            values.append(parsed)
+        return sum(values, Decimal("0"))
+
+    monetary: dict[str, Decimal | None] = {
+        "realized_pnl": required_sum("realized_pnl"),
+        "unrealized_pnl": required_sum("unrealized_pnl"),
+        "net_pnl": required_sum(
+            "net_pnl", "allocated_capital_net_return", "net_return"
+        ),
+        "fees": required_sum("fees", "fee_costs"),
+        "costs": required_sum("costs", "slippage_costs"),
+        "allocated_capital": required_sum(
+            "allocated_capital", "capital_at_risk", "paper_sizing", "paper_size"
+        ),
+        "capital_at_risk": required_sum("capital_at_risk", "allocated_capital"),
+    }
+    if any(value is None for value in monetary.values()):
+        return unavailable_result()
+
+    def endpoint(name: str, fallback: Decimal) -> Decimal | None:
+        values = [
+            decimal_value(doc.get(name))
+            for doc in docs
+            if doc.get(name) is not None
+        ]
+        if any(value is None for value in values):
+            return None
+        return values[-1] if values else fallback
+
+    initial_cash = endpoint("initial_cash", monetary["allocated_capital"] or Decimal("0"))
+    net_pnl = monetary["net_pnl"] or Decimal("0")
+    cash = endpoint(
+        "cash",
+        initial_cash + net_pnl if initial_cash is not None else Decimal("0"),
+    )
+    equity = endpoint("equity", cash if cash is not None else Decimal("0"))
+    if initial_cash is None or cash is None or equity is None:
+        return unavailable_result()
+
+    activity_limit_error: str | None = None
+
+    def activity(name: str, *, default: Any) -> Any:
+        nonlocal activity_limit_error
+        values = [doc.get(name) for doc in docs if doc.get(name) is not None]
+        if not values:
+            return default
+        if all(isinstance(value, (list, tuple)) for value in values):
+            merged: list[Any] = []
+            for value in values:
+                merged.extend(list(value))
+                if (
+                    name == "open_positions"
+                    and len(merged) > _ROLLING_OPEN_POSITIONS_LIMIT
+                ):
+                    activity_limit_error = _ROLLING_OPEN_POSITIONS_LIMIT_REASON
+                    return None
+            return merged
+        counts: list[int] = []
+        for value in values:
+            try:
+                parsed = _rolling_strict_count(value, name)
+            except ValueError:
+                return None
+            counts.append(int(parsed or 0))
+        return sum(counts)
+
+    completed = activity("completed_round_trips", default=None)
+    if completed is None:
+        completed = activity("completed_outcomes", default=0)
+    if not isinstance(completed, int) or completed < 0:
+        return unavailable_result()
+    open_positions = activity("open_positions", default=[])
+    if isinstance(open_positions, int):
+        if open_positions != 0:
+            return unavailable_result()
+        open_positions = []
+
+    def activity_count(name: str) -> int | None:
+        value = activity(name, default=0)
+        if isinstance(value, (list, tuple)):
+            return len(value)
+        return value if isinstance(value, int) else None
+
+    opening_fills = activity_count("opening_fills")
+    closing_fills = activity_count("closing_fills")
+    partial_closing_fills = activity_count("partial_closing_fills")
+    if any(
+        value is None
+        for value in (open_positions, opening_fills, closing_fills, partial_closing_fills)
+    ):
+        return unavailable_result(activity_limit_error)
+    drawdown_values = [
+        decimal_value(doc.get("drawdown"))
+        for doc in docs
+        if doc.get("drawdown") is not None
+    ]
+    reliability_values = [
+        decimal_value(doc.get("reliability"))
+        for doc in docs
+        if doc.get("reliability") is not None
+    ]
+    if any(value is None for value in (*drawdown_values, *reliability_values)):
+        return unavailable_result()
+    return {
+        "accounting_available": True,
+        "accounting_complete": True,
+        "accounting_partial": False,
+        **monetary,
+        "initial_cash": initial_cash,
+        "cash": cash,
+        "equity": equity,
+        "open_positions": list(open_positions),
+        "opening_fills": opening_fills,
+        "closing_fills": closing_fills,
+        "partial_closing_fills": partial_closing_fills,
+        "completed_round_trips": completed,
+        "open_position_count": len(open_positions),
+        "drawdown": max(drawdown_values, default=Decimal("0")),
+        "reliability": (
+            sum(reliability_values, Decimal("0")) / Decimal(len(reliability_values))
+            if reliability_values
+            else Decimal("1")
+        ),
+        "available_from": available_from.isoformat(),
+        "available_through": available_through.isoformat(),
+    }
 
 def _rolling_timestamp(value: Any) -> datetime | None:
     if isinstance(value, datetime):
@@ -1897,6 +2192,16 @@ def _rolling_source_binding(record: Mapping[str, Any]) -> dict[str, Any]:
         binding.setdefault("research_trial_id", binding["trial_id"])
     return binding
 
+def _rolling_binding_shape_is_valid(value: Any) -> bool:
+    """Reject structured/non-finite identity values at source boundaries."""
+    if value is None or value == "":
+        return True
+    if isinstance(value, (Mapping, list, tuple, set, frozenset)):
+        return False
+    if isinstance(value, float) and not math.isfinite(value):
+        return False
+    return isinstance(value, (str, int, float, bool))
+
 
 _ROLLING_SOURCE_BINDING_FIELDS = (
     "dataset_id",
@@ -2285,7 +2590,17 @@ def _rolling_campaign_bound(value: Mapping[str, Any]) -> bool:
 def _rolling_snapshot_view(row: Mapping[str, Any]) -> dict[str, Any]:
     """Merge persisted snapshot/result payloads before terminal metric reads."""
     result: dict[str, Any] = dict(row)
-    pending = [row.get(name) for name in ("payload", "snapshot", "data", "observation", "result", "outcome")]
+    pending = [
+        row.get(name)
+        for name in (
+            "payload",
+            "snapshot",
+            "data",
+            "observation",
+            "result",
+            "outcome",
+        )
+    ]
     seen: set[int] = set()
     while pending:
         value = pending.pop(0)
@@ -2320,16 +2635,29 @@ def _rolling_snapshot_view(row: Mapping[str, Any]) -> dict[str, Any]:
     return result
 
 
-
-
 def _rolling_overlap_key(rows: Sequence[Mapping[str, Any]]) -> str:
     exposures: set[str] = set()
     for raw in rows:
+        if not isinstance(raw, Mapping):
+            continue
+        if raw.get("_rolling_source_rejection") or raw.get(
+            "_rolling_accounting_rejection"
+        ):
+            continue
         row = _rolling_snapshot_view(raw)
-        for key in ("market_id", "market_ids", "universe_id", "universe_version", "market_scope_hash", "scope_hash"):
+        for key in (
+            "market_id",
+            "market_ids",
+            "universe_id",
+            "universe_version",
+            "market_scope_hash",
+            "scope_hash",
+        ):
             value = row.get(key)
             if isinstance(value, (list, tuple, set, frozenset)):
-                exposures.update(str(item).strip() for item in value if str(item).strip())
+                exposures.update(
+                    str(item).strip() for item in value if str(item).strip()
+                )
             elif value is not None and str(value).strip():
                 exposures.add(str(value).strip())
     if not exposures:
@@ -3975,9 +4303,30 @@ class AutonomousResearchProcessor:
             if not strategy_version_id:
                 identity = {"strategy_hash": strategy_hash, "candidate_id": candidate_id}
                 strategy_version_id = "strategy-version-" + _rolling_hash(identity).removeprefix("sha256:")[:40]
+            source_fields = {
+                field_name: item[field_name]
+                for field_name in (
+                    "dataset_id",
+                    "dataset_version",
+                    "dataset_selector",
+                    "market_scope",
+                    "market_scope_hash",
+                    "market_scope_version",
+                    "scope",
+                    "scope_hash",
+                    "scope_version",
+                )
+                if field_name in item and item[field_name] is not None
+            }
+            provenance_values = dict(item.get("provenance") or {})
+            for field_name, value in source_fields.items():
+                # Preserve both direct and nested declarations.  A
+                # contradiction must remain visible to the source-boundary
+                # validator rather than being silently overwritten here.
+                provenance_values.setdefault(field_name, value)
             provenance = _rolling_provenance_bound(
                 {
-                    **dict(item.get("provenance") or {}),
+                    **provenance_values,
                     "rolling_research": True,
                     "research_mode": "ROLLING_RESEARCH",
                     "candidate_id": candidate_id,
@@ -4003,6 +4352,7 @@ class AutonomousResearchProcessor:
                 "execution_scope": "OBSERVATION",
                 "research_only": True,
                 "paper_only": True,
+                **source_fields,
             }
             trial_id = str(item.get("research_trial_id") or provenance.get("research_trial_id") or "").strip()
             if not trial_id:
@@ -4787,24 +5137,60 @@ class AutonomousResearchProcessor:
                     try:
                         row_binding = _rolling_source_binding(item)
                     except (TypeError, ValueError):
-                        row_binding = {}
-                    missing = any(
-                        _binding_value(row_binding.get(field)) is None
+                        row = dict(item)
+                        row["_rolling_lineage_proven"] = False
+                        row["_rolling_source_rejection"] = "SOURCE_BINDING_CONFLICT"
+                        row["_rolling_accounting_rejection"] = "SOURCE_BINDING_CONFLICT"
+                        rows.append(row)
+                        continue
+                    malformed = any(
+                        not _rolling_binding_shape_is_valid(row_binding.get(field))
                         for field in (
+                            "dataset_id",
+                            "dataset_version",
+                            "version",
                             "strategy_hash",
+                            "source_strategy_hash",
+                            "rolling_strategy_hash",
                             "strategy_version_id",
                             "research_trial_id",
                             "candidate_id",
                         )
                     )
-                    if missing:
+                    if malformed:
+                        row = dict(item)
+                        row["_rolling_lineage_proven"] = False
+                        row["_rolling_source_rejection"] = "SOURCE_BINDING_MALFORMED"
+                        row["_rolling_accounting_rejection"] = "SOURCE_BINDING_MALFORMED"
+                        rows.append(row)
+                        continue
+                    required_fields = (
+                        "strategy_hash",
+                        "strategy_version_id",
+                        "research_trial_id",
+                        "candidate_id",
+                    )
+                    missing = any(
+                        _binding_value(row_binding.get(field)) is None
+                        for field in required_fields
+                    )
+                    checked = _rolling_inject_source_binding(item, source_binding)
+                    if checked.get("_rolling_accounting_rejection"):
+                        checked["_rolling_lineage_proven"] = False
+                        checked["_rolling_source_rejection"] = checked.get(
+                            "_rolling_accounting_rejection"
+                        )
+                        rows.append(checked)
+                    elif missing:
+                        # Missing strategy lineage is valid raw market input.
+                        # Keep the source row unmodified so attribution is
+                        # generated only by this new evaluation result.
                         row = dict(item)
                         row["_rolling_lineage_proven"] = False
                         rows.append(row)
                     else:
-                        row = _rolling_inject_source_binding(item, source_binding)
-                        row["_rolling_lineage_proven"] = True
-                        rows.append(row)
+                        checked["_rolling_lineage_proven"] = True
+                        rows.append(checked)
         elif source in {"REPLAY", "LIVE"}:
             loader = getattr(self.store, "load_polymarket_snapshots", None)
             if not callable(loader):
@@ -4830,7 +5216,33 @@ class AutonomousResearchProcessor:
                     try:
                         row_binding = _rolling_source_binding(item)
                     except (TypeError, ValueError):
-                        row_binding = {}
+                        row = dict(item)
+                        row["_rolling_lineage_proven"] = False
+                        row["_rolling_source_rejection"] = "SOURCE_BINDING_CONFLICT"
+                        row["_rolling_accounting_rejection"] = "SOURCE_BINDING_CONFLICT"
+                        rows.append(row)
+                        continue
+                    malformed = any(
+                        not _rolling_binding_shape_is_valid(row_binding.get(field))
+                        for field in (
+                            "dataset_id",
+                            "dataset_version",
+                            "version",
+                            "strategy_hash",
+                            "source_strategy_hash",
+                            "rolling_strategy_hash",
+                            "strategy_version_id",
+                            "research_trial_id",
+                            "candidate_id",
+                        )
+                    )
+                    if malformed:
+                        row = dict(item)
+                        row["_rolling_lineage_proven"] = False
+                        row["_rolling_source_rejection"] = "SOURCE_BINDING_MALFORMED"
+                        row["_rolling_accounting_rejection"] = "SOURCE_BINDING_MALFORMED"
+                        rows.append(row)
+                        continue
                     required_fields = (
                         "strategy_hash",
                         "strategy_version_id",
@@ -4849,11 +5261,6 @@ class AutonomousResearchProcessor:
                         )
                         for field in required_fields
                     )
-                    if conflict:
-                        row = dict(item)
-                        row["_rolling_accounting_rejection"] = "SOURCE_BINDING_CONFLICT"
-                        rows.append(row)
-                        continue
                     if source == "REPLAY":
                         row_dataset = _binding_value(row_binding.get("dataset_id"))
                         row_version = _binding_value(
@@ -4865,21 +5272,27 @@ class AutonomousResearchProcessor:
                             or row_version is not None
                             and row_version != dataset_version
                         ):
-                            row = dict(item)
-                            row["_rolling_accounting_rejection"] = "SOURCE_BINDING_CONFLICT"
-                            rows.append(row)
-                            continue
-                    if missing:
-                        # This row may still be attributable to a newly
-                        # evaluated canonical strategy, but it cannot be
-                        # represented as pre-bound accounting.
+                            conflict = True
+                    checked = _rolling_inject_source_binding(item, source_binding)
+                    if conflict or checked.get("_rolling_accounting_rejection"):
+                        checked["_rolling_lineage_proven"] = False
+                        checked["_rolling_source_rejection"] = checked.get(
+                            "_rolling_accounting_rejection"
+                        ) or "SOURCE_BINDING_CONFLICT"
+                        checked["_rolling_accounting_rejection"] = (
+                            checked.get("_rolling_accounting_rejection")
+                            or "SOURCE_BINDING_CONFLICT"
+                        )
+                        rows.append(checked)
+                    elif missing:
+                        # Raw replay/live observations are evaluator inputs even
+                        # when their strategy lineage has not been attributed.
                         row = dict(item)
                         row["_rolling_lineage_proven"] = False
                         rows.append(row)
                     else:
-                        row = _rolling_inject_source_binding(item, source_binding)
-                        row["_rolling_lineage_proven"] = True
-                        rows.append(row)
+                        checked["_rolling_lineage_proven"] = True
+                        rows.append(checked)
         elif source == "PAPER":
             registry_loader = getattr(self.store, "load_forward_tests", None)
             if not callable(registry_loader):
@@ -5102,38 +5515,57 @@ class AutonomousResearchProcessor:
                 # still PAPER and remains experiment-bound above.
                 declared_source = "PAPER"
             if declared_source and declared_source not in allowed_source_types:
-                continue
+                row["_rolling_source_rejection"] = "SOURCE_TYPE_CONFLICT"
+                row["_rolling_accounting_rejection"] = "SOURCE_TYPE_CONFLICT"
             if _rolling_campaign_bound(row):
-                continue
-            if (
-                source != "PAPER"
-                and row.get("_rolling_lineage_proven") is False
-            ):
-                row["_rolling_accounting_rejection"] = "SOURCE_BINDING_UNPROVEN"
-                row["source_class"] = persisted_source
-                row["source_type"] = persisted_source
-                row["requested_source_class"] = source
-                row["requested_source_type"] = source
-                normalized.append(row)
-                continue
+                row["_rolling_source_rejection"] = "UNTRUSTED_ROLLING_PROVENANCE"
+                row["_rolling_accounting_rejection"] = "UNTRUSTED_ROLLING_PROVENANCE"
             if _rolling_row_time(row) is None:
                 row["_rolling_timestamp_rejection"] = "SOURCE_TIMESTAMP_UNPARSEABLE"
+                row["_rolling_source_rejection"] = "SOURCE_TIMESTAMP_UNPARSEABLE"
+                row["_rolling_accounting_rejection"] = "SOURCE_TIMESTAMP_UNPARSEABLE"
+            if not str(row.get("market_id", "")).strip():
+                row["_rolling_source_rejection"] = "SOURCE_MARKET_ID_MISSING"
+                row["_rolling_accounting_rejection"] = "SOURCE_MARKET_ID_MISSING"
+            if source == "REPLAY" and not any(
+                isinstance(row.get(name), Mapping)
+                for name in ("order_book", "yes_order_book", "no_order_book")
+            ):
+                row["_rolling_source_rejection"] = "REPLAY_BOOK_REQUIRED"
+                row["_rolling_accounting_rejection"] = "REPLAY_BOOK_REQUIRED"
+            if row.get("_rolling_source_rejection"):
                 row["source_class"] = persisted_source
                 row["source_type"] = persisted_source
                 row["requested_source_class"] = source
                 row["requested_source_type"] = source
                 normalized.append(row)
                 continue
-            accounting = self._rolling_accounting_projection(row, record)
-            if accounting is None:
-                if row.get("_rolling_accounting_rejection"):
-                    row["source_class"] = persisted_source
-                    row["source_type"] = persisted_source
-                    row["requested_source_class"] = source
-                    row["requested_source_type"] = source
-                    normalized.append(row)
-                continue
-            row["_rolling_accounting"] = dict(accounting)
+            view = _rolling_snapshot_view(row)
+            has_explicit_accounting = any(
+                isinstance(view.get(name), Mapping)
+                for name in (
+                    "canonical_accounting",
+                    "strategy_accounting",
+                    "accounting",
+                    "resolved_bet",
+                )
+            )
+            should_project_accounting = source == "PAPER" or (
+                source == "LIVE"
+                and row.get("_rolling_lineage_proven") is True
+                and has_explicit_accounting
+            )
+            if should_project_accounting:
+                accounting = self._rolling_accounting_projection(row, record)
+                if accounting is None:
+                    if row.get("_rolling_accounting_rejection"):
+                        row["source_class"] = persisted_source
+                        row["source_type"] = persisted_source
+                        row["requested_source_class"] = source
+                        row["requested_source_type"] = source
+                        normalized.append(row)
+                    continue
+                row["_rolling_accounting"] = dict(accounting)
             binding_conflict = False
             for field_name in ("dataset_id", "dataset_version", "version"):
                 expected = source_binding.get(field_name)
@@ -5203,227 +5635,499 @@ class AutonomousResearchProcessor:
         rows: Sequence[Mapping[str, Any]],
         source_class: str,
     ) -> Mapping[str, Any] | None:
-        """Run the canonical recorded-book evaluator for attributable inputs."""
+        """Evaluate validated market input without requiring prior lineage."""
         requested_source = _rolling_source_name(source_class)
         if requested_source not in {"HISTORICAL", "REPLAY", "LIVE"}:
             return None
-        usable_rows = [
-            dict(row)
-            for row in rows
-            if isinstance(row, Mapping)
-            and not row.get("_rolling_accounting_rejection")
-            and (
-                isinstance(row.get("order_book"), Mapping)
-                or isinstance(row.get("yes_order_book"), Mapping)
-                or isinstance(row.get("no_order_book"), Mapping)
-                or (
-                    requested_source != "LIVE"
-                    and isinstance(row.get("payload"), Mapping)
-                )
+
+        def view_of(row: Mapping[str, Any]) -> dict[str, Any]:
+            return _rolling_snapshot_view(row)
+
+        def has_book(row: Mapping[str, Any]) -> bool:
+            view = view_of(row)
+            return any(
+                isinstance(view.get(name), Mapping)
+                for name in ("order_book", "yes_order_book", "no_order_book")
             )
-        ]
-        # Forward-collected rows without recorded-book material still use the
-        # validated LIVE ledger projection.  Once a LIVE row carries recorded
-        # book data, it follows the same canonical path as historical/replay.
-        if requested_source == "LIVE" and not usable_rows:
+
+        price_fields = (
+            "yes_mid",
+            "no_mid",
+            "yes_bid",
+            "yes_ask",
+            "no_bid",
+            "no_ask",
+            "price",
+            "probability",
+            "implied_probability",
+        )
+        valid_rows: list[dict[str, Any]] = []
+        expected_binding = _rolling_source_binding(strategy)
+        for raw in rows:
+            if not isinstance(raw, Mapping):
+                continue
+            if raw.get("_rolling_source_rejection") or raw.get(
+                "_rolling_accounting_rejection"
+            ):
+                continue
+            try:
+                row_binding = _rolling_source_binding(raw)
+            except (TypeError, ValueError):
+                continue
+            if any(
+                not _rolling_binding_shape_is_valid(row_binding.get(field))
+                for field in (
+                    "dataset_id",
+                    "dataset_version",
+                    "version",
+                    "strategy_hash",
+                    "source_strategy_hash",
+                    "rolling_strategy_hash",
+                    "strategy_version_id",
+                    "research_trial_id",
+                    "candidate_id",
+                )
+            ):
+                continue
+            conflict = False
+            for field_name in (
+                "dataset_id",
+                "dataset_version",
+                "version",
+                "strategy_hash",
+                "source_strategy_hash",
+                "rolling_strategy_hash",
+                "strategy_version_id",
+                "research_trial_id",
+                "candidate_id",
+            ):
+                actual = _binding_value(row_binding.get(field_name))
+                expected = _binding_value(expected_binding.get(field_name))
+                if actual is not None and expected is not None and actual != expected:
+                    conflict = True
+                    break
+            if conflict:
+                continue
+            view = view_of(raw)
+            if _rolling_row_time(view) is None:
+                continue
+            if not str(view.get("market_id", "")).strip():
+                continue
+            if requested_source == "REPLAY" and not has_book(raw):
+                # Replay is evidence of observed execution only.  A row
+                # without a recorded book must never fall back to prices.
+                continue
+            if not (
+                has_book(raw)
+                or any(name in view for name in price_fields)
+                or "settlement" in view
+            ):
+                continue
+            valid_rows.append(dict(raw))
+        if not valid_rows:
             return None
-        if not usable_rows:
-            return None
+        # A LIVE row carrying a private ledger is accounting input, not a
+        # second price-proxy path.  Exact identity was already checked by the
+        # source loader; the evidence path will project that ledger directly.
+        if requested_source == "LIVE" and not any(has_book(row) for row in valid_rows):
+            if any(
+                isinstance(view_of(row).get(name), Mapping)
+                for row in valid_rows
+                for name in (
+                    "canonical_accounting",
+                    "strategy_accounting",
+                    "accounting",
+                    "resolved_bet",
+                )
+            ):
+                return None
+        mode = (
+            "RECORDED_BOOK_REPLAY"
+            if requested_source == "REPLAY" or any(has_book(row) for row in valid_rows)
+            else "PRICE_PROXY_RESEARCH"
+        )
+        source_digest = _rolling_hash(valid_rows)
         document = strategy.get("strategy_document", strategy.get("canonical_strategy"))
+        model_document = strategy.get("model_document")
+        if not isinstance(model_document, Mapping) and isinstance(document, Mapping):
+            model_document = document.get("model_document", document.get("model"))
+
+        def run_identity(material: Mapping[str, Any]) -> str:
+            return (
+                "rolling-evaluation:v2:"
+                + _rolling_hash(material).removeprefix("sha256:")[:40]
+            )
+
         if not isinstance(document, Mapping):
-            return None
+            evaluation = {
+                "evaluation_kind": "CANONICAL_SIMULATION",
+                "evaluator_invoked": False,
+                "evaluator_completed": False,
+                "evaluated_observations": 0,
+                "signal_count": 0,
+                "diagnostic_summary_count": 0,
+                "evaluator_name": None,
+                "evaluator_error": "strategy_document is required",
+                "evaluator_prerequisite": "STRATEGY_DOCUMENT_REQUIRED",
+            }
+            portfolio_accounting = {
+                "accounting_available": False,
+                "initial_cash": None,
+                "cash": None,
+                "equity": None,
+                "realized_pnl": None,
+                "unrealized_pnl": None,
+                "net_pnl": None,
+                "fees": None,
+                "costs": None,
+                "open_positions": [],
+                "opening_fills": 0,
+                "closing_fills": 0,
+                "partial_closing_fills": 0,
+                "completed_round_trips": 0,
+            }
+            material = {
+                "version": "rolling-evaluation:v2:diagnostic",
+                "source": requested_source,
+                "mode": mode,
+                "source_digest": source_digest,
+                "evaluation": evaluation,
+            }
+            return {
+                "evaluation_version": "rolling-evaluation:v2:diagnostic",
+                "evaluation_kind": "CANONICAL_SIMULATION",
+                "evaluation_run_id": run_identity(material),
+                "source_digest": source_digest,
+                "loaded_rows": len(rows),
+                "valid_input_rows": len(valid_rows),
+                "evaluator_invoked": False,
+                "evaluator_completed": False,
+                "evaluated_observations": 0,
+                "signal_count": 0,
+                "diagnostic_summary_count": 0,
+                "evaluator_name": None,
+                "evaluator_error": evaluation["evaluator_error"],
+                "evaluator_prerequisite": evaluation["evaluator_prerequisite"],
+                "portfolio_accounting": portfolio_accounting,
+                "evaluation": evaluation,
+                "metrics": {
+                    "portfolio_accounting": portfolio_accounting,
+                    "evaluation": evaluation,
+                },
+                "accounting_available": False,
+                "accounting_complete": False,
+                "accounting_partial": True,
+                "accounting_unavailable_reason": "STRATEGY_DOCUMENT_REQUIRED",
+            }
         try:
             definition = load_strategy(document)
-            model_document = strategy.get("model_document")
-            if not isinstance(model_document, Mapping):
-                model_document = document.get("model_document", document.get("model"))
             result = run_prediction_research_mode(
-                usable_rows,
+                valid_rows,
                 definition,
-                mode="RECORDED_BOOK_REPLAY",
+                mode=mode,
                 model_document=model_document if isinstance(model_document, Mapping) else None,
                 holding_period=int(strategy.get("holding_period", 1) or 1),
                 exit_policy=strategy.get("exit_policy", "fixed_holding_period"),
             )
-        except (TypeError, ValueError, RuntimeError, KeyError):
-            return None
-        fills = tuple(getattr(result, "fills", ()) or ())
-        outcomes = getattr(result, "outcomes", {})
-        outcomes = outcomes if isinstance(outcomes, Mapping) else {}
-        terminal_values = {
-            "resolved_yes",
-            "resolved_no",
-            "void",
-        }
-        terminal_markets = {
-            str(market)
-            for market, value in outcomes.items()
-            if str(value).strip().lower() in terminal_values
-        }
-        opening_markets = {
-            str(getattr(fill, "market_id", None) or getattr(fill, "symbol", ""))
-            for fill in fills
-            if str((getattr(fill, "metadata", {}) or {}).get("execution_kind", "entry")).lower()
-            not in {"exit", "close"}
-        }
-        completed = len(terminal_markets & opening_markets)
-        fees = Decimal("0")
-        costs = Decimal("0")
-        capital = Decimal("0")
-        for fill in fills:
-            quantity = _rolling_number(getattr(fill, "quantity", 0))
-            price = _rolling_number(getattr(fill, "price", 0))
-            fees += _rolling_number(getattr(fill, "fees", 0))
-            costs += _rolling_number(getattr(fill, "slippage", 0))
-            metadata = getattr(fill, "metadata", {})
-            metadata = metadata if isinstance(metadata, Mapping) else {}
-            execution_kind = str(metadata.get("execution_kind", "entry")).lower()
-            if execution_kind not in {"exit", "close"}:
-                capital += quantity * price
+        except Exception as exc:
+            error = str(exc) or type(exc).__name__
+            evaluation = {
+                "evaluation_kind": "CANONICAL_SIMULATION",
+                "evaluator_invoked": True,
+                "evaluator_completed": False,
+                "evaluated_observations": 0,
+                "signal_count": 0,
+                "diagnostic_summary_count": 1,
+                "evaluator_name": None,
+                "evaluator_error": error,
+                "evaluator_prerequisite": None,
+            }
+            portfolio_accounting = {
+                "accounting_available": False,
+                "initial_cash": None,
+                "cash": None,
+                "equity": None,
+                "realized_pnl": None,
+                "unrealized_pnl": None,
+                "net_pnl": None,
+                "fees": None,
+                "costs": None,
+                "open_positions": [],
+                "opening_fills": 0,
+                "closing_fills": 0,
+                "partial_closing_fills": 0,
+                "completed_round_trips": 0,
+            }
+            material = {
+                "version": "rolling-evaluation:v2:diagnostic",
+                "source": requested_source,
+                "mode": mode,
+                "source_digest": source_digest,
+                "evaluation": evaluation,
+            }
+            return {
+                "evaluation_version": "rolling-evaluation:v2:diagnostic",
+                "evaluation_kind": "CANONICAL_SIMULATION",
+                "evaluation_run_id": run_identity(material),
+                "source_digest": source_digest,
+                "loaded_rows": len(rows),
+                "valid_input_rows": len(valid_rows),
+                "evaluator_invoked": True,
+                "evaluator_completed": False,
+                "evaluated_observations": 0,
+                "signal_count": 0,
+                "diagnostic_summary_count": 1,
+                "evaluator_name": None,
+                "evaluator_error": error,
+                "evaluator_prerequisite": None,
+                "portfolio_accounting": portfolio_accounting,
+                "evaluation": evaluation,
+                "metrics": {
+                    "portfolio_accounting": portfolio_accounting,
+                    "evaluation": evaluation,
+                },
+                "accounting_available": False,
+                "accounting_complete": False,
+                "accounting_partial": True,
+                "accounting_unavailable_reason": error,
+            }
+
         metrics = getattr(result, "metrics", {})
         metrics = metrics if isinstance(metrics, Mapping) else {}
-        curve = tuple(
-            item
-            for item in (getattr(result, "equity_curve", ()) or ())
-            if isinstance(item, Mapping)
+        raw_portfolio = metrics.get("portfolio_accounting")
+        raw_evaluation = metrics.get("evaluation")
+        portfolio_accounting = (
+            dict(raw_portfolio) if isinstance(raw_portfolio, Mapping) else {}
         )
-        def canonical_metric(*names: str) -> Decimal | None:
-            sources: list[Mapping[str, Any]] = [metrics]
-            if curve:
-                sources.append(curve[-1])
-            for source in tuple(sources):
-                for child_name in (
-                    "portfolio",
-                    "portfolio_metrics",
-                    "cashflows",
-                    "cash_flows",
-                    "cashflow",
-                ):
-                    child = source.get(child_name)
-                    if isinstance(child, Mapping):
-                        sources.append(child)
-            for source in sources:
-                for name in names:
-                    if name not in source or source.get(name) is None:
-                        continue
-                    value = _rolling_number(source.get(name), Decimal("NaN"))
-                    if value.is_finite():
-                        return value
-            return None
+        evaluation = dict(raw_evaluation) if isinstance(raw_evaluation, Mapping) else {}
+        evaluation.setdefault("evaluation_kind", "CANONICAL_SIMULATION")
 
-        # PnL is authoritative only when emitted by the canonical portfolio
-        # metrics/cashflow projection.  Fills remain execution evidence for
-        # counts, allocated capital, fees, and slippage; in particular an exit
-        # fill is never treated as another entry-at-resolution payoff.
-        realized = canonical_metric("realized_pnl", "realized", "realized_profit")
-        unrealized = canonical_metric("unrealized_pnl", "unrealized", "unrealized_profit")
-        net_pnl = canonical_metric(
-            "net_pnl",
-            "total_pnl",
-            "net_return",
-            "net_profit",
-            "total_profit",
-            "profit_loss",
-            "pnl",
+        # V2 status is authoritative only when the evaluator emitted both
+        # nested boolean fields.  A result curve is not an evaluator
+        # attestation and must never be used to infer completion.
+        explicit_status = isinstance(raw_evaluation, Mapping) and all(
+            name in raw_evaluation and isinstance(raw_evaluation.get(name), bool)
+            for name in ("evaluator_invoked", "evaluator_completed")
         )
-        pnl_authoritative = realized is not None or net_pnl is not None
-        if realized is None and net_pnl is not None:
-            realized = net_pnl - unrealized if unrealized is not None else net_pnl
-        if realized is None:
-            realized = Decimal("0")
-        if unrealized is None:
-            if net_pnl is not None and pnl_authoritative:
-                unrealized = net_pnl - realized
-            else:
-                unrealized = Decimal("0")
-        unresolved = tuple(getattr(result, "unresolved", ()) or ())
-        source_times = [
-            _rolling_row_time(row)
-            for row in usable_rows
-            if _rolling_row_time(row) is not None
-        ]
-        if not source_times:
-            return None
-        lineage_proven = bool(usable_rows) and all(
-            row.get("_rolling_lineage_proven") is True for row in usable_rows
-        )
-        # The recorded-book evaluator is authoritative for historical/replay
-        # accounting.  Strategy lineage remains separately reported and must
-        # not make evaluator-produced fills disappear.
-        accounting_available = capital > Decimal("0") and pnl_authoritative
-        curve = tuple(
-            item
-            for item in (getattr(result, "equity_curve", ()) or ())
-            if isinstance(item, Mapping)
-        )
+        status_error: str | None = None
+        if not explicit_status:
+            status_error = "EVALUATOR_STATUS_REQUIRED"
+            evaluation["evaluator_invoked"] = (
+                raw_evaluation.get("evaluator_invoked") is True
+                if isinstance(raw_evaluation, Mapping)
+                else False
+            )
+            evaluation["evaluator_completed"] = False
+            evaluation["evaluator_error"] = (
+                evaluation.get("evaluator_error") or status_error
+            )
+            evaluation["evaluator_prerequisite"] = status_error
 
-        def curve_side(item: Mapping[str, Any]) -> str:
-            return str(
-                getattr(item.get("side"), "value", item.get("side", ""))
-            ).strip().lower()
+        # Keep the legacy shape readable, but never treat it as complete
+        # canonical accounting.  V2 admission requires the explicit nested
+        # portfolio accounting emitted by the evaluator.
+        if not portfolio_accounting:
+            legacy = metrics.get("portfolio")
+            legacy = legacy if isinstance(legacy, Mapping) else {}
+            portfolio_accounting = {
+                "accounting_available": False,
+                "initial_cash": metrics.get("initial_equity"),
+                "cash": None,
+                "equity": metrics.get("final_equity"),
+                "realized_pnl": legacy.get("realized_pnl", metrics.get("realized_pnl")),
+                "unrealized_pnl": legacy.get(
+                    "unrealized_pnl", metrics.get("unrealized_pnl")
+                ),
+                "net_pnl": metrics.get("net_pnl"),
+                "fees": metrics.get("fees"),
+                "costs": metrics.get("costs"),
+                "open_positions": list(getattr(result, "unresolved", ()) or ()),
+                "opening_fills": 0,
+                "closing_fills": 0,
+                "partial_closing_fills": 0,
+                "completed_round_trips": metrics.get("completed_outcomes"),
+            }
+        fills = tuple(getattr(result, "fills", ()) or ())
+        allocated_capital = Decimal("0")
+        for fill in fills:
+            metadata = getattr(fill, "metadata", {})
+            metadata = metadata if isinstance(metadata, Mapping) else {}
+            execution_kind = str(metadata.get("execution_kind", "entry")).strip().lower()
+            if execution_kind in {"exit", "close"}:
+                continue
+            allocated_capital += _rolling_number(
+                getattr(fill, "quantity", 0)
+            ) * _rolling_number(getattr(fill, "price", 0))
 
-        actionable_sides = {"buy", "sell", "entry", "exit", "long", "short"}
-        signal_count = sum(1 for item in curve if curve_side(item) in actionable_sides)
-        declined_count = len(curve) - signal_count
-        return {
-            "evaluator": "evaluate_signal_evaluation:v1",
-            "source_digest": _rolling_hash(usable_rows),
-            "accounting_digest": _rolling_hash(
-                {
-                    "fills": [
-                        {
-                            "order_id": getattr(fill, "order_id", ""),
-                            "market_id": getattr(fill, "market_id", None),
-                            "quantity": getattr(fill, "quantity", 0),
-                            "price": getattr(fill, "price", 0),
-                            "fees": getattr(fill, "fees", 0),
-                            "slippage": getattr(fill, "slippage", 0),
-                        }
-                        for fill in fills
-                    ],
-                    "aggregate": {
-                        "capital_at_risk": capital,
-                        "realized_pnl": realized,
-                        "unrealized_pnl": unrealized,
-                        "fees": fees,
-                        "costs": costs,
-                        "completed_outcomes": completed,
-                        "outcomes": dict(outcomes),
-                    },
-                }
+        count_values: dict[str, int] = {}
+        count_error: str | None = None
+        count_defaults = {
+            "evaluated_observations": 0,
+            "signal_count": 0,
+            "diagnostic_summary_count": (
+                0 if evaluation.get("evaluator_completed") is True else 1
             ),
-            "available_from": min(source_times),
-            "available_through": max(source_times),
-            "evaluated_rows": len(usable_rows),
-            "available_rows": len(usable_rows),
-            "signals": signal_count,
-            "declined_evaluations": declined_count,
-            "fills": len(fills),
-            "positions": len(unresolved),
-            "open_positions": list(unresolved)[:64],
-            "openings": len(opening_markets),
-            "completed_outcomes": completed,
-            "realized_pnl": realized,
-            "unrealized_pnl": unrealized,
-            "fees": fees,
-            "costs": costs,
-            "capital_at_risk": capital,
-            "accounting_available": accounting_available,
-            "accounting_complete": accounting_available,
-            "accounting_partial": not accounting_available,
-            "requested_rows": len(rows),
-            "accounting_unavailable_reason": (
-                None
-                if accounting_available
-                else "CANONICAL_PNL_UNAVAILABLE"
-                if not pnl_authoritative
-                else "NO_EVALUATED_FILLS"
-            ),
-            "lineage_proven": lineage_proven,
-            "outcomes": dict(outcomes),
-            "research_quality": str(getattr(getattr(result, "research_quality", None), "value", "") or ""),
         }
+        for name, default in count_defaults.items():
+            try:
+                parsed = _rolling_strict_count(
+                    evaluation.get(name),
+                    name,
+                    default=default,
+                )
+            except ValueError:
+                count_error = name
+                parsed = 0
+            count_values[name] = int(parsed or 0)
+        if count_error is not None:
+            evaluation["evaluator_completed"] = False
+            evaluation["evaluator_error"] = "EVALUATOR_COUNT_METRIC_INVALID"
+            evaluation["evaluator_prerequisite"] = count_error
+            count_values["diagnostic_summary_count"] = 1
+        if status_error is not None:
+            count_values["diagnostic_summary_count"] = 1
 
+        accounting_count_error: str | None = None
+        for name in (
+            "completed_round_trips",
+            "completed_outcomes",
+            "opening_fills",
+            "closing_fills",
+            "partial_closing_fills",
+            "open_position_count",
+        ):
+            if name not in portfolio_accounting:
+                continue
+            value = portfolio_accounting.get(name)
+            if isinstance(value, (list, tuple, set, frozenset)):
+                continue
+            try:
+                _rolling_strict_count(value, name)
+            except ValueError:
+                accounting_count_error = name
+                portfolio_accounting[name] = None
+                break
+        if accounting_count_error is not None:
+            evaluation["evaluator_completed"] = False
+            evaluation["evaluator_error"] = "ACCOUNTING_COUNT_METRIC_INVALID"
+            evaluation["evaluator_prerequisite"] = accounting_count_error
+        evaluator_invoked = evaluation.get("evaluator_invoked") is True
+        evaluator_completed = evaluation.get("evaluator_completed") is True
+        evaluator_name = evaluation.get("evaluator_name")
+        if evaluator_name is None:
+            evaluator_name = metrics.get("evaluator_name")
+        evaluated_observations = count_values["evaluated_observations"]
+        signal_count = count_values["signal_count"]
+        diagnostic_count = count_values["diagnostic_summary_count"]
+        if accounting_count_error is not None:
+            count_values["diagnostic_summary_count"] = 1
+            diagnostic_count = 1
+        evaluation.update(
+            {
+                "evaluation_kind": "CANONICAL_SIMULATION",
+                "evaluator_invoked": evaluator_invoked,
+                "evaluator_completed": evaluator_completed,
+                "evaluated_observations": evaluated_observations,
+                "signal_count": signal_count,
+                "diagnostic_summary_count": diagnostic_count,
+                "evaluator_name": evaluator_name,
+                "evaluator_error": evaluation.get("evaluator_error"),
+                "evaluator_prerequisite": evaluation.get("evaluator_prerequisite"),
+            }
+        )
+
+
+        # Do not synthesize accounting availability from a completed
+        # no-signal run (or from any single P&L field).  Every canonical
+        # monetary/count field must be present and finite before it can be
+        # exposed as available.
+        accounting_complete_flag = portfolio_accounting.get("accounting_complete")
+        accounting_partial_flag = portfolio_accounting.get("accounting_partial")
+        accounting_complete = (
+            evaluator_invoked
+            and evaluator_completed
+            and portfolio_accounting.get("accounting_available") is True
+            and (
+                accounting_complete_flag is None
+                or accounting_complete_flag is True
+            )
+            and (
+                accounting_partial_flag is None
+                or accounting_partial_flag is False
+            )
+            and _rolling_canonical_accounting_complete(portfolio_accounting)
+        )
+        if not accounting_complete:
+            diagnostic_count = max(1, int(diagnostic_count))
+            evaluation["diagnostic_summary_count"] = diagnostic_count
+
+        if not accounting_complete:
+            portfolio_accounting["accounting_available"] = False
+            portfolio_accounting["accounting_complete"] = False
+            portfolio_accounting["accounting_partial"] = True
+            for name in _ROLLING_CANONICAL_MONETARY_FIELDS:
+                value = portfolio_accounting.get(name)
+                if not evaluator_completed or value is None:
+                    portfolio_accounting[name] = None
+                else:
+                    try:
+                        parsed = Decimal(str(value))
+                    except (InvalidOperation, TypeError, ValueError, OverflowError):
+                        portfolio_accounting[name] = None
+                    else:
+                        if isinstance(value, bool) or not parsed.is_finite():
+                            portfolio_accounting[name] = None
+        else:
+            portfolio_accounting["accounting_available"] = True
+            portfolio_accounting["accounting_complete"] = True
+            portfolio_accounting["accounting_partial"] = False
+        if not evaluator_invoked or not evaluator_completed:
+            portfolio_accounting["accounting_available"] = False
+            for name in _ROLLING_CANONICAL_MONETARY_FIELDS:
+                portfolio_accounting[name] = None
+        material = {
+            "version": "rolling-evaluation:v2",
+            "source": requested_source,
+            "mode": mode,
+            "source_digest": source_digest,
+            "portfolio_accounting": portfolio_accounting,
+            "evaluation": evaluation,
+        }
+        evaluation_run_id = run_identity(material)
+        return {
+            "evaluation_version": "rolling-evaluation:v2",
+            "evaluation_kind": "CANONICAL_SIMULATION",
+            "evaluation_run_id": evaluation_run_id,
+            "source_digest": source_digest,
+            "loaded_rows": len(rows),
+            "valid_input_rows": len(valid_rows),
+            "evaluator_invoked": evaluation["evaluator_invoked"],
+            "evaluator_completed": evaluation["evaluator_completed"],
+            "evaluated_observations": evaluated_observations,
+            "signal_count": signal_count,
+            "diagnostic_summary_count": diagnostic_count,
+            "evaluator_name": evaluator_name,
+            "evaluator_error": evaluation.get("evaluator_error"),
+            "evaluator_prerequisite": evaluation.get("evaluator_prerequisite"),
+            "portfolio_accounting": portfolio_accounting,
+            "evaluation": evaluation,
+            "metrics": {
+                "portfolio_accounting": portfolio_accounting,
+                "evaluation": evaluation,
+            },
+            "accounting_available": portfolio_accounting.get("accounting_available"),
+            "accounting_complete": accounting_complete,
+            "accounting_partial": not accounting_complete,
+            "accounting_unavailable_reason": (
+                evaluation.get("evaluator_error")
+                or evaluation.get("evaluator_prerequisite")
+                or (
+                    "ACCOUNTING_FIELDS_INCOMPLETE"
+                    if not accounting_complete
+                    else None
+                )
+            ),
+        }
     def _rolling_evidence_record(
         self,
         strategy: Mapping[str, Any],
@@ -5433,139 +6137,381 @@ class AutonomousResearchProcessor:
         now: datetime,
         evaluation: Mapping[str, Any] | None = None,
     ) -> dict[str, Any] | None:
-        """Aggregate accounting and persist partial canonical progress."""
+        """Build one immutable v2 evidence result from canonical metrics."""
         if days not in {7, 30} or not rows:
             return None
         requested_source = _rolling_source_name(source_class)
         persisted_source = _rolling_persisted_source_class(requested_source)
-        if evaluation is None:
-            evaluation = self._rolling_canonical_evaluation(
-                strategy, rows, requested_source
-            )
         recorded_book = any(
             isinstance(_rolling_snapshot_view(row).get(name), Mapping)
             for row in rows
             if isinstance(row, Mapping)
             for name in ("order_book", "yes_order_book", "no_order_book")
         )
-        canonical_required = requested_source in {"HISTORICAL", "REPLAY"} or (
-            requested_source == "LIVE" and recorded_book
-        )
-        evaluator_authoritative = (
-            canonical_required
-            and isinstance(evaluation, Mapping)
-            and bool(evaluation.get("evaluator"))
-        )
-        if canonical_required and not evaluator_authoritative:
-            # Historical/replay (and recorded LIVE) rows must never fall back
-            # to a row's private accounting projection when the canonical
-            # evaluator is unavailable.  Persist a partial canonical record so
-            # the missing prerequisite remains retryable and visible.
-            prior_reason = (
-                str(evaluation.get("accounting_unavailable_reason", "")).strip().upper()
-                if isinstance(evaluation, Mapping)
-                else ""
+        if requested_source == "REPLAY" and any(
+            isinstance(row, Mapping)
+            and not row.get("_rolling_source_rejection")
+            and not row.get("_rolling_accounting_rejection")
+            and not any(
+                isinstance(_rolling_snapshot_view(row).get(name), Mapping)
+                for name in ("order_book", "yes_order_book", "no_order_book")
             )
-            evaluation = dict(evaluation) if isinstance(evaluation, Mapping) else {}
-            evaluation["evaluator"] = "evaluate_signal_evaluation:v1"
-            evaluation["accounting_available"] = False
-            evaluation["accounting_complete"] = False
-            evaluation["accounting_partial"] = True
-            evaluation["accounting_unavailable_reason"] = (
-                "PNL_UNAVAILABLE" if "PNL" in prior_reason else "CANONICAL_EVALUATION_UNAVAILABLE"
-            )
-            evaluator_authoritative = True
-        projected: list[tuple[Mapping[str, Any], Mapping[str, Any]]] = []
-        missing_accounting = False
-
-        def has_raw_accounting(row: Mapping[str, Any]) -> bool:
-            view = _rolling_snapshot_view(row)
-            return any(
-                isinstance(view.get(name), Mapping)
-                for name in (
-                    "canonical_accounting",
-                    "strategy_accounting",
-                    "accounting",
-                    "resolved_bet",
-                )
+            for row in rows
+        ):
+            # A replay window cannot be represented by a price-only row.
+            return None
+        canonical_required = requested_source in {"HISTORICAL", "REPLAY", "LIVE"}
+        # PAPER is the sole exact-account-ledger source.  Every other source,
+        # including unbound LIVE price-proxy rows, is evaluated canonically.
+        actual_ledger = requested_source == "PAPER"
+        if evaluation is None and canonical_required:
+            evaluation = self._rolling_canonical_evaluation(
+                strategy, rows, requested_source
             )
 
-        if evaluator_authoritative:
-            raw_accounting_rows = sum(
-                1 for row in rows if isinstance(row, Mapping) and has_raw_accounting(row)
-            )
-            if 0 < raw_accounting_rows < len(rows):
-                evaluation = dict(evaluation)
-                evaluation.update(
-                    {
-                        "accounting_available": False,
-                        "accounting_complete": False,
-                        "accounting_partial": True,
-                        "accounting_unavailable_reason": "MIXED_RAW_ACCOUNTING",
-                    }
-                )
-            partial_accounting = (
-                evaluation.get("accounting_available") is not True
-                or evaluation.get("accounting_complete") is False
-                or evaluation.get("accounting_partial") is True
-            )
-            evaluation_from = evaluation.get("available_from")
-            evaluation_through = evaluation.get("available_through")
-            row_times = [
-                _rolling_row_time(row)
+        def dec(value: Any, default: Decimal = Decimal("0")) -> Decimal:
+            if value is None or isinstance(value, bool):
+                return default
+            try:
+                parsed = Decimal(str(value))
+            except (InvalidOperation, TypeError, ValueError, OverflowError):
+                return default
+            return parsed if parsed.is_finite() else default
+
+        valid_times = [
+            _rolling_row_time(_rolling_snapshot_view(row))
+            for row in rows
+            if isinstance(row, Mapping)
+            and not row.get("_rolling_source_rejection")
+            and not row.get("_rolling_accounting_rejection")
+            and _rolling_row_time(_rolling_snapshot_view(row)) is not None
+        ]
+        if not valid_times and actual_ledger:
+            # Keep an exact but incomplete PAPER ledger observable as an
+            # unavailable accounting result; malformed source timestamps still
+            # fail closed without materializing an evidence window.
+            valid_times = [
+                _rolling_row_time(_rolling_snapshot_view(row))
                 for row in rows
-                if isinstance(row, Mapping) and _rolling_row_time(row) is not None
+                if isinstance(row, Mapping)
+                and _rolling_row_time(_rolling_snapshot_view(row)) is not None
             ]
-            start = _rolling_timestamp(evaluation_from) or (
-                min(row_times) if row_times else None
+        if not valid_times:
+            return None
+        evaluation_map = dict(evaluation) if isinstance(evaluation, Mapping) else {}
+        nested_metrics = evaluation_map.get("metrics")
+        nested_metrics = nested_metrics if isinstance(nested_metrics, Mapping) else {}
+        canonical_accounting = evaluation_map.get("portfolio_accounting")
+        if not isinstance(canonical_accounting, Mapping):
+            canonical_accounting = nested_metrics.get("portfolio_accounting")
+        canonical_accounting = (
+            dict(canonical_accounting)
+            if isinstance(canonical_accounting, Mapping)
+            else None
+        )
+        canonical_evaluation = evaluation_map.get("evaluation")
+        if canonical_accounting is not None:
+            # Evidence schema bounds the immutable open-position projection.
+            # Canonical evaluators may report a larger inventory, but the
+            # evidence record must fail closed rather than hand an oversized
+            # document to RollingEvidence.from_mapping during digesting.
+            raw_positions = canonical_accounting.get("open_positions")
+            positions_valid = isinstance(
+                raw_positions, (list, tuple, set, frozenset)
             )
-            through = _rolling_timestamp(evaluation_through) or (
-                max(row_times) if row_times else None
-            )
-            if start is None or through is None or through < start:
-                return None
-            accounting = {
-                "_available_from": start,
-                "_available_through": through,
-                "allocated_capital": (
-                    evaluation.get("capital_at_risk", 0) if not partial_accounting else 0
-                ),
-                "allocated_capital_net_return": (
-                    evaluation.get("realized_pnl", 0) if not partial_accounting else 0
-                ),
-                "realized_pnl": (
-                    evaluation.get("realized_pnl", 0) if not partial_accounting else 0
-                ),
-                "unrealized_pnl": (
-                    evaluation.get("unrealized_pnl", 0) if not partial_accounting else 0
-                ),
-                "fees": evaluation.get("fees", 0) if not partial_accounting else 0,
-                "costs": evaluation.get("costs", 0) if not partial_accounting else 0,
-                "drawdown": evaluation.get("drawdown", 0) if not partial_accounting else 0,
-                "completed_outcomes": (
-                    evaluation.get("completed_outcomes", 0)
-                    if not partial_accounting
-                    else 0
-                ),
-                "reliability": (
-                    evaluation.get("reliability", 1)
-                    if not partial_accounting
-                    else 0
-                ),
-                "execution_feasibility": evaluation.get("execution_feasibility"),
-            }
-            projected.append(({"_rolling_partial": True}, accounting))
-            missing_accounting = partial_accounting
-        else:
-            if isinstance(evaluation, Mapping) and (
-                evaluation.get("accounting_available") is False
-                or evaluation.get("accounting_complete") is False
-                or evaluation.get("accounting_partial") is True
+            if positions_valid and isinstance(raw_positions, (set, frozenset)):
+                try:
+                    raw_positions = tuple(
+                        sorted(raw_positions, key=_canonical_binding)
+                    )
+                except (TypeError, ValueError, ArithmeticError):
+                    positions_valid = False
+            if (
+                not positions_valid
+                or raw_positions is None
+                or len(raw_positions) > _ROLLING_OPEN_POSITIONS_LIMIT
             ):
-                missing_accounting = True
+                canonical_accounting["open_positions"] = []
+                canonical_accounting["accounting_available"] = False
+                canonical_accounting["accounting_complete"] = False
+                canonical_accounting["accounting_partial"] = True
+                canonical_accounting["accounting_unavailable_reason"] = (
+                    _ROLLING_OPEN_POSITIONS_LIMIT_REASON
+                    if positions_valid
+                    and raw_positions is not None
+                    and len(raw_positions) > _ROLLING_OPEN_POSITIONS_LIMIT
+                    else "ACCOUNTING_OPEN_POSITIONS_INVALID"
+                )
+            else:
+                canonical_accounting["open_positions"] = list(raw_positions)
+            # The storage contract compares top-level monetary fields with
+            # their nested accounting projection byte-for-byte.  Evaluators
+            # commonly emit floats while the immutable evidence projection is
+            # decimal text; normalize the nested copy before persistence so
+            # equivalent values do not look like contradictory provenance.
+            for name in (
+                "initial_cash",
+                "cash",
+                "equity",
+                "realized_pnl",
+                "unrealized_pnl",
+                "net_pnl",
+                "fees",
+                "costs",
+                "allocated_capital",
+                "capital_at_risk",
+            ):
+                value = canonical_accounting.get(name)
+                if value is None:
+                    continue
+                try:
+                    parsed = Decimal(str(value))
+                except (InvalidOperation, TypeError, ValueError, OverflowError):
+                    continue
+                if parsed.is_finite() and not isinstance(value, bool):
+                    canonical_accounting[name] = str(parsed)
+        if not isinstance(canonical_evaluation, Mapping):
+            canonical_evaluation = nested_metrics.get("evaluation")
+        canonical_evaluation = (
+            dict(canonical_evaluation)
+            if isinstance(canonical_evaluation, Mapping)
+            else {}
+        )
+        if actual_ledger:
+            # PAPER rows are measured from the exact account ledger.  They do
+            # not execute the evaluator and must remain explicit about that.
+            canonical_accounting = None
+            canonical_evaluation = {
+                "evaluation_kind": "ACTUAL_LEDGER",
+                "evaluator_invoked": False,
+                "evaluator_completed": False,
+                "evaluated_observations": 0,
+                "signal_count": 0,
+                "diagnostic_summary_count": 0,
+                "evaluator_name": None,
+                "evaluator_error": None,
+                "evaluator_prerequisite": None,
+            }
+        else:
+            canonical_evaluation.setdefault("evaluation_kind", "CANONICAL_SIMULATION")
+            if canonical_evaluation.get("evaluation_kind") != "CANONICAL_SIMULATION":
+                canonical_evaluation["evaluator_invoked"] = False
+                canonical_evaluation["evaluator_completed"] = False
+                canonical_evaluation["evaluator_error"] = (
+                    canonical_evaluation.get("evaluator_error")
+                    or "EVALUATION_KIND_INVALID"
+                )
+                canonical_evaluation["evaluator_prerequisite"] = (
+                    canonical_evaluation.get("evaluator_prerequisite")
+                    or "EVALUATION_KIND_INVALID"
+                )
+        canonical_status_valid = isinstance(canonical_evaluation, Mapping) and all(
+            name in canonical_evaluation and isinstance(canonical_evaluation.get(name), bool)
+            for name in ("evaluator_invoked", "evaluator_completed")
+        )
+        if not canonical_status_valid:
+            canonical_evaluation["evaluator_invoked"] = False
+            canonical_evaluation["evaluator_completed"] = False
+            canonical_evaluation["evaluator_error"] = (
+                canonical_evaluation.get("evaluator_error")
+                or "EVALUATOR_STATUS_REQUIRED"
+            )
+            canonical_evaluation["evaluator_prerequisite"] = (
+                canonical_evaluation.get("evaluator_prerequisite")
+                or "EVALUATOR_STATUS_REQUIRED"
+            )
+            canonical_evaluation["diagnostic_summary_count"] = 1
+        if canonical_accounting is not None:
+            accounting_complete_flag = canonical_accounting.get("accounting_complete")
+            accounting_partial_flag = canonical_accounting.get("accounting_partial")
+            accounting_flags_unusable = (
+                (
+                    accounting_complete_flag is not None
+                    and accounting_complete_flag is not True
+                )
+                or (
+                    accounting_partial_flag is not None
+                    and accounting_partial_flag is not False
+                )
+            )
+            accounting_unusable = (
+                canonical_accounting.get("accounting_available") is not True
+                or not _rolling_canonical_accounting_complete(canonical_accounting)
+                or accounting_flags_unusable
+                or (
+                    canonical_required
+                    and (
+                        canonical_evaluation.get("evaluator_invoked") is not True
+                        or canonical_evaluation.get("evaluator_completed") is not True
+                    )
+                )
+            )
+            if accounting_unusable:
+                canonical_accounting["accounting_available"] = False
+                canonical_accounting["accounting_complete"] = False
+                canonical_accounting["accounting_partial"] = True
+        if canonical_required and canonical_accounting is None:
+            # A missing canonical result is an explicit unavailable evaluation,
+            # never permission to consume a row's private accounting.
+            canonical_accounting = {
+                "accounting_available": False,
+                "initial_cash": None,
+                "cash": None,
+                "equity": None,
+                "realized_pnl": None,
+                "unrealized_pnl": None,
+                "net_pnl": None,
+                "fees": None,
+                "costs": None,
+                "open_positions": [],
+                "opening_fills": 0,
+                "closing_fills": 0,
+                "partial_closing_fills": 0,
+                "completed_round_trips": 0,
+            }
+            canonical_evaluation["evaluator_invoked"] = False
+            canonical_evaluation["evaluator_completed"] = False
+            canonical_evaluation.setdefault("evaluated_observations", 0)
+            canonical_evaluation.setdefault("signal_count", 0)
+            try:
+                diagnostic_default = _rolling_strict_count(
+                    canonical_evaluation.get("diagnostic_summary_count"),
+                    "diagnostic_summary_count",
+                    default=0,
+                )
+            except ValueError:
+                diagnostic_default = 0
+            canonical_evaluation["diagnostic_summary_count"] = max(
+                1,
+                int(diagnostic_default or 0),
+            )
+            canonical_evaluation.setdefault("evaluator_name", None)
+            canonical_evaluation["evaluator_error"] = (
+                canonical_evaluation.get("evaluator_error")
+                or "CANONICAL_EVALUATION_UNAVAILABLE"
+            )
+            canonical_evaluation["evaluator_prerequisite"] = (
+                canonical_evaluation.get("evaluator_prerequisite")
+                or "CANONICAL_EVALUATION_UNAVAILABLE"
+            )
+            evaluation_map.setdefault(
+                "evaluation_version", "rolling-evaluation:v2"
+            )
+            evaluation_map.setdefault(
+                "evaluation_run_id",
+                "rolling-evaluation:v2:"
+                + _rolling_hash(
+                    {
+                        "source": requested_source,
+                        "rows": rows,
+                        "reason": canonical_evaluation[
+                            "evaluator_prerequisite"
+                        ],
+                    }
+                ).removeprefix("sha256:")[:40],
+            )
+            evaluation_map.setdefault("source_digest", _rolling_hash(rows))
+
+        projected: list[tuple[Mapping[str, Any], Mapping[str, Any]]] = []
+        partial_accounting = False
+        if canonical_required:
+            pa = canonical_accounting or {}
+            start = next(
+                (
+                    _rolling_timestamp(pa.get(name))
+                    for name in ("available_from", "coverage_from", "window_start")
+                    if _rolling_timestamp(pa.get(name)) is not None
+                ),
+                min(valid_times),
+            )
+            through = next(
+                (
+                    _rolling_timestamp(pa.get(name))
+                    for name in (
+                        "available_through",
+                        "coverage_through",
+                        "window_end",
+                    )
+                    if _rolling_timestamp(pa.get(name)) is not None
+                ),
+                max(valid_times),
+            )
+            if through < start:
+                return None
+            available = (
+                pa.get("accounting_available") is True
+                and _rolling_canonical_accounting_complete(pa)
+                and (
+                    pa.get("accounting_complete") is None
+                    or pa.get("accounting_complete") is True
+                )
+                and (
+                    pa.get("accounting_partial") is None
+                    or pa.get("accounting_partial") is False
+                )
+            )
+            complete = (
+                canonical_evaluation.get("evaluator_invoked") is True
+                and canonical_evaluation.get("evaluator_completed") is True
+                and available
+            )
+            partial_accounting = not available or not complete
+
+            opening_fills = pa.get("opening_fills")
+            opening_fill_rows = (
+                list(opening_fills)
+                if isinstance(opening_fills, (list, tuple))
+                else []
+            )
+            allocated = pa.get("allocated_capital", pa.get("capital_at_risk"))
+            realized = pa.get("realized_pnl")
+            unrealized = pa.get("unrealized_pnl")
+            net_pnl = pa.get("net_pnl")
+            fees = pa.get("fees")
+            costs = pa.get("costs")
+            completed = pa.get(
+                "completed_round_trips",
+                pa.get("completed_outcomes", 0),
+            )
+            reliability = pa.get(
+                "reliability",
+                Decimal("1") if available else Decimal("0"),
+            )
+            drawdown = pa.get("drawdown", 0)
+            projected.append(
+                (
+                    {"_rolling_canonical": True},
+                    {
+                        "_available_from": start,
+                        "_available_through": through,
+                        "allocated_capital": dec(allocated) if available else Decimal("0"),
+                        "allocated_capital_net_return": (
+                            dec(net_pnl if net_pnl is not None else realized)
+                            if available
+                            else Decimal("0")
+                        ),
+                        "realized_pnl": dec(realized) if available else Decimal("0"),
+                        "unrealized_pnl": dec(unrealized) if available else Decimal("0"),
+                        "fees": dec(fees) if available else Decimal("0"),
+                        "costs": dec(costs) if available else Decimal("0"),
+                        "drawdown": dec(drawdown) if available else Decimal("0"),
+                        "completed_outcomes": completed,
+                        "reliability": dec(reliability),
+                        "execution_feasibility": pa.get("execution_feasibility"),
+                    },
+                )
+            )
+        else:
+            # PAPER and exact-identity LIVE ledgers retain their validated
+            # accounting projection.  Raw unbound rows never enter this path.
             for row in rows:
                 if not isinstance(row, Mapping):
-                    missing_accounting = True
+                    partial_accounting = True
+                    continue
+                if row.get("_rolling_source_rejection") or row.get(
+                    "_rolling_accounting_rejection"
+                ):
+                    partial_accounting = True
                     continue
                 accounting = row.get("_rolling_accounting")
                 if not isinstance(accounting, Mapping):
@@ -5573,397 +6519,553 @@ class AutonomousResearchProcessor:
                 if isinstance(accounting, Mapping):
                     projected.append((row, accounting))
                 else:
-                    missing_accounting = True
-            partial_accounting = (
-                missing_accounting
-                or (
-                    isinstance(evaluation, Mapping)
-                    and (
-                        evaluation.get("accounting_complete") is False
-                        or evaluation.get("accounting_partial") is True
-                        or evaluation.get("accounting_available") is False
-                    )
-                )
-            )
+                    partial_accounting = True
             if not projected:
-                evaluation_from = (
-                    evaluation.get("available_from") if isinstance(evaluation, Mapping) else None
-                )
-                evaluation_through = (
-                    evaluation.get("available_through") if isinstance(evaluation, Mapping) else None
-                )
-                row_times = [
-                    _rolling_row_time(row)
-                    for row in rows
-                    if isinstance(row, Mapping) and _rolling_row_time(row) is not None
-                ]
-                start = _rolling_timestamp(evaluation_from) or (
-                    min(row_times) if row_times else None
-                )
-                through = _rolling_timestamp(evaluation_through) or (
-                    max(row_times) if row_times else None
-                )
-                if start is None or through is None or through < start:
-                    return None
-                partial_accounting = (
-                    missing_accounting
-                    or (
-                        isinstance(evaluation, Mapping)
-                        and (
-                            evaluation.get("accounting_complete") is False
-                            or evaluation.get("accounting_partial") is True
-                            or evaluation.get("accounting_available") is not True
-                        )
+                projected.append(
+                    (
+                        {"_rolling_partial": True},
+                        {
+                            "_available_from": min(valid_times),
+                            "_available_through": max(valid_times),
+                            "allocated_capital": Decimal("0"),
+                            "allocated_capital_net_return": Decimal("0"),
+                            "realized_pnl": Decimal("0"),
+                            "unrealized_pnl": Decimal("0"),
+                            "fees": Decimal("0"),
+                            "costs": Decimal("0"),
+                            "drawdown": Decimal("0"),
+                            "completed_outcomes": Decimal("0"),
+                            "reliability": Decimal("0"),
+                        },
                     )
                 )
-                accounting = {
-                    "_available_from": start,
-                    "_available_through": through,
-                    "allocated_capital": (
-                        evaluation.get("capital_at_risk", 0)
-                        if isinstance(evaluation, Mapping) and not partial_accounting
-                        else 0
-                    ),
-                    "allocated_capital_net_return": (
-                        evaluation.get("realized_pnl", 0)
-                        if isinstance(evaluation, Mapping) and not partial_accounting
-                        else 0
-                    ),
-                    "realized_pnl": (
-                        evaluation.get("realized_pnl", 0)
-                        if isinstance(evaluation, Mapping) and not partial_accounting
-                        else 0
-                    ),
-                    "unrealized_pnl": (
-                        evaluation.get("unrealized_pnl", 0)
-                        if isinstance(evaluation, Mapping) and not partial_accounting
-                        else 0
-                    ),
-                    "fees": (
-                        evaluation.get("fees", 0)
-                        if isinstance(evaluation, Mapping) and not partial_accounting
-                        else 0
-                    ),
-                    "costs": (
-                        evaluation.get("costs", 0)
-                        if isinstance(evaluation, Mapping) and not partial_accounting
-                        else 0
-                    ),
-                    "drawdown": 0,
-                    "completed_outcomes": (
-                        evaluation.get("completed_outcomes", 0)
-                        if isinstance(evaluation, Mapping) and not partial_accounting
-                        else 0
-                    ),
-                    "reliability": (
-                        1 if isinstance(evaluation, Mapping) and not partial_accounting else 0
-                    ),
-                }
-                projected.append(({"_rolling_partial": True}, accounting))
-        stream_through = max(
-            accounting["_available_through"]
-            for _row, accounting in projected
-            if isinstance(accounting.get("_available_through"), datetime)
-        )
-        requested_start = stream_through - timedelta(days=days)
-        selected = [
-            (row, accounting)
-            for row, accounting in projected
-            if accounting["_available_through"] >= requested_start
-            and accounting["_available_from"] <= stream_through
-        ]
-        if not selected:
-            return None
+                partial_accounting = True
+
         intervals: list[tuple[datetime, datetime]] = []
-        for _row, accounting in selected:
-            start = max(requested_start, accounting["_available_from"])
-            end = min(stream_through, accounting["_available_through"])
-            if end >= start:
-                intervals.append((start, end))
+        for _row, accounting in projected:
+            start = accounting.get("_available_from")
+            through = accounting.get("_available_through")
+            if isinstance(start, datetime) and isinstance(through, datetime):
+                if through >= start:
+                    intervals.append((start, through))
         if not intervals:
             return None
         intervals.sort()
         merged: list[tuple[datetime, datetime]] = []
-        for start, end in intervals:
+        for start, through in intervals:
             if not merged or start > merged[-1][1]:
-                merged.append((start, end))
-            elif end > merged[-1][1]:
-                merged[-1] = (merged[-1][0], end)
-        actual_coverage = sum(int((end - start).total_seconds()) for start, end in merged)
-        available_from = min(start for start, _end in intervals)
-        available_through = max(end for _start, end in intervals)
-
-        def metric(accounting: Mapping[str, Any], *names: str) -> Decimal:
-            for name in names:
-                if accounting.get(name) is not None:
-                    return Decimal(str(accounting[name]))
-            raise ValueError("validated accounting metric is missing")
-
-        net_return = sum(
-            (
-                metric(accounting, "allocated_capital_net_return", "net_return")
-                for _row, accounting in selected
-            ),
-            Decimal("0"),
+                merged.append((start, through))
+            elif through > merged[-1][1]:
+                merged[-1] = (merged[-1][0], through)
+        available_from = min(start for start, _through in intervals)
+        available_through = max(through for _start, through in intervals)
+        if actual_ledger:
+            canonical_accounting = _rolling_actual_ledger_accounting(
+                () if partial_accounting else projected,
+                available_from=available_from,
+                available_through=available_through,
+            )
+            partial_accounting = (
+                partial_accounting
+                or canonical_accounting.get("accounting_available") is not True
+                or canonical_accounting.get("accounting_complete") is not True
+                or canonical_accounting.get("accounting_partial") is not False
+            )
+        actual_coverage = sum(
+            int((through - start).total_seconds()) for start, through in merged
         )
-        realized_pnl = sum((metric(accounting, "realized_pnl") for _row, accounting in selected), Decimal("0"))
-        unrealized_pnl = sum((metric(accounting, "unrealized_pnl") for _row, accounting in selected), Decimal("0"))
-        fees = sum((metric(accounting, "fees", "fee_costs") for _row, accounting in selected), Decimal("0"))
-        costs = sum((metric(accounting, "costs", "slippage_costs") for _row, accounting in selected), Decimal("0"))
-        if min(fees, costs) < Decimal("0"):
-            return None
-        if not any(
-            accounting.get("allocated_capital_net_return") is not None
-            or accounting.get("net_return") is not None
-            for _row, accounting in selected
-        ):
-            net_return = realized_pnl + unrealized_pnl - fees - costs
-        completed_values = [
-            metric(accounting, "completed_outcomes")
-            for _row, accounting in selected
-            if accounting.get("completed_outcomes") is not None
-        ]
-        completed = sum(int(value) for value in completed_values if value == value.to_integral_value())
-        if any(value != value.to_integral_value() or value < 0 for value in completed_values):
-            return None
-        reliability_values = [
-            metric(accounting, "reliability")
-            for _row, accounting in selected
-            if accounting.get("reliability") is not None
-        ]
-        if any(value < Decimal("0") or value > Decimal("1") for value in reliability_values):
-            return None
+        selected = list(projected)
+
+        count_error: str | None = None
+
+        def count_value(value: Any, name: str = "count") -> int:
+            nonlocal count_error
+            try:
+                parsed = _rolling_strict_count(value, name, default=0)
+            except ValueError:
+                count_error = name
+                return 0
+            return int(parsed or 0)
+
+        def collection_count(value: Any, name: str = "count") -> int:
+            if isinstance(value, (list, tuple, set, frozenset)):
+                return len(value)
+            return count_value(value, name)
+        def aggregate(name: str, *aliases: str) -> Decimal:
+            return sum(
+                (
+                    dec(next((item.get(key) for key in (name,) + aliases if item.get(key) is not None), 0))
+                    for _row, item in selected
+                ),
+                Decimal("0"),
+            )
+
+        allocated_capital = aggregate(
+            "allocated_capital", "paper_sizing", "paper_size"
+        )
+        net_return = aggregate(
+            "allocated_capital_net_return", "net_return", "net_pnl"
+        )
+        realized_pnl = aggregate("realized_pnl")
+        unrealized_pnl = aggregate("unrealized_pnl")
+        fees = aggregate("fees", "fee_costs")
+        costs = aggregate("costs", "slippage_costs")
+        completed_values: list[int] = []
+        for _row, item in selected:
+            raw_completed = next(
+                (
+                    item.get(key)
+                    for key in ("completed_outcomes", "completed_round_trips")
+                    if item.get(key) is not None
+                ),
+                None,
+            )
+            completed_values.append(count_value(raw_completed, "completed_outcomes"))
+        completed = sum(completed_values) if count_error is None else 0
+        reliabilities = [dec(item.get("reliability")) for _row, item in selected]
         reliability = (
-            sum(reliability_values, Decimal("0")) / Decimal(len(reliability_values))
-            if reliability_values
+            sum(reliabilities, Decimal("0")) / Decimal(len(reliabilities))
+            if reliabilities
             else Decimal("0")
         )
-        drawdowns = [
-            metric(accounting, "drawdown")
-            for _row, accounting in selected
-            if accounting.get("drawdown") is not None
-        ]
-        if any(value < Decimal("0") or value > Decimal("1") for value in drawdowns):
-            return None
-        drawdown = max(drawdowns, default=Decimal("0"))
-        allocated_capital = sum(
-            (metric(accounting, "allocated_capital", "paper_sizing", "paper_size") for _row, accounting in selected),
-            Decimal("0"),
+        drawdown = max(
+            (dec(item.get("drawdown")) for _row, item in selected),
+            default=Decimal("0"),
         )
-        feasibility: Any = ""
-        for _row, accounting in selected:
-            if accounting.get("execution_feasibility") is not None:
-                feasibility = accounting["execution_feasibility"]
-                if isinstance(feasibility, bool):
-                    feasibility = str(feasibility)
-                if str(feasibility).strip().upper() in {"FALSE", "NO", "INFEASIBLE"} or feasibility is False:
-                    feasibility = "False"
-                    break
-        provenance = strategy.get("provenance") if isinstance(strategy.get("provenance"), Mapping) else {}
-        candidate_id = str(strategy.get("candidate_id") or provenance.get("candidate_id") or "").strip() or None
-        trial_id = str(strategy.get("research_trial_id") or provenance.get("research_trial_id") or "").strip() or None
+        feasibility: Any = None
+        for _row, item in selected:
+            if item.get("execution_feasibility") is not None:
+                feasibility = item["execution_feasibility"]
+                break
+        provenance = (
+            strategy.get("provenance")
+            if isinstance(strategy.get("provenance"), Mapping)
+            else {}
+        )
+        candidate_id = str(
+            strategy.get("candidate_id") or provenance.get("candidate_id") or ""
+        ).strip() or None
+        trial_id = str(
+            strategy.get("research_trial_id")
+            or provenance.get("research_trial_id")
+            or ""
+        ).strip() or None
         source_binding = _rolling_source_binding(strategy)
-        accounting_digest = [
-            {
-                "identity": str(
-                    row.get("accounting_id", row.get("ledger_id", row.get("observation_id", "")))
-                ),
-                "from": accounting["_available_from"],
-                "through": accounting["_available_through"],
-                "metrics": {
-                    key: accounting.get(key)
-                    for key in (
-                        "allocated_capital_net_return",
-                        "net_return",
-                        "realized_pnl",
-                        "unrealized_pnl",
-                        "fees",
-                        "costs",
-                        "completed_outcomes",
-                        "reliability",
-                        "drawdown",
+        source_digest = str(
+            evaluation_map.get("source_digest") or _rolling_hash(rows)
+        )
+        accounting_digest = str(
+            evaluation_map.get("accounting_digest")
+            or _rolling_hash(canonical_accounting or [dict(item) for _row, item in selected])
+        )
+        evaluated_observations = evaluation_map.get(
+            "evaluated_observations",
+            canonical_evaluation.get("evaluated_observations", 0),
+        )
+        signal_count = evaluation_map.get(
+            "signal_count", canonical_evaluation.get("signal_count", 0)
+        )
+        diagnostic_count = evaluation_map.get(
+            "diagnostic_summary_count",
+            canonical_evaluation.get("diagnostic_summary_count", 0),
+        )
+        for name, value in (
+            ("evaluated_observations", evaluated_observations),
+            ("signal_count", signal_count),
+            ("diagnostic_summary_count", diagnostic_count),
+        ):
+            try:
+                parsed = _rolling_strict_count(value, name, default=0)
+            except ValueError:
+                count_error = name
+                parsed = 0
+            if name == "evaluated_observations":
+                evaluated_observations = int(parsed or 0)
+            elif name == "signal_count":
+                signal_count = int(parsed or 0)
+            else:
+                diagnostic_count = int(parsed or 0)
+        if actual_ledger:
+            evaluator_invoked = False
+            evaluator_completed = False
+        else:
+            evaluator_invoked = canonical_evaluation.get("evaluator_invoked")
+            evaluator_completed = canonical_evaluation.get("evaluator_completed")
+        status_valid = all(
+            isinstance(value, bool)
+            for value in (evaluator_invoked, evaluator_completed)
+        )
+        if canonical_required and not status_valid:
+            evaluator_invoked = False
+            evaluator_completed = False
+            count_error = count_error or "EVALUATOR_STATUS_REQUIRED"
+            diagnostic_count = max(1, int(diagnostic_count))
+        else:
+            evaluator_invoked = evaluator_invoked is True
+            evaluator_completed = evaluator_completed is True
+        if count_error is not None:
+            evaluator_completed = False
+            diagnostic_count = max(1, int(diagnostic_count))
+            canonical_evaluation["evaluator_completed"] = False
+            canonical_evaluation["diagnostic_summary_count"] = diagnostic_count
+            canonical_evaluation["evaluator_error"] = (
+                canonical_evaluation.get("evaluator_error")
+                or evaluation_map.get("evaluator_error")
+                or "EVALUATOR_COUNT_METRIC_INVALID"
+            )
+            canonical_evaluation["evaluator_prerequisite"] = (
+                canonical_evaluation.get("evaluator_prerequisite")
+                or evaluation_map.get("evaluator_prerequisite")
+                or count_error
+            )
+        if canonical_required and canonical_accounting is not None and (
+            not evaluator_invoked
+            or not evaluator_completed
+            or (
+                canonical_accounting.get("accounting_complete") is not None
+                and canonical_accounting.get("accounting_complete") is not True
+            )
+            or (
+                canonical_accounting.get("accounting_partial") is not None
+                and canonical_accounting.get("accounting_partial") is not False
+            )
+        ):
+            canonical_accounting["accounting_available"] = False
+            canonical_accounting["accounting_complete"] = False
+            canonical_accounting["accounting_partial"] = True
+        if canonical_required:
+            partial_accounting = (
+                partial_accounting
+                or evaluator_invoked is not True
+                or evaluator_completed is not True
+            )
+        if count_error is not None:
+            partial_accounting = True
+        if partial_accounting:
+            diagnostic_count = max(1, int(diagnostic_count))
+            canonical_evaluation["diagnostic_summary_count"] = diagnostic_count
+        evaluation_version = str(
+            evaluation_map.get("evaluation_version") or "rolling-evaluation:v2"
+        )
+        evaluation_run_id = str(
+            evaluation_map.get("evaluation_run_id")
+            or (
+                "rolling-evaluation:v2:"
+                + _rolling_hash(
+                    {
+                        "strategy_version_id": strategy.get("strategy_version_id"),
+                        "source": requested_source,
+                        "days": days,
+                        "source_digest": source_digest,
+                        "accounting_digest": accounting_digest,
+                        "evaluated_observations": evaluated_observations,
+                        "signal_count": signal_count,
+                    }
+                ).removeprefix("sha256:")[:40]
+            )
+        )
+        evidence_identity = {
+            "evaluation_run_id": evaluation_run_id,
+            "evaluation_version": evaluation_version,
+            "evaluation_kind": (
+                "CANONICAL_SIMULATION" if canonical_required else "ACTUAL_LEDGER"
+            ),
+            "strategy_version_id": strategy["strategy_version_id"],
+            "candidate_id": candidate_id,
+            "research_trial_id": trial_id,
+            "source_class": persisted_source,
+            "requested_source_class": requested_source,
+            "source_binding": source_binding,
+            "requested_days": days,
+            "available_from": available_from,
+            "available_through": available_through,
+            "actual_coverage_seconds": actual_coverage,
+            "source_digest": source_digest,
+            "accounting_digest": accounting_digest,
+        }
+        evidence_digest = _rolling_hash(evidence_identity)
+        window_id = (
+            "rolling-evaluation:v2:evidence:"
+            + evidence_digest.removeprefix("sha256:")[:40]
+        )
+
+        supersedes: str | None = None
+        lister = getattr(self.store, "list_strategy_evidence_windows", None)
+        if not callable(lister):
+            raise AutonomousResearchError(
+                "PREDECESSOR_LOOKUP_UNAVAILABLE",
+                "list_strategy_evidence_windows is unavailable",
+            )
+        try:
+            try:
+                signature = inspect.signature(lister)
+            except (TypeError, ValueError):
+                signature = None
+            if signature is None:
+                prior_rows = lister(
+                    strategy_version_id=str(strategy.get("strategy_version_id")),
+                    limit=10_000,
+                )
+            else:
+                parameters = signature.parameters
+                strategy_parameter = parameters.get("strategy_version_id")
+                keyword_strategy = (
+                    strategy_parameter is not None
+                    and strategy_parameter.kind
+                    in (
+                        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                        inspect.Parameter.KEYWORD_ONLY,
                     )
-                    if accounting.get(key) is not None
-                },
-            }
-            for row, accounting in selected
-        ]
-        rolling_accounting_digest = _rolling_hash(accounting_digest)
-        evaluation_source_digest = (
-            evaluation.get("source_digest")
-            if isinstance(evaluation, Mapping)
-            else None
+                )
+                accepts_arbitrary_keywords = any(
+                    parameter.kind is inspect.Parameter.VAR_KEYWORD
+                    for parameter in parameters.values()
+                )
+                if keyword_strategy or accepts_arbitrary_keywords:
+                    prior_rows = lister(
+                        strategy_version_id=str(strategy.get("strategy_version_id")),
+                        limit=10_000,
+                    )
+                else:
+                    prior_rows = lister(
+                        str(strategy.get("strategy_version_id")),
+                        limit=10_000,
+                    )
+            if prior_rows is None or isinstance(
+                prior_rows,
+                (Mapping, str, bytes, bytearray),
+            ):
+                raise TypeError("evidence window listing must be an iterable of records")
+            prior_evidence: list[RollingEvidence] = []
+            for prior in prior_rows:
+                if not isinstance(prior, Mapping):
+                    raise TypeError(
+                        "evidence window listing contains a non-record item"
+                    )
+                parsed_prior = RollingEvidence.from_mapping(prior)
+                if (
+                    parsed_prior.evidence_window_id == window_id
+                    or parsed_prior.evaluation_run_id == evaluation_run_id
+                ):
+                    continue
+                prior_evidence.append(parsed_prior)
+            latest = _latest_windows(prior_evidence)
+        except Exception as exc:
+            raise AutonomousResearchError(
+                "PREDECESSOR_LOOKUP_UNAVAILABLE",
+                str(exc) or type(exc).__name__,
+            ) from exc
+
+        active_prior = (
+            latest.get(str(strategy.get("strategy_version_id")), {})
+            .get(persisted_source, {})
+            .get(days)
         )
-        source_digest = (
-            str(evaluation_source_digest)
-            if evaluation_source_digest not in (None, "")
-            else _rolling_hash(rows)
+        if active_prior is not None:
+            supersedes = active_prior.evidence_window_id
+
+        unavailable_reason = (
+            evaluation_map.get("evaluator_error")
+            or canonical_evaluation.get("evaluator_error")
+            or evaluation_map.get("evaluator_prerequisite")
+            or canonical_evaluation.get("evaluator_prerequisite")
+            or (
+                canonical_accounting.get("accounting_unavailable_reason")
+                if isinstance(canonical_accounting, Mapping)
+                else None
+            )
+            or (
+                "EVALUATOR_COUNT_METRIC_INVALID"
+                if count_error is not None
+                else None
+            )
         )
-        evaluation_accounting_digest = (
-            evaluation.get("accounting_digest")
-            if isinstance(evaluation, Mapping)
-            else None
+        valid_input_default = len(valid_times)
+        if actual_ledger:
+            valid_input_default = sum(
+                1
+                for row in rows
+                if isinstance(row, Mapping)
+                and not row.get("_rolling_source_rejection")
+                and not row.get("_rolling_accounting_rejection")
+                and _rolling_row_time(_rolling_snapshot_view(row)) is not None
+            )
+        valid_input_rows = evaluation_map.get("valid_input_rows", valid_input_default)
+        try:
+            valid_input_rows = _rolling_strict_count(
+                valid_input_rows,
+                "valid_input_rows",
+                default=valid_input_default,
+            )
+        except ValueError:
+            count_error = count_error or "valid_input_rows"
+            valid_input_rows = 0
+        declined_evaluations = count_value(
+            canonical_evaluation.get("declined_evaluations", 0),
+            "declined_evaluations",
         )
-        persisted_accounting_digest = (
-            str(evaluation_accounting_digest)
-            if evaluation_accounting_digest not in (None, "")
-            else rolling_accounting_digest
+        positions = (
+            collection_count(
+                canonical_accounting.get("open_positions", ()),
+                "positions",
+            )
+            if isinstance(canonical_accounting, Mapping)
+            else 0
         )
-        evaluated_rows = (
-            int(evaluation.get("evaluated_rows", len(selected)))
-            if isinstance(evaluation, Mapping)
-            else len(selected)
+        openings = (
+            collection_count(
+                canonical_accounting.get("opening_fills", 0),
+                "openings",
+            )
+            if isinstance(canonical_accounting, Mapping)
+            else 0
         )
-        requested_rows = (
-            int(evaluation.get("requested_rows", len(rows)))
-            if isinstance(evaluation, Mapping)
-            else len(rows)
-        )
-        available_rows = (
-            int(evaluation.get("available_rows", len(selected)))
-            if isinstance(evaluation, Mapping)
-            else len(selected)
-        )
-        evaluation_available = (
-            evaluation.get("accounting_available")
-            if isinstance(evaluation, Mapping)
-            and isinstance(evaluation.get("accounting_available"), bool)
-            else None
-        )
-        evaluation_complete = (
-            evaluation.get("accounting_complete")
-            if isinstance(evaluation, Mapping)
-            and isinstance(evaluation.get("accounting_complete"), bool)
-            else None
-        )
-        evaluation_partial = (
-            evaluation.get("accounting_partial")
-            if isinstance(evaluation, Mapping)
-            and isinstance(evaluation.get("accounting_partial"), bool)
-            else None
-        )
-        digest = _rolling_hash(
-            {
-                "strategy_version_id": strategy["strategy_version_id"],
-                "research_trial_id": trial_id,
-                "candidate_id": candidate_id,
-                "source_class": persisted_source,
-                "requested_source_class": requested_source,
-                "source_binding": source_binding,
-                "requested_days": days,
-                "available_from": available_from,
-                "available_through": available_through,
-                "actual_coverage_seconds": actual_coverage,
-                "accounting": accounting_digest,
-                "evaluator_source_digest": (
-                    evaluation.get("source_digest")
-                    if isinstance(evaluation, Mapping)
-                    else None
+        if actual_ledger and partial_accounting and unavailable_reason is None:
+            unavailable_reason = next(
+                (
+                    str(row.get("_rolling_accounting_rejection"))
+                    for row in rows
+                    if isinstance(row, Mapping)
+                    and row.get("_rolling_accounting_rejection")
                 ),
-                "evaluator_accounting_digest": (
-                    evaluation.get("accounting_digest")
-                    if isinstance(evaluation, Mapping)
-                    else None
-                ),
-            }
-        )
-        window_id = "rolling-window-" + digest.removeprefix("sha256:")[:40]
-        requested_seconds = Decimal(days) * Decimal(86400)
-        completeness = (
-            min(Decimal("1"), Decimal(actual_coverage) / requested_seconds)
-            if requested_seconds > 0
-            else Decimal("0")
-        )
+                None,
+            )
+        if count_error is not None:
+            partial_accounting = True
+        if partial_accounting and unavailable_reason is None:
+            unavailable_reason = (
+                "EVALUATOR_COUNT_METRIC_INVALID"
+                if count_error is not None
+                else "ACCOUNTING_FIELDS_INCOMPLETE"
+            )
+        top_level_realized = realized_pnl if not partial_accounting else None
+        top_level_unrealized = unrealized_pnl if not partial_accounting else None
         record = {
             "strategy_version_id": strategy["strategy_version_id"],
             "candidate_id": candidate_id,
             "research_trial_id": trial_id,
             "evidence_window_id": window_id,
+            "evaluation_run_id": evaluation_run_id,
+            "evaluation_version": evaluation_version,
+            "evaluation_kind": (
+                "CANONICAL_SIMULATION" if canonical_required else "ACTUAL_LEDGER"
+            ),
+            "supersedes_evidence_id": supersedes,
             "available_from": available_from.isoformat(),
             "available_through": available_through.isoformat(),
             "requested_days": days,
             "actual_coverage_seconds": actual_coverage,
-            "observation_completeness": str(completeness),
+            "observation_completeness": str(
+                min(
+                    Decimal("1"),
+                    Decimal(actual_coverage) / Decimal(days * 86400),
+                )
+            ),
             "source_class": persisted_source,
+            "requested_source_class": requested_source,
             "paper_sizing_assumptions": {
                 "currency": "USD",
-                "allocated_capital": str(allocated_capital),
+                "allocated_capital": (
+                    str(allocated_capital) if not partial_accounting else None
+                ),
                 "sizing_model": "canonical_accounting",
             },
             "paper_fee_assumptions": {"fee_rate": "0", "fee_bps": "0"},
-            "paper_slippage_assumptions": {"slippage_rate": "0", "slippage_bps": "0"},
-            "allocated_capital_net_return": str(net_return),
-            "realized_pnl": str(realized_pnl),
-            "unrealized_pnl": str(unrealized_pnl),
-            "fees": str(fees),
-            "costs": str(costs),
-            "slippage": str(costs),
-            "capital_at_risk": str(allocated_capital),
-            "drawdown": str(drawdown),
-            "completed_outcomes": completed,
-            "reliability": str(reliability),
-            "execution_feasibility": feasibility,
+            "paper_slippage_assumptions": {
+                "slippage_rate": "0",
+                "slippage_bps": "0",
+            },
+            "allocated_capital_net_return": (
+                str(net_return) if not partial_accounting else None
+            ),
+            "realized_pnl": (
+                str(top_level_realized) if top_level_realized is not None else None
+            ),
+            "unrealized_pnl": (
+                str(top_level_unrealized)
+                if top_level_unrealized is not None
+                else None
+            ),
+            "fees": str(fees) if not partial_accounting else None,
+            "costs": str(costs) if not partial_accounting else None,
+            "slippage": str(costs) if not partial_accounting else None,
+            "execution_feasibility": (
+                "" if feasibility is None else feasibility
+            ),
+            "drawdown": str(drawdown if not partial_accounting else Decimal("0")),
+            "completed_outcomes": completed if not partial_accounting else 0,
+            "reliability": str(reliability if not partial_accounting else Decimal("0")),
             "evidence_digest": "",
-            "overlap_key": _rolling_overlap_key([row for row, _accounting in selected]),
-            "market_path_count": len(
-                {
-                    str(row.get("market_id")).strip()
-                    for row, _accounting in selected
-                    if str(row.get("market_id", "")).strip()
-                }
+            "overlap_key": _rolling_overlap_key(
+                [
+                    row
+                    for row in rows
+                    if isinstance(row, Mapping)
+                    and not row.get("_rolling_source_rejection")
+                    and not row.get("_rolling_accounting_rejection")
+                    and _rolling_row_time(_rolling_snapshot_view(row)) is not None
+                    and str(
+                        _rolling_snapshot_view(row).get("market_id", "")
+                    ).strip()
+                ]
             ),
-            "accounting_complete": (
-                evaluation_complete
-                if evaluation_complete is not None
-                else not partial_accounting
-            ),
-            "accounting_partial": (
-                evaluation_partial
-                if evaluation_partial is not None
-                else partial_accounting
-            ),
-            "market_path_keys": sorted(
-                {
-                    str(row.get("market_id")).strip()
-                    for row, _accounting in selected
-                    if str(row.get("market_id", "")).strip()
-                }
-            ),
-            "accounting_available": (
-                evaluation_available
-                if evaluation_available is not None
-                else not partial_accounting
+            "accounting_complete": bool(not partial_accounting),
+            "accounting_partial": bool(partial_accounting),
+            "accounting_available": bool(
+                canonical_accounting is not None
+                and canonical_accounting.get("accounting_available") is True
+                and not partial_accounting
             ),
             "admitted": bool(not partial_accounting and completed > 0),
             "admission_reasons": (
                 []
                 if not partial_accounting and completed > 0
-                else ["ACCOUNTING_UNAVAILABLE" if partial_accounting else "MINIMUM_OUTCOMES_UNMET"]
+                else ["ACCOUNTING_UNAVAILABLE"]
+                if partial_accounting
+                else ["MINIMUM_OUTCOMES_UNMET"]
             ),
-            "requested_rows": requested_rows,
-            "available_rows": available_rows,
-            "evaluated_rows": evaluated_rows,
-            "signals": int(evaluation.get("signals", 0)) if isinstance(evaluation, Mapping) else 0,
-            "declined_evaluations": (
-                int(evaluation.get("declined_evaluations", 0))
-                if isinstance(evaluation, Mapping)
-                else 0
-            ),
-            "positions": int(evaluation.get("positions", 0)) if isinstance(evaluation, Mapping) else 0,
-            "openings": int(evaluation.get("openings", 0)) if isinstance(evaluation, Mapping) else 0,
-            "open_positions": (
-                list(evaluation.get("open_positions", ()))[:64]
-                if isinstance(evaluation, Mapping)
-                else []
-            ),
+            "loaded_rows": len(rows),
+            "valid_input_rows": int(valid_input_rows or 0),
+            "evaluator_invoked": evaluator_invoked,
+            "evaluator_completed": evaluator_completed,
+            "evaluated_observations": evaluated_observations,
+            "signal_count": signal_count,
+            "diagnostic_summary_count": diagnostic_count,
+            "requested_rows": len(rows),
+            "available_rows": int(valid_input_rows or 0),
+            # Legacy aliases remain truthful: evaluated_rows is actual evaluator
+            # output, never the number of loaded source rows.
+            "evaluated_rows": evaluated_observations,
+            "signals": signal_count,
+            "declined_evaluations": declined_evaluations,
+            "positions": positions,
+            "open_positions": list(
+                canonical_accounting.get("open_positions", ())
+            )[:_ROLLING_OPEN_POSITIONS_LIMIT]
+            if isinstance(canonical_accounting, Mapping)
+            else [],
+            "openings": openings,
             "accounting_unavailable_reason": (
-                evaluation.get("accounting_unavailable_reason")
-                if isinstance(evaluation, Mapping) and partial_accounting
-                else None
+                unavailable_reason if partial_accounting else None
+            ),
+            "evaluator_name": evaluation_map.get(
+                "evaluator_name", canonical_evaluation.get("evaluator_name")
+            ),
+            "evaluator_error": evaluation_map.get(
+                "evaluator_error", canonical_evaluation.get("evaluator_error")
+            ),
+            "evaluator_prerequisite": evaluation_map.get(
+                "evaluator_prerequisite",
+                canonical_evaluation.get("evaluator_prerequisite"),
             ),
             "source_digest": source_digest,
-            "accounting_digest": persisted_accounting_digest,
-            "evaluation": dict(evaluation) if isinstance(evaluation, Mapping) else {},
+            "accounting_digest": accounting_digest,
+            "metrics": {
+                "portfolio_accounting": dict(canonical_accounting or {}),
+                "evaluation": dict(canonical_evaluation),
+            },
+            "portfolio_accounting": dict(canonical_accounting or {}),
+            "evaluation": dict(canonical_evaluation),
             "paper_only": True,
             "rolling_research": True,
             "measured_at": available_through.isoformat(),
@@ -6035,6 +7137,7 @@ class AutonomousResearchProcessor:
             "EVIDENCE_PERSISTENCE_FAILED",
             "INSUFFICIENT_EVIDENCE",
             "HISTORICAL_DATASET_EMPTY",
+            "PREDECESSOR_LOOKUP_UNAVAILABLE",
         }
         def is_terminal_blocker(record: Mapping[str, Any]) -> bool:
             reason = str(record.get("blocker") or "")
@@ -6321,8 +7424,30 @@ class AutonomousResearchProcessor:
                         )
                     )
                 else:
-                    evaluation = self._rolling_canonical_evaluation(
-                        strategy, bounded_rows, source
+                    rejection_reasons = sorted(
+                        {
+                            str(row.get("_rolling_accounting_rejection"))
+                            for row in bounded_rows
+                            if isinstance(row, Mapping)
+                            and row.get("_rolling_accounting_rejection")
+                        }
+                    )
+                    replay_book_blocked = (
+                        source == "REPLAY"
+                        and "REPLAY_BOOK_REQUIRED" in rejection_reasons
+                        and not any(
+                            isinstance(row, Mapping)
+                            and not row.get("_rolling_source_rejection")
+                            and not row.get("_rolling_accounting_rejection")
+                            for row in bounded_rows
+                        )
+                    )
+                    evaluation = (
+                        None
+                        if replay_book_blocked
+                        else self._rolling_canonical_evaluation(
+                            strategy, bounded_rows, source
+                        )
                     )
                     recorded_book = any(
                         isinstance(_rolling_snapshot_view(row).get(name), Mapping)
@@ -6335,17 +7460,40 @@ class AutonomousResearchProcessor:
                     )
                     canonical_reason: str | None = None
                     if canonical_required:
-                        if not isinstance(evaluation, Mapping) or not evaluation.get("evaluator"):
+                        if replay_book_blocked:
+                            canonical_reason = "REPLAY_BOOK_REQUIRED"
+                        elif not isinstance(evaluation, Mapping):
                             canonical_reason = "CANONICAL_EVALUATION_UNAVAILABLE"
-                        elif evaluation.get("accounting_available") is not True:
-                            raw_reason = str(
-                                evaluation.get("accounting_unavailable_reason", "")
-                            ).strip().upper()
-                            canonical_reason = (
-                                "PNL_UNAVAILABLE"
-                                if "PNL" in raw_reason
-                                else raw_reason or "PNL_UNAVAILABLE"
+                        else:
+                            evaluation_kind = evaluation.get("evaluation_kind")
+                            evaluation_invoked = evaluation.get("evaluator_invoked")
+                            evaluation_completed = evaluation.get("evaluator_completed")
+                            accounting = evaluation.get("portfolio_accounting")
+                            accounting_available = (
+                                accounting.get("accounting_available")
+                                if isinstance(accounting, Mapping)
+                                else evaluation.get("accounting_available")
                             )
+                            if evaluation_kind != "CANONICAL_SIMULATION":
+                                canonical_reason = "EVALUATION_KIND_INVALID"
+                            elif evaluation_invoked is not True:
+                                canonical_reason = str(
+                                    evaluation.get("evaluator_error")
+                                    or evaluation.get("evaluator_prerequisite")
+                                    or "EVALUATOR_INVOCATION_REQUIRED"
+                                )
+                            elif evaluation_completed is not True:
+                                canonical_reason = str(
+                                    evaluation.get("evaluator_error")
+                                    or evaluation.get("evaluator_prerequisite")
+                                    or "CANONICAL_EVALUATION_UNAVAILABLE"
+                                )
+                            elif accounting_available is not True:
+                                canonical_reason = str(
+                                    evaluation.get("evaluator_error")
+                                    or evaluation.get("evaluator_prerequisite")
+                                    or "ACCOUNTING_UNAVAILABLE"
+                                )
                         if canonical_reason:
                             persist_blocker(
                                 strategy,
@@ -6367,21 +7515,44 @@ class AutonomousResearchProcessor:
                                     next_attempt_at=(current + timedelta(minutes=5)).isoformat(),
                                 )
                             )
-                    evidence = self._rolling_evidence_record(
-                        strategy,
-                        bounded_rows,
-                        source,
-                        days,
-                        current,
-                        evaluation=evaluation,
-                    )
-                    rejection_reasons = sorted(
-                        {
-                            str(row.get("_rolling_accounting_rejection"))
-                            for row in bounded_rows
-                            if row.get("_rolling_accounting_rejection")
-                        }
-                    )
+                    predecessor_lookup_error: AutonomousResearchError | None = None
+                    try:
+                        evidence = self._rolling_evidence_record(
+                            strategy,
+                            bounded_rows,
+                            source,
+                            days,
+                            current,
+                            evaluation=evaluation,
+                        )
+                    except AutonomousResearchError as exc:
+                        if exc.reason != "PREDECESSOR_LOOKUP_UNAVAILABLE":
+                            raise
+                        predecessor_lookup_error = exc
+                        evidence = None
+                        persist_blocker(
+                            strategy,
+                            days,
+                            source,
+                            fingerprint,
+                            exc.reason,
+                            exc.detail,
+                        )
+
+                    rejection_reasons_set = {
+                        str(row.get("_rolling_accounting_rejection"))
+                        for row in bounded_rows
+                        if isinstance(row, Mapping)
+                        and row.get("_rolling_accounting_rejection")
+                    }
+                    if (
+                        source == "PAPER"
+                        and isinstance(evidence, Mapping)
+                        and evidence.get("accounting_unavailable_reason")
+                        == _ROLLING_OPEN_POSITIONS_LIMIT_REASON
+                    ):
+                        rejection_reasons_set.add(_ROLLING_OPEN_POSITIONS_LIMIT_REASON)
+                    rejection_reasons = sorted(rejection_reasons_set)
                     for rejection in rejection_reasons:
                         rejection_immutable = _rolling_reason_is_immutable(rejection)
                         # Persist before attempting the evidence save.  A row
@@ -6413,7 +7584,9 @@ class AutonomousResearchProcessor:
                         )
                     if evidence is None:
                         reason = (
-                            canonical_reason
+                            predecessor_lookup_error.reason
+                            if predecessor_lookup_error is not None
+                            else canonical_reason
                             or (
                                 "HISTORICAL_DATASET_EMPTY"
                                 if not bounded_rows and source == "HISTORICAL"
@@ -6425,8 +7598,17 @@ class AutonomousResearchProcessor:
                                 strategy,
                                 days,
                                 source,
-                                status="DEFERRED",
+                                status=(
+                                    "BLOCKED"
+                                    if predecessor_lookup_error is not None
+                                    else "DEFERRED"
+                                ),
                                 reason=reason,
+                                error=(
+                                    predecessor_lookup_error.detail
+                                    if predecessor_lookup_error is not None
+                                    else None
+                                ),
                                 blocker_fingerprint=fingerprint,
                                 terminal=False,
                                 retryable=True,
@@ -6576,8 +7758,13 @@ class AutonomousResearchProcessor:
             for name in (
                 "requested_rows",
                 "available_rows",
+                "loaded_rows",
+                "valid_input_rows",
                 "evaluated_rows",
+                "evaluated_observations",
                 "signals",
+                "signal_count",
+                "diagnostic_summary_count",
                 "declined_evaluations",
                 "positions",
                 "openings",

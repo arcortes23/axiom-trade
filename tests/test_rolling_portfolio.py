@@ -8,7 +8,6 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
-from types import SimpleNamespace
 from unittest.mock import patch
 
 from axiom.rolling_portfolio import (
@@ -18,6 +17,14 @@ from axiom.rolling_portfolio import (
     default_rolling_admission_policy,
     evaluate_rolling_selection,
 )
+from axiom.backtest.prediction import (
+    PRICE_PROXY_RESEARCH,
+    RECORDED_BOOK_REPLAY,
+    PredictionMarketBacktester,
+    run_prediction_research_mode,
+)
+from axiom.domain import Fill, MarketType, Side
+from axiom.metrics import calculate_prediction_metrics
 from axiom.experiment_plan import normalize_market_scope
 from axiom.storage import AxiomStore
 from axiom.autonomous import (
@@ -153,6 +160,62 @@ def _evidence(
     return _canonicalize_evidence(record)
 
 
+def _v2_evidence(
+    strategy_version_id: str = "sv-v2",
+    evidence_window_id: str = "window-v2-7",
+    *,
+    no_trade: bool = False,
+    **overrides: object,
+) -> dict[str, object]:
+    accounting: dict[str, object] = {
+        "accounting_available": True,
+        "initial_cash": "100.00",
+        "cash": "100.00",
+        "equity": "100.00",
+        "realized_pnl": "0.00" if no_trade else "8.00",
+        "unrealized_pnl": "0.00",
+        "net_pnl": "0.00" if no_trade else "8.00",
+        "fees": "0.00" if no_trade else "0.25",
+        "costs": "0.00" if no_trade else "0.50",
+        "open_positions": [],
+        "opening_fills": 0,
+        "closing_fills": 0,
+        "partial_closing_fills": 0,
+        "completed_round_trips": 0 if no_trade else 12,
+    }
+    record = _evidence(
+        strategy_version_id,
+        evidence_window_id,
+        score="0.80" if no_trade else "0.90",
+        completed_outcomes=0 if no_trade else 12,
+        realized_pnl="0.00" if no_trade else "8.00",
+        unrealized_pnl="0.00",
+        fees="0.00" if no_trade else "0.25",
+        costs="0.00" if no_trade else "0.50",
+        source_digest="sha256:source-v2",
+        accounting_digest="sha256:accounting-v2",
+        accounting_available=True,
+        accounting_complete=True,
+        accounting_partial=False,
+        evaluation_run_id="run-v2",
+        evaluation_version="rolling-evaluation:v2",
+        evaluator_invoked=True,
+        evaluator_completed=True,
+        evaluated_observations=12,
+        signal_count=0 if no_trade else 12,
+        diagnostic_summary_count=0,
+        portfolio_accounting=accounting,
+        evaluation={
+            "evaluation_run_id": "run-v2",
+            "evaluation_version": "rolling-evaluation:v2",
+            "evaluator_invoked": True,
+            "evaluator_completed": True,
+        },
+    )
+    record.update(overrides)
+    return _canonicalize_evidence(record)
+
+
 def _selection(
     selection_id: str,
     *,
@@ -251,6 +314,97 @@ def _member_value(member: object, key: str) -> object:
     return getattr(member, key)
 
 
+
+def _prediction_strategy(
+    strategy_id: str = "prediction-integration",
+    *,
+    threshold: float = 0.05,
+) -> dict[str, object]:
+    return {
+        "version": 1,
+        "strategy_id": strategy_id,
+        "market_type": "prediction",
+        "family": "probability_mispricing",
+        "parameters": {"threshold": threshold},
+        "operations": [],
+        "probability_model": "fixture-model-v1",
+        "resolution_aware": True,
+        "resolution_inputs": ["settlement"],
+    }
+
+
+def _raw_prediction_row(
+    index: int,
+    yes_price: float,
+    *,
+    market_id: str = "market-integration",
+    model_probability: float = 0.80,
+    settlement: str = "open",
+    book: bool = False,
+    bid_depth: float = 1000.0,
+    ask_depth: float = 1000.0,
+) -> dict[str, object]:
+    timestamp = NOW + timedelta(days=index)
+    row: dict[str, object] = {
+        "market_id": market_id,
+        "timestamp": timestamp,
+        "model_probability": model_probability,
+        "yes_mid": yes_price,
+        "yes_ask": yes_price,
+        "yes_bid": yes_price,
+        "no_mid": 1.0 - yes_price,
+        "no_ask": 1.0 - yes_price,
+        "no_bid": 1.0 - yes_price,
+        "liquidity": max(bid_depth, ask_depth),
+        "settlement": settlement,
+    }
+    if book:
+        row.update(
+            {
+                "source_type": "HISTORICAL",
+                "source_timestamp": timestamp,
+                "source_snapshot_id": f"source-{market_id}-{index}",
+                "order_book": {
+                    "timestamp": timestamp.isoformat(),
+                    "bids": [[yes_price, bid_depth]],
+                    "asks": [[yes_price, ask_depth]],
+                    "token_id": f"yes-{market_id}",
+                },
+                "no_order_book": {
+                    "timestamp": timestamp.isoformat(),
+                    "bids": [[1.0 - yes_price, bid_depth]],
+                    "asks": [[1.0 - yes_price, ask_depth]],
+                    "token_id": f"no-{market_id}",
+                },
+            }
+        )
+    return row
+
+def _prediction_fill(
+    index: int,
+    side: Side,
+    quantity: float,
+    price: float,
+    *,
+    market_id: str,
+    symbol: str = "shared-symbol",
+    partial: bool = False,
+) -> Fill:
+    return Fill(
+        timestamp=NOW + timedelta(days=index),
+        market_type=MarketType.PREDICTION,
+        symbol=symbol,
+        side=side,
+        quantity=quantity,
+        price=price,
+        fees=0.0,
+        slippage=0.0,
+        strategy_id="metrics-regression",
+        order_id=f"order-{index}",
+        market_id=market_id,
+        metadata={"outcome": "yes", "partial_fill": partial},
+    )
+
 class TestRollingPortfolio(unittest.TestCase):
     def setUp(self) -> None:
         self._temporary_directory = tempfile.TemporaryDirectory()
@@ -302,67 +456,311 @@ class TestRollingPortfolio(unittest.TestCase):
             latest = store.load_rolling_evidence_blocker(work_key="work-a")
             self.assertEqual(latest["prerequisite_fingerprint"], "fp-b")
 
-    def test_fixed_holding_exit_uses_canonical_pnl_for_wins_and_losses(self) -> None:
-        processor = AutonomousResearchProcessor.__new__(AutonomousResearchProcessor)
-        rows = [
-            {
-                "snapshot_id": "snapshot-accounting",
-                "timestamp": NOW.isoformat(),
-                "order_book": {"bids": [], "asks": []},
-                "_rolling_lineage_proven": True,
-            }
-        ]
-        strategy = {"strategy_document": {"family": "fixture"}}
-        for final_equity, expected_pnl in (("102.00", "2.00"), ("98.00", "-2.00")):
-            result = SimpleNamespace(
-                fills=(
-                    SimpleNamespace(
-                        market_id="market-fixed-holding",
-                        symbol="market-fixed-holding",
-                        quantity=Decimal("10"),
-                        price=Decimal("0.40"),
-                        fees=Decimal("0.10"),
-                        slippage=Decimal("0.02"),
-                        metadata={"execution_kind": "entry"},
-                    ),
-                    SimpleNamespace(
-                        market_id="market-fixed-holding",
-                        symbol="market-fixed-holding",
-                        quantity=Decimal("10"),
-                        price=Decimal("0.60"),
-                        fees=Decimal("0.10"),
-                        slippage=Decimal("0.02"),
-                        metadata={"execution_kind": "exit"},
-                    ),
-                ),
-                outcomes={"market-fixed-holding": "RESOLVED_YES"},
-                metrics={
-                    "initial_equity": Decimal("100.00"),
-                    "final_equity": Decimal(final_equity),
-                    "portfolio": {
-                        "realized_pnl": Decimal(expected_pnl),
-                        "unrealized_pnl": Decimal("0"),
-                    },
-                },
-                equity_curve=(),
-                unresolved=(),
-                research_quality=None,
-            )
-            with self.subTest(final_equity=final_equity), patch(
-                "axiom.autonomous.load_strategy", return_value=object()
-            ), patch(
-                "axiom.autonomous.run_prediction_research_mode", return_value=result
-            ):
-                evaluation = processor._rolling_canonical_evaluation(
-                    strategy, rows, "HISTORICAL"
+    def test_public_backtest_unresolved_event_entry_then_exit_reports_gain_and_loss(self) -> None:
+        strategy = _prediction_strategy("unresolved-entry-exit")
+        for exit_price, expected_pnl in ((0.60, 25.0), (0.20, -25.0)):
+            rows = [
+                _raw_prediction_row(0, 0.40),
+                _raw_prediction_row(1, 0.40),
+                _raw_prediction_row(2, exit_price),
+            ]
+            with self.subTest(exit_price=exit_price):
+                result = run_prediction_research_mode(
+                    rows,
+                    strategy,
+                    mode=PRICE_PROXY_RESEARCH,
+                    initial_cash=100.0,
+                    fee_bps=0.0,
+                    slippage_bps=0.0,
+                    allocation=0.50,
+                    holding_period=1,
+                    exit_policy={"type": "fixed_holding_period", "holding_period": 1},
                 )
-            self.assertIsNotNone(evaluation)
-            assert evaluation is not None
-            self.assertEqual(evaluation["realized_pnl"], Decimal(expected_pnl))
-            self.assertEqual(evaluation["unrealized_pnl"], Decimal("0"))
-            self.assertEqual(evaluation["fills"], 2)
-            self.assertEqual(evaluation["capital_at_risk"], Decimal("4.00"))
+                accounting = result.metrics["portfolio_accounting"]
+                evaluation = result.metrics["evaluation"]
+                self.assertEqual(
+                    [fill.metadata["execution_kind"] for fill in result.fills],
+                    ["entry", "exit"],
+                )
+                self.assertIsNone(result.fills[1].expected_probability)
+                self.assertEqual(evaluation["evaluated_observations"], 3)
+                self.assertEqual(evaluation["signal_count"], 3)
+                self.assertTrue(accounting["accounting_available"])
+                self.assertEqual(accounting["initial_cash"], 100.0)
+                self.assertAlmostEqual(accounting["cash"], 100.0 + expected_pnl)
+                self.assertAlmostEqual(accounting["equity"], 100.0 + expected_pnl)
+                self.assertAlmostEqual(accounting["realized_pnl"], expected_pnl)
+                self.assertEqual(accounting["unrealized_pnl"], 0.0)
+                self.assertAlmostEqual(accounting["net_pnl"], expected_pnl)
+                self.assertEqual(accounting["open_positions"], [])
+                self.assertEqual(accounting["opening_fills"], 1)
+                self.assertEqual(accounting["closing_fills"], 1)
+                self.assertEqual(accounting["partial_closing_fills"], 0)
+                self.assertEqual(accounting["completed_round_trips"], 1)
 
+    def test_public_legacy_same_outcome_strengthening_rebalances_inventory(self) -> None:
+        result = PredictionMarketBacktester(
+            initial_cash=100.0,
+            fee_bps=0.0,
+            slippage_bps=0.0,
+            allocation=0.25,
+        ).run(
+            [
+                _raw_prediction_row(0, 0.40),
+                _raw_prediction_row(1, 0.20),
+            ],
+            _prediction_strategy("legacy-strengthening"),
+        )
+        self.assertEqual(
+            [fill.metadata["execution_kind"] for fill in result.fills],
+            ["entry", "entry"],
+        )
+        self.assertAlmostEqual(result.fills[0].quantity, 62.5)
+        self.assertAlmostEqual(result.fills[1].quantity, 31.25)
+
+
+    def test_public_recorded_replay_partial_exit_keeps_remaining_inventory(self) -> None:
+        strategy = _prediction_strategy("partial-exit")
+        rows = [
+            _raw_prediction_row(0, 0.40, book=True, ask_depth=1000.0),
+            _raw_prediction_row(
+                1,
+                0.60,
+                book=True,
+                model_probability=0.50,
+                bid_depth=25.0,
+                ask_depth=1000.0,
+            ),
+            _raw_prediction_row(
+                2,
+                0.60,
+                book=True,
+                model_probability=0.50,
+                bid_depth=0.0,
+                ask_depth=1000.0,
+            ),
+            _raw_prediction_row(
+                3,
+                0.60,
+                book=True,
+                model_probability=0.50,
+                bid_depth=10.0,
+                ask_depth=1000.0,
+            ),
+        ]
+        result = run_prediction_research_mode(
+            rows,
+            strategy,
+            mode=RECORDED_BOOK_REPLAY,
+            initial_cash=100.0,
+            fee_bps=0.0,
+            slippage_bps=0.0,
+            allocation=0.50,
+            holding_period=1,
+            exit_policy={"type": "fixed_holding_period", "holding_period": 1},
+        )
+        accounting = result.metrics["portfolio_accounting"]
+        evaluation = result.metrics["evaluation"]
+        self.assertEqual(
+            [fill.metadata["execution_kind"] for fill in result.fills],
+            ["entry", "exit", "exit"],
+        )
+        self.assertTrue(all(fill.expected_probability is None for fill in result.fills[1:]))
+        self.assertEqual(evaluation["evaluated_observations"], 4)
+        self.assertEqual(evaluation["signal_count"], 4)
+        self.assertTrue(accounting["accounting_available"])
+        self.assertEqual(accounting["closing_fills"], 0)
+        self.assertEqual(accounting["partial_closing_fills"], 2)
+        self.assertEqual(accounting["completed_round_trips"], 0)
+        self.assertEqual(accounting["open_positions"], ["market-integration"])
+        self.assertGreater(accounting["unrealized_pnl"], 0.0)
+        self.assertEqual(accounting["net_pnl"], accounting["realized_pnl"] + accounting["unrealized_pnl"])
+
+    def test_recorded_replay_exit_metadata_records_depth_walk_vwap(self) -> None:
+        rows = [
+            _raw_prediction_row(0, 0.40, book=True, ask_depth=1000.0),
+            _raw_prediction_row(
+                1,
+                0.60,
+                book=True,
+                model_probability=0.50,
+                bid_depth=1000.0,
+                ask_depth=1000.0,
+            ),
+        ]
+        exit_book = rows[1]["order_book"]
+        assert isinstance(exit_book, dict)
+        exit_book["bids"] = [[0.60, 25.0], [0.50, 25.0]]
+        result = run_prediction_research_mode(
+            rows,
+            _prediction_strategy("depth-walk-vwap"),
+            mode=RECORDED_BOOK_REPLAY,
+            initial_cash=100.0,
+            fee_bps=0.0,
+            slippage_bps=0.0,
+            allocation=0.50,
+            holding_period=1,
+            exit_policy={"type": "fixed_holding_period", "holding_period": 1},
+        )
+        exit_fill = result.fills[1]
+        self.assertEqual(exit_fill.metadata["execution_kind"], "exit")
+        self.assertAlmostEqual(exit_fill.metadata["raw_execution_price"], 0.55)
+        self.assertAlmostEqual(exit_fill.metadata["reference_price"], 0.55)
+        self.assertAlmostEqual(exit_fill.price, 0.55)
+
+    def test_recorded_replay_curve_evidence_keeps_pending_exit_outcome_on_signal_flip(self) -> None:
+        rows = [
+            _raw_prediction_row(0, 0.40, book=True, ask_depth=1000.0),
+            _raw_prediction_row(
+                1,
+                0.60,
+                book=True,
+                model_probability=0.20,
+                bid_depth=1000.0,
+                ask_depth=1000.0,
+            ),
+        ]
+        yes_exit_book = rows[1]["order_book"]
+        no_signal_book = rows[1]["no_order_book"]
+        assert isinstance(yes_exit_book, dict)
+        assert isinstance(no_signal_book, dict)
+        yes_exit_book["timestamp"] = NOW.isoformat()
+        yes_exit_book["token_id"] = "yes-exit-book"
+        no_signal_book["token_id"] = "no-signal-book"
+        result = run_prediction_research_mode(
+            rows,
+            _prediction_strategy("flip-evidence"),
+            mode=RECORDED_BOOK_REPLAY,
+            initial_cash=100.0,
+            fee_bps=0.0,
+            slippage_bps=0.0,
+            allocation=0.50,
+            holding_period=1,
+            exit_policy={"type": "fixed_holding_period", "holding_period": 1},
+        )
+        self.assertEqual(
+            [fill.metadata["execution_kind"] for fill in result.fills],
+            ["entry", "exit"],
+        )
+        evidence = result.equity_curve[1]["execution_evidence"]
+        self.assertEqual(evidence["outcome"], "yes")
+        self.assertEqual(evidence["book_token_id"], "yes-exit-book")
+        self.assertEqual(evidence["book_timestamp"], NOW.isoformat())
+
+    def test_prediction_lot_matching_uses_market_id_before_shared_symbol(self) -> None:
+        fills = (
+            _prediction_fill(0, Side.BUY, 1.0, 0.40, market_id="market-a"),
+            _prediction_fill(1, Side.BUY, 1.0, 0.50, market_id=" market-b "),
+            _prediction_fill(2, Side.SELL, 1.0, 0.60, market_id="market-b"),
+        )
+        metrics = calculate_prediction_metrics([100.0], fills=fills, initial_equity=100.0)
+        accounting = metrics["portfolio_accounting"]
+        self.assertAlmostEqual(accounting["realized_pnl"], 0.10)
+        self.assertEqual(accounting["completed_round_trips"], 1)
+        self.assertEqual(accounting["open_positions"], ["market-a"])
+
+    def test_prediction_capital_at_risk_tracks_peak_outstanding_cost_basis(self) -> None:
+        fills = (
+            _prediction_fill(0, Side.BUY, 10.0, 1.00, market_id="market-risk"),
+            _prediction_fill(1, Side.SELL, 10.0, 1.20, market_id="market-risk"),
+            _prediction_fill(2, Side.BUY, 5.0, 3.00, market_id="market-risk"),
+        )
+        metrics = calculate_prediction_metrics([100.0], fills=fills, initial_equity=100.0)
+        accounting = metrics["portfolio_accounting"]
+        self.assertAlmostEqual(accounting["allocated_capital"], 25.0)
+        self.assertAlmostEqual(accounting["capital_at_risk"], 15.0)
+        self.assertEqual(accounting["closing_fills"], 1)
+        self.assertEqual(accounting["partial_closing_fills"], 0)
+
+    def test_prediction_partial_closing_fill_is_counted_once(self) -> None:
+        fills = (
+            _prediction_fill(0, Side.BUY, 2.0, 0.40, market_id="market-partial"),
+            _prediction_fill(
+                1,
+                Side.SELL,
+                1.0,
+                0.50,
+                market_id="market-partial",
+                partial=True,
+            ),
+        )
+        metrics = calculate_prediction_metrics([100.0], fills=fills, initial_equity=100.0)
+        accounting = metrics["portfolio_accounting"]
+        self.assertEqual(accounting["closing_fills"], 0)
+        self.assertEqual(accounting["partial_closing_fills"], 1)
+
+    def test_public_backtest_completed_no_signal_has_zero_available_activity(self) -> None:
+        strategy = _prediction_strategy("no-signal")
+        rows = [
+            _raw_prediction_row(index, 0.50, model_probability=0.50)
+            for index in range(3)
+        ]
+        result = run_prediction_research_mode(
+            rows,
+            strategy,
+            mode=PRICE_PROXY_RESEARCH,
+            initial_cash=100.0,
+            fee_bps=0.0,
+            slippage_bps=0.0,
+            allocation=0.50,
+        )
+        accounting = result.metrics["portfolio_accounting"]
+        evaluation = result.metrics["evaluation"]
+        self.assertTrue(accounting["accounting_available"])
+        self.assertEqual(accounting["initial_cash"], 100.0)
+        self.assertEqual(accounting["cash"], 100.0)
+        self.assertEqual(accounting["equity"], 100.0)
+        self.assertEqual(accounting["realized_pnl"], 0.0)
+        self.assertEqual(accounting["unrealized_pnl"], 0.0)
+        self.assertEqual(accounting["net_pnl"], 0.0)
+        self.assertEqual(accounting["opening_fills"], 0)
+        self.assertEqual(accounting["closing_fills"], 0)
+        self.assertEqual(accounting["partial_closing_fills"], 0)
+        self.assertEqual(accounting["completed_round_trips"], 0)
+        self.assertEqual(evaluation["evaluated_observations"], 3)
+        self.assertEqual(evaluation["signal_count"], 0)
+
+
+    def test_public_backtest_evaluator_failure_is_unavailable_without_synthetic_rows(self) -> None:
+        rows = [
+            _raw_prediction_row(0, 0.40),
+            _raw_prediction_row(1, 0.40),
+        ]
+        with patch(
+            "axiom.backtest.prediction.evaluate_signal_evaluation",
+            side_effect=RuntimeError("fixture evaluator exploded"),
+        ):
+            result = run_prediction_research_mode(
+                rows,
+                _prediction_strategy("evaluator-failure"),
+                mode=PRICE_PROXY_RESEARCH,
+                initial_cash=100.0,
+                fee_bps=0.0,
+                slippage_bps=0.0,
+                allocation=0.50,
+            )
+        accounting = result.metrics["portfolio_accounting"]
+        evaluation = result.metrics["evaluation"]
+        self.assertFalse(accounting["accounting_available"])
+        self.assertIsNone(accounting["realized_pnl"])
+        self.assertIsNone(accounting["unrealized_pnl"])
+        self.assertIsNone(accounting["net_pnl"])
+        self.assertTrue(evaluation["evaluator_invoked"])
+        self.assertFalse(evaluation["evaluator_completed"])
+        self.assertEqual(evaluation["evaluated_observations"], 0)
+        self.assertEqual(evaluation["signal_count"], 0)
+        self.assertIsNone(evaluation["evaluator_name"])
+        self.assertEqual(evaluation["evaluator_error"], "fixture evaluator exploded")
+
+    def test_public_backtest_rejects_malformed_timestamped_replay_input(self) -> None:
+        malformed = _raw_prediction_row(0, 0.40, book=True)
+        malformed["timestamp"] = "not-a-timestamp"
+        with self.assertRaisesRegex(ValueError, "missing timestamp"):
+            run_prediction_research_mode(
+                [malformed],
+                _prediction_strategy("malformed-replay"),
+                mode=RECORDED_BOOK_REPLAY,
+            )
     def test_unsupported_snapshot_loader_fails_closed(self) -> None:
         class UnsupportedStore:
             def load_polymarket_snapshots(self) -> list[dict[str, object]]:
@@ -381,52 +779,6 @@ class TestRollingPortfolio(unittest.TestCase):
 
 
 
-    def test_partial_accounting_reports_available_rows_but_cannot_admit(self) -> None:
-        strategy = _strategy("sv-partial", research_trial_id="trial-partial")
-        accounting = {
-            "_available_from": NOW - timedelta(days=7),
-            "_available_through": NOW,
-            "allocated_capital": "10",
-            "allocated_capital_net_return": "1",
-            "realized_pnl": "1",
-            "unrealized_pnl": "0",
-            "fees": "0",
-            "costs": "0",
-            "drawdown": "0",
-            "completed_outcomes": 1,
-            "reliability": "1",
-        }
-        rows = [
-            {"timestamp": NOW.isoformat(), "_rolling_accounting": accounting},
-            {
-                "timestamp": NOW.isoformat(),
-                "_rolling_accounting_rejection": "SOURCE_BINDING_UNPROVEN",
-            },
-        ]
-        processor = AutonomousResearchProcessor.__new__(AutonomousResearchProcessor)
-        record = processor._rolling_evidence_record(
-            strategy,
-            rows,
-            "HISTORICAL",
-            7,
-            NOW,
-            evaluation={
-                "available_from": (NOW - timedelta(days=7)).isoformat(),
-                "available_through": NOW.isoformat(),
-                "accounting_available": False,
-                "accounting_unavailable_reason": "SOURCE_BINDING_UNPROVEN",
-            },
-        )
-        self.assertEqual(record["requested_rows"], 2)
-        self.assertEqual(record["available_rows"], 1)
-        self.assertEqual(record["evaluated_rows"], 1)
-        self.assertTrue(record["source_digest"])
-        self.assertTrue(record["accounting_digest"])
-        self.assertFalse(record["accounting_available"])
-        self.assertFalse(record["accounting_complete"])
-        self.assertTrue(record["accounting_partial"])
-        self.assertFalse(record["admitted"])
-        self.assertEqual(record["admission_reasons"], ["ACCOUNTING_UNAVAILABLE"])
 
     def test_evidence_provenance_digest_roundtrip_and_failure_reason_validation(self) -> None:
         base = _evidence(
@@ -488,6 +840,626 @@ class TestRollingPortfolio(unittest.TestCase):
             RollingEvidence.from_mapping(
                 {**base, "failure_reason": "x" * (MAX_REASON_LENGTH + 1)}
             )
+
+    def test_v2_missing_accounting_state_or_metrics_cannot_be_admitted(self) -> None:
+        policy = _policy(
+            min_actual_coverage_seconds=0,
+            min_completed_outcomes=0,
+            min_reliability="0",
+            experimental_allocation_enabled=True,
+            global_budget="100",
+        )
+        unknown = _v2_evidence("sv-v2-unknown", "window-v2-unknown")
+        for field_name in (
+            "accounting_available",
+            "accounting_complete",
+            "accounting_partial",
+            "evaluator_completed",
+        ):
+            unknown.pop(field_name, None)
+        unknown["portfolio_accounting"] = {
+            key: value
+            for key, value in unknown["portfolio_accounting"].items()
+            if key != "accounting_available"
+        }
+        unknown["evaluation"] = {
+            key: value
+            for key, value in unknown["evaluation"].items()
+            if key != "evaluator_completed"
+        }
+        unknown = _canonicalize_evidence(unknown)
+        restored_unknown = RollingEvidence.from_mapping(unknown)
+        self.assertIsNone(restored_unknown.realized_pnl)
+        self.assertIn(
+            "accounting_unavailable",
+            restored_unknown.minimum_evidence_failures(policy),
+        )
+        unknown_decision = evaluate_rolling_selection(policy, [unknown], None, NOW)
+        unknown_member = _decision_members(unknown_decision)[0]
+        self.assertNotEqual(_member_value(unknown_member, "status"), "ACTIVE")
+        self.assertEqual(
+            Decimal(str(_member_value(unknown_member, "allocation"))),
+            Decimal("0"),
+        )
+
+        missing_metric = _v2_evidence("sv-v2-metric", "window-v2-metric")
+        missing_metric["portfolio_accounting"] = {
+            **missing_metric["portfolio_accounting"],
+            "realized_pnl": None,
+        }
+        missing_metric = _canonicalize_evidence(missing_metric)
+        restored_missing = RollingEvidence.from_mapping(missing_metric)
+        self.assertIsNone(restored_missing.realized_pnl)
+        self.assertIn(
+            "accounting_fields",
+            restored_missing.minimum_evidence_failures(policy),
+        )
+        missing_decision = evaluate_rolling_selection(policy, [missing_metric], None, NOW)
+        missing_member = _decision_members(missing_decision)[0]
+        self.assertNotEqual(_member_value(missing_member, "status"), "ACTIVE")
+
+        unavailable = _v2_evidence("sv-v2-storage", "window-v2-storage")
+        unavailable.update(
+            {
+                "accounting_available": False,
+                "accounting_complete": False,
+                "accounting_partial": True,
+                "evaluator_completed": False,
+                "portfolio_accounting": {
+                    **unavailable["portfolio_accounting"],
+                    "accounting_available": False,
+                    "realized_pnl": None,
+                    "unrealized_pnl": None,
+                    "net_pnl": None,
+                    "fees": None,
+                    "costs": None,
+                },
+                "evaluation": {
+                    **unavailable["evaluation"],
+                    "evaluator_completed": False,
+                },
+            }
+        )
+        unavailable = _canonicalize_evidence(unavailable)
+        with _store(self.tmp_path) as store:
+            store.save_strategy_version(_strategy("sv-v2-storage"))
+            store.save_strategy_evidence_window(unavailable)
+            loaded = store.list_strategy_evidence_windows("sv-v2-storage")[0]
+            self.assertIsNone(loaded["realized_pnl"])
+            self.assertIsNone(loaded["unrealized_pnl"])
+            self.assertIsNone(loaded["net_pnl"])
+            self.assertIsNone(loaded["fees"])
+            self.assertIsNone(loaded["costs"])
+
+    def test_v2_accounting_content_is_part_of_evidence_digest(self) -> None:
+        original = _v2_evidence("sv-v2-digest", "window-v2-digest")
+        altered = {
+            **original,
+            "evidence_digest": original["evidence_digest"],
+            "portfolio_accounting": {
+                **original["portfolio_accounting"],
+                "net_pnl": "999.00",
+            },
+        }
+        self.assertNotEqual(
+            RollingEvidence.from_mapping(altered).evidence_digest,
+            original["evidence_digest"],
+        )
+
+        with _store(self.tmp_path) as store:
+            store.save_strategy_version(_strategy("sv-v2-digest"))
+            with self.assertRaisesRegex(ValueError, "evidence_digest does not match canonical evidence"):
+                store.save_strategy_evidence_window(altered)
+        altered_status = {
+            **original,
+            "accounting_complete": False,
+        }
+        self.assertNotEqual(
+            RollingEvidence.from_mapping(altered_status).evidence_digest,
+            original["evidence_digest"],
+        )
+        with _store(self.tmp_path) as store:
+            store.save_strategy_version(_strategy("sv-v2-digest-status"))
+            with self.assertRaisesRegex(ValueError, "evidence_digest does not match canonical evidence"):
+                store.save_strategy_evidence_window(altered_status)
+        conflicting_status = {
+            **original,
+            "portfolio_accounting": {
+                **original["portfolio_accounting"],
+                "accounting_available": False,
+            },
+        }
+        with self.assertRaisesRegex(ValueError, "conflicts between rolling evidence projections"):
+            RollingEvidence.from_mapping(conflicting_status)
+
+    def test_direct_constructor_rejects_mixed_null_immutable_projections(self) -> None:
+        common = {
+            "strategy_version_id": "sv-direct-constructor",
+            "evidence_window_id": "window-direct-constructor",
+            "source_class": "HISTORICAL",
+            "available_from": NOW - timedelta(days=7),
+            "available_through": NOW,
+            "actual_coverage_seconds": 7 * 24 * 60 * 60,
+        }
+        with self.assertRaisesRegex(ValueError, "evaluation_kind conflicts"):
+            RollingEvidence(
+                **common,
+                evaluation_kind="CANONICAL_SIMULATION",
+                evaluation={"evaluation_kind": None},
+            )
+        with self.assertRaisesRegex(ValueError, "supersedes_evidence_id conflicts"):
+            RollingEvidence(
+                **common,
+                supersedes_evidence_id="window-direct-predecessor",
+                evaluation={"supersedes_evidence_id": None},
+            )
+        for field_name, scalar_value, nested_value in (
+            ("evaluation_run_id", "run-direct-scalar", None),
+            ("evaluation_version", "version-direct-scalar", None),
+            ("evaluation_run_id", "run-direct-scalar", "run-direct-nested"),
+            ("evaluation_version", "version-direct-scalar", "version-direct-nested"),
+        ):
+            with self.subTest(field=field_name, nested=nested_value):
+                with self.assertRaisesRegex(ValueError, f"{field_name} conflicts"):
+                    RollingEvidence(
+                        **common,
+                        **{field_name: scalar_value},
+                        evaluation={field_name: nested_value},
+                    )
+
+        for field_name, nested_value in (
+            ("evaluation_run_id", "run-direct-derived"),
+            ("evaluation_version", "version-direct-derived"),
+        ):
+            with self.subTest(field=field_name, source="evaluation"):
+                evidence = RollingEvidence(
+                    **common,
+                    evaluation={field_name: nested_value},
+                )
+                self.assertEqual(getattr(evidence, field_name), nested_value)
+            with self.subTest(field=field_name, source="metrics.evaluation"):
+                evidence = RollingEvidence(
+                    **common,
+                    metrics={"evaluation": {field_name: nested_value}},
+                )
+                self.assertEqual(getattr(evidence, field_name), nested_value)
+    def test_direct_constructor_reconciles_metrics_status_projections(self) -> None:
+        accounting = {
+            "accounting_available": True,
+            "accounting_complete": True,
+            "accounting_partial": False,
+            "initial_cash": "100.00",
+            "cash": "100.00",
+            "equity": "100.00",
+            "realized_pnl": "0.00",
+            "unrealized_pnl": "0.00",
+            "net_pnl": "0.00",
+            "fees": "0.00",
+            "costs": "0.00",
+            "open_positions": [],
+            "opening_fills": 0,
+            "closing_fills": 0,
+            "partial_closing_fills": 0,
+            "completed_round_trips": 0,
+        }
+        common = {
+            "strategy_version_id": "sv-direct-metrics-status",
+            "evidence_window_id": "window-direct-metrics-status",
+            "source_class": "HISTORICAL",
+            "available_from": NOW - timedelta(days=7),
+            "available_through": NOW,
+            "actual_coverage_seconds": 7 * 24 * 60 * 60,
+            "evaluation_run_id": "run-direct-metrics-status",
+            "evaluation_version": "rolling-evaluation:v2",
+        }
+        evidence = RollingEvidence(
+            **common,
+            metrics={
+                "evaluation": {
+                    "evaluator_invoked": True,
+                    "evaluator_completed": True,
+                },
+                "portfolio_accounting": accounting,
+            },
+        )
+        self.assertEqual(
+            (
+                evidence.evaluator_invoked,
+                evidence.evaluator_completed,
+                evidence.accounting_available,
+                evidence.accounting_complete,
+                evidence.accounting_partial,
+            ),
+            (True, True, True, True, False),
+        )
+        self.assertIsNotNone(evidence.portfolio_accounting)
+        restored = RollingEvidence.from_mapping(evidence.as_dict())
+        self.assertEqual(
+            (
+                restored.evaluator_invoked,
+                restored.evaluator_completed,
+                restored.accounting_available,
+                restored.accounting_complete,
+                restored.accounting_partial,
+            ),
+            (
+                evidence.evaluator_invoked,
+                evidence.evaluator_completed,
+                evidence.accounting_available,
+                evidence.accounting_complete,
+                evidence.accounting_partial,
+            ),
+        )
+
+        with self.assertRaisesRegex(ValueError, "evaluator_invoked conflicts"):
+            RollingEvidence(
+                **common,
+                evaluator_invoked=True,
+                metrics={
+                    "evaluation": {"evaluator_invoked": False},
+                    "portfolio_accounting": accounting,
+                },
+            )
+        with self.assertRaisesRegex(ValueError, "accounting_available conflicts"):
+            RollingEvidence(
+                **common,
+                accounting_available=True,
+                metrics={
+                    "evaluation": {"evaluator_invoked": True},
+                    "portfolio_accounting": {
+                        **accounting,
+                        "accounting_available": False,
+                    },
+                },
+            )
+        with self.assertRaisesRegex(ValueError, "evaluator_completed conflicts"):
+            RollingEvidence(
+                **common,
+                evaluator_completed=True,
+                metrics={
+                    "evaluation": {"evaluator_completed": None},
+                    "portfolio_accounting": accounting,
+                },
+            )
+        with self.assertRaisesRegex(ValueError, "accounting_complete conflicts"):
+            RollingEvidence(
+                **common,
+                accounting_complete=True,
+                metrics={
+                    "evaluation": {"evaluator_invoked": True},
+                    "portfolio_accounting": {
+                        **accounting,
+                        "accounting_complete": None,
+                    },
+                },
+            )
+
+    def test_from_mapping_rejects_mixed_null_and_conflicting_evaluator_identity(self) -> None:
+        for field_name, scalar_value, nested_value in (
+            ("evaluation_run_id", "run-mapping-scalar", None),
+            ("evaluation_version", "version-mapping-scalar", None),
+            ("evaluation_run_id", "run-mapping-scalar", "run-mapping-nested"),
+            ("evaluation_version", "version-mapping-scalar", "version-mapping-nested"),
+        ):
+            record = _v2_evidence(
+                "sv-mapping-identity",
+                f"window-mapping-{field_name}-{nested_value or 'null'}",
+            )
+            record[field_name] = scalar_value
+            record["evaluation"] = {
+                **record["evaluation"],
+                field_name: nested_value,
+            }
+            with self.subTest(field=field_name, nested=nested_value):
+                with self.assertRaisesRegex(ValueError, f"{field_name} conflicts"):
+                    RollingEvidence.from_mapping(record)
+
+
+    def test_link_only_v2_provenance_is_digest_bound(self) -> None:
+        legacy = _evidence(
+            "sv-link-only",
+            "window-link-only",
+            available_through=NOW.isoformat(),
+        )
+        legacy_evidence = RollingEvidence.from_mapping(legacy)
+        linked = dict(legacy)
+        linked["supersedes_evidence_id"] = "window-link-only-predecessor"
+        linked_evidence = RollingEvidence.from_mapping(linked)
+        self.assertEqual(linked_evidence.evaluation_kind, "CANONICAL_SIMULATION")
+        self.assertNotEqual(linked_evidence.evidence_digest, legacy_evidence.evidence_digest)
+
+        relinked = dict(linked)
+        relinked["supersedes_evidence_id"] = "window-link-only-other-predecessor"
+        self.assertNotEqual(
+            RollingEvidence.from_mapping(relinked).evidence_digest,
+            linked_evidence.evidence_digest,
+        )
+
+    def test_storage_rejects_conflicting_projections_and_numeric_aliases(self) -> None:
+        with _store(self.tmp_path) as store:
+            store.save_strategy_version(_strategy("sv-storage-projections"))
+
+            evaluation_conflict = _v2_evidence(
+                "sv-storage-projections",
+                "window-evaluation-conflict",
+            )
+            evaluation_conflict["metrics"] = {
+                "evaluation": {
+                    **evaluation_conflict["evaluation"],
+                    "evaluation_run_id": "run-foreign",
+                }
+            }
+            evaluation_conflict["evidence_digest"] = ""
+            with self.assertRaisesRegex(ValueError, "evaluation projections conflict"):
+                store.save_strategy_evidence_window(evaluation_conflict)
+
+            accounting_conflict = _v2_evidence(
+                "sv-storage-projections",
+                "window-accounting-conflict",
+            )
+            accounting_conflict["metrics"] = {
+                "portfolio_accounting": {
+                    **accounting_conflict["portfolio_accounting"],
+                    "net_pnl": "999.00",
+                }
+            }
+            accounting_conflict["evidence_digest"] = ""
+            with self.assertRaisesRegex(ValueError, "portfolio_accounting projections conflict"):
+                store.save_strategy_evidence_window(accounting_conflict)
+
+            alias_conflict = _v2_evidence(
+                "sv-storage-projections",
+                "window-alias-conflict",
+            )
+            alias_conflict["portfolio_accounting"] = {
+                **alias_conflict["portfolio_accounting"],
+                "realized_pnl_usd": "999.00",
+            }
+            alias_conflict["evidence_digest"] = ""
+            with self.assertRaisesRegex(ValueError, "realized_pnl conflicts"):
+                store.save_strategy_evidence_window(alias_conflict)
+
+    def test_storage_explicit_nested_null_does_not_resurrect_scalar_accounting(self) -> None:
+        record = _v2_evidence(
+            "sv-storage-null",
+            "window-storage-null",
+        )
+        record["portfolio_accounting"] = {
+            **record["portfolio_accounting"],
+            "realized_pnl": None,
+        }
+        record["evidence_digest"] = ""
+        with _store(self.tmp_path) as store:
+            store.save_strategy_version(_strategy("sv-storage-null"))
+            store.save_strategy_evidence_window(record)
+            loaded = store.list_strategy_evidence_windows("sv-storage-null")[0]
+            self.assertIsNone(loaded["realized_pnl"])
+            self.assertIsNone(loaded["portfolio_accounting"]["realized_pnl"])
+
+    def test_storage_rejects_malformed_v2_activity(self) -> None:
+        malformed_values: tuple[tuple[str, object], ...] = (
+            ("open_positions", "not-a-collection"),
+            ("open_positions", list(range(33))),
+            ("opening_fills", 1.5),
+            ("closing_fills", -1),
+            ("partial_closing_fills", True),
+            ("completed_round_trips", "NaN"),
+        )
+        with _store(self.tmp_path) as store:
+            store.save_strategy_version(_strategy("sv-storage-activity"))
+            for index, (field_name, value) in enumerate(malformed_values):
+                record = _v2_evidence(
+                    "sv-storage-activity",
+                    f"window-storage-activity-{index}",
+                )
+                record["portfolio_accounting"] = {
+                    **record["portfolio_accounting"],
+                    field_name: value,
+                }
+                record["evidence_digest"] = ""
+                with self.subTest(field=field_name, value=value):
+                    with self.assertRaises(ValueError):
+                        store.save_strategy_evidence_window(record)
+
+    def test_storage_validates_supersedes_evidence_lineage(self) -> None:
+        with _store(self.tmp_path) as store:
+            store.save_strategy_version(_strategy("sv-storage-lineage"))
+            predecessor = _v2_evidence(
+                "sv-storage-lineage",
+                "window-storage-lineage-old",
+            )
+            predecessor["evidence_digest"] = ""
+            store.save_strategy_evidence_window(predecessor)
+
+            missing = _v2_evidence(
+                "sv-storage-lineage",
+                "window-storage-lineage-missing",
+                supersedes_evidence_id="window-storage-lineage-missing-predecessor",
+            )
+            missing["evidence_digest"] = ""
+            with self.assertRaisesRegex(ValueError, "predecessor does not exist"):
+                store.save_strategy_evidence_window(missing)
+
+            foreign = _v2_evidence(
+                "sv-storage-lineage",
+                "window-storage-lineage-foreign",
+                candidate_id="candidate-foreign",
+                supersedes_evidence_id="window-storage-lineage-old",
+            )
+            foreign["evidence_digest"] = ""
+            with self.assertRaisesRegex(ValueError, "predecessor identity mismatch"):
+                store.save_strategy_evidence_window(foreign)
+
+            valid = _v2_evidence(
+                "sv-storage-lineage",
+                "window-storage-lineage-new",
+                supersedes_evidence_id="window-storage-lineage-old",
+            )
+            valid["evidence_digest"] = ""
+            store.save_strategy_evidence_window(valid)
+            self.assertEqual(
+                len(store.list_strategy_evidence_windows("sv-storage-lineage")),
+                2,
+            )
+
+
+    def test_v2_completed_no_trade_explicit_zero_accounting_remains_measured(self) -> None:
+        record = _v2_evidence("sv-v2-zero", "window-v2-zero", no_trade=True)
+        restored = RollingEvidence.from_mapping(record)
+        self.assertEqual(restored.realized_pnl, Decimal("0.00"))
+        self.assertEqual(restored.unrealized_pnl, Decimal("0.00"))
+        self.assertEqual(restored.fees, Decimal("0.00"))
+        self.assertEqual(restored.costs, Decimal("0.00"))
+        policy = _policy(
+            min_actual_coverage_seconds=0,
+            min_completed_outcomes=0,
+            min_reliability="0",
+            experimental_allocation_enabled=True,
+            global_budget="100",
+        )
+        decision = evaluate_rolling_selection(policy, [record], None, NOW)
+        member = _decision_members(decision)[0]
+        self.assertEqual(_member_value(member, "status"), "ACTIVE")
+        self.assertGreater(
+            Decimal(str(_member_value(member, "allocation"))),
+            Decimal("0"),
+        )
+
+    def test_direct_selection_rejects_malformed_v2_accounting(self) -> None:
+        policy = _policy(
+            min_actual_coverage_seconds=0,
+            min_completed_outcomes=0,
+            min_reliability="0",
+            experimental_allocation_enabled=True,
+            global_budget="100",
+        )
+        malformed_values: tuple[tuple[str, object], ...] = (
+            ("net_pnl", "NaN"),
+            ("cash", float("inf")),
+            ("open_positions", "not-a-collection"),
+            ("open_positions", list(range(33))),
+            ("opening_fills", 1.5),
+            ("closing_fills", -1),
+            ("partial_closing_fills", True),
+            ("completed_round_trips", "NaN"),
+        )
+        for index, (field_name, value) in enumerate(malformed_values):
+            record = _v2_evidence(
+                "sv-direct-v2-malformed",
+                f"window-direct-v2-malformed-{index}",
+            )
+            record["portfolio_accounting"] = {
+                **record["portfolio_accounting"],
+                field_name: value,
+            }
+            with self.subTest(field=field_name, value=value):
+                with self.assertRaises(ValueError):
+                    evaluate_rolling_selection(policy, [record], None, NOW)
+
+    def test_direct_selection_rejects_mixed_null_status_projections(self) -> None:
+        policy = _policy(
+            min_actual_coverage_seconds=0,
+            min_completed_outcomes=0,
+            min_reliability="0",
+            experimental_allocation_enabled=True,
+            global_budget="100",
+        )
+        record = _v2_evidence(
+            "sv-direct-v2-status",
+            "window-direct-v2-status",
+        )
+        record["evaluator_completed"] = None
+        with self.assertRaisesRegex(ValueError, "evaluator_completed conflicts"):
+            evaluate_rolling_selection(policy, [record], None, NOW)
+
+    def test_direct_parsing_rejects_mixed_null_supersedes_projection(self) -> None:
+        record = _v2_evidence(
+            "sv-direct-v2-supersedes",
+            "window-direct-v2-supersedes",
+        )
+        record["supersedes_evidence_id"] = "window-direct-v2-predecessor"
+        record["evaluation"] = {
+            **record["evaluation"],
+            "supersedes_evidence_id": None,
+        }
+        with self.assertRaisesRegex(ValueError, "supersedes_evidence_id conflicts"):
+            RollingEvidence.from_mapping(record)
+
+    def test_direct_parsing_rejects_mixed_null_evaluation_kind_projection(self) -> None:
+        record = _v2_evidence(
+            "sv-direct-v2-evaluation-kind",
+            "window-direct-v2-evaluation-kind",
+        )
+        record["evaluation_kind"] = "CANONICAL_SIMULATION"
+        record["evaluation"] = {
+            **record["evaluation"],
+            "evaluation_kind": None,
+        }
+        with self.assertRaisesRegex(ValueError, "evaluation_kind conflicts"):
+            RollingEvidence.from_mapping(record)
+
+
+    def test_actual_ledger_requires_explicit_false_evaluator_status(self) -> None:
+        record = _v2_evidence(
+            "sv-direct-v2-ledger",
+            "window-direct-v2-ledger",
+        )
+        record.update(
+            {
+                "evaluation_kind": "ACTUAL_LEDGER",
+                "evaluator_invoked": False,
+                "evaluator_completed": False,
+                "evaluation": {
+                    **record["evaluation"],
+                    "evaluator_invoked": False,
+                    "evaluator_completed": False,
+                },
+            }
+        )
+        record = _canonicalize_evidence(record)
+        restored = RollingEvidence.from_mapping(record)
+        self.assertEqual(restored.evaluation_kind, "ACTUAL_LEDGER")
+        self.assertFalse(restored.evaluator_invoked)
+        self.assertFalse(restored.evaluator_completed)
+        policy = _policy(
+            min_actual_coverage_seconds=0,
+            min_completed_outcomes=0,
+            min_reliability="0",
+            experimental_allocation_enabled=True,
+            global_budget="100",
+        )
+        decision = evaluate_rolling_selection(policy, [record], None, NOW)
+        self.assertEqual(_member_value(_decision_members(decision)[0], "status"), "ACTIVE")
+
+    def test_set_like_activity_hashes_deterministically(self) -> None:
+        list_record = _v2_evidence(
+            "sv-direct-v2-set",
+            "window-direct-v2-set",
+        )
+        list_record["portfolio_accounting"] = {
+            **list_record["portfolio_accounting"],
+            "open_positions": ["market-a", "market-b"],
+        }
+        list_record = _canonicalize_evidence(list_record)
+        set_record = {
+            **list_record,
+            "portfolio_accounting": {
+                **list_record["portfolio_accounting"],
+                "open_positions": {"market-b", "market-a"},
+            },
+        }
+        frozenset_record = {
+            **list_record,
+            "portfolio_accounting": {
+                **list_record["portfolio_accounting"],
+                "open_positions": frozenset({"market-a", "market-b"}),
+            },
+        }
+        self.assertEqual(
+            RollingEvidence.from_mapping(set_record).evidence_digest,
+            RollingEvidence.from_mapping(frozenset_record).evidence_digest,
+        )
+
 
     def test_accounting_quality_flags_block_selection_even_when_numeric_thresholds_pass(self) -> None:
         policy = _policy(
@@ -558,54 +1530,6 @@ class TestRollingPortfolio(unittest.TestCase):
             Decimal("0"),
         )
 
-    def test_producer_persists_canonical_provenance_and_row_counts(self) -> None:
-        strategy = _strategy("sv-producer", research_trial_id="trial-producer")
-        accounting = {
-            "_available_from": NOW - timedelta(days=7),
-            "_available_through": NOW,
-            "allocated_capital": "10",
-            "allocated_capital_net_return": "1",
-            "realized_pnl": "1",
-            "unrealized_pnl": "0",
-            "fees": "0",
-            "costs": "0",
-            "drawdown": "0",
-            "completed_outcomes": 1,
-            "reliability": "1",
-        }
-        processor = AutonomousResearchProcessor.__new__(AutonomousResearchProcessor)
-        record = processor._rolling_evidence_record(
-            strategy,
-            [
-                {"timestamp": NOW.isoformat(), "_rolling_accounting": accounting},
-                {"timestamp": NOW.isoformat(), "_rolling_accounting": accounting},
-            ],
-            "PAPER",
-            7,
-            NOW,
-            evaluation={
-                "available_from": (NOW - timedelta(days=7)).isoformat(),
-                "available_through": NOW.isoformat(),
-                "source_digest": "sha256:canonical-source",
-                "accounting_digest": "sha256:canonical-accounting",
-                "accounting_available": True,
-                "accounting_complete": True,
-                "accounting_partial": False,
-                "requested_rows": 2,
-                "available_rows": 2,
-                "evaluated_rows": 2,
-            },
-        )
-        assert record is not None
-        self.assertEqual(record["source_digest"], "sha256:canonical-source")
-        self.assertEqual(record["accounting_digest"], "sha256:canonical-accounting")
-        self.assertTrue(record["accounting_available"])
-        self.assertTrue(record["accounting_complete"])
-        self.assertFalse(record["accounting_partial"])
-        self.assertEqual(
-            (record["requested_rows"], record["available_rows"], record["evaluated_rows"]),
-            (2, 2, 2),
-        )
 
     def test_paper_loader_marks_exact_unmaterialized_intent_pending_then_matches_materialized_spec(self) -> None:
         strategy_hash = "sha256:strategy-alpha"
@@ -1469,6 +2393,37 @@ class TestRollingPortfolio(unittest.TestCase):
             self.assertEqual(store.connection.execute('SELECT COUNT(*) FROM strategy_evidence_windows').fetchone()[0], 1)
             loaded = store.load_admission_policy(policy.policy_id, policy.version)
             self.assertEqual(loaded['config_hash'], policy.config_hash)
+
+    def test_v1_availability_from_payload_survives_migration_and_resave(self) -> None:
+        legacy = _evidence(
+            "sv-v1-migrated",
+            "window-v1-migrated",
+            source_digest="sha256:legacy-source",
+            accounting_digest="sha256:legacy-accounting",
+            accounting_available=True,
+        )
+        with _store(self.tmp_path) as store:
+            store.save_strategy_version(_strategy("sv-v1-migrated"))
+            store.save_strategy_evidence_window(legacy)
+            store.connection.execute(
+                "UPDATE strategy_evidence_windows "
+                "SET accounting_available=NULL "
+                "WHERE evidence_window_id=?",
+                ("window-v1-migrated",),
+            )
+            store.connection.commit()
+
+            loaded = store.list_strategy_evidence_windows("sv-v1-migrated")[0]
+            self.assertTrue(loaded["accounting_available"])
+            self.assertEqual(loaded["evidence_digest"], legacy["evidence_digest"])
+            self.assertEqual(loaded["realized_pnl"], "8.00")
+
+            store.save_strategy_evidence_window(loaded)
+            restored = store.list_strategy_evidence_windows("sv-v1-migrated")[0]
+            self.assertTrue(restored["accounting_available"])
+            self.assertEqual(restored["evidence_digest"], legacy["evidence_digest"])
+            self.assertEqual(restored["realized_pnl"], "8.00")
+
     
     
     def test_evidence_windows_preserve_requested_7_30_days_and_actual_coverage(self) -> None:
@@ -2525,6 +3480,104 @@ class TestRollingPortfolio(unittest.TestCase):
         self.assertGreater(
             Decimal(str(_member_value(members[0], "allocation"))),
             Decimal("0"),
+        )
+
+    def test_correction_chain_selects_active_latest_record(self) -> None:
+        policy = _policy(
+            max_members=1,
+            experimental_allocation_enabled=True,
+            min_actual_coverage_seconds=6 * 24 * 60 * 60,
+            min_completed_outcomes=0,
+            min_reliability="0",
+        )
+        predecessor = _v2_evidence(
+            "sv-correction-chain",
+            "window-correction-base",
+            available_through=NOW.isoformat(),
+            actual_coverage_seconds=6 * 24 * 60 * 60,
+            hard_failure=True,
+        )
+        correction = _v2_evidence(
+            "sv-correction-chain",
+            "window-correction-middle",
+            available_through=(NOW - timedelta(hours=1)).isoformat(),
+            actual_coverage_seconds=6 * 24 * 60 * 60,
+            hard_failure=True,
+            evaluation_run_id="run-correction-middle",
+            supersedes_evidence_id="window-correction-base",
+            evaluation={
+                "evaluation_run_id": "run-correction-middle",
+                "evaluation_version": "rolling-evaluation:v2",
+                "evaluator_invoked": True,
+                "evaluator_completed": True,
+            },
+        )
+        latest = _v2_evidence(
+            "sv-correction-chain",
+            "window-correction-latest",
+            available_through=(NOW - timedelta(hours=2)).isoformat(),
+            actual_coverage_seconds=6 * 24 * 60 * 60,
+            evaluation_run_id="run-correction-latest",
+            supersedes_evidence_id="window-correction-middle",
+            evaluation={
+                "evaluation_run_id": "run-correction-latest",
+                "evaluation_version": "rolling-evaluation:v2",
+                "evaluator_invoked": True,
+                "evaluator_completed": True,
+            },
+        )
+
+        decision = evaluate_rolling_selection(
+            policy,
+            [predecessor, correction, latest],
+            None,
+            NOW,
+        )
+        members = _decision_members(decision)
+
+        self.assertEqual(len(members), 1)
+        self.assertEqual(
+            str(_member_value(members[0], "evidence_window_id")),
+            "window-correction-latest",
+        )
+        self.assertEqual(str(_member_value(members[0], "status")), "ACTIVE")
+
+    def test_foreign_correction_cannot_suppress_predecessor(self) -> None:
+        policy = _policy(
+            max_members=1,
+            experimental_allocation_enabled=True,
+        )
+        predecessor = _v2_evidence(
+            "sv-foreign-correction",
+            "window-foreign-correction-base",
+            available_through=NOW.isoformat(),
+        )
+        foreign = _v2_evidence(
+            "sv-foreign-correction",
+            "window-foreign-correction-foreign",
+            candidate_id="candidate-foreign",
+            available_through=NOW.isoformat(),
+            evaluation_run_id="run-foreign-correction",
+            supersedes_evidence_id="window-foreign-correction-base",
+            evaluation={
+                "evaluation_run_id": "run-foreign-correction",
+                "evaluation_version": "rolling-evaluation:v2",
+                "evaluator_invoked": True,
+                "evaluator_completed": True,
+            },
+        )
+
+        decision = evaluate_rolling_selection(
+            policy,
+            [predecessor, foreign],
+            None,
+            NOW,
+        )
+        members = _decision_members(decision)
+        self.assertEqual(len(members), 1)
+        self.assertEqual(
+            str(_member_value(members[0], "evidence_window_id")),
+            "window-foreign-correction-base",
         )
 
     def test_unsupported_score_declarations_reject_and_default_provenance_matches(self) -> None:

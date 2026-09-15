@@ -116,14 +116,103 @@ cvar = conditional_value_at_risk
 expected_shortfall = conditional_value_at_risk
 
 
+def _lot_key(item: Fill) -> tuple[str, str, str | None]:
+    """Return a stable FIFO identity, isolating prediction markets by market id."""
+    market_type = str(getattr(item.market_type, "value", item.market_type)).strip().lower()
+    if market_type == "prediction":
+        identity = str(getattr(item, "market_id", None) or "").strip()
+        if not identity:
+            identity = str(getattr(item, "symbol", "")).strip()
+        outcome = str(item.metadata.get("outcome", "yes")).strip().lower() or "yes"
+        return identity, market_type, outcome
+    return str(getattr(item, "symbol", "")).strip(), market_type, None
+
+
+def _fill_lot_accounting(
+    fills: Sequence[Fill],
+) -> tuple[int, int, int, int, list[str], float, float, float]:
+    """Match prediction fills FIFO without treating settlement as a trade."""
+    lots: dict[tuple[str, str, str | None], list[list[float]]] = {}
+    opening_fills = closing_fills = partial_closing_fills = completed_round_trips = 0
+    realized = gross_realized = 0.0
+    outstanding_cost_basis = peak_outstanding_cost_basis = 0.0
+    for item in fills:
+        lot_key = _lot_key(item)
+        if item.side.value == "buy":
+            opening_fills += 1
+            lots.setdefault(lot_key, []).append([item.quantity, item.price, item.fees])
+            outstanding_cost_basis += item.quantity * item.price
+            peak_outstanding_cost_basis = max(
+                peak_outstanding_cost_basis,
+                outstanding_cost_basis,
+            )
+            continue
+        if item.side.value != "sell":
+            continue
+        symbol_lots = lots.setdefault(lot_key, [])
+        remaining = item.quantity
+        matched_total = 0.0
+        while remaining > 1e-12 and symbol_lots:
+            lot_quantity, lot_price, lot_fees = symbol_lots[0]
+            matched = min(remaining, lot_quantity)
+            matched_total += matched
+            entry_fees = lot_fees * matched / lot_quantity if lot_quantity else 0.0
+            exit_fees = item.fees * matched / item.quantity if item.quantity else 0.0
+            gross_realized += (item.price - lot_price) * matched
+            realized += (item.price - lot_price) * matched - entry_fees - exit_fees
+            outstanding_cost_basis -= lot_price * matched
+            remaining -= matched
+            lot_quantity -= matched
+            lot_fees -= entry_fees
+            if lot_quantity <= 1e-12:
+                symbol_lots.pop(0)
+                completed_round_trips += 1
+            else:
+                symbol_lots[0] = [lot_quantity, lot_price, lot_fees]
+        if matched_total > 1e-12:
+            is_partial = bool(
+                item.metadata.get(
+                    "partial_fill",
+                    item.metadata.get("partial", False),
+                )
+            )
+            if not is_partial:
+                try:
+                    requested_quantity = float(
+                        item.metadata.get("requested_quantity", item.quantity)
+                    )
+                except (TypeError, ValueError):
+                    requested_quantity = item.quantity
+                is_partial = requested_quantity > item.quantity + 1e-12
+            is_partial = is_partial or remaining > 1e-12
+            if is_partial:
+                partial_closing_fills += 1
+            else:
+                closing_fills += 1
+    open_positions = sorted(
+        {
+            lot_key[0]
+            for lot_key, symbol_lots in lots.items()
+            if any(lot[0] > 1e-12 for lot in symbol_lots)
+        }
+    )
+    return (
+        opening_fills,
+        closing_fills,
+        partial_closing_fills,
+        completed_round_trips,
+        open_positions,
+        realized,
+        gross_realized,
+        peak_outstanding_cost_basis,
+    )
+
+
 def _closed_trade_pnls(fills: Sequence[Fill]) -> list[float]:
     lots: dict[tuple[str, str, str | None], list[list[float]]] = {}
     realized: list[float] = []
     for item in fills:
-        outcome = None
-        if item.market_type.value == "prediction":
-            outcome = str(item.metadata.get("outcome", "yes")).strip().lower() or "yes"
-        lot_key = (item.symbol, item.market_type.value, outcome)
+        lot_key = _lot_key(item)
         if item.side.value == "buy":
             lots.setdefault(lot_key, []).append([item.quantity, item.price, item.fees])
             continue
@@ -209,8 +298,28 @@ def calculate_crypto_metrics(
     return result
 
 
+def _is_entry_observation(item: Mapping[str, Any]) -> bool:
+    execution_kind = item.get("execution_kind")
+    if execution_kind is not None:
+        return str(execution_kind).strip().lower() == "entry"
+    side = item.get("side")
+    if side is None:
+        return True
+    return str(getattr(side, "value", side)).strip().lower() == "buy"
+
+
+def _is_entry_fill(fill: Fill) -> bool:
+    metadata = fill.metadata if isinstance(fill.metadata, Mapping) else {}
+    execution_kind = metadata.get("execution_kind")
+    if execution_kind is not None:
+        return str(execution_kind).strip().lower() == "entry"
+    return str(getattr(fill.side, "value", fill.side)).strip().lower() == "buy"
+
+
 def _probability_outcome(item: Any) -> tuple[float, float] | None:
     if isinstance(item, Mapping):
+        if not _is_entry_observation(item):
+            return None
         probability = item.get("probability", item.get("p", item.get("forecast")))
         outcome = item.get("outcome", item.get("actual", item.get("y")))
     elif isinstance(item, Sequence) and not isinstance(item, (str, bytes)) and len(item) >= 2:
@@ -341,12 +450,14 @@ def calibration_at_horizons(
                     "outcome",
                     item.get("actual", item.get("y", item.get("settlement"))),
                 ),
+                "execution_kind": item.get("execution_kind"),
+                "side": item.get("side"),
             }
         )
         if parsed is None:
             continue
         probability, outcome = parsed
-        market_id = str(item.get("market_id", item.get("key", index)))
+        market_id = str(item.get("market_id", item.get("key", index)) or "").strip()
         grouped.setdefault(market_id, []).append(
             {"timestamp": stamp, "expiry": expiry, "probability": probability, "outcome": outcome}
         )
@@ -450,11 +561,13 @@ def calculate_prediction_metrics(
     fills: Sequence[Fill] = (),
     probabilities: Iterable[Any] | None = None,
     initial_equity: float | None = None,
-) -> dict[str, float]:
+    portfolio: Any | None = None,
+    evaluation: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     values = _equities(records)
     start = initial_equity if initial_equity is not None else (values[0] if values else 0.0)
     end = values[-1] if values else start
-    result = {
+    result: dict[str, Any] = {
         "initial_equity": float(start),
         "final_equity": float(end),
         "roi": (end / start - 1.0) if start else 0.0,
@@ -463,9 +576,17 @@ def calculate_prediction_metrics(
     observations = list(probabilities) if probabilities is not None else []
     if probabilities is None:
         observations = [
-            {"probability": fill.expected_probability, "outcome": fill.metadata.get("outcome_value")}
+            {
+                "probability": fill.expected_probability,
+                "outcome": fill.metadata.get("outcome_value"),
+                "execution_kind": "entry",
+            }
             for fill in fills
-            if fill.expected_probability is not None and "outcome_value" in fill.metadata
+            if (
+                fill.expected_probability is not None
+                and "outcome_value" in fill.metadata
+                and _is_entry_fill(fill)
+            )
         ]
     if observations:
         result.update({
@@ -477,7 +598,7 @@ def calculate_prediction_metrics(
         result.update({"brier": 0.0, "log_loss": 0.0, "ece": 0.0})
     edges = []
     for fill in fills:
-        if fill.expected_probability is None:
+        if fill.expected_probability is None or not _is_entry_fill(fill):
             continue
         cost_per_contract = fill.fees / fill.quantity if fill.quantity > 0 else fill.fees
         execution_price = fill.executable_probability if fill.executable_probability is not None else fill.price
@@ -500,6 +621,106 @@ def calculate_prediction_metrics(
     result["executable_edge"] = mean(item["executable_edge"] for item in edges) if edges else 0.0
     result["expected_value"] = mean(item["executable_ev"] for item in edges) if edges else 0.0
     result["expected_roi"] = mean(item["executable_roi"] for item in edges) if edges else 0.0
+
+    (
+        opening_fills,
+        closing_fills,
+        partial_closing_fills,
+        completed_round_trips,
+        fill_open_positions,
+        fill_realized,
+        _gross_realized,
+        peak_outstanding_cost_basis,
+    ) = _fill_lot_accounting(fills)
+    allocated_capital = sum(
+        float(item.quantity) * float(item.price)
+        for item in fills
+        if item.side.value == "buy"
+    )
+    fee_total = sum(float(item.fees) for item in fills)
+    cost_total = sum(abs(float(item.slippage) * float(item.quantity)) for item in fills)
+    accounting = dict(evaluation or {})
+    evaluator_completed = accounting.get("evaluator_completed", True) is True
+    evaluator_invoked = accounting.get("evaluator_invoked", bool(fills) or bool(values))
+    if portfolio is not None:
+        cash = float(getattr(portfolio, "cash", end))
+        initial_cash = float(getattr(portfolio, "initial_cash", start))
+        equity = float(portfolio.equity())
+        portfolio_unrealized = float(portfolio.unrealized_pnl())
+        net_value = equity - initial_cash
+        open_inventory: dict[str, dict[str, float]] = {}
+        for key, position in getattr(portfolio, "positions", {}).items():
+            quantity = float(getattr(position, "quantity", 0.0))
+            if quantity <= 1e-12:
+                continue
+            open_inventory[str(key)] = {
+                "quantity": quantity,
+                "average_price": float(getattr(position, "average_price", 0.0)),
+                "last_price": (
+                    float(position.last_price)
+                    if getattr(position, "last_price", None) is not None
+                    else float(getattr(position, "average_price", 0.0))
+                ),
+            }
+        open_positions = sorted(
+            {
+                str(getattr(position, "market_id", None) or getattr(position, "symbol", key))
+                for key, position in getattr(portfolio, "positions", {}).items()
+                if float(getattr(position, "quantity", 0.0)) > 1e-12
+            }
+        )
+        # Equity is the authoritative cash-flow result.  This keeps realized
+        # and unrealized values consistent while settlement remains separate
+        # from the trading-fill round-trip count above.
+        realized_value: float | None = net_value - portfolio_unrealized
+        unrealized_value: float | None = portfolio_unrealized
+        net_pnl_value: float | None = net_value
+    else:
+        initial_cash = float(start)
+        cash = float(end)
+        equity = float(end)
+        open_inventory = {}
+        open_positions = fill_open_positions
+        realized_value = float(fill_realized)
+        unrealized_value = None
+        net_pnl_value = float(end - start)
+    if not evaluator_completed:
+        realized_value = unrealized_value = net_pnl_value = None
+    accounting_payload: dict[str, Any] = {
+        "accounting_available": bool(evaluator_completed),
+        "initial_cash": initial_cash,
+        "cash": cash,
+        "equity": equity,
+        "realized_pnl": realized_value,
+        "unrealized_pnl": unrealized_value,
+        "net_pnl": net_pnl_value,
+        "fees": fee_total,
+        "costs": cost_total,
+        "allocated_capital": allocated_capital,
+        "capital_at_risk": peak_outstanding_cost_basis,
+        "open_positions": open_positions,
+        "open_position_count": len(open_positions),
+        "open_inventory": open_inventory,
+        "opening_fills": opening_fills,
+        "closing_fills": closing_fills,
+        "partial_closing_fills": partial_closing_fills,
+        "completed_round_trips": completed_round_trips,
+    }
+    result["portfolio_accounting"] = accounting_payload
+    result["evaluation"] = {
+        "evaluator_invoked": bool(evaluator_invoked),
+        "evaluator_completed": bool(evaluator_completed),
+        "evaluated_observations": int(accounting.get("evaluated_observations", len(values))),
+        "signal_count": int(accounting.get("signal_count", 0)),
+        "diagnostic_summary_count": int(accounting.get("diagnostic_summary_count", 0)),
+        "evaluator_name": (
+            accounting.get("evaluator_name", "evaluate_signal_evaluation:v1")
+            if evaluator_completed
+            else None
+        ),
+        "evaluator_error": accounting.get("evaluator_error"),
+        "evaluator_prerequisite": accounting.get("evaluator_prerequisite"),
+    }
     return result
 
 crypto_metrics = calculate_crypto_metrics

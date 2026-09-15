@@ -94,6 +94,17 @@ _SOURCE_CLASS_ALIASES = {
     "FORWARD_COLLECTED": "LIVE",
 }
 _CANONICAL_SOURCE_CLASSES = frozenset({"HISTORICAL", "REPLAY", "PAPER", "LIVE"})
+_EVALUATION_KINDS = frozenset({"CANONICAL_SIMULATION", "ACTUAL_LEDGER"})
+
+
+def _evaluation_kind(value: Any, *, required: bool = False) -> str:
+    text = _text(value, "evaluation_kind", max_length=64, required=required)
+    if not text:
+        return ""
+    normalized = text.upper().replace("-", "_").replace(" ", "_")
+    if normalized not in _EVALUATION_KINDS:
+        raise ValueError(f"unsupported evaluation_kind: {text}")
+    return normalized
 
 # Machine-readable reasons are intentionally stable: they are persisted and are more
 # useful to operators than a free-form explanation assembled by a caller.
@@ -165,6 +176,145 @@ def _decimal(value: Any, name: str, *, default: Decimal | None = None) -> Decima
     return parsed
 
 
+_NULL_DECIMAL_TEXT = frozenset({"none", "null", "unavailable", "unknown", "n/a"})
+_V2_ACCOUNTING_MONETARY_FIELDS = (
+    "initial_cash",
+    "cash",
+    "equity",
+    "realized_pnl",
+    "unrealized_pnl",
+    "net_pnl",
+    "fees",
+    "costs",
+)
+_V2_ACCOUNTING_ACTIVITY_FIELDS = (
+    "open_positions",
+    "opening_fills",
+    "closing_fills",
+    "partial_closing_fills",
+    "completed_round_trips",
+)
+_V2_ACCOUNTING_STATUS_FIELDS = frozenset(
+    {
+        "accounting_available",
+        "accounting_complete",
+        "accounting_partial",
+        "evaluator_invoked",
+        "evaluator_completed",
+    }
+)
+_V2_IMMUTABLE_PROJECTION_FIELDS = frozenset(
+    {
+        "evaluation_run_id",
+        "evaluation_version",
+        "evaluation_kind",
+        "supersedes_evidence_id",
+    }
+)
+
+
+_MAX_OPEN_POSITIONS = 32
+
+
+def _canonical_v2_accounting(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate and normalize the canonical v2 accounting document.
+
+    The accounting document is part of evidence identity, so values must be
+    validated before readiness is computed and set-like activity must have a
+    stable representation.
+    """
+    canonical = dict(value)
+    for field_name in _V2_ACCOUNTING_MONETARY_FIELDS:
+        if field_name in canonical and canonical[field_name] is not None:
+            canonical[field_name] = _decimal(
+                canonical[field_name],
+                f"portfolio_accounting.{field_name}",
+            )
+    if "open_positions" in canonical and canonical["open_positions"] is not None:
+        positions = canonical["open_positions"]
+        if (
+            isinstance(positions, (str, bytes, bytearray, Mapping))
+            or not isinstance(positions, (list, tuple, set, frozenset))
+        ):
+            raise ValueError(
+                "portfolio_accounting.open_positions must be a bounded collection"
+            )
+        if len(positions) > _MAX_OPEN_POSITIONS:
+            raise ValueError(
+                "portfolio_accounting.open_positions exceeds "
+                f"{_MAX_OPEN_POSITIONS} entries"
+            )
+        if isinstance(positions, (set, frozenset)):
+            try:
+                positions = tuple(sorted(positions, key=_canonical))
+            except (TypeError, ValueError, ArithmeticError) as exc:
+                raise ValueError(
+                    "portfolio_accounting.open_positions must be canonicalizable"
+                ) from exc
+        else:
+            positions = tuple(positions)
+        canonical["open_positions"] = positions
+    for field_name in _V2_ACCOUNTING_ACTIVITY_FIELDS:
+        if (
+            field_name != "open_positions"
+            and field_name in canonical
+            and canonical[field_name] is not None
+        ):
+            canonical[field_name] = _integer(
+                canonical[field_name],
+                f"portfolio_accounting.{field_name}",
+                minimum=0,
+            )
+    return canonical
+
+
+def _v2_projection_values_equal(field_name: str, left: Any, right: Any) -> bool:
+    """Compare duplicate accounting projections after semantic normalization."""
+    if (
+        field_name in _V2_ACCOUNTING_MONETARY_FIELDS
+        or field_name == "allocated_capital_net_return"
+    ):
+        try:
+            return _decimal(left, field_name) == _decimal(right, field_name)
+        except (TypeError, ValueError, ArithmeticError):
+            return False
+    if field_name in _V2_ACCOUNTING_ACTIVITY_FIELDS or field_name == "completed_outcomes":
+        if field_name == "open_positions":
+            try:
+                left_positions = tuple(
+                    sorted(_canonical(item) for item in left)
+                )
+                right_positions = tuple(
+                    sorted(_canonical(item) for item in right)
+                )
+            except (TypeError, ValueError, ArithmeticError):
+                return False
+            return left_positions == right_positions
+        try:
+            return _integer(left, field_name, minimum=0) == _integer(
+                right,
+                field_name,
+                minimum=0,
+            )
+        except (TypeError, ValueError, ArithmeticError):
+            return False
+    try:
+        return _canonical(left) == _canonical(right)
+    except (TypeError, ValueError, ArithmeticError):
+        return left == right
+
+
+
+
+def _nullable_decimal(value: Any, name: str) -> Decimal | None:
+    """Parse a v2 accounting metric while preserving explicit unavailability."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, str) and value.strip().lower() in _NULL_DECIMAL_TEXT:
+        return None
+    return _decimal(value, name)
+
+
 def _nonnegative(value: Any, name: str, *, default: Decimal | None = None) -> Decimal:
     parsed = _decimal(value, name, default=default)
     if parsed < ZERO:
@@ -230,8 +380,22 @@ def _freeze(value: Any) -> Any:
 def _plain(value: Any) -> Any:
     if isinstance(value, Mapping):
         return {str(key): _plain(item) for key, item in value.items()}
-    if isinstance(value, (tuple, list, frozenset, set)):
+    if isinstance(value, (tuple, list)):
         return [_plain(item) for item in value]
+    if isinstance(value, (frozenset, set)):
+        # Set iteration order is process/hash-seed dependent.  Sort by the
+        # canonical JSON representation so equivalent set-like values hash
+        # identically without imposing ordering on their members.
+        plain_items = [_plain(item) for item in value]
+        return sorted(
+            plain_items,
+            key=lambda item: json.dumps(
+                item,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            ),
+        )
     if isinstance(value, Decimal):
         return format(value, "f")
     if isinstance(value, datetime):
@@ -779,11 +943,11 @@ class RollingEvidence:
     source_class: str = ""
     fee_assumption: Decimal = ZERO
     slippage_assumption: Decimal = ZERO
-    allocated_capital_net_return: Decimal = ZERO
-    realized_pnl: Decimal = ZERO
-    unrealized_pnl: Decimal = ZERO
-    fees: Decimal = ZERO
-    costs: Decimal = ZERO
+    allocated_capital_net_return: Decimal | None = ZERO
+    realized_pnl: Decimal | None = ZERO
+    unrealized_pnl: Decimal | None = ZERO
+    fees: Decimal | None = ZERO
+    costs: Decimal | None = ZERO
     drawdown: Decimal = ZERO
     completed_outcomes: int = 0
     reliability: Decimal = ZERO
@@ -797,18 +961,155 @@ class RollingEvidence:
     paper_sizing: Decimal | None = None
     fee_costs: Decimal | None = None
     slippage_costs: Decimal | None = None
-    # Source and evaluator provenance are immutable parts of one evidence
-    # identity. ``None`` preserves compatibility with pre-provenance rows;
-    # newly produced rows populate these fields explicitly.
+    # Source and accounting provenance remain immutable evidence metadata.
     source_digest: str | None = None
     accounting_digest: str | None = None
     accounting_available: bool | None = None
     accounting_complete: bool | None = None
     accounting_partial: bool | None = None
+    # Canonical evaluator provenance is append-only and versioned.  These
+    # fields are optional so pre-v2 evidence remains readable without being
+    # rewritten.
+    evaluation_run_id: str | None = None
+    evaluation_version: str | None = None
+    evaluation_kind: str | None = None
+    supersedes_evidence_id: str | None = None
+    loaded_rows: int | None = None
+    valid_input_rows: int | None = None
+    evaluator_invoked: bool | None = None
+    evaluator_completed: bool | None = None
+    evaluated_observations: int | None = None
+    signal_count: int | None = None
+    diagnostic_summary_count: int | None = None
+    evaluator_name: str | None = None
+    evaluator_error: str | None = None
+    evaluator_prerequisite: str | None = None
+    portfolio_accounting: Mapping[str, Any] | None = None
+    evaluation: Mapping[str, Any] | None = None
+    metrics: Mapping[str, Any] | None = None
     requested_rows: int | None = None
     available_rows: int | None = None
     evaluated_rows: int | None = None
     def __post_init__(self) -> None:
+        evaluation_run_id = (
+            _text(
+                self.evaluation_run_id,
+                "evaluation_run_id",
+                max_length=256,
+                required=False,
+            )
+            or None
+        )
+        evaluation_version = (
+            _text(
+                self.evaluation_version,
+                "evaluation_version",
+                max_length=256,
+                required=False,
+            )
+            or None
+        )
+        evaluation_kind = _evaluation_kind(self.evaluation_kind, required=False) or None
+        supersedes_evidence_id = (
+            _text(
+                self.supersedes_evidence_id,
+                "supersedes_evidence_id",
+                max_length=256,
+                required=False,
+            )
+            or None
+        )
+        # Direct construction has no key-presence metadata for scalar fields,
+        # so a missing scalar continues to derive from a nested projection.
+        # Once a scalar is supplied, however, nested nulls and conflicting
+        # values are ambiguous and must fail closed just like from_mapping.
+        nested_evaluation_projections: list[Mapping[str, Any]] = []
+        metrics_evaluation: Mapping[str, Any] | None = None
+        if isinstance(self.evaluation, Mapping):
+            nested_evaluation_projections.append(self.evaluation)
+        if isinstance(self.metrics, Mapping):
+            metrics_evaluation = self.metrics.get("evaluation")
+            if isinstance(metrics_evaluation, Mapping):
+                nested_evaluation_projections.append(metrics_evaluation)
+        metrics_accounting = (
+            self.metrics.get("portfolio_accounting")
+            if isinstance(self.metrics, Mapping)
+            and isinstance(self.metrics.get("portfolio_accounting"), Mapping)
+            else None
+        )
+
+        def reconcile_immutable_projection(
+            name: str,
+            scalar_value: Any,
+            normalize: Any,
+        ) -> Any:
+            present = [
+                normalize(projection[name])
+                for projection in nested_evaluation_projections
+                if name in projection
+            ]
+            non_null = [value for value in present if value is not None]
+            if non_null and len(non_null) != len(present):
+                raise ValueError(f"{name} conflicts between rolling evidence projections")
+            if len(non_null) > 1 and any(value != non_null[0] for value in non_null[1:]):
+                raise ValueError(f"{name} conflicts between rolling evidence projections")
+            if scalar_value is not None:
+                if any(value is None or value != scalar_value for value in present):
+                    raise ValueError(f"{name} conflicts between rolling evidence projections")
+            elif non_null:
+                scalar_value = non_null[0]
+            return scalar_value
+
+        evaluation_run_id = reconcile_immutable_projection(
+            "evaluation_run_id",
+            evaluation_run_id,
+            lambda value: (
+                _text(
+                    value,
+                    "evaluation_run_id",
+                    max_length=256,
+                    required=False,
+                )
+                or None
+            ),
+        )
+        evaluation_version = reconcile_immutable_projection(
+            "evaluation_version",
+            evaluation_version,
+            lambda value: (
+                _text(
+                    value,
+                    "evaluation_version",
+                    max_length=256,
+                    required=False,
+                )
+                or None
+            ),
+        )
+        evaluation_kind = reconcile_immutable_projection(
+            "evaluation_kind",
+            evaluation_kind,
+            lambda value: _evaluation_kind(value, required=False) or None,
+        )
+        supersedes_evidence_id = reconcile_immutable_projection(
+            "supersedes_evidence_id",
+            supersedes_evidence_id,
+            lambda value: (
+                _text(
+                    value,
+                    "supersedes_evidence_id",
+                    max_length=256,
+                    required=False,
+                )
+                or None
+            ),
+        )
+        v2_provenance = (
+            bool(evaluation_run_id)
+            or bool(evaluation_version)
+            or bool(evaluation_kind)
+            or bool(supersedes_evidence_id)
+        )
         object.__setattr__(self, "strategy_version_id", _text(self.strategy_version_id, "strategy_version_id"))
         object.__setattr__(self, "evidence_window_id", _text(self.evidence_window_id, "evidence_window_id"))
         object.__setattr__(self, "candidate_id", _text(self.candidate_id, "candidate_id", required=False) or None)
@@ -837,6 +1138,14 @@ class RollingEvidence:
                 raise ValueError("actual_coverage_seconds must not exceed available range")
         object.__setattr__(self, "actual_coverage_seconds", coverage)
         object.__setattr__(self, "source_class", _source_class(self.source_class))
+        if v2_provenance and not evaluation_kind:
+            # Pre-kind v2 rows are simulation attestations by default.  Actual
+            # ledger producers now persist the kind explicitly.
+            evaluation_kind = "CANONICAL_SIMULATION"
+        object.__setattr__(self, "evaluation_run_id", evaluation_run_id)
+        object.__setattr__(self, "evaluation_version", evaluation_version)
+        object.__setattr__(self, "evaluation_kind", evaluation_kind or None)
+        object.__setattr__(self, "supersedes_evidence_id", supersedes_evidence_id)
         sizing = self.paper_sizing
         if sizing is None:
             sizing = self.paper_size
@@ -849,19 +1158,159 @@ class RollingEvidence:
         for name in ("fee_assumption", "slippage_assumption"):
             parsed = _nonnegative(getattr(self, name), name, default=ZERO)
             object.__setattr__(self, name, parsed)
-        fees = _nonnegative(self.fees, "fees", default=ZERO)
-        if self.fee_costs is not None:
-            fees += _nonnegative(self.fee_costs, "fee_costs")
-        costs = _nonnegative(self.costs, "costs", default=ZERO)
-        if self.slippage_costs is not None:
-            costs += _nonnegative(self.slippage_costs, "slippage_costs")
+        accounting_sources = [
+            projection
+            for projection in (self.portfolio_accounting, metrics_accounting)
+            if isinstance(projection, Mapping)
+        ]
+        canonical_accounting: dict[str, Any] = {}
+        if len(accounting_sources) > 1:
+            for field_name in {
+                key for source in accounting_sources for key in source
+            }:
+                present = [
+                    source[field_name]
+                    for source in accounting_sources
+                    if field_name in source
+                ]
+                values = [value for value in present if value is not None]
+                if field_name in _V2_ACCOUNTING_STATUS_FIELDS and any(
+                    value is not None and not isinstance(value, bool)
+                    for value in present
+                ):
+                    raise TypeError(f"{field_name} must be bool or None")
+                if (
+                    field_name in _V2_ACCOUNTING_STATUS_FIELDS
+                    and values
+                    and len(values) != len(present)
+                ) or (
+                    len(values) > 1
+                    and any(
+                        not _v2_projection_values_equal(
+                            field_name,
+                            values[0],
+                            candidate,
+                        )
+                        for candidate in values[1:]
+                    )
+                ):
+                    raise ValueError("portfolio_accounting projections conflict")
+        for source in accounting_sources:
+            for field_name, field_value in source.items():
+                canonical_accounting.setdefault(field_name, field_value)
+        status_projections = [
+            projection
+            for projection in (
+                self.evaluation,
+                metrics_evaluation,
+                self.portfolio_accounting,
+                metrics_accounting,
+            )
+            if isinstance(projection, Mapping)
+        ]
+        # Nested status projections are authoritative when a direct constructor
+        # omits the corresponding scalar field, but every duplicate must still
+        # agree, including explicit null versus non-null values.
+        for name in _V2_ACCOUNTING_STATUS_FIELDS:
+            present = [
+                projection[name]
+                for projection in status_projections
+                if name in projection
+            ]
+            if any(value is not None and not isinstance(value, bool) for value in present):
+                raise TypeError(f"{name} must be bool or None")
+            non_null = [value for value in present if value is not None]
+            if non_null and len(non_null) != len(present):
+                raise ValueError(f"{name} conflicts between rolling evidence projections")
+            if len(non_null) > 1 and any(value != non_null[0] for value in non_null[1:]):
+                raise ValueError(f"{name} conflicts between rolling evidence projections")
+            scalar_value = getattr(self, name)
+            if scalar_value is not None and not isinstance(scalar_value, bool):
+                raise TypeError(f"{name} must be bool or None")
+            if scalar_value is not None:
+                if any(value is None or value != scalar_value for value in present):
+                    raise ValueError(f"{name} conflicts between rolling evidence projections")
+            elif non_null:
+                object.__setattr__(self, name, non_null[0])
+        if v2_provenance:
+            canonical_accounting = _canonical_v2_accounting(canonical_accounting)
+        accounting_ready = (
+            self.accounting_available is True
+            and self.accounting_complete is True
+            and self.accounting_partial is False
+            and (
+                (
+                    self.evaluation_kind == "ACTUAL_LEDGER"
+                    and self.evaluator_invoked is False
+                    and self.evaluator_completed is False
+                )
+                or (
+                    self.evaluation_kind == "CANONICAL_SIMULATION"
+                    and self.evaluator_invoked is True
+                    and self.evaluator_completed is True
+                )
+            )
+            and all(
+                field_name in canonical_accounting
+                and canonical_accounting[field_name] is not None
+                for field_name in (
+                    *_V2_ACCOUNTING_MONETARY_FIELDS,
+                    *_V2_ACCOUNTING_ACTIVITY_FIELDS,
+                )
+            )
+        )
+        accounting_unavailable = v2_provenance and not accounting_ready
+
+        def v2_metric(value: Any, name: str) -> Decimal | None:
+            if accounting_unavailable:
+                return None
+            return _nullable_decimal(value, name)
+        if v2_provenance:
+            fees = v2_metric(self.fees, "fees")
+            if fees is not None and fees < ZERO:
+                raise ValueError("fees must be non-negative")
+            if fees is not None and self.fee_costs is not None:
+                fees += _nonnegative(self.fee_costs, "fee_costs")
+            costs = v2_metric(self.costs, "costs")
+            if costs is not None and costs < ZERO:
+                raise ValueError("costs must be non-negative")
+            if costs is not None and self.slippage_costs is not None:
+                costs += _nonnegative(self.slippage_costs, "slippage_costs")
+        else:
+            fees = _nonnegative(self.fees, "fees", default=ZERO)
+            if self.fee_costs is not None:
+                fees += _nonnegative(self.fee_costs, "fee_costs")
+            costs = _nonnegative(self.costs, "costs", default=ZERO)
+            if self.slippage_costs is not None:
+                costs += _nonnegative(self.slippage_costs, "slippage_costs")
         object.__setattr__(self, "fees", fees)
         object.__setattr__(self, "costs", costs)
         object.__setattr__(self, "fee_costs", fees)
         object.__setattr__(self, "slippage_costs", costs)
-        object.__setattr__(self, "allocated_capital_net_return", _decimal(self.allocated_capital_net_return, "allocated_capital_net_return", default=ZERO))
-        object.__setattr__(self, "realized_pnl", _decimal(self.realized_pnl, "realized_pnl", default=ZERO))
-        object.__setattr__(self, "unrealized_pnl", _decimal(self.unrealized_pnl, "unrealized_pnl", default=ZERO))
+        if v2_provenance:
+            object.__setattr__(
+                self,
+                "allocated_capital_net_return",
+                v2_metric(self.allocated_capital_net_return, "allocated_capital_net_return"),
+            )
+            object.__setattr__(self, "realized_pnl", v2_metric(self.realized_pnl, "realized_pnl"))
+            object.__setattr__(self, "unrealized_pnl", v2_metric(self.unrealized_pnl, "unrealized_pnl"))
+        else:
+            object.__setattr__(
+                self,
+                "allocated_capital_net_return",
+                _decimal(self.allocated_capital_net_return, "allocated_capital_net_return", default=ZERO),
+            )
+            object.__setattr__(
+                self,
+                "realized_pnl",
+                _decimal(self.realized_pnl, "realized_pnl", default=ZERO),
+            )
+            object.__setattr__(
+                self,
+                "unrealized_pnl",
+                _decimal(self.unrealized_pnl, "unrealized_pnl", default=ZERO),
+            )
         drawdown = _ratio(self.drawdown, "drawdown", default=ZERO)
         object.__setattr__(self, "drawdown", drawdown)
         object.__setattr__(self, "completed_outcomes", _integer(self.completed_outcomes, "completed_outcomes", minimum=0))
@@ -890,8 +1339,19 @@ class RollingEvidence:
             value = getattr(self, name)
             if value is not None and not isinstance(value, bool):
                 raise TypeError(f"{name} must be bool or None")
+            if v2_provenance and accounting_unavailable:
+                value = name == "accounting_partial"
             object.__setattr__(self, name, value)
-        for name in ("requested_rows", "available_rows", "evaluated_rows"):
+        for name in (
+            "requested_rows",
+            "available_rows",
+            "evaluated_rows",
+            "loaded_rows",
+            "valid_input_rows",
+            "evaluated_observations",
+            "signal_count",
+            "diagnostic_summary_count",
+        ):
             value = getattr(self, name)
             if value is not None:
                 object.__setattr__(self, name, _integer(value, name, minimum=0))
@@ -901,6 +1361,42 @@ class RollingEvidence:
             and self.available_rows > self.requested_rows
         ):
             raise ValueError("available_rows must not exceed requested_rows")
+        if (
+            self.loaded_rows is not None
+            and self.valid_input_rows is not None
+            and self.valid_input_rows > self.loaded_rows
+        ):
+            raise ValueError("valid_input_rows must not exceed loaded_rows")
+        for name in (
+            "evaluator_name",
+            "evaluator_error",
+            "evaluator_prerequisite",
+        ):
+            value = _text(
+                getattr(self, name),
+                name,
+                max_length=MAX_REASON_LENGTH,
+                required=False,
+            )
+            object.__setattr__(self, name, value or None)
+        for name in ("portfolio_accounting", "evaluation", "metrics"):
+            value = getattr(self, name)
+            if value is not None and not isinstance(value, Mapping):
+                raise TypeError(f"{name} must be a mapping or None")
+            if name == "portfolio_accounting" and v2_provenance:
+                canonical = dict(canonical_accounting)
+                canonical.update(
+                    {
+                        "accounting_available": self.accounting_available,
+                        "accounting_complete": self.accounting_complete,
+                        "accounting_partial": self.accounting_partial,
+                    }
+                )
+                if accounting_unavailable:
+                    for field_name in _V2_ACCOUNTING_MONETARY_FIELDS:
+                        canonical[field_name] = None
+                value = canonical
+            object.__setattr__(self, name, _freeze(value) if value is not None else None)
         # Evidence identity is always derived from immutable content.  A caller
         # supplied digest is metadata only; never allow it to override the
         # canonical digest used for selection and persistence.
@@ -908,7 +1404,10 @@ class RollingEvidence:
         object.__setattr__(self, "evidence_digest", _hash(self._digest_projection()))
 
     def _digest_projection(self) -> dict[str, Any]:
-        return {
+        # This is the v1 projection.  Keep it byte-for-byte equivalent in
+        # substance to the projection used before evaluator provenance was
+        # introduced; persisted v1 rows must retain their original digest.
+        projection: dict[str, Any] = {
             "candidate_id": self.candidate_id,
             "research_trial_id": self.research_trial_id,
             "strategy_version_id": self.strategy_version_id,
@@ -941,10 +1440,46 @@ class RollingEvidence:
             "execution_feasibility": self.execution_feasibility,
             "overlap_key": self.overlap_key,
         }
+        # A v2 row is identified by evaluator version/run, evaluation kind, or
+        # an append-only correction link.  The link itself is immutable
+        # provenance and therefore must be digest-bound even when it is the
+        # only v2 field present.
+        if (
+            self.evaluation_run_id is not None
+            or self.evaluation_version is not None
+            or self.evaluation_kind is not None
+            or self.supersedes_evidence_id is not None
+        ):
+            projection.update(
+                {
+                    "evaluation_run_id": self.evaluation_run_id,
+                    "evaluation_version": self.evaluation_version,
+                    "evaluation_kind": self.evaluation_kind,
+                    "supersedes_evidence_id": self.supersedes_evidence_id,
+                    "loaded_rows": self.loaded_rows,
+                    "valid_input_rows": self.valid_input_rows,
+                    "evaluator_invoked": self.evaluator_invoked,
+                    "evaluator_completed": self.evaluator_completed,
+                    "evaluated_observations": self.evaluated_observations,
+                    "signal_count": self.signal_count,
+                    "diagnostic_summary_count": self.diagnostic_summary_count,
+                    "evaluator_name": self.evaluator_name,
+                    "evaluator_error": self.evaluator_error,
+                    "evaluator_prerequisite": self.evaluator_prerequisite,
+                    # v2 accounting is canonical evidence, not merely a
+                    # caller-supplied digest claim.  Include the complete
+                    # immutable document so any accounting mutation changes
+                    # the evidence identity.
+                    "portfolio_accounting": self.portfolio_accounting,
+                }
+            )
+        return projection
 
     @property
     def execution_cost(self) -> Decimal:
-        return self.fees + self.costs + self.allocated_capital * (self.fee_assumption + self.slippage_assumption)
+        fees = self.fees if self.fees is not None else ZERO
+        costs = self.costs if self.costs is not None else ZERO
+        return fees + costs + self.allocated_capital * (self.fee_assumption + self.slippage_assumption)
 
     @property
     def execution_cost_rate(self) -> Decimal:
@@ -954,7 +1489,7 @@ class RollingEvidence:
 
     @property
     def net_return_rate(self) -> Decimal:
-        if self.allocated_capital <= ZERO:
+        if self.allocated_capital <= ZERO or self.allocated_capital_net_return is None:
             return ZERO
         return self.allocated_capital_net_return / self.allocated_capital
 
@@ -972,9 +1507,8 @@ class RollingEvidence:
     @property
     def actual_coverage(self) -> Decimal:
         return self.actual_coverage_seconds
-
     @property
-    def net_return(self) -> Decimal:
+    def net_return(self) -> Decimal | None:
         return self.allocated_capital_net_return
 
     @property
@@ -1004,12 +1538,57 @@ class RollingEvidence:
             failures.append("source_class")
         if self.available_from is None or self.available_through is None:
             failures.append("available_range")
-        if self.accounting_available is False:
+        if (
+            self.allocated_capital_net_return is None
+            or self.realized_pnl is None
+            or self.unrealized_pnl is None
+            or self.fees is None
+            or self.costs is None
+        ):
             failures.append("accounting_unavailable")
-        if self.accounting_complete is False:
-            failures.append("accounting_incomplete")
-        if self.accounting_partial is True:
-            failures.append("accounting_partial")
+        v2_provenance = (
+            bool(self.evaluation_run_id)
+            or bool(self.evaluation_version)
+            or bool(self.evaluation_kind)
+        )
+        if v2_provenance:
+            # Canonical simulations require both an invocation and a
+            # completion attestation.  Actual ledgers are an independent
+            # observed-accounting path and must never claim evaluator work.
+            if self.evaluation_kind == "CANONICAL_SIMULATION":
+                if self.evaluator_invoked is not True:
+                    failures.append("evaluator_not_invoked")
+                if self.evaluator_completed is not True:
+                    failures.append("evaluator_incomplete")
+            elif self.evaluation_kind == "ACTUAL_LEDGER":
+                if self.evaluator_invoked is not False or self.evaluator_completed is not False:
+                    failures.append("actual_ledger_evaluator_status")
+            else:
+                failures.append("evaluation_kind")
+            if self.accounting_available is not True:
+                failures.append("accounting_unavailable")
+            if self.accounting_complete is not True:
+                failures.append("accounting_incomplete")
+            if self.accounting_partial is not False:
+                failures.append("accounting_partial")
+            accounting = self.portfolio_accounting
+            if not isinstance(accounting, Mapping):
+                failures.append("accounting_fields")
+            else:
+                missing = tuple(
+                    field
+                    for field in (*_V2_ACCOUNTING_MONETARY_FIELDS, *_V2_ACCOUNTING_ACTIVITY_FIELDS)
+                    if field not in accounting or accounting[field] is None
+                )
+                if missing:
+                    failures.append("accounting_fields")
+        else:
+            if self.accounting_available is False:
+                failures.append("accounting_unavailable")
+            if self.accounting_complete is False:
+                failures.append("accounting_incomplete")
+            if self.accounting_partial is True:
+                failures.append("accounting_partial")
         # A record claiming complete accounting must carry both immutable
         # provenance digests.  Legacy rows leave the flags unset and continue
         # through the compatibility path above.
@@ -1017,7 +1596,7 @@ class RollingEvidence:
             failures.append("source_digest")
         if self.accounting_available is True and not self.accounting_digest:
             failures.append("accounting_digest")
-        return tuple(failures)
+        return tuple(dict.fromkeys(failures))
 
     def score(self, policy: RollingAdmissionPolicy, *, overlap_penalty: Decimal = ZERO) -> Decimal:
         penalty = _nonnegative(overlap_penalty, "overlap_penalty", default=ZERO)
@@ -1069,6 +1648,23 @@ class RollingEvidence:
             "requested_rows": self.requested_rows,
             "available_rows": self.available_rows,
             "evaluated_rows": self.evaluated_rows,
+            "evaluation_run_id": self.evaluation_run_id,
+            "evaluation_version": self.evaluation_version,
+            "evaluation_kind": self.evaluation_kind,
+            "supersedes_evidence_id": self.supersedes_evidence_id,
+            "loaded_rows": self.loaded_rows,
+            "valid_input_rows": self.valid_input_rows,
+            "evaluator_invoked": self.evaluator_invoked,
+            "evaluator_completed": self.evaluator_completed,
+            "evaluated_observations": self.evaluated_observations,
+            "signal_count": self.signal_count,
+            "diagnostic_summary_count": self.diagnostic_summary_count,
+            "evaluator_name": self.evaluator_name,
+            "evaluator_error": self.evaluator_error,
+            "evaluator_prerequisite": self.evaluator_prerequisite,
+            "portfolio_accounting": self.portfolio_accounting,
+            "evaluation": self.evaluation,
+            "metrics": self.metrics,
         })
 
     to_dict = as_dict
@@ -1077,7 +1673,226 @@ class RollingEvidence:
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "RollingEvidence":
         row = _mapping(value, "rolling evidence")
+        evaluation_nested = row.get("evaluation")
+        evaluation_nested = (
+            evaluation_nested if isinstance(evaluation_nested, Mapping) else {}
+        )
+        metrics_nested = row.get("metrics")
+        metrics_nested = metrics_nested if isinstance(metrics_nested, Mapping) else {}
+        metrics_evaluation = metrics_nested.get("evaluation")
+        metrics_evaluation = (
+            metrics_evaluation if isinstance(metrics_evaluation, Mapping) else {}
+        )
+        accounting_sources: list[Mapping[str, Any]] = []
+        row_accounting = row.get("portfolio_accounting")
+        if isinstance(row_accounting, Mapping):
+            accounting_sources.append(row_accounting)
+        metrics_accounting = metrics_nested.get("portfolio_accounting")
+        if isinstance(metrics_accounting, Mapping):
+            accounting_sources.append(metrics_accounting)
+        accounting_nested: Mapping[str, Any] = (
+            accounting_sources[0] if accounting_sources else {}
+        )
+        if len(accounting_sources) > 1:
+            for field_name in {
+                key for source in accounting_sources for key in source
+            }:
+                present = [
+                    source[field_name]
+                    for source in accounting_sources
+                    if field_name in source
+                ]
+                values = [value for value in present if value is not None]
+                if field_name in _V2_ACCOUNTING_STATUS_FIELDS and any(
+                    value is not None and not isinstance(value, bool)
+                    for value in present
+                ):
+                    raise TypeError(f"{field_name} must be bool or None")
+                if (
+                    field_name in _V2_ACCOUNTING_STATUS_FIELDS
+                    and values
+                    and len(values) != len(present)
+                ) or (
+                    len(values) > 1
+                    and any(
+                        not _v2_projection_values_equal(
+                            field_name,
+                            values[0],
+                            candidate,
+                        )
+                        for candidate in values[1:]
+                    )
+                ):
+                    raise ValueError(
+                        "portfolio_accounting projections conflict"
+                    )
 
+            merged_accounting: dict[str, Any] = {}
+            for source in accounting_sources:
+                for field_name, field_value in source.items():
+                    merged_accounting.setdefault(field_name, field_value)
+            accounting_nested = merged_accounting
+
+        def consistent_value(
+            name: str,
+            sources: tuple[Mapping[str, Any], ...],
+            *,
+            reject_mixed_null: bool = False,
+            strict_null_conflict: bool = False,
+            normalize: Any = None,
+        ) -> Any:
+            present = [source[name] for source in sources if name in source]
+            if normalize is not None:
+                present = [normalize(value) for value in present]
+            values = [value for value in present if value is not None]
+            if reject_mixed_null:
+                if any(value is not None and not isinstance(value, bool) for value in present):
+                    raise TypeError(f"{name} must be bool or None")
+            if (reject_mixed_null or strict_null_conflict) and values and len(values) != len(present):
+                raise ValueError(f"{name} conflicts between rolling evidence projections")
+            if len(values) > 1 and any(candidate != values[0] for candidate in values[1:]):
+                raise ValueError(f"{name} conflicts between rolling evidence projections")
+            return values[0] if values else None
+
+        def normalize_immutable_value(name: str, value: Any) -> Any:
+            if name == "evaluation_kind":
+                return _evaluation_kind(value, required=False) or None
+            if name in {
+                "evaluation_run_id",
+                "evaluation_version",
+                "supersedes_evidence_id",
+            }:
+                return _text(value, name, max_length=256, required=False) or None
+            return value
+
+        def status_value(name: str) -> Any:
+            return consistent_value(
+                name,
+                (row, evaluation_nested, metrics_evaluation, accounting_nested),
+                reject_mixed_null=True,
+            )
+
+        def shared_value(name: str) -> Any:
+            if name in _V2_ACCOUNTING_STATUS_FIELDS:
+                return status_value(name)
+            return consistent_value(
+                name,
+                (row, evaluation_nested, metrics_evaluation),
+                strict_null_conflict=name in _V2_IMMUTABLE_PROJECTION_FIELDS,
+                normalize=(
+                    (lambda value: normalize_immutable_value(name, value))
+                    if name in _V2_IMMUTABLE_PROJECTION_FIELDS
+                    else None
+                ),
+            )
+
+
+        raw_evaluation_kind = shared_value("evaluation_kind")
+        if raw_evaluation_kind is None:
+            # Preserve compatibility for a previously persisted exact PAPER
+            # ledger, but never infer an actual ledger from generic metrics.
+            source_hint = str(row.get("source_class", "")).strip().upper().replace("-", "_")
+            exact_ledger_hint = (
+                source_hint == "PAPER"
+                and isinstance(accounting_nested, Mapping)
+                and any(
+                    row.get(name) is not None
+                    for name in (
+                        "experiment_id",
+                        "paper_experiment_id",
+                        "bet_id",
+                        "resolved_at",
+                        "resolution",
+                    )
+                )
+            )
+            if exact_ledger_hint:
+                raw_evaluation_kind = "ACTUAL_LEDGER"
+
+        def accounting_value(name: str) -> Any:
+            if name in _V2_ACCOUNTING_STATUS_FIELDS:
+                return status_value(name)
+            return consistent_value(
+                name,
+                (row, accounting_nested),
+            )
+
+
+
+        def accounting_metric(name: str, *aliases: str, default: Any = 0) -> Any:
+            saw_null = False
+            for key in (name,) + aliases:
+                if v2_provenance and key in accounting_nested:
+                    # The nested v2 accounting document is canonical.  In
+                    # particular, an explicit null must not be replaced by a
+                    # legacy scalar/SQL compatibility value.
+                    canonical_value = accounting_nested.get(key)
+                    for alias in (name,) + aliases:
+                        if alias == key or alias not in accounting_nested:
+                            continue
+                        alias_value = accounting_nested.get(alias)
+                        if (
+                            canonical_value is not None
+                            and alias_value is not None
+                            and not _v2_projection_values_equal(
+                                name,
+                                canonical_value,
+                                alias_value,
+                            )
+                        ):
+                            raise ValueError(
+                                f"{name} conflicts between rolling evidence projections"
+                            )
+                    return canonical_value
+                if key in row:
+                    if row.get(key) is not None:
+                        return row.get(key)
+                    saw_null = True
+                if key in accounting_nested:
+                    if accounting_nested.get(key) is not None:
+                        return accounting_nested.get(key)
+                    saw_null = True
+            return None if v2_provenance and saw_null else default
+
+        v2_provenance = (
+            bool(shared_value("evaluation_run_id"))
+            or bool(shared_value("evaluation_version"))
+            or bool(raw_evaluation_kind)
+            or bool(shared_value("supersedes_evidence_id"))
+        )
+        if raw_evaluation_kind is None and v2_provenance:
+            raw_evaluation_kind = "CANONICAL_SIMULATION"
+        evaluation_kind = _evaluation_kind(raw_evaluation_kind, required=False) or None
+        accounting_available = accounting_value("accounting_available")
+        accounting_unavailable = v2_provenance and not (
+            accounting_available is True
+            and accounting_value("accounting_complete") is True
+            and accounting_value("accounting_partial") is False
+            and (
+                (
+                    evaluation_kind == "ACTUAL_LEDGER"
+                    and shared_value("evaluator_invoked") is False
+                    and shared_value("evaluator_completed") is False
+                )
+                or (
+                    evaluation_kind == "CANONICAL_SIMULATION"
+                    and shared_value("evaluator_invoked") is True
+                    and shared_value("evaluator_completed") is True
+                )
+            )
+        )
+
+        def monetary_metric(name: str, *aliases: str) -> Any:
+            if accounting_unavailable:
+                return None
+            if v2_provenance and not any(
+                key in accounting_nested for key in (name,) + aliases
+            ):
+                # v2 monetary values are authoritative only in the canonical
+                # accounting document.  A missing nested field is unknown,
+                # even when a legacy scalar compatibility column is present.
+                return None
+            return accounting_metric(name, *aliases, default=None if v2_provenance else 0)
         def assumption_value(raw: Any, *names: str) -> Any:
             if not isinstance(raw, Mapping):
                 return None
@@ -1102,7 +1917,12 @@ class RollingEvidence:
             "slippage_assumptions",
         )
 
-        paper_sizing = row.get("paper_sizing", row.get("paper_size", row.get("allocated_capital", 0)))
+        paper_sizing = accounting_metric(
+            "paper_sizing",
+            "paper_size",
+            "allocated_capital",
+            default=0,
+        )
         nested_sizing = assumption_value(
             sizing_assumptions,
             "paper_sizing",
@@ -1148,28 +1968,63 @@ class RollingEvidence:
             available_through=row.get("available_through"),
             requested_days=row.get("requested_days", row.get("requested_window_days", 7)),
             actual_coverage_seconds=row.get("actual_coverage_seconds", 0),
-            observation_completeness=row.get("observation_completeness", row.get("completeness", 1)),
+            observation_completeness=row.get(
+                "observation_completeness",
+                row.get("completeness", 1),
+            ),
             source_class=row.get("source_class", ""),
             paper_sizing=paper_sizing,
             fee_assumption=fee_assumption,
             slippage_assumption=slippage_assumption,
-            allocated_capital_net_return=row.get("allocated_capital_net_return", row.get("net_return", 0)),
-            realized_pnl=row.get("realized_pnl", 0),
-            unrealized_pnl=row.get("unrealized_pnl", 0),
-            fees=row.get("fees", 0),
-            costs=costs,
-            drawdown=row.get("drawdown", 0),
-            completed_outcomes=row.get("completed_outcomes", row.get("outcomes", 0)),
-            reliability=row.get("reliability", 0),
+            allocated_capital_net_return=monetary_metric(
+                "allocated_capital_net_return",
+                "net_return",
+                "net_pnl",
+            ),
+            realized_pnl=monetary_metric("realized_pnl", "realized_pnl_usd"),
+            unrealized_pnl=monetary_metric("unrealized_pnl"),
+            fees=monetary_metric("fees"),
+            costs=monetary_metric("costs", "slippage_costs"),
+            drawdown=accounting_metric("drawdown", default=0),
+            completed_outcomes=accounting_metric(
+                "completed_outcomes",
+                "completed_round_trips",
+                default=0,
+            ),
+            reliability=accounting_metric("reliability", default=0),
             source_digest=row.get("source_digest"),
             accounting_digest=row.get("accounting_digest"),
-            accounting_available=row.get("accounting_available"),
-            accounting_complete=row.get("accounting_complete"),
-            accounting_partial=row.get("accounting_partial"),
+            accounting_available=accounting_value("accounting_available"),
+            accounting_complete=accounting_value("accounting_complete"),
+            accounting_partial=accounting_value("accounting_partial"),
             requested_rows=row.get("requested_rows"),
             available_rows=row.get("available_rows"),
             evaluated_rows=row.get("evaluated_rows"),
-            execution_feasibility=row.get("execution_feasibility", row.get("execution_feasible")),
+            evaluation_run_id=shared_value("evaluation_run_id"),
+            evaluation_version=shared_value("evaluation_version"),
+            evaluation_kind=evaluation_kind,
+            supersedes_evidence_id=shared_value("supersedes_evidence_id"),
+            loaded_rows=shared_value("loaded_rows"),
+            valid_input_rows=shared_value("valid_input_rows"),
+            evaluator_invoked=shared_value("evaluator_invoked"),
+            evaluator_completed=shared_value("evaluator_completed"),
+            evaluated_observations=shared_value("evaluated_observations"),
+            signal_count=shared_value("signal_count"),
+            diagnostic_summary_count=shared_value("diagnostic_summary_count"),
+            evaluator_name=shared_value("evaluator_name"),
+            evaluator_error=shared_value("evaluator_error"),
+            evaluator_prerequisite=shared_value("evaluator_prerequisite"),
+            portfolio_accounting=accounting_nested,
+            evaluation=(
+                row.get("evaluation")
+                if isinstance(row.get("evaluation"), Mapping)
+                else evaluation_nested
+            ),
+            metrics=row.get("metrics"),
+            execution_feasibility=row.get(
+                "execution_feasibility",
+                row.get("execution_feasible"),
+            ),
             evidence_digest=row.get("evidence_digest", row.get("digest", "")),
             overlap_key=row.get("overlap_key"),
             hard_failure=row.get("hard_failure", False),
@@ -1554,27 +2409,84 @@ def _membership_allocation_signature(
 def _latest_windows(
     evidence: Sequence[RollingEvidence],
 ) -> dict[str, dict[str, dict[int, RollingEvidence]]]:
-    """Keep the newest window per strategy, source class, and duration.
+    """Keep the newest active window per strategy, source class, and duration.
 
     Source classes are part of the evidence identity.  In particular, a 7-day
     HISTORICAL row must never be paired with a 30-day LIVE row merely because
-    they share a strategy version.
+    they share a strategy version.  v2 corrections are append-only: a row
+    identified by ``supersedes_evidence_id`` is no longer an active candidate,
+    even when its availability timestamp would otherwise win the deterministic
+    ordering.
     """
     grouped: dict[str, dict[str, dict[int, RollingEvidence]]] = {}
+    candidates: dict[tuple[str, str, int], list[RollingEvidence]] = {}
+    rows_by_id: dict[str, list[RollingEvidence]] = {}
     for item in evidence:
-        by_source = grouped.setdefault(item.strategy_version_id, {})
-        by_window = by_source.setdefault(item.source_class, {})
-        prior = by_window.get(item.requested_days)
-        if prior is None or (
-            (item.available_through or datetime.min.replace(tzinfo=UTC)),
+        candidates.setdefault(
+            (item.strategy_version_id, item.source_class, item.requested_days),
+            [],
+        ).append(item)
+        rows_by_id.setdefault(item.evidence_window_id, []).append(item)
+
+    minimum_time = datetime.min.replace(tzinfo=UTC)
+
+    def ordering_key(item: RollingEvidence) -> tuple[Any, ...]:
+        return (
+            item.available_through or minimum_time,
             item.evidence_digest,
             item.evidence_window_id,
-        ) > (
-            (prior.available_through or datetime.min.replace(tzinfo=UTC)),
-            prior.evidence_digest,
-            prior.evidence_window_id,
-        ):
-            by_window[item.requested_days] = item
+        )
+
+    def lineage_identity(item: RollingEvidence) -> tuple[Any, ...]:
+        return (
+            item.strategy_version_id,
+            item.source_class,
+            item.requested_days,
+            item.candidate_id,
+            item.research_trial_id,
+        )
+
+    ambiguous_ids = {
+        evidence_id
+        for evidence_id, rows in rows_by_id.items()
+        if len(rows) != 1
+    }
+    for (strategy_version_id, source_class, requested_days), rows in candidates.items():
+        superseded_ids: set[str] = set()
+        invalid_correction_ids: set[str] = set(ambiguous_ids)
+        for item in rows:
+            predecessor_id = item.supersedes_evidence_id
+            if predecessor_id is None:
+                continue
+            predecessors = rows_by_id.get(predecessor_id, ())
+            # A correction is usable only when its predecessor is present and
+            # the complete lineage identity agrees.  Invalid/unavailable
+            # predecessors are retryable input errors: do not admit the
+            # correction and never suppress a valid predecessor.
+            if (
+                len(predecessors) != 1
+                or lineage_identity(item) != lineage_identity(predecessors[0])
+            ):
+                invalid_correction_ids.add(item.evidence_window_id)
+                continue
+            superseded_ids.add(predecessor_id)
+        active_rows = [
+            item
+            for item in rows
+            if item.evidence_window_id not in invalid_correction_ids
+            and item.evidence_window_id not in superseded_ids
+        ]
+        # A valid append-only lineage always has a head.  If malformed
+        # in-memory input forms a cycle, fail closed rather than re-admitting a
+        # record explicitly marked as superseded.
+        if not active_rows:
+            continue
+        selected = max(active_rows, key=ordering_key)
+        by_source = grouped.setdefault(strategy_version_id, {})
+        by_window = by_source.setdefault(source_class, {})
+        prior = by_window.get(requested_days)
+        if prior is None or ordering_key(selected) > ordering_key(prior):
+            by_window[requested_days] = selected
     return grouped
 
 
@@ -1907,6 +2819,43 @@ def evaluate_rolling_selection(
             item.accounting_available is False
             or item.accounting_complete is False
             or item.accounting_partial is True
+            or (
+                (
+                    item.evaluation_run_id is not None
+                    or item.evaluation_version is not None
+                    or item.evaluation_kind is not None
+                    or item.supersedes_evidence_id is not None
+                )
+                and (
+                    item.evaluation_kind not in {"CANONICAL_SIMULATION", "ACTUAL_LEDGER"}
+                    or (
+                        item.evaluation_kind == "CANONICAL_SIMULATION"
+                        and (
+                            item.evaluator_invoked is not True
+                            or item.evaluator_completed is not True
+                        )
+                    )
+                    or (
+                        item.evaluation_kind == "ACTUAL_LEDGER"
+                        and (
+                            item.evaluator_invoked is not False
+                            or item.evaluator_completed is not False
+                        )
+                    )
+                    or item.accounting_available is not True
+                    or item.accounting_complete is not True
+                    or item.accounting_partial is not False
+                    or not isinstance(item.portfolio_accounting, Mapping)
+                    or any(
+                        field not in item.portfolio_accounting
+                        or item.portfolio_accounting[field] is None
+                        for field in (
+                            *_V2_ACCOUNTING_MONETARY_FIELDS,
+                            *_V2_ACCOUNTING_ACTIVITY_FIELDS,
+                        )
+                    )
+                )
+            )
         )
     )
 

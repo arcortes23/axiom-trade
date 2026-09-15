@@ -28,7 +28,7 @@ from axiom.domain import (
 from axiom.metrics import calculate_prediction_metrics
 from axiom.portfolio import OrderRequest, Portfolio
 from axiom.strategy import StrategyDefinition, evaluate_signal, validate_strategy
-from axiom.strategy.signals import evaluate_model_probability_evidence, evaluate_signal_evaluation
+from axiom.strategy.signals import Signal, evaluate_model_probability_evidence, evaluate_signal_evaluation
 from .types import BacktestResult
 
 
@@ -71,11 +71,19 @@ def _nested(item: Any) -> Any:
     return item
 
 
+def _normalize_market_id(value: Any) -> str:
+    return "" if value is None else str(value).strip()
+
+
 def _market_id(item: Any) -> str:
     nested = _nested(item)
     if isinstance(nested, Mapping):
-        return str(nested.get("market_id", item.get("market_id", ""))).strip()
-    return str(getattr(nested, "market_id", getattr(item, "market_id", ""))).strip()
+        value = nested.get("market_id")
+        if value is None and isinstance(item, Mapping):
+            value = item.get("market_id", "")
+    else:
+        value = getattr(nested, "market_id", getattr(item, "market_id", ""))
+    return _normalize_market_id(value)
 
 
 def _observation_timestamp(item: Any) -> datetime | None:
@@ -242,8 +250,13 @@ def _complement_book(book: OrderBookSnapshot) -> OrderBookSnapshot:
     """Legacy compatibility only; explicit replay never calls this."""
     bids = tuple(OrderBookLevel(1.0 - level.price, level.size) for level in book.asks)
     asks = tuple(OrderBookLevel(1.0 - level.price, level.size) for level in book.bids)
-    return OrderBookSnapshot(book.timestamp, bids=bids, asks=asks)
-
+    return OrderBookSnapshot(
+        book.timestamp,
+        bids=bids,
+        asks=asks,
+        token_id=book.token_id,
+        condition_id=book.condition_id,
+    )
 
 def _coerce_book(
     value: Any,
@@ -290,6 +303,7 @@ def _coerce_book(
             bids=bids,
             asks=asks,
             token_id=value.get("token_id"),
+            condition_id=value.get("condition_id", value.get("conditionId")),
         )
     except (TypeError, ValueError):
         return None
@@ -576,9 +590,19 @@ class PredictionMarketBacktester:
             model_source = strategy.get("model_document", strategy.get("model"))
         contracts: dict[str, ResolvedContract] = {}
         if isinstance(resolutions, Mapping):
-            contracts.update(resolutions)
+            contracts.update(
+                {
+                    _normalize_market_id(market_id): contract
+                    for market_id, contract in resolutions.items()
+                }
+            )
         elif resolutions:
-            contracts.update({contract.market_id: contract for contract in resolutions})
+            contracts.update(
+                {
+                    _normalize_market_id(contract.market_id): contract
+                    for contract in resolutions
+                }
+            )
         portfolio = Portfolio(self.initial_cash if initial_cash is None else initial_cash)
         observed_outcomes: dict[str, str] = {}
         curve: list[dict[str, Any]] = []
@@ -587,35 +611,81 @@ class PredictionMarketBacktester:
         proxy_pending: dict[str, list[dict[str, Any]]] = {}
         proxy_fills: list[dict[str, Any]] = []
         market_observation_index: dict[str, int] = {}
+        evaluator_invoked = False
+        evaluator_completed = False
+        evaluated_observations = 0
+        signal_count = 0
+        diagnostic_summary_count = 1 if not rows else 0
+        evaluator_error: str | None = None
         for index, snapshot in enumerate(rows):
             timestamp = _time(snapshot)
-            market_id = str(_value(snapshot, "market_id", ""))
+            market_id = _market_id(snapshot)
             active_snapshot = dict(snapshot) if isinstance(snapshot, Mapping) else snapshot
-            model_evaluation = evaluate_model_probability_evidence(model_source, active_snapshot) if model_source is not None else None
-            if model_evaluation is not None and isinstance(active_snapshot, dict):
-                active_snapshot["model_evaluation"] = model_evaluation.as_record()
-                if model_evaluation.probability is not None and _value(active_snapshot, "model_probability") is None:
-                    active_snapshot["model_probability"] = model_evaluation.probability
+            if isinstance(active_snapshot, dict):
+                active_snapshot["market_id"] = market_id
             market_history = history_by_market.setdefault(market_id, [])
             market_index = market_observation_index.get(market_id, 0)
-            context = {
-                "snapshots": tuple(market_history + [active_snapshot]),
-                "observations": tuple(market_history + [active_snapshot]),
-                "history": tuple(market_history + [active_snapshot]),
-                "market_id": market_id,
-            }
-            if isinstance(active_snapshot, Mapping):
-                context.update(active_snapshot)
-                context["snapshots"] = tuple(market_history + [active_snapshot])
-                context["observations"] = tuple(market_history + [active_snapshot])
-                context["history"] = tuple(market_history + [active_snapshot])
-            if model_evaluation is not None:
-                context["model_evaluation"] = model_evaluation.as_record()
-                if model_evaluation.probability is not None:
-                    context["model_probability"] = model_evaluation.probability
-            if model_source is not None:
-                context["model_document"] = model_source
-            evaluation = evaluate_signal_evaluation(definition, context)
+            model_evaluation = None
+            if evaluator_error is None:
+                evaluator_invoked = True
+                try:
+                    model_evaluation = (
+                        evaluate_model_probability_evidence(model_source, active_snapshot)
+                        if model_source is not None
+                        else None
+                    )
+                    if model_evaluation is not None and isinstance(active_snapshot, dict):
+                        active_snapshot["model_evaluation"] = model_evaluation.as_record()
+                        if (
+                            model_evaluation.probability is not None
+                            and _value(active_snapshot, "model_probability") is None
+                        ):
+                            active_snapshot["model_probability"] = model_evaluation.probability
+                    context = {
+                        "snapshots": tuple(market_history + [active_snapshot]),
+                        "observations": tuple(market_history + [active_snapshot]),
+                        "history": tuple(market_history + [active_snapshot]),
+                        "market_id": market_id,
+                    }
+                    if isinstance(active_snapshot, Mapping):
+                        context.update(active_snapshot)
+                        context["snapshots"] = tuple(market_history + [active_snapshot])
+                        context["observations"] = tuple(market_history + [active_snapshot])
+                        context["history"] = tuple(market_history + [active_snapshot])
+                    if model_evaluation is not None:
+                        context["model_evaluation"] = model_evaluation.as_record()
+                        if model_evaluation.probability is not None:
+                            context["model_probability"] = model_evaluation.probability
+                    if model_source is not None:
+                        context["model_document"] = model_source
+                    evaluation = evaluate_signal_evaluation(definition, context)
+                    evaluator_completed = True
+                    evaluated_observations += 1
+                    if abs(float(evaluation.score)) > 1e-12:
+                        signal_count += 1
+                except Exception as exc:
+                    evaluator_completed = False
+                    evaluator_error = str(exc) or type(exc).__name__
+                    evaluated_observations = 0
+                    signal_count = 0
+                    diagnostic_summary_count = 1
+                    evaluation = Signal(
+                        definition.family,
+                        0.0,
+                        "flat",
+                        definition.market_type.value,
+                        "EVALUATOR_ERROR",
+                        {"error": evaluator_error},
+                    )
+            else:
+                evaluation = Signal(
+                    definition.family,
+                    0.0,
+                    "flat",
+                    definition.market_type.value,
+                    "EVALUATOR_ERROR",
+                    {"error": evaluator_error},
+                )
             score = evaluation.score
             history_by_market[market_id].append(active_snapshot)
             # Explicit resolutions and snapshot settlement become observable
@@ -654,6 +724,91 @@ class PredictionMarketBacktester:
                 else state
             )
             proxy_executed = False
+            closed_now = False
+            executed_exit_book: OrderBookSnapshot | None = None
+            executed_exit_outcome: str | None = None
+            if mode is PredictionResearchMode.RECORDED_BOOK_REPLAY:
+                pending_for_market = proxy_pending.get(market_id, [])
+                remaining_pending: list[dict[str, Any]] = []
+                for pending in pending_for_market:
+                    if market_index < pending["due_observation_index"]:
+                        remaining_pending.append(pending)
+                        continue
+                    if resolved_now:
+                        continue
+                    position = portfolio.get_position(market_id, outcome=pending["outcome"])
+                    quantity = position.quantity if position is not None else 0.0
+                    if quantity <= 1e-12:
+                        continue
+                    pending_book = _coerce_book(
+                        _raw_book(snapshot, pending["outcome"]),
+                        timestamp,
+                        require_timestamp=True,
+                    )
+                    if pending_book is None or not pending_book.bids:
+                        pending["gap_observations"] += 1
+                        pending["due_observation_index"] = market_index + 1
+                        remaining_pending.append(pending)
+                        continue
+                    raw_exit_vwap, _ = pending_book.executable_price(Side.SELL, quantity)
+                    fill = portfolio.execute_order(
+                        OrderRequest(
+                            symbol=market_id,
+                            side=Side.SELL,
+                            quantity=quantity,
+                            market_type=MarketType.PREDICTION,
+                            strategy_id=definition.id,
+                            market_id=market_id,
+                            outcome=pending["outcome"],
+                            expected_probability=None,
+                        ),
+                        timestamp=timestamp,
+                        order_book=pending_book,
+                        fee_bps=self.fee_bps,
+                        slippage_bps=self.slippage_bps,
+                        metadata={
+                            "evaluation_reason": pending["reason_code"],
+                            "evaluation_evidence": dict(pending["evidence"]),
+                            "research_mode": mode.value,
+                            "execution_kind": "exit",
+                            "decision_timestamp": pending["decision_timestamp"],
+                            "execution_timestamp": timestamp.isoformat(),
+                            "decision_source_snapshot_id": pending.get("decision_source_snapshot_id"),
+                            "execution_source_snapshot_id": _value(
+                                snapshot,
+                                "source_snapshot_id",
+                                _value(snapshot, "snapshot_id"),
+                            ),
+                            "decision_observation_index": pending["decision_observation_index"],
+                            "execution_observation_index": market_index,
+                            "quote_gap_observations": pending["gap_observations"],
+                            "raw_execution_price": raw_exit_vwap,
+                            "assumption_version": RECORDED_BOOK_REPLAY_ASSUMPTIONS_VERSION,
+                            "exit_policy": dict(normalized_exit_policy),
+                            "holding_period": holding_period,
+                        },
+                    )
+                    if fill is None:
+                        pending["gap_observations"] += 1
+                        pending["due_observation_index"] = market_index + 1
+                        remaining_pending.append(pending)
+                        continue
+                    closed_now = True
+                    executed_exit_book = pending_book
+                    executed_exit_outcome = str(pending["outcome"])
+                    remaining_quantity = (
+                        portfolio.get_position(market_id, outcome=pending["outcome"]).quantity
+                        if portfolio.get_position(market_id, outcome=pending["outcome"]) is not None
+                        else 0.0
+                    )
+                    if remaining_quantity > 1e-12:
+                        pending["due_observation_index"] = market_index + 1
+                        pending["gap_observations"] = 0
+                        remaining_pending.append(pending)
+                if remaining_pending:
+                    proxy_pending[market_id] = remaining_pending
+                else:
+                    proxy_pending.pop(market_id, None)
             if mode is PredictionResearchMode.PRICE_PROXY_RESEARCH:
                 pending_for_market = proxy_pending.get(market_id, [])
                 remaining_pending: list[dict[str, Any]] = []
@@ -696,7 +851,11 @@ class PredictionMarketBacktester:
                             strategy_id=definition.id,
                             market_id=market_id,
                             outcome=pending["outcome"],
-                            expected_probability=pending.get("trade_probability"),
+                            expected_probability=(
+                                pending.get("trade_probability")
+                                if pending["kind"] == "entry"
+                                else None
+                            ),
                         ),
                         timestamp=timestamp,
                         price=quote,
@@ -727,6 +886,10 @@ class PredictionMarketBacktester:
                             "price_path_status": pending["price_path_status"],
                         },
                     )
+                    if fill is None:
+                        pending["gap_observations"] += 1
+                        remaining_pending.append(pending)
+                        continue
                     proxy_executed = True
                     proxy_fills.append(
                         {
@@ -764,6 +927,16 @@ class PredictionMarketBacktester:
                                 "gap_observations": 0,
                             }
                         )
+                    else:
+                        remaining_quantity = (
+                            portfolio.get_position(market_id, outcome=pending["outcome"]).quantity
+                            if portfolio.get_position(market_id, outcome=pending["outcome"]) is not None
+                            else 0.0
+                        )
+                        if remaining_quantity > 1e-12:
+                            pending["due_observation_index"] = market_index + 1
+                            pending["gap_observations"] = 0
+                            remaining_pending.append(pending)
                 if remaining_pending:
                     proxy_pending[market_id] = remaining_pending
                 else:
@@ -808,18 +981,36 @@ class PredictionMarketBacktester:
                     order_book = None
                 if order_book is not None and order_book.best_ask is not None:
                     ask = order_book.best_ask
+            has_pending_exit = (
+                mode is PredictionResearchMode.RECORDED_BOOK_REPLAY
+                and any(
+                    pending.get("kind") == "exit"
+                    for pending in proxy_pending.get(market_id, ())
+                )
+            )
             if (
                 mode is not PredictionResearchMode.PRICE_PROXY_RESEARCH
                 and not resolved_now
+                and not closed_now
+                and not has_pending_exit
                 and effective_state not in {SettlementState.VOID, SettlementState.UNKNOWN, "void", "unknown", SettlementState.RESOLVED_YES, SettlementState.RESOLVED_NO, "resolved_yes", "resolved_no"}
                 and score != 0
                 and market_id
                 and ask > 0
             ):
+                has_active_position = (
+                    current is not None
+                    and current_quantity > 1e-12
+                    and (current.outcome or "yes") == outcome
+                )
                 desired = max(0.0, portfolio.cash) * max(0.0, min(1.0, self.allocation)) * min(1.0, abs(score)) / ask
-                delta = desired - (current_quantity if (current and (current.outcome or "yes") == outcome) else 0.0)
+                delta = (
+                    0.0
+                    if mode is PredictionResearchMode.RECORDED_BOOK_REPLAY and has_active_position
+                    else max(0.0, desired - current_quantity)
+                )
                 if delta > 1e-12:
-                    portfolio.execute_order(
+                    entry_fill = portfolio.execute_order(
                         OrderRequest(
                             symbol=market_id,
                             side=Side.BUY,
@@ -839,13 +1030,15 @@ class PredictionMarketBacktester:
                             "evaluation_reason": evaluation.reason_code,
                             "evaluation_evidence": dict(evaluation.evidence),
                             "research_mode": mode.value if mode is not None else "LEGACY",
+                            "execution_kind": "entry",
+                            "decision_timestamp": timestamp.isoformat(),
+                            "execution_timestamp": timestamp.isoformat(),
+                            "decision_observation_index": market_index,
+                            "execution_observation_index": market_index,
+                            "holding_observations": 0,
                             "raw_execution_price": ask if mode is not None else None,
                             "assumed_execution_price": (
-                                ask
-                                * (
-                                    1.0
-                                    + self.slippage_bps / 10_000.0
-                                )
+                                ask * (1.0 + self.slippage_bps / 10_000.0)
                                 if mode is not None
                                 else None
                             ),
@@ -858,8 +1051,50 @@ class PredictionMarketBacktester:
                                 if mode is PredictionResearchMode.PRICE_PROXY_RESEARCH
                                 else None
                             ),
+                            "exit_policy": (
+                                dict(normalized_exit_policy)
+                                if isinstance(normalized_exit_policy, Mapping)
+                                else normalized_exit_policy
+                            ),
+                            "holding_period": holding_period if mode is not None else None,
                         },
                     )
+                    if (
+                        entry_fill is not None
+                        and mode is PredictionResearchMode.RECORDED_BOOK_REPLAY
+                    ):
+                        if isinstance(entry_fill.metadata, dict):
+                            entry_fill.metadata.update(
+                                {
+                                    "raw_execution_price": entry_fill.metadata.get(
+                                        "reference_price",
+                                        entry_fill.price,
+                                    ),
+                                    "assumed_execution_price": entry_fill.price,
+                                }
+                            )
+                        proxy_pending.setdefault(market_id, []).append(
+                            {
+                                "market_id": market_id,
+                                "outcome": outcome,
+                                "side": Side.SELL,
+                                "kind": "exit",
+                                "score": score,
+                                "trade_probability": trade_probability,
+                                "reason_code": evaluation.reason_code,
+                                "evidence": dict(evaluation.evidence),
+                                "due_observation_index": market_index + holding_period,
+                                "decision_observation_index": market_index,
+                                "decision_timestamp": timestamp.isoformat(),
+                                "decision_source_snapshot_id": _value(
+                                    snapshot,
+                                    "source_snapshot_id",
+                                    _value(snapshot, "snapshot_id"),
+                                ),
+                                "price_path_status": None,
+                                "gap_observations": 0,
+                            }
+                        )
             if (
                 mode is PredictionResearchMode.PRICE_PROXY_RESEARCH
                 and not proxy_executed
@@ -906,11 +1141,32 @@ class PredictionMarketBacktester:
                     prices[market_id] = yes_mid
                 if no_mid is not None:
                     prices[f"{market_id}|no"] = no_mid
+                if mode is PredictionResearchMode.RECORDED_BOOK_REPLAY:
+                    for book_outcome, book_key in (("yes", market_id), ("no", f"{market_id}|no")):
+                        if book_key in prices:
+                            continue
+                        book = _coerce_book(
+                            _raw_book(snapshot, book_outcome),
+                            timestamp,
+                            require_timestamp=True,
+                        )
+                        if book is None:
+                            continue
+                        mark = (
+                            (book.best_bid + book.best_ask) / 2.0
+                            if book.best_bid is not None and book.best_ask is not None
+                            else book.best_bid if book.best_bid is not None
+                            else book.best_ask
+                        )
+                        if mark is not None and mark > 0:
+                            prices[book_key] = mark
             equity = portfolio.equity(prices)
             quality = SimulationQuality.HIGH if _number(snapshot, "liquidity", 0.0) > 0 and (
                 (_probability(snapshot, "yes_bid", 0.0) > 0 and _probability(snapshot, "yes_ask", 0.0) > 0)
                 or (_probability(snapshot, "no_bid", 0.0) > 0 and _probability(snapshot, "no_ask", 0.0) > 0)
             ) else SimulationQuality.MEDIUM
+            evidence_book = executed_exit_book if executed_exit_book is not None else order_book
+            evidence_outcome = executed_exit_outcome if executed_exit_outcome is not None else outcome
             labels.append(quality)
             curve.append(
                 {
@@ -948,9 +1204,16 @@ class PredictionMarketBacktester:
                     "execution_evidence": (
                         {
                             "raw_book_observed": mode is PredictionResearchMode.RECORDED_BOOK_REPLAY
-                            and order_book is not None,
-                            "book_timestamp": order_book.timestamp.isoformat()
-                            if order_book is not None
+                            and evidence_book is not None,
+                            "book_timestamp": evidence_book.timestamp.isoformat()
+                            if evidence_book is not None
+                            else None,
+                            "outcome": evidence_outcome,
+                            "book_token_id": evidence_book.token_id
+                            if evidence_book is not None
+                            else None,
+                            "book_condition_id": evidence_book.condition_id
+                            if evidence_book is not None
                             else None,
                             "depth": _value(snapshot, "depth", _value(snapshot, "order_book_depth")),
                             "delay": _value(snapshot, "delay", _value(snapshot, "response_delay_seconds")),
@@ -970,25 +1233,56 @@ class PredictionMarketBacktester:
             )
             market_observation_index[market_id] = market_index + 1
         outcomes = dict(observed_outcomes)
-        probability_records: list[dict[str, float | None]] = []
+        probability_records: list[dict[str, float | None | str]] = []
         for fill in portfolio.fills:
-            terminal = outcomes.get(fill.market_id or fill.symbol)
-            if fill.expected_probability is None or terminal not in {
-                SettlementState.RESOLVED_YES.value,
-                SettlementState.RESOLVED_NO.value,
-            }:
+            terminal = outcomes.get(_normalize_market_id(fill.market_id or fill.symbol))
+            execution_kind = fill.metadata.get("execution_kind")
+            is_entry = (
+                str(execution_kind).strip().lower() == "entry"
+                if execution_kind is not None
+                else fill.side is Side.BUY
+            )
+            if (
+                fill.expected_probability is None
+                or not is_entry
+                or terminal not in {
+                    SettlementState.RESOLVED_YES.value,
+                    SettlementState.RESOLVED_NO.value,
+                }
+            ):
                 continue
             traded_outcome = str(fill.metadata.get("outcome", "yes")).lower()
             outcome_value = 1.0 if terminal == SettlementState.RESOLVED_YES.value else 0.0
             if traded_outcome == "no":
                 outcome_value = 1.0 - outcome_value
-            probability_records.append({"probability": fill.expected_probability, "outcome": outcome_value})
+            probability_records.append(
+                {
+                    "probability": fill.expected_probability,
+                    "outcome": outcome_value,
+                    "execution_kind": "entry",
+                }
+            )
         unresolved = tuple(sorted({position.market_id or position.symbol for position in portfolio.positions.values() if position.market_type is MarketType.PREDICTION and position.quantity}))
         metrics = calculate_prediction_metrics(
             curve,
             fills=portfolio.fills,
             probabilities=probability_records,
             initial_equity=portfolio.initial_cash,
+            portfolio=portfolio,
+            evaluation={
+                "evaluator_invoked": evaluator_invoked,
+                "evaluator_completed": evaluator_completed,
+                "evaluated_observations": evaluated_observations,
+                "signal_count": signal_count,
+                "diagnostic_summary_count": diagnostic_summary_count,
+                "evaluator_name": (
+                    CANONICAL_EVALUATOR_VERSION
+                    if evaluator_completed
+                    else None
+                ),
+                "evaluator_error": evaluator_error,
+                "evaluator_prerequisite": None,
+            },
         )
         if mode is PredictionResearchMode.PRICE_PROXY_RESEARCH:
             resolved_quality = ResearchQuality.PRICE_PROXY
@@ -1029,7 +1323,12 @@ class PredictionMarketBacktester:
         observation_horizon: Mapping[str, Any] | int | None = None,
         exit_policy: str | Mapping[str, Any] = "fixed_holding_period",
     ) -> BacktestResult:
-        """Evaluate using one explicit evidence mode and the canonical evaluator."""
+        """Evaluate with explicit evidence when ``mode`` is provided.
+
+        Omitting ``mode`` preserves the historical public class behavior and
+        routes through the legacy compatibility path.  The standalone
+        ``run_prediction_research_mode`` entry point remains explicit-only.
+        """
         if mode is not None and research_mode is not None and _mode(mode) is not _mode(research_mode):
             raise ValueError("mode and research_mode disagree")
         resolved_mode = _mode(mode if mode is not None else research_mode)
@@ -1072,9 +1371,14 @@ def run_prediction_research_mode(
     observation_horizon: Mapping[str, Any] | int | None = None,
     exit_policy: str | Mapping[str, Any] = "fixed_holding_period",
 ) -> BacktestResult:
-    """Stable orchestration entry point used by autonomous research."""
+    """Stable orchestration entry point used by autonomous research.
+
+    ``mode`` is required here; callers needing historical compatibility
+    should use ``PredictionMarketBacktester.run`` without a mode.
+    """
     resolved = _mode(mode)
-    assert resolved is not None
+    if resolved is None:
+        raise ValueError("prediction research mode is required")
     return PredictionMarketBacktester(
         initial_cash=initial_cash,
         fee_bps=fee_bps,

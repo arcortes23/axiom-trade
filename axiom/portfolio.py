@@ -100,6 +100,8 @@ class OrderState:
 
     @property
     def remaining_quantity(self) -> float:
+        if self.status.strip().lower() in {"cancelled", "canceled", "rejected"}:
+            return 0.0
         return max(0.0, self.requested_quantity - self.filled_quantity)
 
 
@@ -124,22 +126,160 @@ class Portfolio:
         self.total_slippage = 0.0
         self._settled_markets: set[str] = set()
     @staticmethod
-    def _position_key(symbol: str, market_type: MarketType, outcome: str | None) -> str:
+    def _normalize_market_id(market_id: object | None) -> str | None:
+        if market_id is None:
+            return None
+        normalized = str(market_id).strip()
+        return normalized or None
+
+    @classmethod
+    def _market_identity(cls, market_id: object | None, symbol: object) -> str:
+        return cls._normalize_market_id(market_id) or str(symbol).strip()
+
+    @classmethod
+    def _position_key(
+        cls,
+        symbol: str,
+        market_type: MarketType,
+        outcome: str | None,
+        *,
+        market_id: object | None = None,
+    ) -> str:
         if market_type is MarketType.PREDICTION:
             normalized = (outcome or "yes").lower()
             if normalized not in {"yes", "no"}:
                 raise ValueError("prediction position outcome must be yes or no")
-            return f"{symbol}|{normalized}"
+            return f"{cls._market_identity(market_id, symbol)}|{normalized}"
         return symbol
 
-    def get_position(self, symbol: str, *, outcome: str | None = None) -> Position | None:
+    def get_position(
+        self,
+        symbol: str,
+        *,
+        outcome: str | None = None,
+        market_id: object | None = None,
+    ) -> Position | None:
+        normalized_market_id = self._normalize_market_id(market_id)
+        if normalized_market_id is not None:
+            normalized_outcome = (outcome or "yes").lower()
+            key = self._position_key(
+                symbol,
+                MarketType.PREDICTION,
+                normalized_outcome,
+                market_id=normalized_market_id,
+            )
+            direct = self.positions.get(key)
+            if direct is not None:
+                return direct
+            requested_symbol = str(symbol).strip()
+            matches = [
+                position
+                for position in self.positions.values()
+                if position.market_type is MarketType.PREDICTION
+                and self._normalize_market_id(position.market_id) == normalized_market_id
+                and str(position.symbol).strip() == requested_symbol
+                and (position.outcome or "yes").lower() == normalized_outcome
+            ]
+            if len(matches) > 1:
+                raise ValueError("ambiguous prediction position for market")
+            return matches[0] if matches else None
         if outcome is not None:
-            return self.positions.get(self._position_key(symbol, MarketType.PREDICTION, outcome))
+            key = self._position_key(symbol, MarketType.PREDICTION, outcome)
+            direct = self.positions.get(key)
+            identity = self._market_identity(None, symbol)
+            requested_symbol = str(symbol).strip()
+            normalized_outcome = (outcome or "yes").lower()
+            matches = [
+                position
+                for position in self.positions.values()
+                if position.market_type is MarketType.PREDICTION
+                and (position.outcome or "yes").lower() == normalized_outcome
+                and (
+                    self._market_identity(position.market_id, position.symbol) == identity
+                    or str(position.symbol).strip() == requested_symbol
+                )
+            ]
+            if direct is not None and direct not in matches:
+                matches.insert(0, direct)
+            identities = {
+                self._market_identity(position.market_id, position.symbol)
+                for position in matches
+            }
+            if len(identities) > 1:
+                raise ValueError("ambiguous prediction position for symbol")
+            return matches[0] if matches else None
         direct = self.positions.get(symbol)
         if direct is not None:
             return direct
         prefix = f"{symbol}|"
-        return next((position for key, position in self.positions.items() if key.startswith(prefix)), None)
+        prefix_matches = [
+            position
+            for key, position in self.positions.items()
+            if key.startswith(prefix)
+        ]
+        if prefix_matches:
+            identities = {
+                self._market_identity(position.market_id, position.symbol)
+                for position in prefix_matches
+            }
+            if len(identities) > 1:
+                raise ValueError("ambiguous prediction position for symbol")
+            return prefix_matches[0]
+        identity = self._market_identity(None, symbol)
+        requested_symbol = str(symbol).strip()
+        matches = [
+            position
+            for position in self.positions.values()
+            if position.market_type is MarketType.PREDICTION
+            and (
+                self._market_identity(position.market_id, position.symbol) == identity
+                or str(position.symbol).strip() == requested_symbol
+            )
+        ]
+        identities = {
+            self._market_identity(position.market_id, position.symbol)
+            for position in matches
+        }
+        if len(identities) > 1:
+            raise ValueError("ambiguous prediction position for symbol")
+        return matches[0] if matches else None
+
+    def _resolve_prediction_market_id(
+        self,
+        symbol: str,
+        market_id: object | None,
+        outcome: str | None,
+    ) -> str:
+        normalized_market_id = self._normalize_market_id(market_id)
+        if normalized_market_id is not None:
+            return normalized_market_id
+        requested_symbol = str(symbol).strip()
+        identity = self._market_identity(None, symbol)
+        normalized_outcome = (
+            str(outcome).strip().lower() if outcome is not None else None
+        )
+        matches = [
+            position
+            for position in self.positions.values()
+            if position.market_type is MarketType.PREDICTION
+            and (
+                normalized_outcome is None
+                or (position.outcome or "yes").lower() == normalized_outcome
+            )
+            and (
+                self._market_identity(position.market_id, position.symbol) == identity
+                or str(position.symbol).strip() == requested_symbol
+            )
+        ]
+        candidate_market_ids = {
+            self._market_identity(position.market_id, position.symbol)
+            for position in matches
+        }
+        if len(candidate_market_ids) > 1:
+            raise ValueError("ambiguous prediction position for symbol")
+        if candidate_market_ids:
+            return next(iter(candidate_market_ids))
+        return identity
 
     def submit_order(self, request: OrderRequest, *, order_id: str | None = None) -> OrderState:
         if request.quantity <= 0 or not math.isfinite(request.quantity):
@@ -151,9 +291,29 @@ class Portfolio:
             if existing.status == "cancelled":
                 raise ValueError("cannot reopen a cancelled order")
             return existing
+        market_id = (
+            self._resolve_prediction_market_id(request.symbol, request.market_id, request.outcome)
+            if request.market_type is MarketType.PREDICTION
+            else self._market_identity(request.market_id, request.symbol)
+        )
+        if (
+            request.market_type is MarketType.PREDICTION
+            and request.side is Side.BUY
+            and self.is_settled(market_id)
+        ):
+            raise ValueError("cannot buy a settled prediction market")
         order = OrderState(request=request, order_id=order_id or uuid4().hex, requested_quantity=float(request.quantity))
         self.orders[order.order_id] = order
         return order
+
+    def is_settled(self, market_id: object) -> bool:
+        """Return whether a prediction market has reached terminal settlement."""
+        normalized = self._normalize_market_id(market_id)
+        return normalized is not None and normalized in self._settled_markets
+
+    settled = is_settled
+
+
 
     def cancel_order(self, order_id: str) -> bool:
         order = self.orders.get(order_id)
@@ -175,11 +335,36 @@ class Portfolio:
             or fill.slippage < 0
         ):
             raise ValueError("fill fees and slippage must be finite and non-negative")
+        normalized_fill_market_id = self._normalize_market_id(fill.market_id)
         outcome = str(fill.metadata.get("outcome", "")).lower() or None
-        key = self._position_key(fill.symbol, fill.market_type, outcome)
-        position = self.positions.get(key)
+        position: Position | None = None
+        if fill.market_type is MarketType.PREDICTION:
+            market_id = self._resolve_prediction_market_id(
+                fill.symbol,
+                normalized_fill_market_id,
+                outcome,
+            )
+        else:
+            market_id = self._market_identity(fill.market_id, fill.symbol)
+        position_market_id = (
+            market_id if fill.market_type is MarketType.PREDICTION else normalized_fill_market_id
+        )
+        if (
+            fill.market_type is MarketType.PREDICTION
+            and fill.side is Side.BUY
+            and self.is_settled(market_id)
+        ):
+            raise ValueError("cannot buy a settled prediction market")
+        key = self._position_key(
+            fill.symbol,
+            fill.market_type,
+            outcome,
+            market_id=market_id if fill.market_type is MarketType.PREDICTION else None,
+        )
         if position is None:
-            position = Position(fill.symbol, fill.market_type, market_id=fill.market_id, outcome=outcome)
+            position = self.positions.get(key)
+        if position is None:
+            position = Position(fill.symbol, fill.market_type, market_id=position_market_id, outcome=outcome)
         if fill.side is Side.SELL and fill.quantity > max(0.0, position.quantity) + 1e-12:
             raise ValueError("cannot sell more than the available position")
         if fill.side is Side.BUY and self.cash + 1e-9 < fill.quantity * fill.price + fill.fees:
@@ -201,7 +386,7 @@ class Portfolio:
         position.quantity += signed
         if abs(position.quantity) <= 1e-12:
             position.quantity = 0.0
-        position.market_id = fill.market_id or position.market_id
+        position.market_id = position_market_id or position.market_id
         position.outcome = outcome or position.outcome
         position.fees += fill.fees
         self.cash -= signed * fill.price + fill.fees
@@ -239,19 +424,50 @@ class Portfolio:
         ):
             raise ValueError("available_quantity must be finite and non-negative")
         existing_order = order_id is not None and order_id in self.orders
+        normalized_request_market_id = self._normalize_market_id(request.market_id)
+        market_id = (
+            self._resolve_prediction_market_id(
+                request.symbol,
+                normalized_request_market_id,
+                request.outcome,
+            )
+            if request.market_type is MarketType.PREDICTION
+            else self._market_identity(normalized_request_market_id, request.symbol)
+        )
+        settled_buy = (
+            request.market_type is MarketType.PREDICTION
+            and request.side is Side.BUY
+            and self.is_settled(market_id)
+        )
+        if settled_buy and not existing_order:
+            return None
         order = self.submit_order(request, order_id=order_id)
+        if settled_buy:
+            if order.status.strip().lower() not in {"filled", "cancelled", "canceled", "rejected"}:
+                order.status = "cancelled"
+            return None
         requested_quantity = order.remaining_quantity if existing_order else request.quantity
         quantity = min(requested_quantity, available_quantity) if available_quantity is not None else requested_quantity
         if request.side is Side.SELL:
             position = self.get_position(
                 request.symbol,
-                outcome=request.outcome if request.market_type is MarketType.PREDICTION else None,
+                outcome=(
+                    request.outcome or "yes"
+                    if request.market_type is MarketType.PREDICTION
+                    else None
+                ),
+                market_id=(
+                    normalized_request_market_id
+                    if request.market_type is MarketType.PREDICTION
+                    else None
+                ),
             )
             quantity = min(quantity, max(0.0, position.quantity if position is not None else 0.0))
         if quantity <= 0:
             if order.remaining_quantity > 1e-12:
                 order.status = "cancelled"
             return None
+        requested_fill_quantity = requested_quantity
         filled = quantity
         slippage_factor = 1.0 + (slippage_bps / 10_000.0) * (1 if request.side is Side.BUY else -1)
         limit_price = request.limit_price if request.order_type is OrderType.LIMIT else None
@@ -326,6 +542,8 @@ class Portfolio:
                     order.status = "cancelled"
                     return None
         extra = dict(metadata or {})
+        extra.setdefault("requested_quantity", requested_fill_quantity)
+        extra.setdefault("partial_fill", filled + 1e-12 < requested_fill_quantity)
         extra.setdefault("reference_price", base_price)
         if order_book is not None:
             best = order_book.best_ask if request.side is Side.BUY else order_book.best_bid
@@ -340,7 +558,8 @@ class Portfolio:
             symbol=request.symbol, side=request.side, quantity=filled, price=executed_price,
             fees=abs(executed_price * filled) * max(0.0, fee_bps) / 10_000.0,
             slippage=abs(executed_price - base_price), strategy_id=request.strategy_id,
-            order_id=order.order_id, market_id=request.market_id,
+            order_id=order.order_id,
+            market_id=market_id if request.market_type is MarketType.PREDICTION else request.market_id,
             expected_probability=request.expected_probability,
             executable_probability=executed_price if request.market_type is MarketType.PREDICTION else None,
             metadata=extra,
@@ -352,7 +571,13 @@ class Portfolio:
         for key, position in self.positions.items():
             if position.quantity == 0:
                 continue
-            value = prices.get(key, prices.get(position.symbol))
+            value = prices.get(key)
+            if value is None and position.market_type is MarketType.PREDICTION:
+                normalized_market_id = self._normalize_market_id(position.market_id)
+                if normalized_market_id is not None:
+                    value = prices.get(normalized_market_id)
+            if value is None:
+                value = prices.get(position.symbol)
             if isinstance(value, PredictionMarketSnapshot):
                 value = value.no_mid if (position.outcome or "yes").lower() == "no" else value.yes_mid
             if value is not None:
@@ -361,28 +586,35 @@ class Portfolio:
 
     def resolve(self, contract: ResolvedContract) -> float:
         """Settle prediction positions once at binary payout or void refund."""
-        if contract.market_id in self._settled_markets:
+        market_id = self._normalize_market_id(contract.market_id)
+        if market_id is None or market_id in self._settled_markets:
             return 0.0
         if contract.outcome is SettlementState.UNKNOWN:
             return 0.0
         if contract.outcome is SettlementState.VOID:
             refund_total = 0.0
             for position in self.positions.values():
-                if position.market_type is not MarketType.PREDICTION or (position.market_id or position.symbol) != contract.market_id:
+                if (
+                    position.market_type is not MarketType.PREDICTION
+                    or self._market_identity(position.market_id, position.symbol) != market_id
+                ):
                     continue
                 refund = position.quantity * position.average_price
                 self.cash += refund
                 refund_total += refund
                 position.quantity = 0.0
                 position.last_price = 0.0
-            self._settled_markets.add(contract.market_id)
+            self._settled_markets.add(market_id)
             return refund_total
         winning = "yes" if contract.outcome is SettlementState.RESOLVED_YES else "no" if contract.outcome is SettlementState.RESOLVED_NO else None
         if winning is None:
             return 0.0
         payout_total = 0.0
         for position in self.positions.values():
-            if position.market_type is not MarketType.PREDICTION or (position.market_id or position.symbol) != contract.market_id:
+            if (
+                position.market_type is not MarketType.PREDICTION
+                or self._market_identity(position.market_id, position.symbol) != market_id
+            ):
                 continue
             payout = position.quantity * (1.0 if (position.outcome or "yes").lower() == winning else 0.0)
             position.realized_pnl += payout - position.quantity * position.average_price
@@ -390,7 +622,7 @@ class Portfolio:
             payout_total += payout
             position.quantity = 0.0
             position.last_price = 0.0
-        self._settled_markets.add(contract.market_id)
+        self._settled_markets.add(market_id)
         return payout_total
 
     settle = resolve
@@ -401,6 +633,10 @@ class Portfolio:
             value = position.last_price
             if prices is not None:
                 raw = prices.get(key)
+                if raw is None and position.market_type is MarketType.PREDICTION:
+                    normalized_market_id = self._normalize_market_id(position.market_id)
+                    if normalized_market_id is not None:
+                        raw = prices.get(normalized_market_id)
                 if raw is None:
                     raw = prices.get(position.symbol)
                 if isinstance(raw, PredictionMarketSnapshot):

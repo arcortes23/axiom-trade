@@ -12,7 +12,7 @@ class BacktestResult:
     equity_curve: tuple[dict[str, Any], ...]
     fills: tuple[Fill, ...]
     quality: SimulationQuality
-    metrics: dict[str, float] = field(default_factory=dict)
+    metrics: dict[str, Any] = field(default_factory=dict)
     unresolved: tuple[str, ...] = ()
     outcomes: dict[str, str] = field(default_factory=dict)
     quality_labels: tuple[SimulationQuality, ...] = ()

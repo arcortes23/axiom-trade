@@ -205,6 +205,9 @@ _CAMPAIGN_TRIAL_TERMINAL = frozenset(
         "FINAL_ASSESSMENT",
     }
 )
+_ROLLING_DIAGNOSTIC_LIMIT = 64
+_ROLLING_DIAGNOSTIC_STRING_LENGTH = 512
+
 
 
 def _pagination_params(query: Mapping[str, Any] | None = None) -> dict[str, Any]:
@@ -2634,6 +2637,210 @@ class DashboardData:
                 ]
             return rows[-max(0, limit):]
 
+        def hydrate_exact_evidence_row(row: Any) -> Mapping[str, Any]:
+            """Project a raw SQL row like ``list_strategy_evidence_windows``.
+
+            The exact lookup deliberately bypasses the bounded catalogue
+            loader.  Keep its JSON columns on the same parsed/flattened shape
+            as storage rows before the identity checks below, while retaining
+            a fail-closed marker for malformed documents.
+            """
+            if isinstance(row, Mapping):
+                raw = dict(row)
+            else:
+                try:
+                    keys = row.keys()
+                    raw = {key: row[key] for key in keys}
+                except Exception:
+                    return {}
+
+            json_columns = frozenset(
+                {
+                    "payload_json",
+                    "evaluation_json",
+                    "portfolio_accounting_json",
+                    "paper_sizing_assumptions_json",
+                    "paper_fee_assumptions_json",
+                    "paper_slippage_assumptions_json",
+                }
+            )
+
+            def decode_json(value: Any) -> tuple[Any, bool, bool]:
+                if value is None or value == "":
+                    return None, True, False
+                if isinstance(value, (Mapping, list, tuple, bool, int, float)):
+                    return value, True, True
+                try:
+                    return json.loads(value), True, True
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    return None, False, True
+
+            payload, payload_valid, payload_present = decode_json(
+                raw.get("payload_json")
+            )
+            item: dict[str, Any] = (
+                dict(payload) if payload_valid and isinstance(payload, Mapping) else {}
+            )
+            for key, value in raw.items():
+                if key not in json_columns:
+                    item[key] = value
+            malformed_json = not payload_valid
+
+            evaluation, evaluation_valid, evaluation_present = decode_json(
+                raw.get("evaluation_json")
+            )
+            if evaluation_present and not evaluation_valid:
+                malformed_json = True
+                evaluation = {}
+            if not isinstance(evaluation, Mapping):
+                candidate = item.get("evaluation")
+                if not isinstance(candidate, Mapping):
+                    metrics = item.get("metrics")
+                    candidate = (
+                        metrics.get("evaluation")
+                        if isinstance(metrics, Mapping)
+                        else {}
+                    )
+                evaluation = candidate if isinstance(candidate, Mapping) else {}
+            if evaluation_present or isinstance(evaluation, Mapping) and evaluation:
+                item["evaluation"] = dict(evaluation)
+
+            portfolio, portfolio_valid, portfolio_present = decode_json(
+                raw.get("portfolio_accounting_json")
+            )
+            if portfolio_present and not portfolio_valid:
+                malformed_json = True
+                portfolio = {}
+            if not isinstance(portfolio, Mapping):
+                candidate = item.get("portfolio_accounting")
+                if not isinstance(candidate, Mapping):
+                    metrics = item.get("metrics")
+                    candidate = (
+                        metrics.get("portfolio_accounting")
+                        if isinstance(metrics, Mapping)
+                        else {}
+                    )
+                portfolio = candidate if isinstance(candidate, Mapping) else {}
+            if portfolio_present or isinstance(portfolio, Mapping) and portfolio:
+                item["portfolio_accounting"] = dict(portfolio)
+
+            for column_name, field_name in (
+                ("paper_sizing_assumptions_json", "paper_sizing_assumptions"),
+                ("paper_fee_assumptions_json", "paper_fee_assumptions"),
+                ("paper_slippage_assumptions_json", "paper_slippage_assumptions"),
+            ):
+                decoded, valid, present = decode_json(raw.get(column_name))
+                if not valid:
+                    malformed_json = True
+                elif present:
+                    item[field_name] = decoded
+
+            evaluation_field_names = (
+                "evaluation_run_id",
+                "evaluation_version",
+                "supersedes_evidence_id",
+                "loaded_rows",
+                "valid_input_rows",
+                "evaluator_invoked",
+                "evaluator_completed",
+                "evaluated_observations",
+                "signal_count",
+                "diagnostic_summary_count",
+                "evaluator_name",
+                "evaluator_error",
+                "evaluator_prerequisite",
+            )
+            evaluation_count_fields = frozenset(
+                {
+                    "loaded_rows",
+                    "valid_input_rows",
+                    "evaluated_observations",
+                    "signal_count",
+                    "diagnostic_summary_count",
+                }
+            )
+            for field_name in evaluation_field_names:
+                column_value = raw.get(field_name)
+                if column_value is None:
+                    continue
+                try:
+                    normalized = (
+                        bool(column_value)
+                        if field_name in {"evaluator_invoked", "evaluator_completed"}
+                        else int(column_value)
+                        if field_name in evaluation_count_fields
+                        else column_value
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    malformed_json = True
+                    continue
+                evaluation[field_name] = normalized
+                item[field_name] = normalized
+            if evaluation:
+                item["evaluation"] = dict(evaluation)
+
+            accounting_available = raw.get("accounting_available")
+            if accounting_available is not None:
+                try:
+                    accounting_available = bool(accounting_available)
+                except (TypeError, ValueError):
+                    malformed_json = True
+                else:
+                    item["accounting_available"] = accounting_available
+                    portfolio["accounting_available"] = accounting_available
+
+            for field_name in ("accounting_complete", "accounting_partial"):
+                value = item.get(field_name)
+                if value is None:
+                    value = portfolio.get(field_name)
+                if value is None:
+                    continue
+                if isinstance(value, bool):
+                    normalized = value
+                elif isinstance(value, int) and value in (0, 1):
+                    normalized = bool(value)
+                elif isinstance(value, str) and value.strip().upper() in {
+                    "TRUE",
+                    "1",
+                    "YES",
+                }:
+                    normalized = True
+                elif isinstance(value, str) and value.strip().upper() in {
+                    "FALSE",
+                    "0",
+                    "NO",
+                }:
+                    normalized = False
+                else:
+                    malformed_json = True
+                    continue
+                item[field_name] = normalized
+                portfolio[field_name] = normalized
+
+            for field_name in (
+                "initial_cash",
+                "cash",
+                "equity",
+                "realized_pnl",
+                "unrealized_pnl",
+                "net_pnl",
+                "fees",
+                "costs",
+                "open_positions",
+                "opening_fills",
+                "closing_fills",
+                "partial_closing_fills",
+                "completed_round_trips",
+            ):
+                if field_name in portfolio:
+                    item[field_name] = portfolio[field_name]
+            if portfolio_present or portfolio:
+                item["portfolio_accounting"] = dict(portfolio)
+            if malformed_json:
+                item["_evidence_json_invalid"] = True
+            return item
+
+
         def exact_evidence(
             strategy_id: str | None,
             evidence_window_id: str | None,
@@ -2686,13 +2893,7 @@ class DashboardData:
                 except Exception:
                     row = None
                 if row is not None:
-                    if isinstance(row, Mapping):
-                        return row
-                    try:
-                        keys = row.keys()
-                        return {key: row[key] for key in keys}
-                    except Exception:
-                        pass
+                    return hydrate_exact_evidence_row(row)
             if callable(evidence_loader):
                 try:
                     rows = evidence_loader(strategy_id, limit=4096)
@@ -2725,6 +2926,270 @@ class DashboardData:
             if isinstance(payload, Mapping) and payload.get(key) is not None:
                 return payload.get(key)
             return default
+        evaluation_field_names = (
+            "evaluation_run_id",
+            "evaluation_version",
+            "supersedes_evidence_id",
+            "loaded_rows",
+            "valid_input_rows",
+            "evaluator_invoked",
+            "evaluator_completed",
+            "evaluated_observations",
+            "signal_count",
+            "diagnostic_summary_count",
+            "evaluator_name",
+            "evaluator_error",
+            "evaluator_prerequisite",
+        )
+        accounting_field_names = (
+            "accounting_available",
+            "initial_cash",
+            "cash",
+            "equity",
+            "realized_pnl",
+            "unrealized_pnl",
+            "net_pnl",
+            "fees",
+            "costs",
+            "allocated_capital",
+            "capital_at_risk",
+            "open_positions",
+            "opening_fills",
+            "closing_fills",
+            "partial_closing_fills",
+            "fills",
+            "completed_round_trips",
+        )
+        monetary_field_names = (
+            "initial_cash",
+            "cash",
+            "equity",
+            "realized_pnl",
+            "unrealized_pnl",
+            "net_pnl",
+            "fees",
+            "costs",
+            "allocated_capital",
+            "capital_at_risk",
+        )
+
+        def evaluation_kind_projection(
+            row: Mapping[str, Any],
+            payload: Mapping[str, Any],
+        ) -> tuple[str | None, bool, bool]:
+            """Project the explicit v2 evaluator/accounting provenance.
+
+            ``ACTUAL_LEDGER`` is intentionally never inferred from accounting
+            values.  A v2 row without an explicit kind remains canonical for
+            legacy non-PAPER sources; PAPER rows remain unknown and fail closed.
+            """
+            metrics = row.get("metrics")
+            metrics = metrics if isinstance(metrics, Mapping) else {}
+            nested = row.get("evaluation")
+            nested = nested if isinstance(nested, Mapping) else {}
+            metrics_evaluation = metrics.get("evaluation")
+            metrics_evaluation = (
+                metrics_evaluation
+                if isinstance(metrics_evaluation, Mapping)
+                else {}
+            )
+            sources = (row, payload, nested, metrics_evaluation)
+            explicit: list[str] = []
+            invalid = False
+            for source in sources:
+                if "evaluation_kind" not in source:
+                    continue
+                value = str(source.get("evaluation_kind") or "").strip().upper()
+                value = value.replace("-", "_").replace(" ", "_")
+                if value in {"CANONICAL_SIMULATION", "ACTUAL_LEDGER"}:
+                    explicit.append(value)
+                else:
+                    invalid = True
+            # Match storage/domain's v2 provenance discriminator exactly.
+            # Accounting/status fields may be present on legacy rows and
+            # must not upgrade them into canonical v2 evidence.
+            v2_fields = (
+                "evaluation_kind",
+                "evaluation_run_id",
+                "evaluation_version",
+                "supersedes_evidence_id",
+            )
+            is_v2 = any(
+                any(field_name in source for field_name in v2_fields)
+                for source in sources
+            )
+            kind_values = set(explicit)
+            conflict = invalid or len(kind_values) > 1
+            if conflict:
+                return None, True, is_v2
+            if explicit:
+                return explicit[0], False, is_v2
+            source_value = next(
+                (
+                    source.get("source_class")
+                    for source in sources
+                    if source.get("source_class") not in (None, "")
+                ),
+                None,
+            )
+            try:
+                normalized_source = _source_class(source_value, required=False)
+            except (TypeError, ValueError):
+                normalized_source = str(source_value or "").strip().upper()
+            if is_v2 and normalized_source != "PAPER":
+                return "CANONICAL_SIMULATION", False, True
+            return None, False, is_v2
+
+        def evaluation_projection(row: Mapping[str, Any]) -> dict[str, Any]:
+            payload = row.get("payload")
+            payload = payload if isinstance(payload, Mapping) else {}
+            nested = row.get("evaluation")
+            if not isinstance(nested, Mapping):
+                metrics = row.get("metrics")
+                nested = metrics.get("evaluation") if isinstance(metrics, Mapping) else {}
+            result: dict[str, Any] = dict(nested) if isinstance(nested, Mapping) else {}
+            for field_name in evaluation_field_names:
+                value = row.get(field_name)
+                if value is None:
+                    value = payload.get(field_name)
+                if value is not None:
+                    result[field_name] = value
+            evaluation_kind, kind_conflict, is_v2 = evaluation_kind_projection(
+                row,
+                payload,
+            )
+            result["evaluation_kind"] = evaluation_kind
+            result["evaluation_kind_conflict"] = kind_conflict
+            result["evaluation_v2"] = is_v2
+            for field_name in ("evaluator_error", "evaluator_prerequisite"):
+                if field_name in result:
+                    detail = text(result[field_name])
+                    result[field_name] = (
+                        detail[:_ROLLING_DIAGNOSTIC_STRING_LENGTH]
+                        if detail
+                        else None
+                    )
+            return result
+
+        def _accounting_projection_key(value: Any) -> Any:
+            """Build a deterministic, type-aware key for duplicate fields."""
+            if value is None:
+                return ("none",)
+            if isinstance(value, bool):
+                return ("bool", value)
+            if isinstance(value, Mapping):
+                return (
+                    "mapping",
+                    tuple(
+                        sorted(
+                            [
+                                (str(key), _accounting_projection_key(child))
+                                for key, child in value.items()
+                            ],
+                            key=lambda item: item[0],
+                        )
+                    ),
+                )
+            if isinstance(value, (set, frozenset)):
+                return (
+                    "set",
+                    tuple(
+                        sorted(
+                            (_accounting_projection_key(child) for child in value),
+                            key=repr,
+                        )
+                    ),
+                )
+            if isinstance(value, (list, tuple)):
+                return (
+                    "sequence",
+                    tuple(_accounting_projection_key(child) for child in value),
+                )
+            if isinstance(value, Decimal):
+                return ("decimal", str(value))
+            return (type(value).__module__, type(value).__qualname__, value)
+
+        def _accounting_projection_value(value: Any) -> Any:
+            """Canonicalize set-like nested values before public bounding."""
+            if isinstance(value, Mapping):
+                return {
+                    str(key): _accounting_projection_value(child)
+                    for key, child in value.items()
+                }
+            if isinstance(value, (set, frozenset)):
+                values = [_accounting_projection_value(child) for child in value]
+                return sorted(values, key=lambda child: repr(_accounting_projection_key(child)))
+            if isinstance(value, tuple):
+                return [_accounting_projection_value(child) for child in value]
+            if isinstance(value, list):
+                return [_accounting_projection_value(child) for child in value]
+            return value
+
+        def accounting_projection(row: Mapping[str, Any]) -> dict[str, Any]:
+            payload = row.get("payload")
+            payload = payload if isinstance(payload, Mapping) else {}
+            metrics = row.get("metrics")
+            nested_sources = tuple(
+                (source_name, source)
+                for source_name, source in (
+                    ("row.portfolio_accounting", row.get("portfolio_accounting")),
+                    (
+                        "metrics.portfolio_accounting",
+                        metrics.get("portfolio_accounting")
+                        if isinstance(metrics, Mapping)
+                        else None,
+                    ),
+                    ("payload.portfolio_accounting", payload.get("portfolio_accounting")),
+                )
+                if isinstance(source, Mapping)
+            )
+            result: dict[str, Any] = {}
+            conflicting_fields: set[str] = set()
+            field_names = {
+                key
+                for _source_name, source in nested_sources
+                for key in source
+            }
+            for field_name in sorted(field_names, key=str):
+                projections = [
+                    (source_name, source[field_name])
+                    for source_name, source in nested_sources
+                    if field_name in source
+                ]
+                first_value = projections[0][1]
+                first_key = _accounting_projection_key(first_value)
+                if any(
+                    _accounting_projection_key(value) != first_key
+                    for _source_name, value in projections[1:]
+                ):
+                    conflicting_fields.add(field_name)
+                    result[field_name] = None
+                else:
+                    result[field_name] = _accounting_projection_value(first_value)
+            for field_name in accounting_field_names:
+                if field_name in result:
+                    continue
+                value = row.get(field_name)
+                if value is None:
+                    value = payload.get(field_name)
+                if value is not None:
+                    result[field_name] = value
+            if conflicting_fields:
+                result["accounting_projection_mismatch"] = True
+                result["accounting_projection_conflicts"] = sorted(
+                    conflicting_fields,
+                    key=str,
+                )[:32]
+                result["accounting_available"] = False
+                result["accounting_complete"] = False
+                result["accounting_partial"] = True
+            elif "accounting_available" not in result:
+                result["accounting_available"] = None
+            availability = result.get("accounting_available")
+            if availability is not True:
+                for field_name in monetary_field_names:
+                    result[field_name] = None
+            return result
 
         def evidence_number(row: Mapping[str, Any], *keys: str) -> Decimal:
             for key in keys:
@@ -2739,54 +3204,171 @@ class DashboardData:
                     return parsed
             return Decimal("0")
 
-        evidence_measured_fields = (
-            "requested_rows",
-            "available_rows",
-            "evaluated_rows",
-            "signals",
-            "declined_evaluations",
-            "positions",
-            "openings",
-            "completed_outcomes",
+        def optional_count(value: Any) -> int | None:
+            if value in (None, "") or isinstance(value, bool):
+                return None
+            if isinstance(value, (Mapping, list, tuple, set, frozenset)):
+                return len(value)
+            try:
+                parsed = Decimal(str(value))
+            except (TypeError, ValueError, ArithmeticError):
+                return None
+            if (
+                not parsed.is_finite()
+                or parsed < 0
+                or parsed != parsed.to_integral_value()
+            ):
+                return None
+            return int(parsed)
+
+        def bounded_diagnostic(value: Any) -> str | None:
+            detail = text(value)
+            return (
+                detail[:_ROLLING_DIAGNOSTIC_STRING_LENGTH]
+                if detail
+                else None
+            )
+
+        projected_evidence = [
+            (row, evaluation_projection(row), accounting_projection(row))
+            for row in all_evidence_rows
+        ]
+
+
+        def aggregate_count(
+            field_name: str,
+            *,
+            legacy_names: tuple[str, ...] = (),
+        ) -> int | None:
+            values: list[int] = []
+            for row, evaluation, accounting in projected_evidence:
+                value = accounting.get(field_name)
+                if value is None:
+                    value = evaluation.get(field_name)
+                if value is None:
+                    value = next(
+                        (
+                            evidence_field(row, legacy_name)
+                            for legacy_name in legacy_names
+                            if evidence_field(row, legacy_name) is not None
+                        ),
+                        None,
+                    )
+                parsed = optional_count(value)
+                if parsed is not None:
+                    values.append(parsed)
+            return sum(values) if values else None
+
+        opening_fills = aggregate_count(
+            "opening_fills",
+            legacy_names=("openings",),
+        )
+        closing_fills = aggregate_count(
+            "closing_fills",
+            legacy_names=("closings", "exits"),
+        )
+        partial_closing_fills = aggregate_count(
+            "partial_closing_fills",
+            legacy_names=("partial_closings", "partial_exits"),
+        )
+        canonical_fill_counts = (
+            opening_fills,
+            closing_fills,
+            partial_closing_fills,
         )
         measured = {
-            key: sum(
-                (
-                    int(evidence_number(row, key))
-                    for row in all_evidence_rows
-                ),
-                0,
+            "loaded_rows": aggregate_count("loaded_rows", legacy_names=("requested_rows",)),
+            "valid_input_rows": aggregate_count(
+                "valid_input_rows",
+                legacy_names=("available_rows",),
+            ),
+            "evaluated_observations": aggregate_count(
+                "evaluated_observations",
+                legacy_names=("evaluated_rows",),
+            ),
+            "signal_count": aggregate_count("signal_count", legacy_names=("signals",)),
+            "diagnostic_summary_count": aggregate_count("diagnostic_summary_count"),
+            "fills": (
+                sum(value or 0 for value in canonical_fill_counts)
+                if any(value is not None for value in canonical_fill_counts)
+                else aggregate_count("fills", legacy_names=("fills",))
+            ),
+            "opening_fills": opening_fills,
+            "closing_fills": closing_fills,
+            "partial_closing_fills": partial_closing_fills,
+            "completed_round_trips": aggregate_count(
+                "completed_round_trips",
+                legacy_names=("completed_outcomes",),
+            ),
+            "positions": aggregate_count("positions"),
+        }
+        measured["exits"] = sum(
+            value or 0
+            for value in (
+                measured.get("closing_fills"),
+                measured.get("partial_closing_fills"),
             )
-            for key in evidence_measured_fields
-        }
-        monetary_fields = {
-            "realized_pnl": ("realized_pnl",),
-            "unrealized_pnl": ("unrealized_pnl",),
-            "fees": ("fees", "fee_costs"),
-            "slippage": ("slippage", "slippage_costs", "costs"),
-            "capital_at_risk": ("capital_at_risk", "allocated_capital"),
-        }
-        monetary = {
-            key: sum(
-                (evidence_number(row, *aliases) for row in all_evidence_rows),
-                Decimal("0"),
-            )
-            for key, aliases in monetary_fields.items()
-        }
+        )
+        evaluator_invoked = [
+            evaluation.get("evaluator_invoked")
+            for _row, evaluation, _accounting in projected_evidence
+            if evaluation.get("evaluator_invoked") is not None
+        ]
+        evaluator_completed = [
+            evaluation.get("evaluator_completed")
+            for _row, evaluation, _accounting in projected_evidence
+            if evaluation.get("evaluator_completed") is not None
+        ]
+        evaluation_kinds = [
+            evaluation.get("evaluation_kind")
+            for _row, evaluation, _accounting in projected_evidence
+            if evaluation.get("evaluation_kind") is not None
+        ]
+        accounting_states = [
+            accounting.get("accounting_available")
+            for _row, _evaluation, accounting in projected_evidence
+        ]
+        monetary_fields = monetary_field_names
+        monetary: dict[str, Any] = {}
+        if projected_evidence and all(value is True for value in accounting_states):
+            for field_name in monetary_fields:
+                values = [
+                    Decimal(str(accounting[field_name]))
+                    for _row, _evaluation, accounting in projected_evidence
+                    if accounting.get(field_name) not in (None, "")
+                ]
+                monetary[field_name] = sum(values, Decimal("0")) if len(values) == len(projected_evidence) else None
+        else:
+            monetary = {field_name: None for field_name in monetary_fields}
         evidence_reasons: list[str] = []
-        for row in all_evidence_rows:
+        for row, evaluation, accounting in projected_evidence:
             reasons = plural(
                 evidence_field(row, "admission_reasons"),
                 evidence_field(row, "reasons", evidence_field(row, "reason")),
             )
-            unavailable = text(evidence_field(row, "accounting_unavailable_reason"))
+            unavailable = bounded_diagnostic(
+                evidence_field(row, "accounting_unavailable_reason")
+            )
             if unavailable:
                 reasons.append(unavailable)
+            for field_name in ("evaluator_error", "evaluator_prerequisite"):
+                detail = bounded_diagnostic(evaluation.get(field_name))
+                if detail:
+                    reasons.append(detail)
+            if accounting.get("accounting_available") is False:
+                reasons.append("ACCOUNTING_UNAVAILABLE")
             for reason in reasons:
                 if reason not in evidence_reasons:
                     evidence_reasons.append(reason)
-        evidence_attribution = [
-            {
+        evidence_attribution: list[dict[str, Any]] = []
+        for row in recent_chronological(
+            all_evidence_rows,
+            limit=64,
+            timestamp_keys=("available_through", "available_from", "created_at"),
+        ):
+            evaluation = evaluation_projection(row)
+            accounting = accounting_projection(row)
+            attribution = {
                 key: evidence_field(row, key)
                 for key in (
                     "evidence_window_id",
@@ -2795,6 +3377,7 @@ class DashboardData:
                     "candidate_id",
                     "requested_days",
                     "source_class",
+                    "evaluation_kind",
                     "evidence_digest",
                     "source_digest",
                     "accounting_digest",
@@ -2807,12 +3390,11 @@ class DashboardData:
                 )
                 if evidence_field(row, key) is not None
             }
-            for row in recent_chronological(
-                all_evidence_rows,
-                limit=64,
-                timestamp_keys=("available_through", "available_from", "created_at"),
-            )
-        ]
+            attribution["evaluation"] = evaluation
+            attribution["evaluation_kind"] = evaluation.get("evaluation_kind")
+            attribution["portfolio_accounting"] = accounting
+            attribution["accounting_available"] = accounting.get("accounting_available")
+            evidence_attribution.append(attribution)
         rolling_evidence_summary = {
             # A historical/partial admitted row is informative, but cannot
             # make the portfolio ready before every active member's exact
@@ -2841,11 +3423,47 @@ class DashboardData:
             "attribution": evidence_attribution,
             "cursor": dict(rolling_cursor),
             "blockers": rolling_blockers[:32],
+            "evaluation": {
+                "loaded_rows": measured.get("loaded_rows"),
+                "valid_input_rows": measured.get("valid_input_rows"),
+                "evaluator_invoked": evaluator_invoked,
+                "evaluator_completed": evaluator_completed,
+                "evaluation_kinds": evaluation_kinds,
+                "evaluated_observations": measured.get("evaluated_observations"),
+                "signal_count": measured.get("signal_count"),
+                "diagnostic_summary_count": measured.get("diagnostic_summary_count"),
+                "errors": [
+                    bounded_diagnostic(evaluation.get("evaluator_error"))
+                    for _row, evaluation, _accounting in projected_evidence
+                    if bounded_diagnostic(evaluation.get("evaluator_error"))
+                ][:_ROLLING_DIAGNOSTIC_LIMIT],
+                "prerequisites": [
+                    bounded_diagnostic(evaluation.get("evaluator_prerequisite"))
+                    for _row, evaluation, _accounting in projected_evidence
+                    if bounded_diagnostic(evaluation.get("evaluator_prerequisite"))
+                ][:_ROLLING_DIAGNOSTIC_LIMIT],
+            },
+            "accounting": {
+                "availability": accounting_states,
+                "available": (
+                    True
+                    if accounting_states and all(value is True for value in accounting_states)
+                    else False
+                    if accounting_states and all(value is False for value in accounting_states)
+                    else None
+                ),
+                "fills": measured.get("fills"),
+                "exits": measured.get("exits"),
+                "completed_round_trips": measured.get("completed_round_trips"),
+                "monetary": monetary,
+            },
         }
 
         def evidence_payload(
             row: Mapping[str, Any],
         ) -> tuple[Mapping[str, Any], str | None]:
+            if row.get("_evidence_json_invalid") is True:
+                return {}, "evidence_payload_invalid"
             payload = row.get("payload")
             if isinstance(payload, Mapping):
                 return payload, None
@@ -2919,8 +3537,13 @@ class DashboardData:
                         return source.get(name)
                 return None
 
+            row_evaluation = evaluation_projection(evidence)
+            row_accounting = accounting_projection(evidence)
             accounting_flags = {
-                "accounting_available": evidence_field("accounting_available"),
+                "accounting_available": row_accounting.get(
+                    "accounting_available",
+                    evidence_field("accounting_available"),
+                ),
                 "accounting_complete": evidence_field("accounting_complete"),
                 "accounting_partial": evidence_field("accounting_partial"),
                 "admitted": evidence_field("admitted"),
@@ -2988,6 +3611,24 @@ class DashboardData:
                     and normalized_persisted_source != normalized_member_source
                 ):
                     blockers.append("evidence_source_class_mismatch")
+            if row_accounting.get("accounting_projection_mismatch") is True:
+                blockers.append("accounting_projection_mismatch")
+            if row_evaluation.get("evaluation_kind_conflict"):
+                blockers.append("evaluation_kind_conflict")
+            evaluation_kind = row_evaluation.get("evaluation_kind")
+            if row_evaluation.get("evaluation_v2") and evaluation_kind is None:
+                blockers.append("evaluation_kind_required")
+            if evaluation_kind == "CANONICAL_SIMULATION":
+                if row_evaluation.get("evaluator_invoked") is not True:
+                    blockers.append("evaluator_invoked_required")
+                if row_evaluation.get("evaluator_completed") is not True:
+                    blockers.append("evaluator_completed_required")
+            for field_name, blocker_name in (
+                ("evaluator_error", "evaluator_error"),
+                ("evaluator_prerequisite", "evaluator_prerequisite"),
+            ):
+                if text(row_evaluation.get(field_name)):
+                    blockers.append(blocker_name)
             for flag_name, expected_value, blocker_name in (
                 ("accounting_available", True, "accounting_unavailable"),
                 ("accounting_complete", True, "accounting_incomplete"),
@@ -3001,6 +3642,21 @@ class DashboardData:
                 evidence_count += 1
             active_rows.append(
                 {
+                    "evaluation_run_id": row_evaluation.get("evaluation_run_id"),
+                    "evaluation_version": row_evaluation.get("evaluation_version"),
+                    "evaluation_kind": row_evaluation.get("evaluation_kind"),
+                    "supersedes_evidence_id": row_evaluation.get("supersedes_evidence_id"),
+                    "evaluation": row_evaluation,
+                    "portfolio_accounting": row_accounting,
+                    "evaluation_error": row_evaluation.get("evaluator_error"),
+                    "evaluation_prerequisite": row_evaluation.get("evaluator_prerequisite"),
+                    "accounting_status": (
+                        "AVAILABLE"
+                        if accounting_flags["accounting_available"] is True
+                        else "UNAVAILABLE"
+                        if accounting_flags["accounting_available"] is False
+                        else "UNKNOWN"
+                    ),
                     "accounting_available": accounting_flags["accounting_available"],
                     "accounting_complete": accounting_flags["accounting_complete"],
                     "accounting_partial": accounting_flags["accounting_partial"],
@@ -3026,20 +3682,32 @@ class DashboardData:
                         member_value(member, payload, "actual_coverage_seconds"),
                     ),
                     "source_class": persisted_source_class or member_source_class,
-                    "net_return": evidence.get(
-                        "allocated_capital_net_return",
+                    "net_return": (
                         evidence.get(
-                            "net_return",
-                            member_value(member, payload, "net_return"),
-                        ),
+                            "allocated_capital_net_return",
+                            evidence.get(
+                                "net_return",
+                                member_value(member, payload, "net_return"),
+                            ),
+                        )
+                        if accounting_flags["accounting_available"] is True
+                        else None
                     ),
-                    "drawdown": evidence.get(
-                        "drawdown",
-                        member_value(member, payload, "drawdown"),
+                    "drawdown": (
+                        evidence.get(
+                            "drawdown",
+                            member_value(member, payload, "drawdown"),
+                        )
+                        if accounting_flags["accounting_available"] is True
+                        else None
                     ),
-                    "exposure": member_value(member, payload, "exposure")
-                    or member_value(member, payload, "position_management_state")
-                    or {},
+                    "exposure": (
+                        member_value(member, payload, "exposure")
+                        or member_value(member, payload, "position_management_state")
+                        or {}
+                    )
+                    if accounting_flags["accounting_available"] is True
+                    else {},
                     "reason": member_value(member, payload, "reason"),
                     "reasons": reasons,
                     "admission_reasons": admission_reasons,
@@ -8262,7 +8930,22 @@ def _dashboard_html(
         ? `<button class="link rolling-policy-action" data-rolling-action="activate" data-draft-id="${safe(proposed.draft_id)}" data-draft-version="${safe(proposed.draft_version)}" data-risk-id="${safe(review.canary_binding?.risk_config_id)}" data-risk-generation="${safe(review.canary_binding?.risk_config_generation)}" data-risk-hash="${safe(review.canary_binding?.risk_config_hash)}">Review and activate this draft</button>`
         : "";
       $("rolling-policy-controls").innerHTML=`<article class="panel"><div class="section-title"><h3>POLICY / ALLOCATION REVIEW</h3><span class="badge ${statusClass(draftStatus)}">${safe(draftStatus)}</span></div><p class="page-note">Active policy and canary settings remain authoritative. Review creates a non-active immutable draft; activation is a separate deliberate operation and never enables canary execution.</p><div class="three-col"><label class="key-value"><span class="key">Proposed portfolio budget (USD)</span><input id="rolling-budget" aria-label="Proposed portfolio budget" inputmode="decimal" value="${safe(proposed.global_budget??allocation.global_budget_usd??active.global_budget??"0.00")}"></label><div class="key-value"><span class="key">Max active strategies</span><strong>${safe(proposed.max_active_strategies??allocation.max_active_strategies??"—")}</strong></div><div class="key-value"><span class="key">Max open positions</span><strong>${safe(caps.max_open_positions??allocation.max_open_positions??"—")}</strong></div><div class="key-value"><span class="key">Submissions/day</span><strong>${safe(caps.submissions_per_day??allocation.active_submissions_per_day??"—")}</strong></div><div class="key-value"><span class="key">Per-buy / daily buy</span><strong>${safe(caps.per_buy_usd??allocation.active_per_buy_usd??"—")} / ${safe(caps.daily_buy_usd??allocation.active_daily_buy_usd??"—")}</strong></div><div class="key-value"><span class="key">Exposure / venue minimum</span><strong>${safe(caps.open_exposure_usd??allocation.active_open_exposure_usd??"—")} / ${safe(venue.status||"UNKNOWN")}</strong></div></div><p class="page-note"><button class="link rolling-policy-action" data-rolling-action="review" data-risk-id="${safe(review.canary_binding?.risk_config_id)}" data-risk-generation="${safe(review.canary_binding?.risk_config_generation)}" data-risk-hash="${safe(review.canary_binding?.risk_config_hash)}">Review proposed allocation</button>${draftControls?` · ${draftControls}`:""}</p>${proposed.draft_id?`<p class="page-note">Draft identity generated internally: ${safe(proposed.draft_id)} / ${safe(proposed.draft_version)} · bound canary config ${safe(review.proposed_canary_binding?.risk_config_id)} generation ${safe(review.proposed_canary_binding?.risk_config_generation)}.</p>`:""}</article>`;
-      $("rolling-members").innerHTML=rows.length?`<table><thead><tr><th>Strategy version</th><th>Research trial</th><th>Candidate</th><th>Evidence window</th><th>Evidence digest</th><th>Status</th><th>Allocation</th><th>Coverage</th><th>Reason</th></tr></thead><tbody>${rows.map(row=>`<tr><td>${safe(row.strategy_version_id)}</td><td>${safe(row.research_trial_id)}</td><td>${safe(row.candidate_id)}</td><td>${safe(row.evidence_window_id)}</td><td>${safe(row.evidence_digest)}</td><td><span class="badge ${statusClass(row.executable?"ACTIVE":"BLOCKED")}">${safe(row.executable?"EXECUTABLE":"NON-EXECUTABLE")}</span></td><td>${safe(row.allocation)}</td><td>${safe(row.actual_coverage_seconds)}</td><td>${safe(arr(row.reasons).join(", ")||row.reason||arr(row.blockers).join(", ")||"—")}</td></tr>`).join("")}</tbody></table>`:empty("No active rolling members","No persisted active rolling selection is available.");
+      function rollingEvaluationStage(row) {
+        const evaluation=row?.evaluation&&typeof row.evaluation==="object"?row.evaluation:{};
+        const accounting=row?.portfolio_accounting&&typeof row.portfolio_accounting==="object"?row.portfolio_accounting:{};
+        const countValue=(value)=>value==null?"?":String(value);
+        const yesNo=(value)=>value===true?"YES":value===false?"NO":"UNKNOWN";
+        const details=[evaluation.evaluator_error,evaluation.evaluator_prerequisite].filter(Boolean).map(value=>`<div>${safe(value)}</div>`).join("");
+        return `<div><strong>${countValue(evaluation.loaded_rows)} loaded / ${countValue(evaluation.valid_input_rows)} valid</strong> → invoked ${yesNo(evaluation.evaluator_invoked)} / completed ${yesNo(evaluation.evaluator_completed)} → ${countValue(evaluation.evaluated_observations)} observations / ${countValue(evaluation.signal_count)} signals</div>${details?`<small>${details}</small>`:""}`;
+      }
+      function rollingAccountingStage(row) {
+        const accounting=row?.portfolio_accounting&&typeof row.portfolio_accounting==="object"?row.portfolio_accounting:{};
+        const available=accounting.accounting_available===true?"AVAILABLE":accounting.accounting_available===false?"UNAVAILABLE":"UNKNOWN";
+        const fills=[accounting.opening_fills,accounting.closing_fills,accounting.partial_closing_fills].map(value=>Array.isArray(value)?value.length:Number(value||0));
+        const exits=fills[1]+fills[2];
+        return `<strong>${safe(available)}</strong> · fills ${safe(fills[0]+exits)} / exits ${safe(exits)} · round trips ${safe(accounting.completed_round_trips??"—")} → admission ${safe(row?.admitted===true?"ADMITTED":"BLOCKED")}`;
+      }
+      $("rolling-members").innerHTML=rows.length?`<table><thead><tr><th>Strategy version</th><th>Research trial</th><th>Candidate</th><th>Evidence window</th><th>Evidence digest</th><th>Status</th><th>Allocation</th><th>Coverage</th><th>Evaluation pipeline</th><th>Accounting / admission</th><th>Reason</th></tr></thead><tbody>${rows.map(row=>`<tr><td>${safe(row.strategy_version_id)}</td><td>${safe(row.research_trial_id)}</td><td>${safe(row.candidate_id)}</td><td>${safe(row.evidence_window_id)}</td><td>${safe(row.evidence_digest)}</td><td><span class="badge ${statusClass(row.executable?"ACTIVE":"BLOCKED")}">${safe(row.executable?"EXECUTABLE":"NON-EXECUTABLE")}</span></td><td>${safe(row.allocation)}</td><td>${safe(row.actual_coverage_seconds)}</td><td>${rollingEvaluationStage(row)}</td><td>${rollingAccountingStage(row)}</td><td>${safe(arr(row.reasons).join(", ")||row.reason||arr(row.blockers).join(", ")||row.evaluation_error||row.evaluation_prerequisite||"—")}</td></tr>`).join("")}</tbody></table>`:empty("No active rolling members","No persisted active rolling selection is available.");
       $("rolling-reasons").innerHTML=`<article class="panel"><div class="section-title"><h3>Admission / replacement history</h3><span class="badge">${arr(data?.reason_history).length} retained</span></div>${arr(data?.reason_history).length?`<pre>${safe(json(arr(data.reason_history).slice(-32)))}</pre>`:empty("No rolling review history","Admission and replacement reasons are retained after members leave active K.")}</article>${cold.length?`<article class="panel"><div class="section-title"><h3>Cold-start requirements</h3><span class="badge warn">BLOCKED</span></div><ul>${cold.slice(0,16).map(item=>`<li>${safe(researchFeedValue(item))}</li>`).join("")}</ul></article>`:""}`;
       const jobs=data?.next_jobs; $("rolling-jobs").innerHTML=jobs&&((Array.isArray(jobs)&&jobs.length)||(typeof jobs==="object"&&Object.keys(jobs).length))?`<article class="panel"><div class="section-title"><h3>Next rolling jobs</h3><span class="badge">durable</span></div><pre>${safe(json(jobs))}</pre></article>`:empty("No next rolling jobs","The durable worker has not persisted a next action.");
     }
