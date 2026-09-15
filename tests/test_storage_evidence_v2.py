@@ -3,9 +3,9 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 import json
 import unittest
+from unittest.mock import patch
 
 from axiom.storage import AxiomStore
-
 
 UTC = timezone.utc
 THROUGH = datetime(2026, 1, 31, 12, tzinfo=UTC)
@@ -84,6 +84,32 @@ class StorageEvidenceV2Tests(unittest.TestCase):
     def _save(self, store: AxiomStore, record: dict[str, object]) -> None:
         store.save_strategy_version(_strategy(str(record["strategy_version_id"])))
         store.save_strategy_evidence_window(record)
+    def test_dataset_payload_projection_checks_bound_before_decode(self) -> None:
+        with AxiomStore(":memory:") as store:
+            payload = json.dumps([{"value": "bounded"}], separators=(",", ":"))
+            store.connection.execute(
+                "INSERT INTO datasets(dataset_id,version,payload_json,metadata_json,quality,created_at) "
+                "VALUES (?,?,?,?,?,?)",
+                ("projection", "v1", payload, "{}", "HIGH", THROUGH.isoformat()),
+            )
+            store.connection.commit()
+            with patch("axiom.storage._load", side_effect=AssertionError("decoded")) as load:
+                with self.assertRaisesRegex(ValueError, "requested byte bound"):
+                    store.load_dataset_payload_projection(
+                        "projection",
+                        "v1",
+                        max_payload_bytes=len(payload.encode("utf-8")) - 1,
+                    )
+            load.assert_not_called()
+            self.assertEqual(
+                store.load_dataset_payload_projection(
+                    "projection",
+                    "v1",
+                    max_payload_bytes=len(payload.encode("utf-8")),
+                ),
+                [{"value": "bounded"}],
+            )
+
 
     def test_hydrated_v2_evidence_can_be_resaved_idempotently(self) -> None:
         with AxiomStore(":memory:") as store:

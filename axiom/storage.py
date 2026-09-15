@@ -5483,6 +5483,41 @@ class AxiomStore:
             return _load(row["payload_json"])
         catalog = self.load_dataset_catalog(str(dataset_id), version)
         return self._catalog_records(catalog) if catalog is not None else None
+    def load_dataset_payload_projection(
+        self,
+        dataset_id: str,
+        version: str,
+        *,
+        max_payload_bytes: int,
+    ) -> Any | None:
+        """Load one dataset payload under an explicit caller-owned byte bound.
+
+        ``load_dataset`` retains the historical 16 MiB contract used by
+        general consumers.  Replay publishers need a separate finite bound,
+        so this narrow projection checks the stored UTF-8 size before JSON
+        decoding and never changes the general loader's semantics.
+        """
+        if (
+            isinstance(max_payload_bytes, bool)
+            or not isinstance(max_payload_bytes, int)
+            or max_payload_bytes < 0
+        ):
+            raise ValueError("max_payload_bytes must be a non-negative integer")
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT payload_json FROM datasets "
+                "WHERE dataset_id=? AND version=? LIMIT 1",
+                (str(dataset_id), str(version)),
+            ).fetchone()
+        if row is None:
+            return None
+        payload_json = row["payload_json"]
+        if not isinstance(payload_json, str):
+            raise ValueError("dataset payload is invalid")
+        if len(payload_json.encode("utf-8")) > max_payload_bytes:
+            raise ValueError("dataset payload exceeds requested byte bound")
+        return _load(payload_json)
+
 
     def load_dataset_record(self, dataset_id: str, version: str | None = None) -> dict[str, Any] | None:
         """Return payload plus version, quality and metadata for dashboards."""

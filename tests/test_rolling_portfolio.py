@@ -29,9 +29,12 @@ from axiom.experiment_plan import normalize_market_scope
 from axiom.storage import AxiomStore
 from axiom.autonomous import (
     AutonomousResearchProcessor,
+    _MAX_ROLLING_REPLAY_PAYLOAD_BYTES,
     _rolling_cursor_index,
     _rolling_cursor_record,
+    _rolling_hash,
     _rolling_inject_source_binding,
+    _rolling_rule_scope_market_ids,
     _rolling_work_items,
 )
 
@@ -1749,6 +1752,436 @@ class TestRollingPortfolio(unittest.TestCase):
             ):
                 processor._load_rolling_historical_dataset("oversized", "v1")
             self.assertEqual(json_calls, [])
+    def test_replay_ranks_catalogs_before_loading_only_winner_and_accepts_62mb_payload(self) -> None:
+        dataset_id = "Polymarket-recorded-book-replay"
+        stamp = NOW - timedelta(days=31)
+
+        def encoded(value: object) -> str:
+            return json.dumps(
+                value,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=lambda item: item.isoformat()
+                if isinstance(item, datetime)
+                else str(item),
+            )
+
+        with AxiomStore(":memory:") as store:
+            def publish(market_id: str, filler_size: int) -> str:
+                snapshot_id = f"snapshot-{market_id}"
+                publisher_payload = {
+                    "settlement": "CLOSED",
+                    "source_type": "FORWARD_COLLECTED",
+                }
+                store.save_polymarket_snapshot(
+                    snapshot_id,
+                    market_id,
+                    stamp,
+                    stamp,
+                    publisher_payload,
+                    source_type="FORWARD_COLLECTED",
+                )
+                source_record_hash = _rolling_hash(
+                    {
+                        "snapshot_id": snapshot_id,
+                        "market_id": market_id,
+                        "source_timestamp": stamp,
+                        "observed_at": stamp,
+                        "payload": publisher_payload,
+                    }
+                )
+                row = {
+                    "market_id": market_id,
+                    "timestamp": stamp,
+                    "source_timestamp": stamp,
+                    "observed_at": stamp,
+                    "source_type": "FORWARD_COLLECTED",
+                    "source_snapshot_id": snapshot_id,
+                    "source_record_hash": source_record_hash,
+                    "research_mode": "RECORDED_BOOK_REPLAY",
+                    "settlement": "CLOSED",
+                    "publisher_padding": "x" * filler_size,
+                }
+                manifest = [
+                    {
+                        "snapshot_id": snapshot_id,
+                        "source_record_hash": source_record_hash,
+                        "market_id": market_id,
+                        "source_timestamp": stamp,
+                    }
+                ]
+                version = _rolling_hash(
+                    {
+                        "dataset_id": dataset_id,
+                        "research_mode": "RECORDED_BOOK_REPLAY",
+                        "cutoff": NOW,
+                        "manifest": manifest,
+                        "rows": [row],
+                    }
+                )
+                store.connection.execute(
+                    "INSERT INTO datasets(dataset_id,version,payload_json,metadata_json,quality,created_at) "
+                    "VALUES (?,?,?,?,?,?)",
+                    (
+                        dataset_id,
+                        version,
+                        encoded([row]),
+                        "{}",
+                        "ORDER_BOOK_SIMULATED",
+                        NOW.isoformat(),
+                    ),
+                )
+                store.connection.execute(
+                    "INSERT INTO dataset_catalog("
+                    "dataset_id,dataset_version,provider,instrument,market_type,timeframe,"
+                    "start_timestamp,end_timestamp,row_count,completeness,missing_ranges_json,"
+                    "quality,source_type,snapshot_id,created_at,updated_at,metadata_json"
+                    ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        dataset_id,
+                        version,
+                        "publisher-fixture",
+                        "POLYMARKET",
+                        "prediction",
+                        "1d",
+                        stamp.isoformat(),
+                        stamp.isoformat(),
+                        1,
+                        1.0,
+                        "[]",
+                        "ORDER_BOOK_SIMULATED",
+                        "FORWARD_COLLECTED",
+                        f"manifest:{version}",
+                        NOW.isoformat(),
+                        NOW.isoformat(),
+                        encoded(
+                            {
+                                "research_mode": "RECORDED_BOOK_REPLAY",
+                                "exact_cutoff": NOW,
+                                "snapshot_manifest": manifest,
+                            }
+                        ),
+                    ),
+                )
+                store.connection.commit()
+                return version
+
+            winner = publish("winner-market", 61_000_000)
+            loser = publish("loser-market", 32)
+            processor = AutonomousResearchProcessor.__new__(AutonomousResearchProcessor)
+            processor.store = store
+            calls: list[str] = []
+            load_projection = store.load_dataset_payload_projection
+
+            def counted(
+                dataset: str,
+                version: str,
+                *,
+                max_payload_bytes: int,
+            ) -> object:
+                calls.append(version)
+                return load_projection(
+                    dataset,
+                    version,
+                    max_payload_bytes=max_payload_bytes,
+                )
+
+            with patch.object(store, "load_dataset_payload_projection", counted):
+                rows, catalog = processor._rolling_replay_catalog_rows(
+                    {"market_scope": {"market_ids": ["winner-market"]}},
+                    NOW,
+                )
+            self.assertEqual(calls, [winner])
+            self.assertEqual(catalog["dataset_version"], winner)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(len(rows[0]["publisher_padding"]), 61_000_000)
+            self.assertNotEqual(winner, loser)
+
+    def test_replay_payload_over_cap_is_rejected_before_json_decode(self) -> None:
+        def encoded(value: object) -> str:
+            return json.dumps(
+                value,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=lambda item: item.isoformat()
+                if isinstance(item, datetime)
+                else str(item),
+            )
+
+        dataset_id = "Polymarket-recorded-book-replay"
+        version = "sha256:" + ("0" * 64)
+        metadata = {
+            "research_mode": "RECORDED_BOOK_REPLAY",
+            "exact_cutoff": NOW,
+            "snapshot_manifest": [
+                {
+                    "snapshot_id": "never-loaded",
+                    "source_record_hash": "sha256:" + ("1" * 64),
+                    "market_id": "market-over-cap",
+                    "source_timestamp": NOW - timedelta(days=31),
+                }
+            ],
+        }
+        with AxiomStore(":memory:") as store:
+            store.connection.execute(
+                "INSERT INTO datasets(dataset_id,version,payload_json,metadata_json,quality,created_at) "
+                "VALUES (?,?,?,?,?,?)",
+                (
+                    dataset_id,
+                    version,
+                    encoded_payload := json.dumps(
+                        "x" * (_MAX_ROLLING_REPLAY_PAYLOAD_BYTES + 1)
+                    ),
+                    "{}",
+                    "ORDER_BOOK_SIMULATED",
+                    NOW.isoformat(),
+                ),
+            )
+            store.connection.execute(
+                "INSERT INTO dataset_catalog("
+                "dataset_id,dataset_version,provider,instrument,market_type,timeframe,"
+                "start_timestamp,end_timestamp,row_count,completeness,missing_ranges_json,"
+                "quality,source_type,snapshot_id,created_at,updated_at,metadata_json"
+                ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    dataset_id,
+                    version,
+                    "publisher-fixture",
+                    "POLYMARKET",
+                    "prediction",
+                    "1d",
+                    NOW.isoformat(),
+                    NOW.isoformat(),
+                    1,
+                    1.0,
+                    "[]",
+                    "ORDER_BOOK_SIMULATED",
+                    "FORWARD_COLLECTED",
+                    f"manifest:{version}",
+                    NOW.isoformat(),
+                    NOW.isoformat(),
+                    encoded(metadata),
+                ),
+            )
+            store.connection.commit()
+            processor = AutonomousResearchProcessor.__new__(AutonomousResearchProcessor)
+            processor.store = store
+            with patch("axiom.storage._load", side_effect=AssertionError("decoded")) as load:
+                with self.assertRaisesRegex(
+                    ValueError, "REPLAY_DATASET_UNAVAILABLE"
+                ):
+                    processor._rolling_replay_catalog_rows({}, NOW)
+            load.assert_not_called()
+            self.assertGreater(len(encoded_payload.encode("utf-8")), _MAX_ROLLING_REPLAY_PAYLOAD_BYTES)
+    def test_replay_scope_without_overlap_is_ineligible_before_payload_load(self) -> None:
+        dataset_id = "Polymarket-recorded-book-replay"
+        version = "sha256:" + ("2" * 64)
+        metadata = json.dumps(
+            {
+                "research_mode": "RECORDED_BOOK_REPLAY",
+                "exact_cutoff": NOW,
+                "snapshot_manifest": [
+                    {
+                        "snapshot_id": "foreign-snapshot",
+                        "source_record_hash": "sha256:" + ("3" * 64),
+                        "market_id": "foreign-market",
+                        "source_timestamp": NOW - timedelta(days=31),
+                    }
+                ],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            default=lambda item: item.isoformat()
+            if isinstance(item, datetime)
+            else str(item),
+        )
+        with AxiomStore(":memory:") as store:
+            store.connection.execute(
+                "INSERT INTO datasets(dataset_id,version,payload_json,metadata_json,quality,created_at) "
+                "VALUES (?,?,?,?,?,?)",
+                (
+                    dataset_id,
+                    version,
+                    "[]",
+                    "{}",
+                    "ORDER_BOOK_SIMULATED",
+                    NOW.isoformat(),
+                ),
+            )
+            store.connection.execute(
+                "INSERT INTO dataset_catalog("
+                "dataset_id,dataset_version,provider,instrument,market_type,timeframe,"
+                "start_timestamp,end_timestamp,row_count,completeness,missing_ranges_json,"
+                "quality,source_type,snapshot_id,created_at,updated_at,metadata_json"
+                ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    dataset_id,
+                    version,
+                    "publisher-fixture",
+                    "POLYMARKET",
+                    "prediction",
+                    "1d",
+                    NOW.isoformat(),
+                    NOW.isoformat(),
+                    1,
+                    1.0,
+                    "[]",
+                    "ORDER_BOOK_SIMULATED",
+                    "FORWARD_COLLECTED",
+                    f"manifest:{version}",
+                    NOW.isoformat(),
+                    NOW.isoformat(),
+                    metadata,
+                ),
+            )
+            store.connection.commit()
+            processor = AutonomousResearchProcessor.__new__(AutonomousResearchProcessor)
+            processor.store = store
+            calls: list[str] = []
+
+            def forbidden_payload_load(*args: object, **kwargs: object) -> object:
+                calls.append(str(args[1] if len(args) > 1 else kwargs.get("version")))
+                return []
+
+            with patch.object(
+                store,
+                "load_dataset_payload_projection",
+                forbidden_payload_load,
+            ):
+                with self.assertRaisesRegex(
+                    ValueError, "REPLAY_DATASET_UNAVAILABLE"
+                ):
+                    processor._rolling_replay_catalog_rows(
+                        {"market_scope": {"market_ids": ["requested-market"]}},
+                        NOW,
+                    )
+            self.assertEqual(calls, [])
+    def test_rule_scope_partial_persisted_resolution_blocks_replay(self) -> None:
+        record = {
+            "candidate_id": "rule-candidate",
+            "market_scope_hash": "scope-hash",
+            "market_scope_version": "scope-v1",
+            "market_scope": {
+                "mode": "RULE_BASED_MARKETS",
+                "instrument": "POLYMARKET",
+                "categories": [],
+                "filters": {},
+                "regime_restrictions": {},
+            },
+        }
+
+        class PartialResolutionStore:
+            def load_market_scope_resolution(self, *_args: object, **_kwargs: object) -> object:
+                return {
+                    "candidate_id": "rule-candidate",
+                    "scope_hash": "scope-hash",
+                    "scope_version": "scope-v1",
+                    "status": "PARTIAL",
+                    "matched_markets": [{"market_id": "scope-present"}],
+                }
+
+        with self.assertRaisesRegex(
+            ValueError, "RULE_BASED_MARKET_SCOPE_RESOLUTION_INCOMPLETE"
+        ):
+            _rolling_rule_scope_market_ids(
+                PartialResolutionStore(),
+                record,
+                record,
+                (),
+                NOW,
+            )
+
+    def test_rule_scope_missing_resolution_blocks_replay(self) -> None:
+        record = {
+            "candidate_id": "rule-candidate-missing",
+            "market_scope_hash": "scope-hash-missing",
+            "market_scope_version": "scope-v1",
+            "market_scope": {
+                "mode": "RULE_BASED_MARKETS",
+                "instrument": "POLYMARKET",
+                "categories": [],
+                "filters": {},
+                "regime_restrictions": {},
+            },
+        }
+
+        class MissingResolutionStore:
+            def load_market_scope_resolution(self, *_args: object, **_kwargs: object) -> object:
+                return None
+
+        with self.assertRaisesRegex(
+            ValueError, "RULE_BASED_MARKET_SCOPE_RESOLUTION_INCOMPLETE"
+        ):
+            _rolling_rule_scope_market_ids(
+                MissingResolutionStore(),
+                record,
+                record,
+                (),
+                NOW,
+            )
+
+    def test_replay_partial_scope_is_ineligible_before_payload_load(self) -> None:
+        dataset_id = "Polymarket-recorded-book-replay"
+        version = "sha256:" + ("4" * 64)
+        with AxiomStore(":memory:") as store:
+            store.save_dataset_catalog(
+                dataset_id,
+                version,
+                provider="publisher-fixture",
+                instrument="POLYMARKET",
+                market_type="prediction",
+                timeframe="1d",
+                start_timestamp=NOW - timedelta(days=31),
+                end_timestamp=NOW - timedelta(days=31),
+                row_count=1,
+                completeness=1.0,
+                missing_ranges=(),
+                quality="ORDER_BOOK_SIMULATED",
+                source_type="FORWARD_COLLECTED",
+                snapshot_id=f"manifest:{version}",
+                metadata={
+                    "research_mode": "RECORDED_BOOK_REPLAY",
+                    "exact_cutoff": NOW,
+                    "snapshot_manifest": [
+                        {
+                            "snapshot_id": "partial-snapshot",
+                            "source_record_hash": "sha256:" + ("5" * 64),
+                            "market_id": "scope-present",
+                            "source_timestamp": NOW - timedelta(days=31),
+                        }
+                    ],
+                },
+                created_at=NOW,
+                updated_at=NOW,
+            )
+            processor = AutonomousResearchProcessor.__new__(AutonomousResearchProcessor)
+            processor.store = store
+            calls: list[str] = []
+
+            def forbidden_payload_load(*args: object, **kwargs: object) -> object:
+                calls.append(str(args[1] if len(args) > 1 else kwargs.get("version")))
+                return []
+
+            with patch.object(
+                store,
+                "load_dataset_payload_projection",
+                forbidden_payload_load,
+            ):
+                with self.assertRaisesRegex(
+                    ValueError, "REPLAY_DATASET_UNAVAILABLE"
+                ):
+                    processor._rolling_replay_catalog_rows(
+                        {
+                            "market_scope": {
+                                "market_ids": ["scope-present", "scope-missing"]
+                            }
+                        },
+                        NOW,
+                    )
+            self.assertEqual(calls, [])
+
+
+
 
     def test_paper_loader_requires_exact_registry_lineage_for_resolved_bet(self) -> None:
         strategy_hash = "sha256:strategy-alpha"

@@ -40,7 +40,6 @@ from .robustness import bootstrap_confidence_interval, minimum_sample_check, nei
 from .storage import (
     AxiomStore,
     _PAPER_POSITION_PROJECTION_LIMIT,
-    _dataset_catalog_record,
     _json_array_count,
     _json_array_count_for_key,
 )
@@ -91,10 +90,17 @@ _ROLLING_NON_AUTHORITATIVE_ARRAY_KEYS = frozenset(
         "market_bindings",
     }
 )
-# Historical rolling evidence is preflighted before JSON decoding.  The fixed
-# 16 MiB/25,000-row boundary keeps immutable source material bounded while
+# Historical rolling evidence is preflighted before JSON decoding.  The
+# historical source remains bounded at 16 MiB; immutable recorded-book replay
+# is a separately bounded publisher payload (the current 10,000-row catalog is
+# approximately 61.9 MiB including JSON punctuation and therefore fits under
+# this 64 MiB limit).
 # the source-row projection below remains deterministic.
 _MAX_ROLLING_DATASET_PAYLOAD_BYTES = 16 * 1024 * 1024
+_MAX_ROLLING_REPLAY_PAYLOAD_BYTES = 64 * 1024 * 1024
+_MAX_ROLLING_REPLAY_CATALOG_METADATA_BYTES = 4 * 1024 * 1024
+_MAX_ROLLING_REPLAY_METADATA_BUDGET_BYTES = 64 * 1024 * 1024
+_MAX_ROLLING_REPLAY_CATALOGS = 256
 _MAX_ROLLING_SOURCE_ROWS = 25_000
 _MAX_ROLLING_EXIT_LINEAGE = 20
 _MAX_ROLLING_TOTAL_ROWS = 100_000
@@ -2095,7 +2101,7 @@ _ROLLING_PERSISTED_SOURCE_CLASSES: Mapping[str, str] = {
     "LIVE": "FORWARD_COLLECTED",
 }
 _ROLLING_REPLAY_DATASET_ID = "Polymarket-recorded-book-replay"
-_ROLLING_REPLAY_MAX_CATALOGS = 256
+_ROLLING_REPLAY_MAX_CATALOGS = _MAX_ROLLING_REPLAY_CATALOGS
 _ROLLING_INPUT_MANIFEST_MARKETS = 128
 _ROLLING_INPUT_MANIFEST_ROWS = 25_000
 
@@ -2681,9 +2687,10 @@ def _rolling_rule_scope_market_ids(
             _binding_value(resolution.get("candidate_id")) != candidate_id
             or _binding_value(resolution.get("scope_hash")) != scope_hash
             or _binding_value(resolution.get("scope_version")) != scope_version
-            or str(resolution.get("status", "")).strip().upper() != "MATCHED"
         ):
             raise ValueError("RULE_BASED_MARKET_SCOPE_RESOLUTION_INVALID")
+        if str(resolution.get("status", "")).strip().upper() != "MATCHED":
+            raise ValueError("RULE_BASED_MARKET_SCOPE_RESOLUTION_INCOMPLETE")
         matched = resolution.get("matched_markets", ())
         if not isinstance(matched, (list, tuple)):
             raise ValueError("RULE_BASED_MARKET_SCOPE_RESOLUTION_INVALID")
@@ -2697,6 +2704,8 @@ def _rolling_rule_scope_market_ids(
                 market_id = _binding_value(market)
             if market_id:
                 result.add(market_id)
+        if not result:
+            raise ValueError("RULE_BASED_MARKET_SCOPE_RESOLUTION_INCOMPLETE")
         return result
     # Custom stores may not persist resolutions.  Reuse the canonical resolver
     # against their bounded inventory rather than implementing a second rule
@@ -2728,11 +2737,14 @@ def _rolling_rule_scope_market_ids(
     if resolved_status != "MATCHED":
         raise ValueError("RULE_BASED_MARKET_SCOPE_RESOLUTION_INCOMPLETE")
     matched = getattr(resolved, "matched_markets", ())
-    return {
+    result = {
         market_id
         for market in matched
         if (market_id := _binding_value(getattr(market, "market_id", None)))
     }
+    if not result:
+        raise ValueError("RULE_BASED_MARKET_SCOPE_RESOLUTION_INCOMPLETE")
+    return result
 def _rolling_document_is_marked(value: Mapping[str, Any], provenance: Mapping[str, Any] | None = None) -> bool:
     containers = [value]
     if isinstance(provenance, Mapping):
@@ -5319,15 +5331,23 @@ class AutonomousResearchProcessor:
         self,
         record: Mapping[str, Any],
         now: datetime,
+        *,
+        scope_market_ids: set[str] | None = None,
     ) -> tuple[list[dict[str, Any]], Mapping[str, Any]]:
-        """Select one exact immutable recorded-book catalog and its rows."""
+        """Rank bounded catalog metadata, then validate payloads in rank order.
+
+        Catalog metadata is the only material decoded during discovery.  The
+        immutable dataset payload and publisher snapshots are loaded only for
+        one candidate at a time, and validation stops at the first winner.
+        """
         connection = getattr(self.store, "connection", None)
         execute = getattr(connection, "execute", None)
         if not callable(execute):
             raise ValueError("REPLAY_DATASET_UNAVAILABLE")
         try:
             descriptors = execute(
-                "SELECT dataset_version,row_count,"
+                "SELECT dataset_version,row_count,completeness,"
+                "start_timestamp,end_timestamp,updated_at,"
                 "LENGTH(CAST(metadata_json AS BLOB)) AS metadata_bytes,"
                 "LENGTH(CAST(missing_ranges_json AS BLOB)) AS missing_ranges_bytes "
                 "FROM dataset_catalog "
@@ -5342,62 +5362,6 @@ class AutonomousResearchProcessor:
         except Exception as exc:
             raise ValueError("REPLAY_DATASET_UNAVAILABLE") from exc
 
-        catalogs: list[Mapping[str, Any]] = []
-        for descriptor in descriptors:
-            version = str(descriptor["dataset_version"] or "").strip()
-            expected_count = descriptor["row_count"]
-            if (
-                not version
-                or isinstance(expected_count, bool)
-                or not isinstance(expected_count, int)
-                or expected_count < 0
-                or expected_count > _ROLLING_INPUT_MANIFEST_ROWS
-            ):
-                continue
-            try:
-                metadata_bytes = int(descriptor["metadata_bytes"])
-                missing_ranges_bytes = int(descriptor["missing_ranges_bytes"])
-            except (TypeError, ValueError, OverflowError):
-                continue
-            if (
-                metadata_bytes < 0
-                or missing_ranges_bytes < 0
-                or metadata_bytes > _MAX_ROLLING_DATASET_PAYLOAD_BYTES
-                or missing_ranges_bytes > _MAX_ROLLING_DATASET_PAYLOAD_BYTES
-            ):
-                continue
-            try:
-                raw_catalog = execute(
-                    "SELECT * FROM dataset_catalog "
-                    "WHERE dataset_id=? AND dataset_version=? LIMIT 1",
-                    (_ROLLING_REPLAY_DATASET_ID, version),
-                ).fetchone()
-                if raw_catalog is None:
-                    continue
-                metadata_json = raw_catalog["metadata_json"]
-                missing_json = raw_catalog["missing_ranges_json"]
-                manifest_count = _json_array_count_for_key(
-                    metadata_json,
-                    ("snapshot_manifest", "manifest"),
-                    limit=_ROLLING_INPUT_MANIFEST_ROWS,
-                )
-                missing_count = _json_array_count(
-                    missing_json,
-                    limit=_ROLLING_INPUT_MANIFEST_ROWS,
-                )
-                if (
-                    manifest_count is not None
-                    and manifest_count > _ROLLING_INPUT_MANIFEST_ROWS
-                ) or (
-                    missing_count is not None
-                    and missing_count > _ROLLING_INPUT_MANIFEST_ROWS
-                ):
-                    continue
-                catalogs.append(_dataset_catalog_record(raw_catalog))
-            except Exception:
-                continue
-        if not catalogs:
-            raise ValueError("REPLAY_DATASET_UNAVAILABLE")
         binding = _rolling_source_binding(record)
         requested_id = _binding_value(binding.get("dataset_id"))
         requested_version = _binding_value(
@@ -5408,120 +5372,276 @@ class AutonomousResearchProcessor:
             if requested_id == _ROLLING_REPLAY_DATASET_ID
             else None
         )
-        scope_ids = _rolling_market_scope_ids(binding)
-        candidates: list[tuple[tuple[Any, ...], Mapping[str, Any], list[dict[str, Any]]]] = []
+        scope_ids = (
+            set(scope_market_ids)
+            if scope_market_ids is not None
+            else _rolling_market_scope_ids(binding)
+        )
+        metadata_budget = 0
+        ranked: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
 
-        def catalog_rows(catalog: Mapping[str, Any]) -> list[dict[str, Any]] | None:
-            metadata = catalog.get("metadata")
-            if not isinstance(metadata, Mapping):
-                return None
-            if str(catalog.get("dataset_id", "")).strip() != _ROLLING_REPLAY_DATASET_ID:
-                return None
-            if str(catalog.get("source_type", "")).strip().upper() != "FORWARD_COLLECTED":
-                return None
-            if str(metadata.get("research_mode", "")).strip().upper().replace("-", "_") != "RECORDED_BOOK_REPLAY":
+        def integer(value: Any) -> int | None:
+            if isinstance(value, bool) or value is None:
                 return None
             try:
-                complete = float(catalog.get("completeness"))
+                parsed = int(value)
             except (TypeError, ValueError, OverflowError):
                 return None
-            if not math.isfinite(complete) or complete != 1.0:
-                return None
-            missing_ranges = catalog.get("missing_ranges", ())
-            if not isinstance(missing_ranges, Sequence) or isinstance(missing_ranges, (str, bytes)):
-                return None
-            if len(missing_ranges) > _ROLLING_INPUT_MANIFEST_ROWS:
-                return None
-            if any(
-                not isinstance(item, Mapping) or not _rolling_replay_row_terminal(item)
-                for item in missing_ranges
+            return parsed if parsed >= 0 else None
+
+        def bounded_catalog(descriptor: Any) -> dict[str, Any] | None:
+            nonlocal metadata_budget
+            version = str(descriptor["dataset_version"] or "").strip()
+            expected_count = integer(descriptor["row_count"])
+            if (
+                not re.fullmatch(r"sha256:[0-9a-f]{64}", version)
+                or expected_count is None
+                or expected_count > _ROLLING_INPUT_MANIFEST_ROWS
+                or (pinned_version is not None and version != pinned_version)
             ):
+                return None
+            try:
+                metadata_bytes = integer(descriptor["metadata_bytes"])
+                missing_bytes = integer(descriptor["missing_ranges_bytes"])
+            except (KeyError, TypeError):
+                return None
+            if (
+                metadata_bytes is None
+                or missing_bytes is None
+                or metadata_bytes > _MAX_ROLLING_REPLAY_CATALOG_METADATA_BYTES
+                or missing_bytes > _MAX_ROLLING_REPLAY_CATALOG_METADATA_BYTES
+                or metadata_budget + metadata_bytes + missing_bytes
+                > _MAX_ROLLING_REPLAY_METADATA_BUDGET_BYTES
+            ):
+                return None
+            try:
+                raw = execute(
+                    "SELECT * FROM dataset_catalog "
+                    "WHERE dataset_id=? AND dataset_version=? LIMIT 1",
+                    (_ROLLING_REPLAY_DATASET_ID, version),
+                ).fetchone()
+            except Exception:
+                return None
+            if raw is None:
+                return None
+            metadata_json = raw["metadata_json"]
+            missing_json = raw["missing_ranges_json"]
+            if (
+                not isinstance(metadata_json, str)
+                or not isinstance(missing_json, str)
+                or len(metadata_json.encode("utf-8")) != metadata_bytes
+                or len(missing_json.encode("utf-8")) != missing_bytes
+            ):
+                return None
+            # Count bounded arrays without deserializing them.  An oversized
+            # manifest is rejected before json.loads can allocate its entries.
+            manifest_count = _json_array_count_for_key(
+                metadata_json,
+                ("snapshot_manifest", "manifest"),
+                limit=_ROLLING_INPUT_MANIFEST_ROWS,
+            )
+            missing_count = _json_array_count(
+                missing_json,
+                limit=_ROLLING_INPUT_MANIFEST_ROWS,
+            )
+            if (
+                manifest_count is None
+                or manifest_count > _ROLLING_INPUT_MANIFEST_ROWS
+                or missing_count is None
+                or missing_count > _ROLLING_INPUT_MANIFEST_ROWS
+            ):
+                return None
+            try:
+                metadata = json.loads(metadata_json)
+                missing_ranges = json.loads(missing_json)
+            except (TypeError, ValueError, RecursionError):
+                return None
+            if not isinstance(metadata, Mapping) or not isinstance(
+                missing_ranges, list
+            ):
+                return None
+            if (
+                str(raw["dataset_id"]).strip() != _ROLLING_REPLAY_DATASET_ID
+                or str(raw["source_type"]).strip().upper() != "FORWARD_COLLECTED"
+                or str(metadata.get("research_mode", "")).strip().upper().replace("-", "_")
+                != "RECORDED_BOOK_REPLAY"
+                or len(missing_ranges) > _ROLLING_INPUT_MANIFEST_ROWS
+                or any(
+                    not isinstance(item, Mapping)
+                    or not _rolling_replay_row_terminal(item)
+                    for item in missing_ranges
+                )
+            ):
+                return None
+            # Replay catalogs are complete immutable snapshots; a catalog
+            # carrying any missing range is not eligible for selection.
+            if missing_ranges:
+                return None
+            try:
+                completeness = float(raw["completeness"])
+            except (TypeError, ValueError, OverflowError):
+                return None
+            if not math.isfinite(completeness) or completeness != 1.0:
                 return None
             manifest = metadata.get("snapshot_manifest", metadata.get("manifest"))
-            if not isinstance(manifest, Sequence) or isinstance(manifest, (str, bytes)):
-                return None
-            if len(manifest) > _ROLLING_INPUT_MANIFEST_ROWS:
-                return None
-            if any(not isinstance(item, Mapping) for item in manifest):
-                return None
-            expected_count = catalog.get("row_count")
             if (
-                isinstance(expected_count, bool)
-                or not isinstance(expected_count, int)
-                or expected_count < 0
-                or expected_count > _ROLLING_INPUT_MANIFEST_ROWS
+                not isinstance(manifest, Sequence)
+                or isinstance(manifest, (str, bytes))
+                or len(manifest) > _ROLLING_INPUT_MANIFEST_ROWS
+                or len(manifest) != expected_count
+                or any(not isinstance(item, Mapping) for item in manifest)
             ):
                 return None
-            dataset_version = str(catalog.get("dataset_version", catalog.get("version", ""))).strip()
-            if not re.fullmatch(r"sha256:[0-9a-f]{64}", dataset_version):
+
+            markets = {
+                str(item.get("market_id", "")).strip()
+                for item in manifest
+                if str(item.get("market_id", "")).strip()
+            }
+            if scope_ids and not scope_ids.issubset(markets):
+                # A non-empty requested scope must be fully represented by
+                # the immutable manifest; otherwise downstream filtering
+                # would silently label a partial replay as complete.
                 return None
-            try:
-                dataset_lengths = execute(
-                    "SELECT LENGTH(CAST(payload_json AS BLOB)) AS payload_bytes,"
-                    "LENGTH(CAST(metadata_json AS BLOB)) AS metadata_bytes "
-                    "FROM datasets WHERE dataset_id=? AND version=? LIMIT 1",
-                    (_ROLLING_REPLAY_DATASET_ID, dataset_version),
-                ).fetchone()
-                if dataset_lengths is None:
+            stamps = [
+                stamp
+                for stamp in (
+                    _rolling_timestamp(item.get("source_timestamp"))
+                    for item in manifest
+                )
+                if stamp is not None
+            ]
+            first = min(stamps) if stamps else _rolling_timestamp(
+                raw["start_timestamp"]
+            )
+            last = max(stamps) if stamps else _rolling_timestamp(raw["end_timestamp"])
+            available = _rolling_timestamp(
+                metadata.get("available_through", metadata.get("exact_cutoff"))
+            ) or _rolling_timestamp(raw["updated_at"])
+            manifest_digest = _rolling_hash(list(manifest))
+            tie_digest = _rolling_hash(
+                {"manifest": manifest_digest, "dataset_version": version}
+            )
+            catalog = {
+                "dataset_id": raw["dataset_id"],
+                "dataset_version": raw["dataset_version"],
+                "version": raw["dataset_version"],
+                "provider": raw["provider"],
+                "instrument": raw["instrument"],
+                "market_type": raw["market_type"],
+                "timeframe": raw["timeframe"],
+                "start_timestamp": _rolling_timestamp(raw["start_timestamp"]),
+                "end_timestamp": _rolling_timestamp(raw["end_timestamp"]),
+                "row_count": int(raw["row_count"]),
+                "completeness": completeness,
+                "missing_ranges": missing_ranges,
+                "quality": raw["quality"],
+                "source_type": raw["source_type"],
+                "snapshot_id": raw["snapshot_id"],
+                "created_at": _rolling_timestamp(raw["created_at"]),
+                "updated_at": _rolling_timestamp(raw["updated_at"]),
+                "last_updated": _rolling_timestamp(raw["updated_at"]),
+                "metadata": metadata,
+            }
+            metadata_budget += metadata_bytes + missing_bytes
+            required_start = ensure_utc(now) - timedelta(days=30)
+            scope_complete = bool(scope_ids) and scope_ids.issubset(markets)
+            overlap = len(scope_ids & markets) if scope_ids else 0
+            lookback_sufficient = bool(
+                first is not None
+                and first <= required_start
+                and last is not None
+                and last <= ensure_utc(now)
+            )
+            coverage_seconds = (
+                int((last - first).total_seconds())
+                if first is not None and last is not None and last >= first
+                else 0
+            )
+            rank = (
+                1,  # source_type is selected by the SQL source gate
+                1,  # research_mode is validated above
+                1,  # completeness is exactly complete
+                1 if not missing_ranges else 0,
+                1 if scope_complete else 0,
+                overlap,
+                1 if lookback_sufficient else 0,
+                coverage_seconds,
+                available or datetime.min.replace(tzinfo=timezone.utc),
+                tie_digest,
+                version,
+            )
+            return {
+                "rank": rank,
+                "catalog": catalog,
+                "manifest": list(manifest),
+                "metadata_bytes": metadata_bytes,
+            }
+
+        for descriptor in descriptors:
+            candidate = bounded_catalog(descriptor)
+            if candidate is not None:
+                ranked.append((candidate["rank"], candidate))
+        if not ranked:
+            raise ValueError("REPLAY_DATASET_UNAVAILABLE")
+        ranked.sort(key=lambda item: item[0], reverse=True)
+
+        def load_payload(version: str) -> Any | None:
+            projection_loader = getattr(
+                self.store, "load_dataset_payload_projection", None
+            )
+            if callable(projection_loader):
+                try:
+                    return projection_loader(
+                        _ROLLING_REPLAY_DATASET_ID,
+                        version,
+                        max_payload_bytes=_MAX_ROLLING_REPLAY_PAYLOAD_BYTES,
+                    )
+                except Exception:
                     return None
-                payload_bytes = int(dataset_lengths["payload_bytes"])
-                metadata_bytes = int(dataset_lengths["metadata_bytes"])
-            except Exception:
-                return None
-            if (
-                payload_bytes < 0
-                or metadata_bytes < 0
-                or payload_bytes > _MAX_ROLLING_DATASET_PAYLOAD_BYTES
-                or metadata_bytes > _MAX_ROLLING_DATASET_PAYLOAD_BYTES
-            ):
-                return None
             try:
-                dataset_row = execute(
+                row = execute(
                     "SELECT payload_json FROM datasets "
                     "WHERE dataset_id=? AND version=? LIMIT 1",
-                    (_ROLLING_REPLAY_DATASET_ID, dataset_version),
+                    (_ROLLING_REPLAY_DATASET_ID, version),
                 ).fetchone()
-                payload_json = (
-                    dataset_row["payload_json"] if dataset_row is not None else None
-                )
-                root_count = _json_array_count(
-                    payload_json,
-                    limit=_ROLLING_INPUT_MANIFEST_ROWS,
-                )
-                records_count = _json_array_count_for_key(
-                    payload_json,
-                    ("records", "rows"),
-                    limit=_ROLLING_INPUT_MANIFEST_ROWS,
-                )
-                if any(
-                    count is not None and count > _ROLLING_INPUT_MANIFEST_ROWS
-                    for count in (root_count, records_count)
-                ):
+                payload_json = row["payload_json"] if row is not None else None
+                if not isinstance(payload_json, str):
                     return None
-                values = json.loads(payload_json) if isinstance(payload_json, str) else None
-            except Exception:
+                if len(payload_json.encode("utf-8")) > _MAX_ROLLING_REPLAY_PAYLOAD_BYTES:
+                    return None
+                return json.loads(payload_json)
+            except (TypeError, ValueError, RecursionError):
                 return None
+
+        def validate(candidate: Mapping[str, Any]) -> tuple[
+            list[dict[str, Any]], Mapping[str, Any]
+        ] | None:
+            catalog = candidate["catalog"]
+            metadata = catalog["metadata"]
+            manifest = candidate["manifest"]
+            version = str(catalog["dataset_version"])
+            values = load_payload(version)
             if isinstance(values, Mapping):
                 values = values.get("records", values.get("rows", ()))
-            if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
+            if (
+                not isinstance(values, Sequence)
+                or isinstance(values, (str, bytes))
+                or len(values) > _ROLLING_INPUT_MANIFEST_ROWS
+                or len(values) != len(manifest)
+                or len(values) != int(catalog["row_count"])
+                or any(not isinstance(value, Mapping) for value in values)
+            ):
                 return None
-            if len(values) > _ROLLING_INPUT_MANIFEST_ROWS:
-                return None
-            rows = [dict(value) for value in values if isinstance(value, Mapping)]
-            if len(rows) != len(values) or len(rows) != len(manifest):
-                return None
-            if expected_count != len(rows):
-                return None
+            rows = [dict(value) for value in values]
             source_loader = getattr(
-                self.store,
-                "load_polymarket_snapshots_by_ids",
-                None,
+                self.store, "load_polymarket_snapshots_by_ids", None
             )
             if not callable(source_loader):
                 return None
-            source_ids = tuple(
-                str(item["snapshot_id"]).strip() for item in manifest
-            )
+            source_ids = tuple(str(item.get("snapshot_id", "")).strip() for item in manifest)
+            if any(not item for item in source_ids) or len(set(source_ids)) != len(source_ids):
+                return None
             try:
                 source_values = source_loader(
                     source_ids,
@@ -5532,8 +5652,7 @@ class AutonomousResearchProcessor:
             if isinstance(source_values, Mapping):
                 source_by_id = dict(source_values)
             elif isinstance(source_values, Sequence) and not isinstance(
-                source_values,
-                (str, bytes),
+                source_values, (str, bytes)
             ):
                 source_by_id = {
                     str(item.get("snapshot_id", "")).strip(): item
@@ -5585,12 +5704,13 @@ class AutonomousResearchProcessor:
                     or source_time is None
                     or row_time != manifest_time
                     or source_time != manifest_time
+                    or str(row.get("source_type", "")).strip().upper()
+                    != "FORWARD_COLLECTED"
                 ):
                     return None
-                if str(row.get("source_type", "")).strip().upper() != "FORWARD_COLLECTED":
-                    return None
-            cutoff = metadata.get("exact_cutoff", metadata.get("cutoff"))
-            cutoff_stamp = _rolling_timestamp(cutoff)
+            cutoff_stamp = _rolling_timestamp(
+                metadata.get("exact_cutoff", metadata.get("cutoff"))
+            )
             if cutoff_stamp is None:
                 return None
             expected_version = _rolling_hash(
@@ -5602,78 +5722,29 @@ class AutonomousResearchProcessor:
                     "rows": rows,
                 }
             )
-            if expected_version != dataset_version:
+            if expected_version != version:
                 return None
-            return rows
+            return rows, catalog
 
-        for catalog in catalogs[:_ROLLING_REPLAY_MAX_CATALOGS]:
-            if not isinstance(catalog, Mapping):
+        for _rank, candidate in ranked:
+            selected = validate(candidate)
+            if selected is None:
                 continue
-            version = _binding_value(catalog.get("dataset_version", catalog.get("version")))
-            if pinned_version is not None and version != pinned_version:
-                continue
-            rows = catalog_rows(catalog)
-            if rows is None:
-                continue
-            metadata = catalog.get("metadata")
-            assert isinstance(metadata, Mapping)
-            markets = {
-                str(row.get("market_id", "")).strip()
-                for row in rows
-                if str(row.get("market_id", "")).strip()
-            }
-            overlap = len(scope_ids & markets) if scope_ids else 0
-            scope_complete = bool(scope_ids) and scope_ids.issubset(markets)
-            stamps = [
-                stamp
-                for stamp in (
-                    _rolling_timestamp(row.get("source_timestamp", row.get("timestamp")))
-                    for row in rows
-                )
-                if stamp is not None
-            ]
-            first = min(stamps) if stamps else None
-            last = max(stamps) if stamps else None
-            required_start = ensure_utc(now) - timedelta(days=30)
-            lookback_sufficient = bool(first is not None and first <= required_start and last is not None and last <= ensure_utc(now))
-            coverage_seconds = (
-                int((last - first).total_seconds())
-                if first is not None and last is not None and last >= first
-                else 0
+            selected_rows, selected_catalog = selected
+            selected_id = str(
+                selected_catalog.get("dataset_id", _ROLLING_REPLAY_DATASET_ID)
             )
-            availability = _rolling_timestamp(
-                metadata.get("available_through", metadata.get("exact_cutoff"))
-            ) or _rolling_timestamp(catalog.get("updated_at"))
-            manifest_digest = _rolling_hash(list(metadata.get("snapshot_manifest", metadata.get("manifest", ()))))
-            tie_digest = _rolling_hash(
-                {"manifest": manifest_digest, "dataset_version": version}
-            )
-            rank = (
-                1 if scope_complete else 0,
-                overlap,
-                1 if lookback_sufficient else 0,
-                coverage_seconds,
-                availability or datetime.min.replace(tzinfo=timezone.utc),
-                tie_digest,
-                str(version or ""),
-            )
-            candidates.append((rank, catalog, rows))
-        if not candidates:
-            raise ValueError("REPLAY_DATASET_UNAVAILABLE")
-        _rank, selected_catalog, selected_rows = max(candidates, key=lambda item: item[0])
-        selected_id = str(selected_catalog.get("dataset_id", _ROLLING_REPLAY_DATASET_ID))
-        selected_version = str(
-            selected_catalog.get("dataset_version", selected_catalog.get("version", ""))
-        )
-        for row in selected_rows:
-            row["_rolling_replay_catalog"] = {
-                "dataset_id": selected_id,
-                "dataset_version": selected_version,
-                "research_mode": "RECORDED_BOOK_REPLAY",
-            }
-            row.setdefault("dataset_id", selected_id)
-            row.setdefault("dataset_version", selected_version)
-        return selected_rows, selected_catalog
+            selected_version = str(selected_catalog["dataset_version"])
+            for row in selected_rows:
+                row["_rolling_replay_catalog"] = {
+                    "dataset_id": selected_id,
+                    "dataset_version": selected_version,
+                    "research_mode": "RECORDED_BOOK_REPLAY",
+                }
+                row.setdefault("dataset_id", selected_id)
+                row.setdefault("dataset_version", selected_version)
+            return selected_rows, selected_catalog
+        raise ValueError("REPLAY_DATASET_UNAVAILABLE")
 
     def _ensure_rolling_paper_observation(
         self,
@@ -5853,6 +5924,25 @@ class AutonomousResearchProcessor:
             source_binding.get("strategy_version_id")
         )
         rows: list[dict[str, Any]] = []
+        replay_rule_scope_resolved = False
+        replay_scope_market_ids: set[str] | None = None
+        if source == "REPLAY":
+            replay_scope = binding.get("market_scope", binding.get("scope"))
+            if (
+                isinstance(replay_scope, Mapping)
+                and str(replay_scope.get("mode", "")).strip().upper()
+                == "RULE_BASED_MARKETS"
+            ):
+                replay_rule_scope_resolved = True
+                # Resolve persisted scope membership before selecting a broad
+                # replay catalog. Missing/partial resolution fails closed.
+                replay_scope_market_ids = _rolling_rule_scope_market_ids(
+                    self.store,
+                    record,
+                    binding,
+                    (),
+                    now,
+                )
         if source == "HISTORICAL":
             # Dataset identity alone is not strategy/accounting lineage.
             # Unbound rows remain usable input for canonical evaluation but
@@ -5923,7 +6013,9 @@ class AutonomousResearchProcessor:
                         rows.append(checked)
         elif source == "REPLAY":
             replay_rows, _replay_catalog = self._rolling_replay_catalog_rows(
-                record, now
+                record,
+                now,
+                scope_market_ids=replay_scope_market_ids,
             )
             # The strategy's historical dataset selector is not replay
             # identity.  Catalog identity is carried by each exact row and
@@ -6235,13 +6327,16 @@ class AutonomousResearchProcessor:
                 if pending_intent:
                     raise ValueError("PAPER_MARKET_AUTHORITY_PENDING")
                 raise ValueError("PAPER_SPEC_BINDING_MISMATCH")
-        resolved_scope_market_ids = _rolling_rule_scope_market_ids(
-            self.store,
-            record,
-            binding,
-            rows,
-            now,
-        )
+        if replay_rule_scope_resolved:
+            resolved_scope_market_ids = replay_scope_market_ids
+        else:
+            resolved_scope_market_ids = _rolling_rule_scope_market_ids(
+                self.store,
+                record,
+                binding,
+                rows,
+                now,
+            )
         normalized: list[dict[str, Any]] = []
         allowed_source_types = _ROLLING_SOURCE_TYPES[source]
         for raw in rows:
