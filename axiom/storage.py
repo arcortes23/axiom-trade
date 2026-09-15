@@ -12704,15 +12704,25 @@ class AxiomStore:
         # One current row per candidate makes the funnel represent current
         # authority, not every historical reevaluation.
         query = (
-            "WITH ranked AS ("
-            "SELECT candidate_id,status,reason,scope_hash,scope_version,resolved_at,resolution_id,"
-            "ROW_NUMBER() OVER (PARTITION BY candidate_id "
-            "ORDER BY resolved_at DESC,resolution_id DESC) AS row_number "
-            "FROM market_scope_resolutions "
-            + clauses
-            + ") SELECT candidate_id,status,reason,scope_hash,scope_version,resolved_at,resolution_id "
-            "FROM ranked WHERE row_number=1 "
-            "ORDER BY resolved_at DESC,resolution_id DESC LIMIT ?"
+            "WITH candidates AS ("
+            "SELECT candidate_id FROM candidate_lifecycle "
+            "UNION "
+            "SELECT DISTINCT r.candidate_id "
+            "FROM market_scope_resolutions AS r "
+            "LEFT JOIN candidate_lifecycle AS c ON c.candidate_id=r.candidate_id "
+            "WHERE c.candidate_id IS NULL"
+            "), latest AS ("
+            "SELECT c.candidate_id,"
+            "(SELECT resolution_id FROM market_scope_resolutions AS r "
+            "WHERE r.candidate_id=c.candidate_id "
+            "ORDER BY r.resolved_at DESC,r.resolution_id DESC LIMIT 1) AS resolution_id "
+            "FROM candidates AS c"
+            ") SELECT r.candidate_id,r.status,r.reason,r.scope_hash,r.scope_version,"
+            "r.resolved_at,r.resolution_id "
+            "FROM market_scope_resolutions AS r "
+            "JOIN latest AS l ON l.resolution_id=r.resolution_id "
+            + ("WHERE r.candidate_id=? " if clauses else "")
+            + "ORDER BY r.resolved_at DESC,r.resolution_id DESC LIMIT ?"
         )
         values.append(int(limit))
         with self._lock:
@@ -14950,21 +14960,79 @@ class AxiomStore:
             clauses.append(like_sql)
             values.extend(like_values)
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
-        with self._lock:
-            total = int(self._conn.execute(f"SELECT COUNT(*) AS n FROM dataset_catalog{where}", values).fetchone()["n"])
-            actual_page, pages = _pagination_shape(requested_page, size, total)
-            query = (
-                "SELECT dataset_catalog.*, "
-                "(SELECT COUNT(*) FROM json_each(dataset_catalog.metadata_json)) AS metadata_key_count, "
-                "json_extract(dataset_catalog.metadata_json,'$.category') AS metadata_category, "
-                "json_extract(dataset_catalog.metadata_json,'$.historical_order_book_available') AS metadata_historical_order_book_available, "
-                "json_extract(dataset_catalog.metadata_json,'$.universe_version') AS metadata_universe_version, "
-                "json_array_length(dataset_catalog.missing_ranges_json) AS missing_range_count "
-                "FROM dataset_catalog"
-                f"{where} ORDER BY {order_column} {order_direction.upper()},dataset_id ASC,dataset_version ASC "
+        page_identifiers: list[tuple[str, str]] | None = None
+        # ``metadata_json`` is an append-only, payload-bearing column.  The
+        # dashboard page only needs it for the bounded rows that are returned,
+        # but a direct ``SELECT *`` forces SQLite to visit every payload before
+        # it can sort the page.  Use the covering updated-at index to select
+        # identifiers first, then hydrate those rows in a second indexed lookup.
+        # Keep the original query for metadata filters, whose semantics require
+        # inspecting every candidate payload.
+        can_bound_page = (
+            order_column == "updated_at"
+            and not str(filter or "").strip()
+            and category is None
+        )
+        index_hint = (
+            "idx_dataset_catalog_source"
+            if source_type is not None and str(source_type).strip()
+            else "idx_dataset_catalog_updated"
+        )
+        if can_bound_page:
+            page_sql = (
+                "SELECT dataset_id,dataset_version FROM dataset_catalog "
+                f"INDEXED BY {index_hint}{where} "
+                f"ORDER BY {order_column} {order_direction.upper()},dataset_id ASC,dataset_version ASC "
                 "LIMIT ? OFFSET ?"
             )
-            rows = self._conn.execute(query, [*values, size, (actual_page - 1) * size]).fetchall()
+        else:
+            page_sql = ""
+        with self.transaction():
+            total = int(self._conn.execute(f"SELECT COUNT(*) AS n FROM dataset_catalog{where}", values).fetchone()["n"])
+            actual_page, pages = _pagination_shape(requested_page, size, total)
+            offset = (actual_page - 1) * size
+            if page_sql:
+                page_identifiers = [
+                    (str(row["dataset_id"]), str(row["dataset_version"]))
+                    for row in self._conn.execute(page_sql, [*values, size, offset]).fetchall()
+                ]
+                if page_identifiers:
+                    identifier_where = " OR ".join(
+                        "(dataset_id=? AND dataset_version=?)"
+                        for _ in page_identifiers
+                    )
+                    identifier_values = [
+                        value
+                        for identifier in page_identifiers
+                        for value in identifier
+                    ]
+                    query = (
+                        "SELECT dataset_catalog.*, "
+                        "(SELECT COUNT(*) FROM json_each(dataset_catalog.metadata_json)) AS metadata_key_count, "
+                        "json_extract(dataset_catalog.metadata_json,'$.category') AS metadata_category, "
+                        "json_extract(dataset_catalog.metadata_json,'$.historical_order_book_available') AS metadata_historical_order_book_available, "
+                        "json_extract(dataset_catalog.metadata_json,'$.universe_version') AS metadata_universe_version, "
+                        "json_array_length(dataset_catalog.missing_ranges_json) AS missing_range_count "
+                        "FROM dataset_catalog "
+                        f"WHERE {identifier_where} "
+                        f"ORDER BY {order_column} {order_direction.upper()},dataset_id ASC,dataset_version ASC"
+                    )
+                    rows = self._conn.execute(query, identifier_values).fetchall()
+                else:
+                    rows = []
+            else:
+                query = (
+                    "SELECT dataset_catalog.*, "
+                    "(SELECT COUNT(*) FROM json_each(dataset_catalog.metadata_json)) AS metadata_key_count, "
+                    "json_extract(dataset_catalog.metadata_json,'$.category') AS metadata_category, "
+                    "json_extract(dataset_catalog.metadata_json,'$.historical_order_book_available') AS metadata_historical_order_book_available, "
+                    "json_extract(dataset_catalog.metadata_json,'$.universe_version') AS metadata_universe_version, "
+                    "json_array_length(dataset_catalog.missing_ranges_json) AS missing_range_count "
+                    "FROM dataset_catalog"
+                    f"{where} ORDER BY {order_column} {order_direction.upper()},dataset_id ASC,dataset_version ASC "
+                    "LIMIT ? OFFSET ?"
+                )
+                rows = self._conn.execute(query, [*values, size, offset]).fetchall()
         return {
             "items": [_dataset_catalog_dashboard_record(row) for row in rows],
             "page": actual_page,
@@ -15283,6 +15351,178 @@ class AxiomStore:
         items = [_research_queue_record(row) for row in rows]
         return {"items": items, "page": actual_page, "page_size": size, "total": total, "pages": pages}
 
+    def _paginate_research_activity_default(
+        self,
+        *,
+        requested_page: int,
+        page_size: int,
+        direction: str,
+    ) -> dict[str, Any]:
+        """Page the unfiltered feed without materializing payload-bearing tables.
+
+        The dashboard's default activity view has no predicates and orders by
+        timestamp.  Each source only needs its first ``page * page_size`` rows
+        to produce the same global page, while counts remain exact and are
+        computed independently.
+        """
+        sources = (
+            "dataset_catalog",
+            "dataset_bootstrap_state",
+            "collection_cycles",
+            "candidate_lifecycle_events",
+            "research_queue",
+            "research_queue_events",
+            "reports",
+            "collection_errors",
+            "operator_actions",
+        )
+        order = "DESC" if direction == "desc" else "ASC"
+        with self.transaction():
+            totals = [
+                int(
+                    self._conn.execute(
+                        f"SELECT COUNT(*) AS n FROM {table}"
+                    ).fetchone()["n"]
+                )
+                for table in sources
+            ]
+            total = sum(totals)
+            actual_page, pages = _pagination_shape(requested_page, page_size, total)
+            needed = actual_page * page_size
+            activity_cte = f"""
+                WITH activity(
+                    kind,timestamp,event_id,message,details_json,source,source_type,
+                    status,item_type,market_id
+                ) AS (
+                    SELECT 'dataset',updated_at,'dataset:' || dataset_id || '/' || dataset_version,
+                        'Dataset ' || dataset_id || ' published (' || row_count || ' rows)',
+                        json_object('dataset_id',dataset_id,'dataset_version',dataset_version,
+                            'source_type',source_type,'timeframe',timeframe,'quality',quality),
+                        source_type,source_type,NULL,NULL,NULL
+                    FROM (
+                        SELECT dataset_id,dataset_version,updated_at,row_count,source_type,timeframe,quality
+                        FROM dataset_catalog INDEXED BY idx_dataset_catalog_updated
+                        ORDER BY updated_at {order},
+                            ('dataset:' || dataset_id || '/' || dataset_version) ASC LIMIT ?
+                    )
+                    UNION ALL
+                    SELECT 'bootstrap',updated_at,'bootstrap:' || dataset_id,
+                        dataset_id || ' bootstrap ' || lower(status),payload_json,
+                        'bootstrap','bootstrap',status,NULL,NULL
+                    FROM (
+                        SELECT updated_at,dataset_id,status,payload_json
+                        FROM dataset_bootstrap_state
+                        ORDER BY updated_at {order},dataset_id ASC LIMIT ?
+                    )
+                    UNION ALL
+                    SELECT 'collection',COALESCE(ended_at,started_at),'collection:' || cycle_id,
+                        'Polymarket collection cycle completed (' ||
+                            COALESCE(json_extract(payload_json,'$.markets_seen'),0) || ' markets)',
+                        payload_json,collector_name,'collection',NULL,NULL,NULL
+                    FROM (
+                        SELECT ended_at,started_at,cycle_id,payload_json,collector_name
+                        FROM collection_cycles
+                        ORDER BY COALESCE(ended_at,started_at) {order},cycle_id ASC LIMIT ?
+                    )
+                    UNION ALL
+                    SELECT 'lifecycle',created_at,'lifecycle:' || event_id,
+                        'Candidate ' || candidate_id || ' moved to ' || to_stage,
+                        json_object('from_stage',from_stage,'reason',reason),
+                        'lifecycle','lifecycle',to_stage,NULL,NULL
+                    FROM (
+                        SELECT created_at,event_id,candidate_id,to_stage,from_stage,reason
+                        FROM candidate_lifecycle_events
+                        ORDER BY created_at {order},event_id ASC LIMIT ?
+                    )
+                    UNION ALL
+                    SELECT 'research',updated_at,'research:item:' || item_id,
+                        'Research item ' || item_type || ' is ' || lower(status),
+                        json_object('item_id',item_id,'last_error',last_error),
+                        source,'research',status,item_type,
+                        json_extract(payload_json,'$.market_id')
+                    FROM (
+                        SELECT updated_at,item_id,item_type,status,last_error,source,payload_json
+                        FROM research_queue
+                        ORDER BY updated_at {order},item_id ASC LIMIT ?
+                    )
+                    UNION ALL
+                    SELECT 'research',created_at,'research:event:' || event_id,
+                        'Research queue item ' || item_id || ' moved to ' || to_status,
+                        detail,'queue','research',to_status,NULL,NULL
+                    FROM (
+                        SELECT created_at,event_id,item_id,to_status,detail
+                        FROM research_queue_events
+                        ORDER BY created_at {order},event_id ASC LIMIT ?
+                    )
+                    UNION ALL
+                    SELECT 'report',created_at,'report:' || report_id,
+                        'Research report ' || report_id || ' saved',
+                        json_object('experiment_id',experiment_id),
+                        'report','report',NULL,NULL,NULL
+                    FROM (
+                        SELECT created_at,report_id,experiment_id
+                        FROM reports
+                        ORDER BY created_at {order},report_id ASC LIMIT ?
+                    )
+                    UNION ALL
+                    SELECT 'collection_error',observed_at,'collection_error:' || error_id,
+                        'Collection error: ' || kind || ' (' || detail || ')',
+                        payload_json,'collection','collection_error',kind,NULL,market_id
+                    FROM (
+                        SELECT observed_at,error_id,kind,detail,payload_json,market_id
+                        FROM collection_errors
+                        ORDER BY observed_at {order},error_id ASC LIMIT ?
+                    )
+                    UNION ALL
+                    SELECT 'operator',timestamp,'operator:' || action_id,
+                        'Operator action ' || action || ' on ' || target || ' ' ||
+                            CASE WHEN success=1 THEN 'succeeded' ELSE 'failed' END,
+                        json_object('success',success,'reason',reason,'result',json(result_json)),
+                        'operator','operator',
+                        CASE WHEN success=1 THEN 'SUCCEEDED' ELSE 'FAILED' END,
+                        action,NULL
+                    FROM (
+                        SELECT timestamp,action_id,action,target,success,reason,result_json
+                        FROM operator_actions
+                        ORDER BY timestamp {order},action_id ASC LIMIT ?
+                    )
+                )
+                SELECT kind,timestamp,event_id,message,details_json,source,source_type,
+                    status,item_type,market_id
+                FROM activity
+                ORDER BY timestamp {order},event_id ASC
+                LIMIT ? OFFSET ?
+            """
+            rows = self._conn.execute(
+                activity_cte,
+                [needed] * len(sources)
+                + [page_size, (actual_page - 1) * page_size],
+            ).fetchall()
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            details = _load(row["details_json"]) if row["details_json"] else {}
+            items.append(
+                {
+                    "kind": row["kind"],
+                    "timestamp": _parse_datetime(row["timestamp"]),
+                    "event_id": row["event_id"],
+                    "message": row["message"],
+                    "details": details if isinstance(details, Mapping) else {"value": details},
+                    "source": row["source"],
+                    "source_type": row["source_type"],
+                    "status": row["status"],
+                    "item_type": row["item_type"],
+                    "market_id": row["market_id"],
+                }
+            )
+        return {
+            "items": items,
+            "page": actual_page,
+            "page_size": page_size,
+            "total": total,
+            "pages": pages,
+        }
+
     def paginate_research_activity(
         self,
         *,
@@ -15320,6 +15560,26 @@ class AxiomStore:
         order_direction = str(direction or "desc").strip().lower()
         if order_direction not in {"asc", "desc"}:
             raise ValueError("direction must be 'asc' or 'desc'")
+        if (
+            order_column == "timestamp"
+            and not any(
+                str(value or "").strip()
+                for value in (
+                    source,
+                    source_type,
+                    kind,
+                    item_type,
+                    status,
+                    market,
+                    filter,
+                )
+            )
+        ):
+            return self._paginate_research_activity_default(
+                requested_page=requested_page,
+                page_size=size,
+                direction=order_direction,
+            )
         cte = """
             WITH activity(
                 kind,timestamp,event_id,message,details_json,source,source_type,
@@ -16280,20 +16540,39 @@ class AxiomStore:
             forward_catalog_count = self._conn.execute(
                 "SELECT COUNT(*) AS n FROM dataset_catalog WHERE source_type='FORWARD_COLLECTED'"
             ).fetchone()["n"]
+            # Materialize catalog quality once per dataset.  Parsing
+            # metadata_json inside the bars join repeats the same potentially
+            # large document for every bar row.
             quality_rows = self._conn.execute(
-                "SELECT COALESCE(NULLIF(c.quality,''),NULLIF(d.quality,''),"
+                "WITH bar_keys AS MATERIALIZED ("
+                "SELECT DISTINCT b.dataset_id,b.dataset_version "
+                "FROM bars AS b"
+                + bar_where
+                + "), catalog_quality AS MATERIALIZED ("
+                "SELECT c.dataset_id,c.dataset_version,COALESCE("
+                "NULLIF(CASE WHEN json_valid(c.metadata_json) "
+                "THEN json_extract(c.metadata_json,'$.quality') END,''),"
+                "NULLIF(CASE WHEN json_valid(c.metadata_json) "
+                "THEN json_extract(c.metadata_json,'$.research_quality') END,''),"
+                "NULLIF(c.quality,'')) AS quality "
+                "FROM dataset_catalog AS c "
+                "JOIN bar_keys AS k "
+                "ON k.dataset_id=c.dataset_id AND k.dataset_version=c.dataset_version"
+                ") "
+                "SELECT COALESCE(cq.quality,NULLIF(d.quality,''),"
                 "NULLIF(CASE WHEN json_valid(b.payload_json) "
                 "THEN json_extract(b.payload_json,'$.quality') END,''),"
                 "NULLIF(CASE WHEN json_valid(b.payload_json) "
                 "THEN json_extract(b.payload_json,'$.research_quality') END,''),"
                 "'UNKNOWN') AS quality,COUNT(*) AS n "
                 "FROM bars AS b "
-                "LEFT JOIN dataset_catalog AS c "
-                "ON c.dataset_id=b.dataset_id AND c.dataset_version=b.dataset_version "
+                "JOIN bar_keys AS bk "
+                "ON bk.dataset_id=b.dataset_id AND bk.dataset_version=b.dataset_version "
+                "LEFT JOIN catalog_quality AS cq "
+                "ON cq.dataset_id=b.dataset_id AND cq.dataset_version=b.dataset_version "
                 "LEFT JOIN datasets AS d "
-                "ON d.dataset_id=b.dataset_id AND d.version=b.dataset_version"
-                + bar_where
-                + " GROUP BY 1",
+                "ON d.dataset_id=b.dataset_id AND d.version=b.dataset_version "
+                "GROUP BY 1",
                 values,
             ).fetchall()
             quality = {str(row["quality"] or "UNKNOWN"): int(row["n"]) for row in quality_rows}
@@ -16338,7 +16617,11 @@ class AxiomStore:
                     json_object('dataset_id',dataset_id,'dataset_version',dataset_version,
                         'source_type',source_type,'timeframe',timeframe,'quality',quality),
                     source_type,source_type,NULL,NULL,NULL
-                FROM (SELECT * FROM dataset_catalog ORDER BY updated_at DESC LIMIT 32)
+                FROM (
+                    SELECT dataset_id,dataset_version,updated_at,row_count,source_type,timeframe,quality
+                    FROM dataset_catalog INDEXED BY idx_dataset_catalog_updated
+                    ORDER BY updated_at DESC,dataset_id ASC,dataset_version ASC LIMIT 32
+                )
                 UNION ALL
                 SELECT 'bootstrap',updated_at,'bootstrap:' || dataset_id,
                     dataset_id || ' bootstrap ' || lower(status),payload_json,

@@ -73,6 +73,271 @@ class DashboardScaleFixtureTests(unittest.TestCase):
             finally:
                 writer.close()
                 store.close()
+    def test_dataset_page_does_not_scan_unreturned_metadata_payloads(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "dashboard-dataset-page.sqlite3"
+            store = AxiomStore(str(database_path))
+            try:
+                # Keep the returned page small while making an unbounded
+                # metadata scan observably expensive.  The page query must
+                # select identifiers from the covering updated-at index before
+                # hydrating metadata for only those ten rows.
+                rows = []
+                metadata = json.dumps({"diagnostic": "x" * 200_000})
+                for index in range(64):
+                    timestamp = T0 + timedelta(seconds=index)
+                    rows.append(
+                        (
+                            f"page-dataset-{index:04d}",
+                            "v1",
+                            "fixture",
+                            f"instrument-{index:04d}",
+                            "PREDICTION",
+                            "1h",
+                            timestamp.isoformat(),
+                            timestamp.isoformat(),
+                            1,
+                            1.0,
+                            "[]",
+                            "HIGH",
+                            "HISTORICAL",
+                            f"page-snapshot-{index:04d}",
+                            timestamp.isoformat(),
+                            timestamp.isoformat(),
+                            metadata,
+                        )
+                    )
+                with store.transaction():
+                    store.connection.executemany(
+                        "INSERT INTO dataset_catalog("
+                        "dataset_id,dataset_version,provider,instrument,market_type,timeframe,"
+                        "start_timestamp,end_timestamp,row_count,completeness,missing_ranges_json,"
+                        "quality,source_type,snapshot_id,created_at,updated_at,metadata_json) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        rows,
+                    )
+
+                started = time.perf_counter()
+                page = store.paginate_dataset_catalog(page=1, page_size=10)
+                elapsed = time.perf_counter() - started
+
+                self.assertEqual(page["total"], len(rows))
+                self.assertEqual(len(page["items"]), 10)
+                self.assertLess(elapsed, 1.0)
+
+                started = time.perf_counter()
+                activity = store.paginate_research_activity(page=1, page_size=10)
+                activity_elapsed = time.perf_counter() - started
+                self.assertEqual(activity["total"], len(rows))
+                self.assertEqual(len(activity["items"]), 10)
+                self.assertLess(activity_elapsed, 1.0)
+
+
+            finally:
+                store.close()
+
+    def test_dataset_page_count_and_rows_share_one_read_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "dashboard-dataset-snapshot.sqlite3"
+            store = AxiomStore(str(database_path))
+            writer = AxiomStore(str(database_path))
+            try:
+                self._seed_catalog(store, 1)
+                inserted = threading.Event()
+
+                def trace(statement: str) -> None:
+                    if (
+                        not inserted.is_set()
+                        and statement.lstrip().startswith(
+                            "SELECT dataset_id,dataset_version FROM dataset_catalog"
+                        )
+                    ):
+                        writer.save_dataset_catalog(
+                            "snapshot-race-dataset",
+                            "v1",
+                            provider="fixture",
+                            instrument="race",
+                            market_type="PREDICTION",
+                            row_count=1,
+                            completeness=1.0,
+                            quality="HIGH",
+                            source_type="HISTORICAL",
+                            snapshot_id="snapshot-race",
+                            created_at=T0 + timedelta(days=1),
+                            updated_at=T0 + timedelta(days=1),
+                        )
+                        inserted.set()
+
+                store.connection.set_trace_callback(trace)
+                page = store.paginate_dataset_catalog(page=1, page_size=10)
+                store.connection.set_trace_callback(None)
+
+                self.assertTrue(inserted.is_set())
+                self.assertEqual(page["total"], 1)
+                self.assertEqual(len(page["items"]), 1)
+                self.assertEqual(page["items"][0]["dataset_id"], "scale-dataset-0000")
+            finally:
+                store.connection.set_trace_callback(None)
+                writer.close()
+                store.close()
+
+    def test_activity_count_and_rows_share_one_read_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "dashboard-activity-snapshot.sqlite3"
+            store = AxiomStore(str(database_path))
+            writer = AxiomStore(str(database_path))
+            try:
+                self._seed_activity(store, 1)
+                inserted = threading.Event()
+
+                def trace(statement: str) -> None:
+                    if not inserted.is_set() and statement.lstrip().startswith("WITH activity("):
+                        writer.save_collection_cycle(
+                            "snapshot-race-cycle",
+                            "polymarket",
+                            {"markets_seen": 1, "markets_successful": 1, "markets_failed": 0},
+                            started_at=T0 + timedelta(days=1),
+                            ended_at=T0 + timedelta(days=1),
+                        )
+                        inserted.set()
+
+                store.connection.set_trace_callback(trace)
+                page = store.paginate_research_activity(page=1, page_size=10)
+                store.connection.set_trace_callback(None)
+
+                self.assertTrue(inserted.is_set())
+                self.assertEqual(page["total"], 1)
+                self.assertEqual(len(page["items"]), 1)
+                self.assertEqual(page["items"][0]["event_id"], "collection:scale-cycle-00000")
+            finally:
+                store.connection.set_trace_callback(None)
+                writer.close()
+                store.close()
+
+    def test_data_health_reads_catalog_metadata_once_per_dataset(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "dashboard-data-health.sqlite3"
+            store = AxiomStore(str(database_path))
+            metadata = json.dumps(
+                {"research_quality": "HIGH", "diagnostic": "x" * 100_000},
+                separators=(",", ":"),
+            )
+            metadata_valid_calls = 0
+            metadata_extract_calls = 0
+            unrelated_valid_calls = 0
+
+            def json_valid(value: object) -> int:
+                nonlocal metadata_valid_calls, unrelated_valid_calls
+                if isinstance(value, str) and "unrelated-huge" in value:
+                    unrelated_valid_calls += 1
+                elif isinstance(value, str) and "diagnostic" in value:
+                    metadata_valid_calls += 1
+                return 1
+
+            def json_extract(value: object, path: str) -> object:
+                nonlocal metadata_extract_calls
+                if isinstance(value, str) and "unrelated-huge" in value:
+                    return "LOW" if path == "$.research_quality" else None
+                if isinstance(value, str) and "diagnostic" in value:
+                    metadata_extract_calls += 1
+                    return "HIGH" if path == "$.research_quality" else None
+                return None
+
+            try:
+                store.save_dataset_catalog(
+                    "health-dataset",
+                    "v1",
+                    provider="fixture",
+                    instrument="health",
+                    market_type="PREDICTION",
+                    row_count=40,
+                    completeness=1.0,
+                    quality="LOW",
+                    source_type="HISTORICAL",
+                    snapshot_id="health-snapshot",
+                    metadata={"research_quality": "HIGH", "diagnostic": "x" * 100_000},
+                    created_at=T0,
+                    updated_at=T0,
+                )
+                store.save_dataset_catalog(
+                    "scalar-quality",
+                    "v1",
+                    provider="fixture",
+                    instrument="scalar",
+                    market_type="PREDICTION",
+                    row_count=1,
+                    completeness=1.0,
+                    quality="HIGH",
+                    source_type="HISTORICAL",
+                    snapshot_id="scalar-snapshot",
+                    metadata={},
+                    created_at=T0,
+                    updated_at=T0,
+                )
+                with store.transaction():
+                    store.connection.execute(
+                        "INSERT INTO datasets(dataset_id,version,payload_json,metadata_json,quality,created_at) "
+                        "VALUES (?,?,?,?,?,?)",
+                        ("legacy-dataset", "v1", "{}", "{}", "MEDIUM", T0.isoformat()),
+                    )
+                    store.connection.executemany(
+                        "INSERT INTO bars(symbol,timestamp,payload_json,dataset_id,dataset_version,created_at) "
+                        "VALUES (?,?,?,?,?,?)",
+                        [
+                            (
+                                "HEALTH",
+                                (T0 + timedelta(seconds=index)).isoformat(),
+                                "{}",
+                                "health-dataset",
+                                "v1",
+                                T0.isoformat(),
+                            )
+                            for index in range(40)
+                        ]
+                        + [
+                            (
+                                "SCALAR",
+                                (T0 + timedelta(seconds=40)).isoformat(),
+                                "{}",
+                                "scalar-quality",
+                                "v1",
+                                T0.isoformat(),
+                            ),
+                            (
+                                "LEGACY",
+                                (T0 + timedelta(seconds=41)).isoformat(),
+                                "{}",
+                                "legacy-dataset",
+                                "v1",
+                                T0.isoformat(),
+                            ),
+                        ],
+                    )
+                store.save_dataset_catalog(
+                    "unrelated-huge",
+                    "v1",
+                    provider="fixture",
+                    instrument="unrelated",
+                    market_type="PREDICTION",
+                    row_count=0,
+                    completeness=1.0,
+                    quality="LOW",
+                    source_type="HISTORICAL",
+                    snapshot_id="unrelated-snapshot",
+                    metadata={"research_quality": "LOW", "unrelated-huge": "u" * 500_000},
+                    created_at=T0,
+                    updated_at=T0,
+                )
+
+                store.connection.create_function("json_valid", 1, json_valid)
+                store.connection.create_function("json_extract", 2, json_extract)
+                health = store.data_health()
+                self.assertEqual(health["quality"], {"HIGH": 41, "MEDIUM": 1})
+                self.assertLessEqual(metadata_valid_calls, 2)
+                self.assertLessEqual(metadata_extract_calls, 2)
+                self.assertEqual(unrelated_valid_calls, 0)
+            finally:
+                store.close()
 
     def test_overview_forward_evidence_stays_bounded_at_catalog_scale(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
