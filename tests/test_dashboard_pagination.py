@@ -2168,7 +2168,7 @@ class DashboardPaginationEndpointTests(DashboardPaginationFixture):
         self.assertTrue(row["open_positions_truncated"])
         self.assertEqual(len(row["open_positions"]), 32)
 
-    def test_large_dataset_metadata_and_worker_payloads_are_digest_bounded(self) -> None:
+    def test_large_dataset_and_worker_status_payloads_are_bounded(self) -> None:
         metadata_manifest = "replay-manifest-" + ("m" * 2_600_000)
         self.store.save_dataset_catalog(
             "large-dashboard-catalog",
@@ -2218,21 +2218,34 @@ class DashboardPaginationEndpointTests(DashboardPaginationFixture):
             "grade": "A",
             "stale_after_seconds": 300,
             "worker_identity_valid": True,
-            "large_diagnostic": "worker-history-" + ("w" * 13_000_000),
+            "last_error": "worker-history-" + ("w" * 13_000_000),
         }
         self.store.save_worker_state("large-worker", "IDLE", worker_payload, heartbeat_at=T0)
-        status, status_page, status_body = self._request("api/status")
+
+        def reject_oversized_load(encoded: str) -> object:
+            if len(encoded) > 1_000_000:
+                raise AssertionError("oversized worker payload was deserialized")
+            return json.loads(encoded)
+
+        started = time.perf_counter()
+        with patch("axiom.storage._load", side_effect=reject_oversized_load):
+            status, status_page, status_body = self._request("api/status")
+        elapsed = time.perf_counter() - started
         self.assertEqual(status, 200)
+        self.assertLess(elapsed, 1.0)
         self.assertLess(len(status_body), 200_000)
         worker = next(item for item in status_page["workers"] if item["worker_name"] == "large-worker")
         self.assertTrue(worker["payload_truncated"])
-        self.assertEqual(worker["payload_key_count"], len(worker_payload))
-        expected_worker_json = json.dumps(worker_payload, sort_keys=True, separators=(",", ":"))
-        self.assertEqual(
-            worker["payload_sha256"],
-            hashlib.sha256(expected_worker_json.encode("utf-8")).hexdigest(),
-        )
-        self.assertNotIn(worker_payload["large_diagnostic"], status_body)
+        self.assertGreaterEqual(worker["payload_bytes"], len(worker_payload["last_error"]))
+        self.assertEqual(worker["payload"]["grade"], "A")
+        self.assertEqual(worker["payload"]["stale_after_seconds"], 300)
+        self.assertIs(worker["payload"]["worker_identity_valid"], True)
+        self.assertTrue(worker["payload"]["projection_truncated"])
+        self.assertIn("last_error", worker["payload"]["projection_truncated_fields"])
+        self.assertNotIn("last_error", worker["payload"])
+        self.assertNotIn("payload_key_count", worker)
+        self.assertNotIn("payload_sha256", worker)
+        self.assertNotIn(worker_payload["last_error"], status_body)
 
 
     def test_every_ui_sort_column_has_a_supported_paged_endpoint(self) -> None:

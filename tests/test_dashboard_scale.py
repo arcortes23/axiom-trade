@@ -128,6 +128,173 @@ class DashboardScaleFixtureTests(unittest.TestCase):
             finally:
                 store.connection.set_trace_callback(None)
                 store.close()
+    def test_dashboard_count_projection_initialization_releases_write_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "dashboard-count-lock.sqlite3"
+            store = AxiomStore(str(database_path))
+            writer = None
+            try:
+                self.assertFalse(store.connection.in_transaction)
+                writer = AxiomStore(str(database_path))
+                writer.save_polymarket_trade(
+                    "lock-market",
+                    {"trade_id": "lock-trade", "timestamp": T0.isoformat()},
+                    trade_key="lock-trade",
+                )
+                self.assertEqual(store.dashboard_summary()["polymarket_trades"], 1)
+            finally:
+                if writer is not None:
+                    writer.close()
+                store.close()
+
+    def test_dashboard_count_projection_initialization_rolls_back_on_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "dashboard-count-rollback.sqlite3"
+            store = AxiomStore(str(database_path))
+            try:
+                store.connection.execute("PRAGMA query_only=ON")
+                with self.assertRaises(sqlite3.OperationalError):
+                    store._initialize_dashboard_count_projection()
+                self.assertFalse(store.connection.in_transaction)
+            finally:
+                store.connection.execute("PRAGMA query_only=OFF")
+                store.close()
+    def test_bounded_worker_projection_preserves_small_health_reasons(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "dashboard-worker-reasons.sqlite3"
+            store = AxiomStore(str(database_path))
+            try:
+                reasons = [
+                    {"code": f"REASON_{index}", "reason": f"reason-{index}"}
+                    for index in range(20)
+                ]
+                store.save_worker_state(
+                    "health-monitor",
+                    "RUNNING",
+                    {
+                        "grade": "A",
+                        "worker_identity_valid": True,
+                        "last_cycle_duration_seconds": 1.5,
+                        "last_cycle_started_at": T0.isoformat(),
+                        "last_cycle_ended_at": T0.isoformat(),
+                        "last_cycle_markets_attempted": 3,
+                        "last_cycle_markets_successful": 2,
+                        "last_cycle_markets_failed": 1,
+                        "reasons": reasons,
+                    },
+                )
+                statements: list[str] = []
+                store.connection.set_trace_callback(statements.append)
+                try:
+                    workers = store.list_worker_states_dashboard(limit=32)
+                finally:
+                    store.connection.set_trace_callback(None)
+                self.assertFalse(
+                    any("payload_json" in statement for statement in statements)
+                )
+                health = next(
+                    item for item in workers if item["worker_name"] == "health-monitor"
+                )
+                self.assertEqual(health["payload"]["grade"], "A")
+                self.assertIs(health["payload"]["worker_identity_valid"], True)
+                self.assertEqual(health["payload"]["reasons"], reasons[:16])
+                self.assertTrue(health["payload"]["reasons_truncated"])
+                self.assertEqual(health["payload"]["last_cycle_duration_seconds"], 1.5)
+                self.assertEqual(health["payload"]["last_cycle_markets_attempted"], 3)
+
+                store.save_worker_state(
+                    "polymarket-collector",
+                    "RUNNING",
+                    {"last_cycle": {"duration_seconds": 2.5, "markets_attempted": 4}},
+                    heartbeat_at=T0,
+                )
+                collector = next(
+                    item
+                    for item in store.list_worker_states_dashboard(limit=32)
+                    if item["worker_name"] == "polymarket-collector"
+                )
+                self.assertEqual(
+                    collector["payload"]["last_cycle"]["duration_seconds"],
+                    2.5,
+                )
+                self.assertEqual(
+                    collector["payload"]["last_cycle"]["markets_attempted"],
+                    4,
+                )
+                status = DashboardData(store=store, clock=lambda: T0).status_data()
+                self.assertEqual(status["health_grade"], "A")
+                self.assertEqual(status["health_reasons"], reasons[:16])
+            finally:
+                store.close()
+
+    def test_bounded_worker_projection_counts_utf8_payload_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "dashboard-worker-utf8.sqlite3"
+            store = AxiomStore(str(database_path))
+            try:
+                payload_json = json.dumps(
+                    {"grade": "A", "diagnostic": "é" * 40_000},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                )
+                with store.transaction():
+                    store.connection.execute(
+                        "INSERT INTO worker_state("
+                        "worker_name,status,payload_json,started_at,heartbeat_at,updated_at"
+                        ") VALUES (?,?,?,?,?,?)",
+                        (
+                            "utf8-worker",
+                            "IDLE",
+                            payload_json,
+                            None,
+                            T0.isoformat(),
+                            T0.isoformat(),
+                        ),
+                    )
+                store.close()
+                with patch(
+                    "axiom.storage._load",
+                    side_effect=AssertionError("legacy worker payload parsed during init"),
+                ):
+                    reopened = AxiomStore(str(database_path))
+                try:
+                    worker = next(
+                        item
+                        for item in reopened.list_worker_states_dashboard(limit=32)
+                        if item["worker_name"] == "utf8-worker"
+                    )
+                    self.assertIsNone(worker["payload_bytes"])
+                    self.assertIsNone(worker["payload_truncated"])
+                    self.assertTrue(worker["payload_projection_pending"])
+                    self.assertEqual(worker["payload"], {})
+
+                    reopened.save_worker_state(
+                        "utf8-worker",
+                        "IDLE",
+                        {"grade": "A", "diagnostic": "é" * 40_000},
+                        heartbeat_at=T0,
+                    )
+                    worker = next(
+                        item
+                        for item in reopened.list_worker_states_dashboard(limit=32)
+                        if item["worker_name"] == "utf8-worker"
+                    )
+                    stored_json = reopened.connection.execute(
+                        "SELECT payload_json FROM worker_state WHERE worker_name='utf8-worker'"
+                    ).fetchone()[0]
+                    self.assertEqual(
+                        worker["payload_bytes"],
+                        len(stored_json.encode("utf-8")),
+                    )
+                    self.assertFalse(worker["payload_projection_pending"])
+                    self.assertEqual(worker["payload"]["grade"], "A")
+                finally:
+                    reopened.close()
+            finally:
+                store.close()
+
+
     def test_dashboard_count_projection_handles_holes_writes_deletes_and_reopen(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             database_path = Path(temporary_directory) / "dashboard-count-projection.sqlite3"

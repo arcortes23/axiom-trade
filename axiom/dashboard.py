@@ -4534,7 +4534,12 @@ class DashboardData:
             else None
         )
         worker_limit = 128
-        workers = self.store.list_worker_states(limit=worker_limit)
+        worker_dashboard_loader = getattr(self.store, "list_worker_states_dashboard", None)
+        workers = (
+            worker_dashboard_loader(limit=worker_limit)
+            if callable(worker_dashboard_loader)
+            else self.store.list_worker_states(limit=worker_limit)
+        )
         now = ensure_utc(self.clock())
         statuses: list[str] = []
         normalized_workers: list[dict[str, Any]] = []

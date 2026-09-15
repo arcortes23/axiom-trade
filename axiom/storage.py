@@ -79,6 +79,11 @@ _PAPER_POSITION_PROJECTION_LIMIT = 32
 _DATASET_METADATA_PROJECTION_LIMIT = 64
 _DATASET_MISSING_RANGE_PROJECTION_LIMIT = 32
 _DASHBOARD_PAYLOAD_MAX_BYTES = 65_536
+_DASHBOARD_WORKER_PROJECTION_MAX_BYTES = 262_144
+_DASHBOARD_WORKER_REASONS_MAX_ITEMS = 16
+_DASHBOARD_WORKER_REASON_MAX_BYTES = 4_096
+_DASHBOARD_WORKER_REASONS_MAX_BYTES = 32_768
+_DASHBOARD_WORKER_PROJECTION_VERSION = 1
 _DASHBOARD_PAYLOAD_MAX_DEPTH = 4
 _DASHBOARD_PAYLOAD_MAX_ITEMS = 64
 _DASHBOARD_PAYLOAD_MAX_STRING = 4_096
@@ -853,6 +858,10 @@ class AxiomStore:
                     worker_name TEXT PRIMARY KEY,
                     status TEXT NOT NULL,
                     payload_json TEXT NOT NULL,
+                    payload_summary_json TEXT NOT NULL DEFAULT '{}',
+                    payload_bytes INTEGER NOT NULL DEFAULT 0,
+                    payload_truncated INTEGER NOT NULL DEFAULT 0,
+                    payload_projection_version INTEGER NOT NULL DEFAULT 0,
                     started_at TEXT,
                     heartbeat_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -931,10 +940,31 @@ class AxiomStore:
                     "ALTER TABLE dataset_integrity_attestation ADD COLUMN reason TEXT NOT NULL DEFAULT ''"
                 )
             self._migrate_market_tables()
+            self._initialize_worker_dashboard_projection()
             self._initialize_canary_risk_schema()
             self._initialize_rolling_portfolio_schema()
             self._create_dataset_attestation_triggers()
             self._initialize_dashboard_count_projection()
+    def _initialize_worker_dashboard_projection(self) -> None:
+        """Ensure bounded worker summary columns exist without reading payloads."""
+        columns = {
+            str(row["name"])
+            for row in self._conn.execute(
+                "PRAGMA table_info(worker_state)"
+            ).fetchall()
+        }
+        additions = (
+            ("payload_summary_json", "TEXT NOT NULL DEFAULT '{}'"),
+            ("payload_bytes", "INTEGER NOT NULL DEFAULT 0"),
+            ("payload_truncated", "INTEGER NOT NULL DEFAULT 0"),
+            ("payload_projection_version", "INTEGER NOT NULL DEFAULT 0"),
+        )
+        for name, definition in additions:
+            if name not in columns:
+                self._conn.execute(
+                    f"ALTER TABLE worker_state ADD COLUMN {name} {definition}"
+                )
+
     def _migrate_market_tables(self) -> None:
         """Upgrade pre-versioned market tables without discarding records."""
         for table, primary_key, index_name in (
@@ -6456,73 +6486,81 @@ class AxiomStore:
                 "WHERE table_name='polymarket_trades'; END",
             ),
         )
-        if not self._conn.in_transaction:
-            self._conn.execute("BEGIN IMMEDIATE")
-        self._conn.execute(
-            "CREATE TABLE IF NOT EXISTS dashboard_row_counts ("
-            "table_name TEXT PRIMARY KEY,"
-            "row_count INTEGER NOT NULL CHECK(row_count >= 0),"
-            f"projection_version INTEGER NOT NULL DEFAULT {_DASHBOARD_COUNT_PROJECTION_VERSION})"
-        )
-        columns = {
-            str(row["name"])
-            for row in self._conn.execute(
-                "PRAGMA table_info(dashboard_row_counts)"
-            ).fetchall()
-        }
-        if "projection_version" not in columns:
+        started_transaction = False
+        try:
+            if not self._conn.in_transaction:
+                self._conn.execute("BEGIN IMMEDIATE")
+                started_transaction = True
             self._conn.execute(
-                "ALTER TABLE dashboard_row_counts ADD COLUMN "
-                "projection_version INTEGER NOT NULL DEFAULT 0"
+                "CREATE TABLE IF NOT EXISTS dashboard_row_counts ("
+                "table_name TEXT PRIMARY KEY,"
+                "row_count INTEGER NOT NULL CHECK(row_count >= 0),"
+                f"projection_version INTEGER NOT NULL DEFAULT {_DASHBOARD_COUNT_PROJECTION_VERSION})"
             )
-        required_tables = {"bars", "polymarket_trades"}
-        existing_rows = {
-            str(row["table_name"]): int(row["projection_version"])
-            for row in self._conn.execute(
-                "SELECT table_name,projection_version FROM dashboard_row_counts "
-                "WHERE table_name IN ('bars','polymarket_trades')"
-            ).fetchall()
-        }
-        existing_trigger_sql = {
-            str(row["name"]): " ".join(str(row["sql"] or "").split()).lower()
-            for row in self._conn.execute(
-                "SELECT name,sql FROM sqlite_master WHERE type='trigger' "
-                "AND name IN (?,?,?,?)",
-                tuple(name for name, _ in trigger_sql),
-            ).fetchall()
-        }
-        expected_trigger_sql = {
-            name: " ".join(statement.split()).lower()
-            for name, statement in trigger_sql
-        }
-        needs_reconcile = (
-            set(existing_rows) != required_tables
-            or any(
-                version != _DASHBOARD_COUNT_PROJECTION_VERSION
-                for version in existing_rows.values()
+            columns = {
+                str(row["name"])
+                for row in self._conn.execute(
+                    "PRAGMA table_info(dashboard_row_counts)"
+                ).fetchall()
+            }
+            if "projection_version" not in columns:
+                self._conn.execute(
+                    "ALTER TABLE dashboard_row_counts ADD COLUMN "
+                    "projection_version INTEGER NOT NULL DEFAULT 0"
+                )
+            required_tables = {"bars", "polymarket_trades"}
+            existing_rows = {
+                str(row["table_name"]): int(row["projection_version"])
+                for row in self._conn.execute(
+                    "SELECT table_name,projection_version FROM dashboard_row_counts "
+                    "WHERE table_name IN ('bars','polymarket_trades')"
+                ).fetchall()
+            }
+            existing_trigger_sql = {
+                str(row["name"]): " ".join(str(row["sql"] or "").split()).lower()
+                for row in self._conn.execute(
+                    "SELECT name,sql FROM sqlite_master WHERE type='trigger' "
+                    "AND name IN (?,?,?,?)",
+                    tuple(name for name, _ in trigger_sql),
+                ).fetchall()
+            }
+            expected_trigger_sql = {
+                name: " ".join(statement.split()).lower()
+                for name, statement in trigger_sql
+            }
+            needs_reconcile = (
+                set(existing_rows) != required_tables
+                or any(
+                    version != _DASHBOARD_COUNT_PROJECTION_VERSION
+                    for version in existing_rows.values()
+                )
+                or existing_trigger_sql != expected_trigger_sql
             )
-            or existing_trigger_sql != expected_trigger_sql
-        )
-        if not needs_reconcile:
-            return
-        for name, _ in trigger_sql:
-            self._conn.execute(f"DROP TRIGGER IF EXISTS {name}")
-        self._conn.execute(
-            "DELETE FROM dashboard_row_counts "
-            "WHERE table_name IN ('bars','polymarket_trades')"
-        )
-        self._conn.execute(
-            "INSERT INTO dashboard_row_counts(table_name,row_count,projection_version) "
-            "SELECT 'bars',COUNT(*),? FROM bars",
-            (_DASHBOARD_COUNT_PROJECTION_VERSION,),
-        )
-        self._conn.execute(
-            "INSERT INTO dashboard_row_counts(table_name,row_count,projection_version) "
-            "SELECT 'polymarket_trades',COUNT(*),? FROM polymarket_trades",
-            (_DASHBOARD_COUNT_PROJECTION_VERSION,),
-        )
-        for _, statement in trigger_sql:
-            self._conn.execute(statement)
+            if needs_reconcile:
+                for name, _ in trigger_sql:
+                    self._conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+                self._conn.execute(
+                    "DELETE FROM dashboard_row_counts "
+                    "WHERE table_name IN ('bars','polymarket_trades')"
+                )
+                self._conn.execute(
+                    "INSERT INTO dashboard_row_counts(table_name,row_count,projection_version) "
+                    "SELECT 'bars',COUNT(*),? FROM bars",
+                    (_DASHBOARD_COUNT_PROJECTION_VERSION,),
+                )
+                self._conn.execute(
+                    "INSERT INTO dashboard_row_counts(table_name,row_count,projection_version) "
+                    "SELECT 'polymarket_trades',COUNT(*),? FROM polymarket_trades",
+                    (_DASHBOARD_COUNT_PROJECTION_VERSION,),
+                )
+                for _, statement in trigger_sql:
+                    self._conn.execute(statement)
+            if started_transaction:
+                self._conn.commit()
+        except BaseException:
+            if started_transaction and self._conn.in_transaction:
+                self._conn.rollback()
+            raise
 
     def _create_dataset_attestation_triggers(self) -> None:
         """Stale attestations when either catalog identity or payload identity changes."""
@@ -14106,16 +14144,32 @@ class AxiomStore:
         if not state:
             raise ValueError("worker status is required")
         heartbeat = heartbeat_at or utc_now()
+        payload_value = payload if payload is not None else {}
+        payload_json = _dump(payload_value)
+        payload_summary = _worker_dashboard_summary(payload_value)
+        payload_bytes = len(payload_json.encode("utf-8"))
+        payload_truncated = int(payload_bytes > _DASHBOARD_PAYLOAD_MAX_BYTES)
         def operation() -> None:
             with self._write_context():
                 self._conn.execute(
-                    "INSERT INTO worker_state(worker_name,status,payload_json,started_at,heartbeat_at,updated_at) VALUES (?,?,?,?,?,?) "
-                    "ON CONFLICT(worker_name) DO UPDATE SET status=excluded.status,payload_json=excluded.payload_json,"
-                    "started_at=COALESCE(worker_state.started_at,excluded.started_at),heartbeat_at=excluded.heartbeat_at,updated_at=excluded.updated_at",
+                    "INSERT INTO worker_state("
+                    "worker_name,status,payload_json,payload_summary_json,payload_bytes,"
+                    "payload_truncated,payload_projection_version,started_at,heartbeat_at,updated_at"
+                    ") VALUES (?,?,?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(worker_name) DO UPDATE SET status=excluded.status,"
+                    "payload_json=excluded.payload_json,payload_summary_json=excluded.payload_summary_json,"
+                    "payload_bytes=excluded.payload_bytes,payload_truncated=excluded.payload_truncated,"
+                    "payload_projection_version=excluded.payload_projection_version,"
+                    "started_at=COALESCE(worker_state.started_at,excluded.started_at),"
+                    "heartbeat_at=excluded.heartbeat_at,updated_at=excluded.updated_at",
                     (
                         worker,
                         state,
-                        _dump(payload if payload is not None else {}),
+                        payload_json,
+                        _dump(payload_summary),
+                        payload_bytes,
+                        payload_truncated,
+                        _DASHBOARD_WORKER_PROJECTION_VERSION,
                         _iso(started_at) if started_at else None,
                         _iso(heartbeat),
                         _now_iso(),
@@ -14145,72 +14199,13 @@ class AxiomStore:
 
 
     def list_worker_states_dashboard(self, *, limit: int = 32) -> list[dict[str, Any]]:
-        """Return worker liveness scalars without transferring raw payloads.
-
-        Worker diagnostics are append-only JSON and may contain multi-megabyte
-        histories.  Overview cards only need scalar liveness/progress fields,
-        so extract those fields in SQLite and never materialize ``payload_json``
-        in the dashboard process.
-        """
+        """Return persisted bounded worker summaries without raw payload reads."""
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
             raise ValueError("limit must be a non-negative integer")
-        scalar_fields = (
-            ("worker_identity_valid", "$.worker_identity_valid"),
-            ("stale_after_seconds", "$.stale_after_seconds"),
-            ("degrading_reason", "$.degrading_reason"),
-            ("reason_code", "$.reason_code"),
-            ("last_error", "$.last_error"),
-            ("grade", "$.grade"),
-            ("configured_interval_seconds", "$.configured_interval_seconds"),
-            ("effective_collection_cadence_seconds", "$.effective_collection_cadence_seconds"),
-            ("last_cycle_duration_seconds", "$.last_cycle_duration_seconds"),
-            ("last_cycle_started_at", "$.last_cycle_started_at"),
-            ("last_cycle_ended_at", "$.last_cycle_ended_at"),
-            ("last_cycle_markets_attempted", "$.last_cycle_markets_attempted"),
-            ("last_cycle_markets_successful", "$.last_cycle_markets_successful"),
-            ("last_cycle_markets_failed", "$.last_cycle_markets_failed"),
-            ("last_successful_collection_at", "$.last_successful_collection_at"),
-            ("last_successful_tick", "$.last_successful_tick"),
-            ("next_scheduled_collection_at", "$.next_scheduled_collection_at"),
-            ("worker_heartbeat_at", "$.worker_heartbeat_at"),
-            ("collection_errors", "$.collection_errors"),
-            ("stale_market_count", "$.stale_market_count"),
-            ("gap_count", "$.gap_count"),
-            ("markets_attempted", "$.markets_attempted"),
-            ("markets_successful", "$.markets_successful"),
-            ("markets_failed", "$.markets_failed"),
-            ("passes", "$.passes"),
-            ("queue_items_processed", "$.queue_items_processed"),
-            ("processed_candidates", "$.processed_candidates"),
-            ("remaining_candidates", "$.remaining_candidates"),
-            ("worker_status", "$.worker_status"),
-            ("last_tick_at", "$.last_tick_at"),
-            ("last_tick_started_at", "$.last_tick_started_at"),
-            ("last_tick_completed_at", "$.last_tick_completed_at"),
-            ("last_error_code", "$.last_error_code"),
-            ("consecutive_failures", "$.consecutive_failures"),
-            ("next_retry_at", "$.next_retry_at"),
-            ("candidates_evaluated", "$.candidates_evaluated"),
-            ("signals_generated", "$.signals_generated"),
-            ("orders_attempted", "$.orders_attempted"),
-            ("next_decision", "$.next_decision"),
-            ("blocker", "$.blocker"),
-            ("last_signal_id", "$.last_signal_id"),
-            ("cycle_status", "$.last_cycle.status"),
-            ("cycle_completed_at", "$.last_cycle.completed_at"),
-            ("cycle_ended_at", "$.last_cycle.ended_at"),
-            ("cycle_last_completion_at", "$.last_cycle.last_completion_at"),
-            ("cycle_last_completed_at", "$.last_cycle.last_completed_at"),
-            ("cycle_cycle_ended_at", "$.last_cycle.cycle_ended_at"),
-            ("crypto_enabled", "$.crypto_paper.enabled"),
-            ("crypto_last_error", "$.crypto_paper.last_error"),
-        )
-        projection_paths = ",".join(repr(path) for _, path in scalar_fields)
         query = (
-            "SELECT worker_name,status,heartbeat_at,updated_at,LENGTH(payload_json) AS payload_bytes,"
-            "json_extract(CASE WHEN LENGTH(payload_json)<=262144 AND json_valid(payload_json) "
-            "THEN payload_json ELSE '{}' END,"
-            f"{projection_paths}) AS projected_fields_json "
+            "SELECT worker_name,status,started_at,heartbeat_at,updated_at,"
+            "payload_summary_json,payload_bytes,payload_truncated,"
+            "payload_projection_version "
             "FROM worker_state "
             "ORDER BY CASE WHEN worker_name IN "
             "('polymarket-collector','paper-engine','research-engine','health-monitor','axiom-node') "
@@ -14221,37 +14216,43 @@ class AxiomStore:
         result: list[dict[str, Any]] = []
         for row in rows:
             try:
-                values = json.loads(row["projected_fields_json"] or "[]")
+                summary = _load(row["payload_summary_json"] or "{}")
             except (TypeError, ValueError, json.JSONDecodeError):
-                values = []
-            values = values if isinstance(values, list) else []
-            payload = {
-                key: value
-                for (key, _), value in zip(scalar_fields, values)
-                if value is not None
-            }
+                summary = {}
+            payload = dict(summary) if isinstance(summary, Mapping) else {}
             cycle = {
-                key.removeprefix("cycle_"): value
-                for key, _ in scalar_fields
-                for value in (payload.pop(key, None),)
-                if key.startswith("cycle_") and value is not None
+                key.removeprefix("cycle_"): payload.pop(key, None)
+                for key in tuple(payload)
+                if key.startswith("cycle_")
             }
+            cycle = {key: value for key, value in cycle.items() if value is not None}
             if cycle:
                 payload["last_cycle"] = cycle
             crypto = {
-                key.removeprefix("crypto_"): value
-                for key, _ in scalar_fields
-                for value in (payload.pop(key, None),)
-                if key.startswith("crypto_") and value is not None
+                key.removeprefix("crypto_"): payload.pop(key, None)
+                for key in tuple(payload)
+                if key.startswith("crypto_")
             }
+            crypto = {key: value for key, value in crypto.items() if value is not None}
             if crypto:
                 payload["crypto_paper"] = crypto
+            projection_pending = (
+                int(row["payload_projection_version"] or 0)
+                != _DASHBOARD_WORKER_PROJECTION_VERSION
+            )
             result.append(
                 {
                     "worker_name": row["worker_name"],
                     "status": row["status"],
                     "payload": payload,
-                    "payload_bytes": int(row["payload_bytes"] or 0),
+                    "payload_bytes": (
+                        None if projection_pending else int(row["payload_bytes"] or 0)
+                    ),
+                    "payload_truncated": (
+                        None if projection_pending else bool(row["payload_truncated"])
+                    ),
+                    "payload_projection_pending": projection_pending,
+                    "started_at": _parse_datetime(row["started_at"]),
                     "heartbeat_at": _parse_datetime(row["heartbeat_at"]),
                     "updated_at": _parse_datetime(row["updated_at"]),
                 }
@@ -17111,6 +17112,8 @@ def _dataset_metadata_projection(
     except (TypeError, ValueError, json.JSONDecodeError):
         decoded = {}
     if not isinstance(decoded, Mapping):
+
+
         return {
             "sha256": digest,
             "bytes": len(raw.encode("utf-8")),
@@ -17145,6 +17148,125 @@ def _dataset_metadata_projection(
         }
     )
     return projection
+_WORKER_DASHBOARD_SCALAR_PATHS = (
+    ("worker_identity_valid", ("worker_identity_valid",)),
+    ("stale_after_seconds", ("stale_after_seconds",)),
+    ("degrading_reason", ("degrading_reason",)),
+    ("reason_code", ("reason_code",)),
+    ("last_error", ("last_error",)),
+    ("grade", ("grade",)),
+    ("configured_interval_seconds", ("configured_interval_seconds",)),
+    ("effective_collection_cadence_seconds", ("effective_collection_cadence_seconds",)),
+    ("last_cycle_duration_seconds", (("last_cycle_duration_seconds",), ("last_cycle", "duration_seconds"))),
+    ("last_cycle_started_at", (("last_cycle_started_at",), ("last_cycle", "started_at"))),
+    ("last_cycle_ended_at", (("last_cycle_ended_at",), ("last_cycle", "ended_at"))),
+    ("last_cycle_markets_attempted", (("last_cycle_markets_attempted",), ("last_cycle", "markets_attempted"))),
+    ("last_cycle_markets_successful", (("last_cycle_markets_successful",), ("last_cycle", "markets_successful"))),
+    ("last_cycle_markets_failed", (("last_cycle_markets_failed",), ("last_cycle", "markets_failed"))),
+    ("last_successful_collection_at", ("last_successful_collection_at",)),
+    ("last_successful_tick", ("last_successful_tick",)),
+    ("next_scheduled_collection_at", ("next_scheduled_collection_at",)),
+    ("worker_heartbeat_at", ("worker_heartbeat_at",)),
+    ("collection_errors", ("collection_errors",)),
+    ("stale_market_count", ("stale_market_count",)),
+    ("gap_count", ("gap_count",)),
+    ("markets_attempted", ("markets_attempted",)),
+    ("markets_successful", ("markets_successful",)),
+    ("markets_failed", ("markets_failed",)),
+    ("passes", ("passes",)),
+    ("queue_items_processed", ("queue_items_processed",)),
+    ("processed_candidates", ("processed_candidates",)),
+    ("remaining_candidates", ("remaining_candidates",)),
+    ("worker_status", ("worker_status",)),
+    ("last_tick_at", ("last_tick_at",)),
+    ("last_tick_started_at", ("last_tick_started_at",)),
+    ("last_tick_completed_at", ("last_tick_completed_at",)),
+    ("last_error_code", ("last_error_code",)),
+    ("consecutive_failures", ("consecutive_failures",)),
+    ("next_retry_at", ("next_retry_at",)),
+    ("candidates_evaluated", ("candidates_evaluated",)),
+    ("signals_generated", ("signals_generated",)),
+    ("orders_attempted", ("orders_attempted",)),
+    ("next_decision", ("next_decision",)),
+    ("blocker", ("blocker",)),
+    ("last_signal_id", ("last_signal_id",)),
+    ("cycle_status", ("last_cycle", "status")),
+    ("cycle_completed_at", ("last_cycle", "completed_at")),
+    ("cycle_ended_at", ("last_cycle", "ended_at")),
+    ("cycle_last_completion_at", ("last_cycle", "last_completion_at")),
+    ("cycle_last_completed_at", ("last_cycle", "last_completed_at")),
+    ("cycle_cycle_ended_at", ("last_cycle", "cycle_ended_at")),
+    ("crypto_enabled", ("crypto_paper", "enabled")),
+    ("crypto_last_error", ("crypto_paper", "last_error")),
+)
+
+
+def _worker_dashboard_summary(payload: Any) -> dict[str, Any]:
+    body = payload if isinstance(payload, Mapping) else {}
+    summary: dict[str, Any] = {}
+    truncated_fields: list[str] = []
+    for name, path in _WORKER_DASHBOARD_SCALAR_PATHS:
+        candidate_paths = (
+            path if path and isinstance(path[0], tuple) else (path,)
+        )
+        value: Any = None
+        selected_path: tuple[str, ...] | None = None
+        for candidate_path in candidate_paths:
+            value = body
+            for part in candidate_path:
+                if not isinstance(value, Mapping) or part not in value:
+                    value = None
+                    break
+                value = value[part]
+            if value is not None:
+                selected_path = candidate_path
+                break
+        if value is None or isinstance(value, (Mapping, list, tuple)):
+            continue
+        if isinstance(value, str):
+            if len(value.encode("utf-8")) > _DASHBOARD_WORKER_REASON_MAX_BYTES:
+                truncated_fields.append(name)
+                continue
+        elif not isinstance(value, (bool, int, float)):
+            continue
+        summary_name = (
+            "cycle_" + selected_path[1]
+            if selected_path is not None
+            and len(selected_path) == 2
+            and selected_path[0] == "last_cycle"
+            else name
+        )
+        summary[summary_name] = value
+
+    raw_reasons = body.get("reasons")
+    if isinstance(raw_reasons, list):
+        reasons: list[Any] = []
+        reasons_bytes = 0
+        reasons_truncated = False
+        for index, reason in enumerate(raw_reasons):
+            if index >= _DASHBOARD_WORKER_REASONS_MAX_ITEMS:
+                reasons_truncated = True
+                break
+            encoded_reason = json.dumps(
+                reason, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+            if len(encoded_reason) > _DASHBOARD_WORKER_REASON_MAX_BYTES:
+                reasons_truncated = True
+                continue
+            if reasons_bytes + len(encoded_reason) > _DASHBOARD_WORKER_REASONS_MAX_BYTES:
+                reasons_truncated = True
+                break
+            reasons.append(reason)
+            reasons_bytes += len(encoded_reason)
+        summary["reasons"] = reasons
+        if reasons_truncated:
+            summary["reasons_truncated"] = True
+    if truncated_fields:
+        summary["projection_truncated"] = True
+        summary["projection_truncated_fields"] = truncated_fields[:64]
+    return summary
+
+
 
 
 def _dataset_missing_range_projection(raw_json: Any) -> tuple[Any, bool]:
