@@ -76,6 +76,7 @@ class PaperTradingConfig:
     depth: int = 20
     quality: SimulationQuality = SimulationQuality.MEDIUM
     live: bool = False
+    operational_policy: Any | None = None
 
     def __post_init__(self) -> None:
         fee_rate = float(self.fee_rate)
@@ -438,6 +439,7 @@ class PaperTrader:
         market_id: str | None = None,
         outcome: str | None = None,
         group: str | None = None,
+        event_id: str | None = None,
     ) -> Fill:
         slippage = abs(price - reference)
         fee = abs(price * quantity) * self.config.fee_rate
@@ -450,6 +452,8 @@ class PaperTrader:
             metadata["outcome"] = outcome
         if group is not None and str(group).strip():
             metadata["group"] = str(group).strip()
+        if event_id is not None and str(event_id).strip():
+            metadata["event_id"] = str(event_id).strip()
         return Fill(
             timestamp=ensure_utc(timestamp),
             market_type=self.market_type,
@@ -482,6 +486,8 @@ class PaperTrader:
         signal_observation: Any | None = None,
         signal_history: Sequence[Any] | None = None,
     ) -> Fill | None:
+        # Operational paper policies install a pure pre-submission decision
+        # callback on the trader.  Diagnostic paper execution leaves this unset.
         event_market_id = str(market_id or symbol)
         self._begin_execution_event(market_id=event_market_id, timestamp=timestamp)
 
@@ -511,9 +517,13 @@ class PaperTrader:
             mark = _finite_number(reference)
             if mark is not None and mark >= 0:
                 mark_prices[symbol] = mark
+        event_value = value("event_id", value("event_key", value("event")))
         context: dict[str, Any] = {
             "market_type": self.market_type.value,
             "symbol": symbol,
+            "market_id": event_market_id,
+            "event_id": str(event_value).strip() if event_value is not None else None,
+            "strategy_id": self.strategy_id,
             "observation": observation,
             "signal_observation": signal_observation if signal_observation is not None else observation,
             "market": observation,
@@ -626,6 +636,20 @@ class PaperTrader:
             return None
         self._execution_transition("SIGNAL", signal=True, signal_valid=True)
         side, indicated_quantity = normalized
+        if (
+            side is Side.BUY
+            and isinstance(observation, Mapping)
+            and observation.get("entry_eligible") is False
+            and not callable(getattr(self, "_operational_gate", None))
+        ):
+            self._execution_transition(
+                "NO_SIGNAL",
+                reason="ENTRY_PREDICATE_NOT_SATISFIED",
+                reason_code="ENTRY_PREDICATE_NOT_SATISFIED",
+                signal=False,
+                entry_eligible=False,
+            )
+            return None
         outcome = self._signal_outcome(signal) if self.market_type is MarketType.PREDICTION else None
         execution_book = book
         if outcome == "yes" and execution_book is None:
@@ -685,6 +709,7 @@ class PaperTrader:
             executable_reference = execution_book.best_ask if side is Side.BUY else execution_book.best_bid
             if executable_reference is not None and executable_reference > 0:
                 execution_reference = float(executable_reference)
+        venue_quote = execution_reference
         if self.market_type is MarketType.PREDICTION and execution_reference > 1.0:
             self._execution_transition("SIGNAL", reason="prediction_price_out_of_range")
             return None
@@ -712,6 +737,7 @@ class PaperTrader:
                 "order_book": execution_book,
                 "spread": spread,
                 "reference_price": execution_reference,
+                "venue_price": venue_quote,
                 "model_probability": expected,
                 "trade_probability": trade_probability,
             }
@@ -779,6 +805,10 @@ class PaperTrader:
             outcome=outcome,
         )
         spread_paid = max(0.0, float(spread)) if spread is not None and math.isfinite(float(spread)) else 0.0
+        # Record the order attempt before validating executable depth.  A
+        # rejected/empty book is still an attempted order; emitting this
+        # transition only after depth validation loses the hard execution
+        # blocker used by forward qualification.
         self._execution_transition(
             "ORDER_ATTEMPT",
             signal=True,
@@ -792,16 +822,15 @@ class PaperTrader:
             liquidity=liquidity,
             spread_paid=spread_paid,
         )
+        slippage_factor = 1.0 + (self.config.slippage_bps / 10000.0) * (1.0 if side is Side.BUY else -1.0)
+        if not math.isfinite(slippage_factor) or slippage_factor <= 0:
+            self._execution_transition("NO_FILL", reason="invalid_slippage", liquidity_rejected=True)
+            return None
         if execution_book is not None:
-            slippage_factor = 1.0 + (self.config.slippage_bps / 10000.0) * (1.0 if side is Side.BUY else -1.0)
-            if not math.isfinite(slippage_factor) or slippage_factor <= 0:
-                self._execution_transition("NO_FILL", reason="invalid_slippage", liquidity_rejected=True)
-                return None
             try:
                 projected_price, projected_quantity = execution_book.executable_price(
                     side,
                     quantity,
-                    price_multiplier=slippage_factor,
                 )
             except (TypeError, ValueError):
                 self._execution_transition("NO_FILL", reason="invalid_order_book", liquidity_rejected=True)
@@ -814,41 +843,99 @@ class PaperTrader:
                 self._execution_transition("NO_FILL", reason="insufficient_liquidity", liquidity_rejected=True)
                 return None
             if quantity < projected_quantity:
-                projected_price, projected_quantity = execution_book.executable_price(
-                    side,
-                    quantity,
-                    price_multiplier=slippage_factor,
-                )
+                try:
+                    projected_price, projected_quantity = execution_book.executable_price(
+                        side,
+                        quantity,
+                    )
+                except (TypeError, ValueError):
+                    self._execution_transition("NO_FILL", reason="invalid_order_book", liquidity_rejected=True)
+                    return None
             if projected_quantity <= 0 or projected_price <= 0:
                 self._execution_transition("NO_FILL", reason="insufficient_liquidity", liquidity_rejected=True)
                 return None
             execution_reference = projected_price
             risk_price = projected_price * slippage_factor
             context["reference_price"] = execution_reference
-            context["risk_price"] = risk_price
+        else:
+            risk_price = execution_reference * slippage_factor
+        context["risk_price"] = risk_price
+        context["outcome"] = outcome
+        operational_gate = getattr(self, "_operational_gate", None)
+        decision: Mapping[str, Any] = {"allowed": True}
+        if callable(operational_gate):
+            try:
+                raw_decision = operational_gate(order, context)
+            except Exception as exc:
+                raw_decision = {
+                    "allowed": False,
+                    "reason": "operational_policy_error",
+                    "error": type(exc).__name__,
+                }
+            if not isinstance(raw_decision, Mapping):
+                raw_decision = {"allowed": bool(raw_decision)}
+            decision = raw_decision
+            if not bool(decision.get("allowed")):
+                reason = str(
+                    decision.get("reason_code")
+                    or decision.get("reason")
+                    or "operational_policy_rejected"
+                )
+                evidence = dict(decision)
+                self._execution_transition(
+                    "RISK_REJECTED",
+                    reason=reason,
+                    reason_code=reason,
+                    risk_rejected=True,
+                    operational_policy=True,
+                    operational_evidence=evidence,
+                )
+                return None
+            gated_quantity = _finite_number(decision.get("quantity"))
+            if gated_quantity is not None and gated_quantity > 0 and gated_quantity < quantity:
+                quantity = gated_quantity
+                requested_quantity = float(quantity)
+                order = replace(order, quantity=requested_quantity, reference_price=execution_reference)
+            context["operational_evidence"] = dict(decision)
+            self._execution_transition(
+                "ORDER_ATTEMPT",
+                signal=True,
+                order_attempted=True,
+                order_id=order.order_id,
+                side=side.value,
+                outcome=outcome,
+                regime=value("regime", value("regime_state")),
+                requested_quantity=requested_quantity,
+                filled_quantity=0.0,
+                liquidity=liquidity,
+                spread_paid=spread_paid,
+                operational_evidence=context.get("operational_evidence"),
+            )
         if not self._approved(order, context):
             self._execution_transition("RISK_REJECTED", reason="risk_check_rejected", risk_rejected=True)
             return None
+        operational_commit = getattr(self, "_operational_commit", None)
+        if callable(operational_commit):
+            operational_commit(decision, context, order)
         if execution_book is not None:
-            price, filled = execution_book.executable_price(side, quantity)
+            raw_price, filled = execution_book.executable_price(
+                side,
+                quantity,
+            )
+            price = raw_price * slippage_factor
             quantity = filled
             if not quantity:
                 self._execution_transition("NO_FILL", reason="insufficient_liquidity", liquidity_rejected=True)
                 return None
         else:
-            price = execution_reference
-        if price <= 0 or not math.isfinite(price):
-            self._execution_transition("NO_FILL", reason="invalid_execution_price")
-            return None
-        direction = 1.0 if side is Side.BUY else -1.0
-        price *= 1.0 + direction * self.config.slippage_bps / 10000.0
+            price = risk_price
         if (
             price <= 0
             or not math.isfinite(price)
             or self.market_type is MarketType.PREDICTION
             and price > 1.0 + 1e-12
         ):
-            self._execution_transition("NO_FILL", reason="invalid_slippage_adjusted_price")
+            self._execution_transition("NO_FILL", reason="invalid_execution_price")
             return None
         partial = quantity < requested_quantity - 1e-12
         execution_status = "PARTIAL_FILL" if partial else "FULL_FILL"
@@ -862,6 +949,7 @@ class PaperTrader:
             market_id=market_id,
             outcome=outcome,
             group=context.get("group"),
+            event_id=context.get("event_id"),
             expected_probability=trade_probability,
             order_id=order.order_id,
         )
@@ -897,16 +985,15 @@ class PaperTrader:
 
 class CryptoPaperTrader(PaperTrader):
     market_type = MarketType.CRYPTO_SPOT
-
     def run_once(
         self,
         symbol: str,
         *,
-        quantity: float | None = None,
         timestamp: datetime | None = None,
         ticker: CryptoTicker | None = None,
         book: OrderBookSnapshot | None | object = _BOOK_UNSET,
         book_observed_at: datetime | None = None,
+        quantity: float | None = None,
     ) -> Fill | None:
         ticker = ticker or self.provider.ticker(symbol)
         if ticker is None:

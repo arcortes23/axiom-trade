@@ -31,10 +31,15 @@ from .bootstrap import (
 )
 from .data import PolymarketAdapter, SyntheticPredictionProvider
 from .domain import OrderBookSnapshot, ensure_utc, parse_timestamp, to_record, utc_now
-from .forward import ForwardTestRegistry, _content_hash
+from .forward import (
+    ForwardTestRegistry,
+    _content_hash,
+    _operational_setup_hash,
+)
 from .opportunity import scan_opportunities
 from .paper import CryptoPaperTrader
 from .paper_engine import (
+    OperationalPaperPolicy,
     PAPER_STATE_EXECUTION_BINDING_MISMATCH,
     paper_execution_binding,
     paper_state_binding_blocker,
@@ -53,6 +58,7 @@ from .lifecycle import PromotionCriteria
 from .strategy import evaluate_signal_record, load_strategy
 from .auto_canary import AutonomousCanaryWorker
 from .canary import CanaryBlocked, CanaryService
+from .canary_settings import CanarySettingsService
 
 POLYMARKET_HISTORICAL_JOB_NAME = "polymarket-historical-refresh"
 POLYMARKET_AUTONOMY_JOB_NAME = "polymarket-autonomy"
@@ -558,6 +564,122 @@ class _PersistedProbabilityModel:
         except (TypeError, ValueError):
             return None
         return None
+
+
+_OPERATIONAL_IDENTITY_ALIASES: dict[str, tuple[str, ...]] = {
+    "config_id": (
+        "operational_config_id",
+        "operational_settings_config_id",
+        "settings_config_id",
+        "active_settings_config_id",
+        "risk_config_id",
+        "active_risk_config_id",
+        "active_config_id",
+        "config_id",
+    ),
+    "generation": (
+        "operational_config_generation",
+        "operational_settings_generation",
+        "settings_generation",
+        "active_settings_generation",
+        "risk_config_generation",
+        "active_risk_config_generation",
+        "active_config_generation",
+        "generation",
+    ),
+    "config_hash": (
+        "operational_config_hash",
+        "operational_settings_hash",
+        "settings_config_hash",
+        "active_settings_config_hash",
+        "risk_config_hash",
+        "active_risk_config_hash",
+        "active_config_hash",
+        "config_hash",
+    ),
+}
+_OPERATIONAL_IDENTITY_ALIAS_TO_FIELD = {
+    alias: field_name
+    for field_name, aliases in _OPERATIONAL_IDENTITY_ALIASES.items()
+    for alias in aliases
+}
+
+
+_OPERATIONAL_IDENTITY_NAMESPACE_KEYS = frozenset(
+    {"operational_settings", "operational_identity", "active_settings"}
+)
+_OPERATIONAL_TOP_LEVEL_IDENTITY_ALIASES = frozenset(
+    alias
+    for aliases in _OPERATIONAL_IDENTITY_ALIASES.values()
+    for alias in aliases
+    if alias.startswith("operational_")
+)
+
+
+def _operational_identity_declarations(
+    config: Mapping[str, Any],
+) -> tuple[dict[str, tuple[Any, ...]], bool]:
+    """Collect declarations from explicit operational identity namespaces.
+
+    Generic ``config_id``, ``generation``, and ``config_hash`` fields are
+    common in legacy strategy/config documents and are not operational
+    identity by themselves.  Only explicit operational settings namespaces
+    may promote those generic names; at the config root, only the canonical
+    ``operational_*`` aliases are recognized.
+    """
+    declarations: dict[str, list[Any]] = {
+        field_name: [] for field_name in _OPERATIONAL_IDENTITY_ALIASES
+    }
+    operational_source_declared = False
+    seen: set[int] = set()
+
+    def visit(
+        value: Any,
+        *,
+        depth: int = 0,
+        in_operational_namespace: bool = False,
+    ) -> None:
+        nonlocal operational_source_declared
+        if depth > 8 or not isinstance(value, Mapping) or id(value) in seen:
+            return
+        seen.add(id(value))
+        for raw_key, child in value.items():
+            key = str(raw_key).replace("-", "_").strip().lower()
+            field_name = _OPERATIONAL_IDENTITY_ALIAS_TO_FIELD.get(key)
+            is_namespace = key in _OPERATIONAL_IDENTITY_NAMESPACE_KEYS
+            is_risk_alias = key.startswith(("risk_config_", "active_risk_config_"))
+            allowed_alias = (
+                not is_risk_alias
+                and (
+                    in_operational_namespace
+                    or (depth == 0 and key in _OPERATIONAL_TOP_LEVEL_IDENTITY_ALIASES)
+                )
+            )
+            if field_name is not None and child not in (None, "") and allowed_alias:
+                declarations[field_name].append(child)
+                operational_source_declared = True
+            if is_namespace and child is not None:
+                operational_source_declared = True
+            child_in_operational_namespace = (
+                in_operational_namespace or is_namespace
+            )
+            if isinstance(child, Mapping):
+                visit(
+                    child,
+                    depth=depth + 1,
+                    in_operational_namespace=child_in_operational_namespace,
+                )
+            elif isinstance(child, (list, tuple)):
+                for item in child:
+                    if isinstance(item, Mapping):
+                        visit(
+                            item,
+                            depth=depth + 1,
+                            in_operational_namespace=child_in_operational_namespace,
+                        )
+
+    visit(config)
+    return {name: tuple(values) for name, values in declarations.items()}, operational_source_declared
 
 
 class ResearchNode:
@@ -4514,6 +4636,344 @@ class ResearchNode:
             heartbeat_at=ensure_utc(self.clock()),
         )
         return stats
+    def _operational_paper_runtime(
+        self,
+        spec: Any,
+        *,
+        observed_at: datetime,
+    ) -> dict[str, Any] | None:
+        """Resolve the active paper envelope for an explicit operational setup.
+
+        Operational setup records are the only forward candidates allowed to
+        consume the live settings projection.  The projection is read-only and
+        never consults the legacy canary control row as authorization.
+        """
+        config = spec.config if isinstance(spec.config, Mapping) else {}
+        setup = config.get("operational_setup")
+        setup_hash = str(config.get("operational_setup_hash", "") or "").strip()
+        if setup is None and not setup_hash:
+            return None
+
+        def blocked(blocker: str, **details: Any) -> dict[str, Any]:
+            return {
+                "blocker": blocker,
+                "reason": details.pop("reason", blocker),
+                "retryable": False,
+                "non_retryable": True,
+                **details,
+            }
+
+        if not isinstance(setup, Mapping) or not setup_hash:
+            return blocked("OPERATIONAL_SETUP_INVALID")
+        family = str(setup.get("family", "")).strip().lower()
+        setup_id = str(setup.get("setup_id", "")).strip().lower()
+        if family not in {"momentum", "mean_reversion"} or not setup_id.startswith(
+            f"{family}:absolute-move-v1:"
+        ):
+            return blocked("OPERATIONAL_SETUP_UNSUPPORTED")
+        try:
+            canonical_hash = _operational_setup_hash(setup)
+        except Exception:
+            canonical_hash = ""
+        if setup_hash != canonical_hash:
+            return blocked("OPERATIONAL_SETUP_HASH_MISMATCH")
+
+        settings = CanarySettingsService(
+            self.store,
+            clock=self.clock,
+            initialize=False,
+        )
+        try:
+            snapshot = settings.snapshot(now=observed_at)
+        except Exception as exc:
+            return blocked(
+                "ACTIVE_SETTINGS_UNAVAILABLE",
+                reason="active canary settings are unavailable",
+                error=str(exc),
+            )
+        if (
+            not isinstance(snapshot, Mapping)
+            or str(snapshot.get("status", "")).strip().upper() != "CURRENT"
+            or snapshot.get("settings_available") is not True
+        ):
+            return blocked(
+                "ACTIVE_SETTINGS_NOT_CURRENT",
+                reason="active canary settings are not CURRENT",
+                settings_snapshot=dict(snapshot) if isinstance(snapshot, Mapping) else None,
+            )
+        active = snapshot.get("active")
+        if not isinstance(active, Mapping):
+            return blocked("ACTIVE_SETTINGS_IDENTITY_INVALID")
+        active_state = str(active.get("state", active.get("status", ""))).strip().upper()
+        config_id = str(snapshot.get("config_id") or active.get("config_id") or "").strip()
+        config_hash = str(snapshot.get("config_hash") or active.get("config_hash") or "").strip()
+        try:
+            generation = int(snapshot.get("generation", active.get("generation", 0)))
+            active_generation = int(active.get("generation", 0))
+        except (TypeError, ValueError, OverflowError):
+            generation = 0
+            active_generation = 0
+        if (
+            active_state not in {"ACTIVE", "CURRENT"}
+            or not config_id
+            or not config_hash
+            or generation < 1
+            or active_generation != generation
+            or str(active.get("config_id", "")).strip() != config_id
+            or str(active.get("config_hash", "")).strip() != config_hash
+        ):
+            return blocked("ACTIVE_SETTINGS_IDENTITY_INVALID")
+        identity = {
+            "config_id": config_id,
+            "generation": generation,
+            "config_hash": config_hash,
+            "paper_only": True,
+        }
+
+        declarations, identity_declared = _operational_identity_declarations(config)
+        expected: dict[str, Any] = {}
+        conflicting: dict[str, tuple[Any, ...]] = {}
+        for field_name, values in declarations.items():
+            if not values:
+                continue
+            normalized_values: list[Any] = []
+            for value in values:
+                if field_name == "generation":
+                    if isinstance(value, bool):
+                        normalized_values.append(str(value))
+                        continue
+                    try:
+                        parsed_generation = int(value)
+                    except (TypeError, ValueError, OverflowError):
+                        normalized_values.append(value)
+                        continue
+                    if isinstance(value, float) and not value.is_integer():
+                        normalized_values.append(value)
+                    elif isinstance(value, str) and not re.fullmatch(
+                        r"[+-]?\d+", value.strip()
+                    ):
+                        normalized_values.append(value)
+                    else:
+                        normalized_values.append(parsed_generation)
+                else:
+                    normalized_values.append(str(value).strip())
+            unique_values: list[Any] = []
+            for value in normalized_values:
+                if value not in unique_values:
+                    unique_values.append(value)
+            if len(unique_values) > 1:
+                conflicting[field_name] = tuple(unique_values)
+            expected[field_name] = unique_values[0]
+        if conflicting:
+            return blocked(
+                "OPERATIONAL_SETTINGS_IDENTITY_MISMATCH",
+                reason="operational settings identity declarations conflict",
+                expected_identity=expected,
+                conflicting_identity=conflicting,
+                current_identity=dict(identity),
+            )
+        if identity_declared and set(expected) != {"config_id", "generation", "config_hash"}:
+            return blocked(
+                "OPERATIONAL_SETTINGS_IDENTITY_MISMATCH",
+                reason="operational settings identity is incomplete",
+                expected_identity=expected,
+                current_identity=dict(identity),
+            )
+        if any(expected.get(name) != identity[name] for name in expected):
+            return blocked(
+                "OPERATIONAL_SETTINGS_IDENTITY_MISMATCH",
+                expected_identity=expected,
+                current_identity=dict(identity),
+            )
+
+        limits = snapshot.get("effective_limits")
+        if not isinstance(limits, Mapping):
+            limits = active.get("values", active.get("settings"))
+        if not isinstance(limits, Mapping):
+            return blocked("ACTIVE_SETTINGS_LIMITS_INVALID")
+        required_limits = (
+            "max_all_in_buy_usd",
+            "max_fee_reserve_usd",
+            "max_gross_daily_buy_usd",
+            "max_aggregate_open_cost_usd",
+            "max_aggregate_exposure_usd",
+            "max_positions",
+            "max_submitted_orders_per_day",
+            "realized_loss_entry_stop_usd",
+            "equity_loss_entry_stop_usd",
+        )
+        if any(name not in limits or limits[name] in (None, "") for name in required_limits):
+            return blocked("ACTIVE_SETTINGS_LIMITS_INVALID")
+        try:
+            policy = OperationalPaperPolicy.from_value(limits)
+        except (TypeError, ValueError) as exc:
+            return blocked(
+                "ACTIVE_SETTINGS_LIMITS_INVALID",
+                reason="active canary settings limits are invalid",
+                error=str(exc),
+            )
+        return {
+            "policy": policy,
+            "identity": identity,
+            "settings_snapshot": dict(snapshot),
+        }
+
+    def _operational_paper_blocked_result(
+        self,
+        spec: Any,
+        *,
+        worker_name: str,
+        started: datetime,
+        runtime: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        blocker = str(runtime.get("blocker") or "ACTIVE_SETTINGS_UNAVAILABLE")
+        result = {
+            "status": "BLOCKED",
+            "experiment_id": spec.experiment_id,
+            "observations_seen": 0,
+            "observations_processed": 0,
+            "observations_skipped": 0,
+            "fills_inserted": 0,
+            "settlements": 0,
+            "execution_events": 0,
+            "errors": [blocker],
+            "blocker": blocker,
+            "reason_code": blocker,
+            "reason": str(runtime.get("reason") or blocker),
+            "retryable": False,
+            "non_retryable": True,
+            "execution_skipped": True,
+            "paper_only": True,
+            "live_execution": False,
+        }
+        for key in ("error", "settings_snapshot", "expected_identity", "current_identity"):
+            if key in runtime:
+                result[key] = runtime[key]
+        self.store.save_worker_state(
+            worker_name,
+            "blocked",
+            {
+                "pid": os.getpid(),
+                "experiment_id": spec.experiment_id,
+                **result,
+                "last_error": None,
+                "next_retry_at": None,
+            },
+            started_at=started,
+            heartbeat_at=ensure_utc(self.clock()),
+        )
+        return result
+
+    @staticmethod
+    def _carry_forward_market_rules(
+        observation: dict[str, Any],
+        payload: Mapping[str, Any],
+        *,
+        include_missing: bool,
+    ) -> None:
+        """Project venue rules from collected snapshot/book metadata."""
+        names = {
+            "min_order_size": (
+                "min_order_size",
+                "order_min_size",
+                "minimum_order_size",
+                "min_size",
+                "minimum_size",
+                "quantity_min",
+                "minQuantity",
+                "minOrderSize",
+            ),
+            "size_increment": (
+                "size_increment",
+                "quantity_step",
+                "order_size_increment",
+                "step_size",
+                "quantity_increment",
+                "sizeIncrement",
+            ),
+            "min_notional": (
+                "min_notional",
+                "minimum_notional",
+                "min_cost",
+                "minimum_cost",
+                "min_notional_usd",
+                "minimum_notional_usd",
+                "minimum_cost_usd",
+                "min_order_value",
+                "minimum_order_value",
+                "minNotional",
+                "minimumNotional",
+            ),
+            "tick_size": (
+                "tick_size",
+                "tickSize",
+                "price_increment",
+                "price_tick_size",
+                "order_price_min_tick_size",
+                "orderPriceMinTickSize",
+            ),
+        }
+
+        def sources_for(
+            source: Mapping[str, Any] | None,
+        ) -> list[Mapping[str, Any]]:
+            if not isinstance(source, Mapping):
+                return []
+            result = [source]
+            for key in ("market_rules", "rules", "extra", "metadata", "snapshot", "order_book"):
+                nested = source.get(key)
+                if isinstance(nested, Mapping):
+                    result.append(nested)
+            return result
+
+        def extract(sources: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+            found: dict[str, Any] = {}
+            for source in sources:
+                for canonical, aliases in names.items():
+                    if canonical in found:
+                        continue
+                    for alias in aliases:
+                        value = source.get(alias)
+                        if value not in (None, ""):
+                            found[canonical] = value
+                            break
+            return found
+
+        snapshot = observation.get("snapshot")
+        base_sources: list[Mapping[str, Any]] = []
+        for source in (
+            payload,
+            observation,
+            snapshot if isinstance(snapshot, Mapping) else None,
+            payload.get("metadata"),
+        ):
+            base_sources.extend(sources_for(source))
+        found = extract(base_sources)
+        for canonical, value in found.items():
+            observation.setdefault(canonical, value)
+            if canonical == "min_notional":
+                observation.setdefault("min_cost", value)
+        if include_missing:
+            for canonical in names:
+                observation.setdefault(canonical, None)
+
+        for outcome in ("yes", "no"):
+            outcome_sources: list[Mapping[str, Any]] = []
+            for source in (
+                payload.get(f"{outcome}_market_rules"),
+                payload.get(f"{outcome}_order_book"),
+            ):
+                outcome_sources.extend(sources_for(source))
+            outcome_found = extract(outcome_sources)
+            if outcome_found or include_missing:
+                nested_rules = dict(outcome_found)
+                if "min_notional" in nested_rules:
+                    nested_rules.setdefault("min_cost", nested_rules["min_notional"])
+                if include_missing:
+                    for canonical in names:
+                        nested_rules.setdefault(canonical, None)
+                observation[f"{outcome}_market_rules"] = nested_rules
+
     def _paper_binding_blocked_result(
         self,
         spec: Any,
@@ -4521,6 +4981,8 @@ class ResearchNode:
         worker_name: str,
         started: datetime,
         paper_store: AxiomStore,
+        operational_policy: OperationalPaperPolicy | Mapping[str, Any] | Any | None = None,
+        operational_settings: Mapping[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         state_record = paper_store.load_paper_state(spec.experiment_id)
         if state_record is None:
@@ -4533,7 +4995,11 @@ class ResearchNode:
         )
         blocker = paper_state_binding_blocker(
             persisted_binding,
-            paper_execution_binding(spec),
+            paper_execution_binding(
+                spec,
+                operational_policy=operational_policy,
+                operational_settings=operational_settings,
+            ),
         )
         if blocker is None:
             return None
@@ -4582,11 +5048,27 @@ class ResearchNode:
             heartbeat_at=started,
         )
         try:
+            runtime = self._operational_paper_runtime(spec, observed_at=started)
+            if runtime is not None and "blocker" in runtime:
+                return self._operational_paper_blocked_result(
+                    spec,
+                    worker_name=worker_name,
+                    started=started,
+                    runtime=runtime,
+                )
+            operational_policy = (
+                runtime.get("policy") if isinstance(runtime, Mapping) else None
+            )
+            operational_settings = (
+                runtime.get("identity") if isinstance(runtime, Mapping) else None
+            )
             blocked_result = self._paper_binding_blocked_result(
                 spec,
                 worker_name=worker_name,
                 started=started,
                 paper_store=paper_store,
+                operational_policy=operational_policy,
+                operational_settings=operational_settings,
             )
             if blocked_result is not None:
                 return blocked_result
@@ -4601,9 +5083,34 @@ class ResearchNode:
                 raise ValueError("persisted executable documents do not match frozen forward-test hashes")
             if strategy_definition.market_type.value != "prediction":
                 raise ValueError("node Polymarket workers require a prediction strategy")
-            if "probability" not in model_document and "yes_probability" not in model_document and not (
-                isinstance(model_document.get("field"), str) and model_document["field"].strip()
-            ):
+            model_required = model_document.get("model_required")
+            if model_required is not None and not isinstance(model_required, bool):
+                raise ValueError("persisted model document has invalid model_required")
+            claimed_model = any(
+                key in model_document for key in ("probability", "yes_probability", "field")
+            )
+            if claimed_model:
+                for key in ("probability", "yes_probability"):
+                    if key not in model_document:
+                        continue
+                    value = model_document[key]
+                    if isinstance(value, Mapping):
+                        value = value.get(
+                            "probability",
+                            value.get("yes_probability", value.get("prediction")),
+                        )
+                    try:
+                        probability = float(value)
+                    except (TypeError, ValueError):
+                        raise ValueError("persisted model document is malformed") from None
+                    if not math.isfinite(probability) or not 0.0 <= probability <= 1.0:
+                        raise ValueError("persisted model document is malformed")
+                if "field" in model_document and not (
+                    isinstance(model_document["field"], str)
+                    and model_document["field"].strip()
+                ):
+                    raise ValueError("persisted model document is malformed")
+            elif model_required is not False:
                 raise ValueError("persisted model document is not executable")
             strategy = _PersistedStrategy(strategy_definition)
             model = _PersistedProbabilityModel(model_document)
@@ -4666,6 +5173,11 @@ class ResearchNode:
                     for key in ("yes_order_book", "no_order_book", "available_at"):
                         if key in payload:
                             observation[key] = payload[key]
+                    self._carry_forward_market_rules(
+                        observation,
+                        payload,
+                        include_missing=operational_policy is not None,
+                    )
                     opportunity_records = opportunity_by_market.get(str(market_id), [])
                     if opportunity_records:
                         observation["opportunities"] = opportunity_records
@@ -4696,13 +5208,31 @@ class ResearchNode:
                 strategy=strategy,
                 model=model,
                 observations=observations,
+                operational_policy=operational_policy,
+                operational_settings=operational_settings,
                 now=started,
             )
             cycle_payload = cycle.as_record()
             self.store.save_worker_state(
                 worker_name,
                 "idle",
-                {"pid": os.getpid(), "experiment_id": spec.experiment_id, "cycle": cycle_payload, "paper_only": True, "live_execution": False},
+                {
+                    "pid": os.getpid(),
+                    "experiment_id": spec.experiment_id,
+                    "cycle": cycle_payload,
+                    "operational_settings": (
+                        dict(operational_settings)
+                        if isinstance(operational_settings, Mapping)
+                        else None
+                    ),
+                    "operational_policy": (
+                        operational_policy.as_record()
+                        if isinstance(operational_policy, OperationalPaperPolicy)
+                        else None
+                    ),
+                    "paper_only": True,
+                    "live_execution": False,
+                },
                 started_at=started,
                 heartbeat_at=ensure_utc(self.clock()),
             )

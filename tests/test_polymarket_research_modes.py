@@ -9,6 +9,11 @@ from axiom.backtest.prediction import (
     PredictionMarketBacktester,
     PredictionResearchMode,
     run_prediction_research_mode,
+    select_prediction_paths,
+)
+from axiom.backtest import (
+    run_prediction_research_mode as package_run_prediction_research_mode,
+    select_prediction_paths as package_select_prediction_paths,
 )
 from axiom.domain import ResearchQuality
 from axiom.strategy.signals import (
@@ -109,6 +114,30 @@ class PolymarketResearchModeTests(unittest.TestCase):
                 [_row(0, 0.4), _row(1, 0.6)],
                 _strategy(),
                 mode=PredictionResearchMode.RECORDED_BOOK_REPLAY,
+            )
+
+    def test_prediction_research_helpers_are_publicly_exported(self) -> None:
+        self.assertIs(package_run_prediction_research_mode, run_prediction_research_mode)
+        self.assertIs(package_select_prediction_paths, select_prediction_paths)
+
+    def test_explicit_replay_rejects_paper_forward_rows(self) -> None:
+        strategy = _strategy()
+        strategy["parameters"] = {
+            **strategy["parameters"],
+            "entry_predicate": {
+                "version": "absolute-move-v1",
+                "minimum_move": "0.05",
+                "units": "probability",
+                "boundary": "inclusive",
+            },
+        }
+        rows = [_row(index, 0.40 + 0.10 * index, book=True) for index in range(3)]
+        rows[0]["source_type"] = "PAPER_FORWARD"
+        with self.assertRaisesRegex(ValueError, "PAPER_FORWARD"):
+            PredictionMarketBacktester().run(
+                rows,
+                strategy,
+                mode=RECORDED_BOOK_REPLAY,
             )
 
 
@@ -282,5 +311,119 @@ class PolymarketResearchModeTests(unittest.TestCase):
         )
 
 
+
+    def test_structural_manifest_uses_only_complete_same_market_paths(self) -> None:
+        strategy = _strategy()
+        strategy["parameters"] = {
+            **strategy["parameters"],
+            "entry_predicate": {
+                "version": "absolute-move-v1",
+                "minimum_move": "0.05",
+                "units": "probability",
+                "boundary": "inclusive",
+            },
+        }
+        rows: list[dict[str, object]] = []
+        for market_id, count in (
+            ("path-1", 1),
+            ("path-2", 2),
+            ("path-3", 3),
+            ("path-4", 4),
+        ):
+            rows.extend(
+                _row(index, 0.40 + 0.05 * index, market_id=market_id)
+                for index in range(count)
+            )
+        manifest = select_prediction_paths(
+            rows,
+            strategy,
+            mode=PRICE_PROXY_RESEARCH,
+            holding_period=1,
+        )
+        self.assertEqual(manifest["required_observations"], 3)
+        self.assertEqual(manifest["expected_market_ids"], ["path-1", "path-2", "path-3", "path-4"])
+        self.assertEqual(manifest["eligible_market_ids"], ["path-3", "path-4"])
+        self.assertEqual(manifest["excluded_market_ids"], ["path-1", "path-2"])
+        self.assertEqual(manifest["expected_row_count"], 10)
+        self.assertEqual(manifest["eligible_row_count"], 7)
+        self.assertEqual(
+            manifest["exclusion_reasons"],
+            {"INSUFFICIENT_OBSERVATIONS": 2},
+        )
+        self.assertTrue(manifest["no_imputation"])
+        self.assertFalse(manifest["forward_fill"])
+
+    def test_path_choice_is_invariant_to_price_permutation(self) -> None:
+        strategy = _strategy()
+        strategy["parameters"] = {
+            **strategy["parameters"],
+            "entry_predicate": {
+                "version": "absolute-move-v1",
+                "minimum_move": "0.05",
+                "units": "probability",
+                "boundary": "inclusive",
+            },
+        }
+        rows = [
+            _row(0, 0.40, market_id="market-a"),
+            _row(0, 0.40, market_id="market-b"),
+            _row(1, 0.60, market_id="market-a"),
+            _row(1, 0.60, market_id="market-b"),
+            _row(2, 0.62, market_id="market-a"),
+            _row(2, 0.62, market_id="market-b"),
+        ]
+        permuted = [dict(row) for row in rows]
+        for row, price in zip(permuted, (0.95, 0.05, 0.10, 0.90, 0.20, 0.80)):
+            row["yes_mid"] = price
+            row["yes_bid"] = max(0.01, price - 0.01)
+            row["yes_ask"] = min(0.99, price + 0.01)
+            row["no_mid"] = 1.0 - price
+            row["no_bid"] = max(0.01, 1.0 - price - 0.01)
+            row["no_ask"] = min(0.99, 1.0 - price + 0.01)
+        baseline = select_prediction_paths(rows, strategy, mode=PRICE_PROXY_RESEARCH)
+        changed = select_prediction_paths(permuted, strategy, mode=PRICE_PROXY_RESEARCH)
+        self.assertEqual(baseline["expected_market_ids"], changed["expected_market_ids"])
+        self.assertEqual(baseline["eligible_market_ids"], changed["eligible_market_ids"])
+        self.assertEqual(baseline["excluded_market_ids"], changed["excluded_market_ids"])
+        self.assertEqual(baseline["paths"], changed["paths"])
+
+    def test_replay_depth_gaps_are_execution_gaps_but_missing_books_exclude(self) -> None:
+        strategy = _strategy()
+        strategy["parameters"] = {
+            **strategy["parameters"],
+            "entry_predicate": {
+                "version": "absolute-move-v1",
+                "minimum_move": "0.05",
+                "units": "probability",
+                "boundary": "inclusive",
+            },
+        }
+        empty_rows = [_row(index, 0.40 + index * 0.1, book=True, market_id="empty") for index in range(3)]
+        for row in empty_rows:
+            assert isinstance(row["order_book"], dict)
+            assert isinstance(row["no_order_book"], dict)
+            row["order_book"]["bids"] = []
+            row["order_book"]["asks"] = []
+            row["no_order_book"]["asks"] = []
+        one_sided_rows = [_row(index, 0.40 + index * 0.1, book=True, market_id="one-sided") for index in range(3)]
+        for row in one_sided_rows:
+            assert isinstance(row["order_book"], dict)
+            row["order_book"]["asks"] = []
+        missing_rows = [_row(index, 0.40 + index * 0.1, book=True, market_id="missing-book") for index in range(3)]
+        for row in missing_rows:
+            row.pop("no_order_book")
+        manifest = select_prediction_paths(
+            empty_rows + one_sided_rows + missing_rows,
+            strategy,
+            mode=RECORDED_BOOK_REPLAY,
+        )
+        by_market = {path["market_id"]: path for path in manifest["paths"]}
+        self.assertEqual(manifest["eligible_market_ids"], ["empty", "one-sided"])
+        self.assertEqual(manifest["excluded_market_ids"], ["missing-book"])
+        self.assertTrue(by_market["empty"]["gap_flags"]["execution_gap"])
+        self.assertTrue(by_market["empty"]["gap_flags"]["empty_depth"])
+        self.assertTrue(by_market["one-sided"]["gap_flags"]["execution_gap"])
+        self.assertTrue(by_market["one-sided"]["gap_flags"]["one_sided_depth"])
+        self.assertEqual(by_market["missing-book"]["exclusion_reasons"], ["REPLAY_BOOK_REQUIRED"])
 if __name__ == "__main__":
     unittest.main()

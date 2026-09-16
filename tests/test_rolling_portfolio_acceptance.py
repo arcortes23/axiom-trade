@@ -585,6 +585,44 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.path = Path(self._tmp.name)
+    def test_operational_stage_evidence_is_namespaced_and_digest_bound(self) -> None:
+        payload = _canonicalize_evidence(
+            {
+                **_evidence("sv-acceptance-operational"),
+                "evaluation_run_id": "run-acceptance-operational",
+                "evaluation_version": "rolling-evaluation:v2",
+                "evaluation_kind": "CANONICAL_SIMULATION",
+                "evaluator_invoked": True,
+                "evaluator_completed": True,
+                "operational_evidence": {
+                    "valid_observations": 4,
+                    "risk_approved_order_attempts": 1,
+                    "net_result": "2.00",
+                },
+            }
+        )
+        evidence = RollingEvidence.from_mapping(payload)
+        serialized = json.loads(json.dumps(evidence.as_dict()))
+        self.assertEqual(
+            serialized["operational_evidence"],
+            {
+                "valid_observations": 4,
+                "risk_approved_order_attempts": 1,
+                "net_result": "2.00",
+            },
+        )
+        restored = RollingEvidence.from_mapping(serialized)
+        self.assertEqual(restored.evidence_digest, evidence.evidence_digest)
+        self.assertEqual(restored.valid_observations, 4)
+        self.assertEqual(restored.net_result, Decimal("2.00"))
+
+        conflict = dict(payload)
+        conflict["metrics"] = {
+            "operational_evidence": {"valid_observations": 5},
+        }
+        with self.assertRaisesRegex(ValueError, "valid_observations conflicts"):
+            RollingEvidence.from_mapping(conflict)
+
     def test_settled_market_guards_normalize_whitespace_and_type_variant_ids(self) -> None:
         portfolio = Portfolio(10.0)
         portfolio.resolve(

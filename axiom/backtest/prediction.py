@@ -7,7 +7,7 @@ must choose either ``PRICE_PROXY_RESEARCH`` (price-path assumptions only) or
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 import math
 from typing import Any, Mapping, Sequence
@@ -252,6 +252,33 @@ def _outcome(value: Any) -> str:
     if isinstance(value, SettlementState):
         return value.value
     return str(value or "").strip().lower()
+_TERMINAL_REPLAY_VALUES = frozenset(
+    {
+        "resolved_yes",
+        "resolved_no",
+        "void",
+        "resolved",
+        "closed",
+        "final",
+        "completed",
+        "settled",
+        "expired",
+        "cancelled",
+        "canceled",
+    }
+)
+
+
+def _is_terminal_replay_row(row: Any) -> bool:
+    return any(
+        _outcome(_value(row, name, "")) in _TERMINAL_REPLAY_VALUES
+        for name in ("settlement", "resolution", "status")
+    ) or any(
+        _value(row, name, False) is True
+        for name in ("closed", "terminal", "is_terminal")
+    )
+
+
 
 
 def _complement_book(book: OrderBookSnapshot) -> OrderBookSnapshot:
@@ -405,26 +432,7 @@ def _validate_replay_rows(rows: Sequence[Any]) -> None:
         if prior is not None and timestamp < prior:
             raise ValueError(f"recorded replay chronology is not monotonic for {market_id}")
         seen_market_timestamps[market_id] = timestamp
-        terminal_values = {
-            "resolved_yes",
-            "resolved_no",
-            "void",
-            "resolved",
-            "closed",
-            "final",
-            "completed",
-            "settled",
-            "expired",
-            "cancelled",
-            "canceled",
-        }
-        terminal = any(
-            _outcome(_value(row, name, "")) in terminal_values
-            for name in ("settlement", "resolution", "status")
-        ) or any(
-            _value(row, name, False) is True
-            for name in ("closed", "terminal", "is_terminal")
-        )
+        terminal = _is_terminal_replay_row(row)
         paired_books = _strict_paired_books(row, timestamp)
         # Nonterminal replay is a paired-book mode: both timestamped outcome
         # books must be present, while either side may have empty depth.
@@ -442,19 +450,49 @@ def _validate_replay_rows(rows: Sequence[Any]) -> None:
         else:
             books_to_validate = []
             for name in ("yes", "no"):
+                raw_book = _raw_book(row, name)
+                if raw_book is None:
+                    continue
                 book = _coerce_book(
-                    _raw_book(row, name),
+                    raw_book,
                     timestamp,
                     require_timestamp=True,
                 )
-                if book is not None:
-                    books_to_validate.append((name, book))
+                if book is None:
+                    raise ValueError(
+                        f"REPLAY_BOOK_TIMESTAMP_REQUIRED: recorded replay row {index} "
+                        f"has an invalid or untimestamped {name} book"
+                    )
+                books_to_validate.append((name, book))
         for name, book in books_to_validate:
             if ensure_utc(book.timestamp) > timestamp:
                 raise ValueError(f"prediction research {name} book is future-dated for {market_id}")
         source_type = str(_value(row, "source_type", "")).strip().upper()
         if source_type == "PAPER_FORWARD":
             raise ValueError("retrospective recorded replay cannot use PAPER_FORWARD rows")
+
+def _validate_explicit_replay_restrictions(rows: Sequence[Any]) -> None:
+    """Validate replay-only source restrictions without rejecting path gaps."""
+    for index, row in enumerate(rows):
+        source_type = str(_value(row, "source_type", "")).strip().upper()
+        if source_type == "PAPER_FORWARD":
+            raise ValueError("retrospective recorded replay cannot use PAPER_FORWARD rows")
+        timestamp = _observation_timestamp(row)
+        if timestamp is None or not _is_terminal_replay_row(row):
+            continue
+        market_id = _market_id(row)
+        for name in ("yes", "no"):
+            raw_book = _raw_book(row, name)
+            if raw_book is None:
+                continue
+            book = _coerce_book(raw_book, timestamp, require_timestamp=True)
+            if book is None:
+                raise ValueError(
+                    f"REPLAY_BOOK_TIMESTAMP_REQUIRED: recorded replay row {index} "
+                    f"has an invalid or untimestamped {name} book"
+                )
+            if ensure_utc(book.timestamp) > timestamp:
+                raise ValueError(f"prediction research {name} book is future-dated for {market_id}")
 
 
 def _validate_temporal_rows(rows: Sequence[Any]) -> None:
@@ -551,6 +589,379 @@ def _normalize_observation_horizon(
     }, int(count)
 
 
+# Path manifests are intentionally small.  They describe the deterministic
+# selection decision without copying the input dataset into result metadata.
+_PREDICTION_PATH_MANIFEST_LIMIT = 128
+_PREDICTION_ROW_IDENTITY_LIMIT = 256
+
+
+def _explicit_entry_predicate(definition: StrategyDefinition) -> Mapping[str, Any] | None:
+    predicate = definition.parameters.get("entry_predicate")
+    return predicate if isinstance(predicate, Mapping) else None
+
+
+def _row_identity(row: Any, source_index: int) -> str:
+    for name in (
+        "source_snapshot_id",
+        "snapshot_id",
+        "observation_id",
+        "row_id",
+        "id",
+    ):
+        value = _value(row, name, None)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return f"source-row-{source_index}"
+
+
+def _normalize_max_gap_policy(
+    definition: StrategyDefinition,
+    override: Mapping[str, Any] | int | float | timedelta | None = None,
+) -> dict[str, Any]:
+    """Normalize a declared temporal max-gap policy without using prices."""
+    parameters = definition.parameters
+    unsupported_parameter_keys = (
+        "max_gap_observations",
+        "max_missing_observations",
+    )
+    if any(key in parameters for key in unsupported_parameter_keys):
+        raise ValueError(
+            "max_gap_observations is unsupported; declare max_gap_seconds instead"
+        )
+    raw: Any = override
+    if raw is None:
+        raw = parameters.get(
+            "max_gap_policy",
+            parameters.get("max_gap", parameters.get("max_gap_seconds")),
+        )
+    if raw is None:
+        for key in ("max_gap_seconds", "max_gap_minutes"):
+            if key in parameters:
+                raw = {key: parameters[key]}
+                break
+    if isinstance(raw, Mapping) and any(
+        key in raw
+        for key in ("max_gap_observations", "max_missing_observations", "observations")
+    ):
+        raise ValueError(
+            "max_gap_observations is unsupported; declare max_gap_seconds instead"
+        )
+    policy: dict[str, Any] = {
+        "declared": raw is not None,
+        "max_gap_seconds": None,
+        "max_gap_observations": None,
+        "source": "undeclared" if raw is None else "strategy",
+    }
+    if raw is None:
+        return policy
+    if isinstance(raw, timedelta):
+        policy["max_gap_seconds"] = max(0.0, raw.total_seconds())
+    elif isinstance(raw, Mapping):
+        policy.update(
+            {
+                key: raw[key]
+                for key in ("name", "type", "unit", "semantics")
+                if key in raw
+            }
+        )
+        seconds = raw.get(
+            "max_gap_seconds",
+            raw.get(
+                "seconds",
+                raw.get("max_seconds", raw.get("duration_seconds")),
+            ),
+        )
+        if seconds is None and "max_gap_minutes" in raw:
+            try:
+                seconds = float(raw["max_gap_minutes"]) * 60.0
+            except (TypeError, ValueError, OverflowError):
+                seconds = None
+        if seconds is None and "max_gap" in raw:
+            seconds = raw["max_gap"]
+        if seconds is not None:
+            try:
+                seconds = float(seconds)
+            except (TypeError, ValueError, OverflowError):
+                seconds = None
+            if seconds is not None and math.isfinite(seconds) and seconds >= 0:
+                policy["max_gap_seconds"] = seconds
+    else:
+        try:
+            number = float(raw)
+        except (TypeError, ValueError, OverflowError):
+            number = math.nan
+        if math.isfinite(number) and number >= 0:
+            policy["max_gap_seconds"] = number
+    if policy["max_gap_seconds"] is None:
+        raise ValueError("max_gap_policy must declare max_gap_seconds")
+    return policy
+
+
+def _book_depth_flags(book: OrderBookSnapshot | None) -> tuple[bool, bool]:
+    if book is None:
+        return False, False
+    empty = not book.bids and not book.asks
+    one_sided = bool(book.bids) != bool(book.asks)
+    return empty, one_sided
+
+
+def _path_manifest_record(
+    market_id: str,
+    rows: Sequence[tuple[int, Any]],
+    *,
+    reasons: Sequence[str],
+    mode: PredictionResearchMode | None,
+    required_observations: int,
+    max_gap_policy: Mapping[str, Any],
+) -> dict[str, Any]:
+    timestamps = [_observation_timestamp(row) for _, row in rows]
+    valid_timestamps = [stamp for stamp in timestamps if stamp is not None]
+    source_indices = [index for index, _ in rows]
+    identities = [_row_identity(row, index) for index, row in rows]
+    timestamp_gaps: list[float] = []
+    for prior, current in zip(valid_timestamps, valid_timestamps[1:]):
+        timestamp_gaps.append(max(0.0, (current - prior).total_seconds()))
+    gap_seconds = max(timestamp_gaps, default=0.0)
+    max_gap_exceeded = bool(
+        max_gap_policy.get("max_gap_seconds") is not None
+        and gap_seconds > float(max_gap_policy["max_gap_seconds"])
+    )
+    return {
+        "market_id": market_id,
+        "row_count": len(rows),
+        "rows": len(rows),
+        "required_observations": required_observations,
+        "source_order": list(source_indices[:_PREDICTION_ROW_IDENTITY_LIMIT]),
+        "row_identities": list(identities[:_PREDICTION_ROW_IDENTITY_LIMIT]),
+        "source_order_truncated": len(source_indices) > _PREDICTION_ROW_IDENTITY_LIMIT,
+        "first_timestamp": (
+            valid_timestamps[0].isoformat() if valid_timestamps else None
+        ),
+        "last_timestamp": (
+            valid_timestamps[-1].isoformat() if valid_timestamps else None
+        ),
+        "max_timestamp_gap_seconds": gap_seconds,
+        "max_gap_seconds": gap_seconds,
+        "gap_count": 1 if max_gap_exceeded else 0,
+        "gap_flags": {
+            "timestamp_gap": max_gap_exceeded,
+            "max_gap_exceeded": max_gap_exceeded,
+            "execution_gap": False,
+            "empty_depth": False,
+            "one_sided_depth": False,
+            "missing_book": False,
+        },
+        "exclusion_reasons": sorted(set(reasons)),
+        "eligible": not reasons,
+        "mode": mode.value if isinstance(mode, PredictionResearchMode) else None,
+    }
+
+
+def _select_prediction_paths(
+    rows: Sequence[PredictionMarketSnapshot | Mapping[str, Any]],
+    definition: StrategyDefinition,
+    *,
+    mode: PredictionResearchMode | None,
+    holding_period: int,
+    max_gap_policy: Mapping[str, Any] | int | float | timedelta | None = None,
+) -> tuple[tuple[Any, ...], dict[str, Any]]:
+    """Select complete same-market paths using structure only.
+
+    The input index and row identity are retained in the bounded manifest.
+    No quote, signal, return, or P&L field is read while deciding eligibility.
+    """
+    if isinstance(holding_period, bool) or not isinstance(holding_period, int) or holding_period < 1:
+        raise ValueError("holding_period must be a positive integer")
+    lookback_raw = definition.parameters.get("lookback", 1)
+    try:
+        lookback = max(1, int(lookback_raw))
+    except (TypeError, ValueError, OverflowError):
+        lookback = 1
+    required = lookback + int(holding_period) + 1
+    policy = _normalize_max_gap_policy(definition, max_gap_policy)
+    grouped: dict[str, list[tuple[int, Any]]] = {}
+    expected_order: list[str] = []
+    for source_index, original in enumerate(rows):
+        row = _normalize_row(original)
+        market_id = _market_id(row)
+        if market_id not in grouped:
+            grouped[market_id] = []
+            expected_order.append(market_id)
+        grouped[market_id].append((source_index, row))
+
+    records: list[dict[str, Any]] = []
+    eligible_rows: list[Any] = []
+    eligible_ids: list[str] = []
+    excluded_ids: list[str] = []
+    exclusion_reasons: dict[str, int] = {}
+    for market_id in expected_order:
+        market_rows = grouped[market_id]
+        reasons: list[str] = []
+        if not market_id:
+            reasons.append("MISSING_MARKET_ID")
+        if len(market_rows) < required:
+            reasons.append("INSUFFICIENT_OBSERVATIONS")
+        previous: datetime | None = None
+        timestamp_values: list[datetime] = []
+        for _, row in market_rows:
+            timestamp = _observation_timestamp(row)
+            if timestamp is None:
+                reasons.append("MISSING_TIMESTAMP")
+                continue
+            timestamp_values.append(timestamp)
+            if previous is not None and timestamp < previous:
+                reasons.append("NON_MONOTONIC_TIMESTAMP")
+            previous = timestamp
+            try:
+                _validate_metadata_timestamps(row, timestamp, market_id)
+            except ValueError:
+                reasons.append("FUTURE_DATED_METADATA")
+        if timestamp_values and policy.get("max_gap_seconds") is not None:
+            max_gap = max(
+                (current - prior).total_seconds()
+                for prior, current in zip(timestamp_values, timestamp_values[1:])
+            )
+            if max_gap > float(policy["max_gap_seconds"]):
+                reasons.append("MAX_GAP_EXCEEDED")
+
+        depth_flags = {
+            "execution_gap": False,
+            "empty_depth": False,
+            "one_sided_depth": False,
+            "missing_book": False,
+        }
+        if mode is PredictionResearchMode.RECORDED_BOOK_REPLAY:
+            for _, row in market_rows:
+                timestamp = _observation_timestamp(row)
+                if timestamp is None:
+                    continue
+                terminal = _is_terminal_replay_row(row)
+                paired = _strict_paired_books(row, timestamp)
+                if paired is None:
+                    if not terminal:
+                        depth_flags["missing_book"] = True
+                        reasons.append("REPLAY_BOOK_REQUIRED")
+                        continue
+                    books = []
+                    for name in ("yes", "no"):
+                        raw_book = _raw_book(row, name)
+                        if raw_book is None:
+                            continue
+                        book = _coerce_book(
+                            raw_book,
+                            timestamp,
+                            require_timestamp=True,
+                        )
+                        if book is None:
+                            reasons.append("REPLAY_BOOK_TIMESTAMP_REQUIRED")
+                            continue
+                        books.append(book)
+                else:
+                    books = list(paired)
+                for book in books:
+                    empty, one_sided = _book_depth_flags(book)
+                    depth_flags["empty_depth"] |= empty
+                    depth_flags["one_sided_depth"] |= one_sided
+                    depth_flags["execution_gap"] |= empty or one_sided
+                    if ensure_utc(book.timestamp) > timestamp:
+                        reasons.append("BOOK_FUTURE_DATED")
+        record = _path_manifest_record(
+            market_id,
+            market_rows,
+            reasons=reasons,
+            mode=mode,
+            required_observations=required,
+            max_gap_policy=policy,
+        )
+        record["gap_flags"].update(depth_flags)
+        record["gap_count"] = int(
+            record["gap_count"]
+            or depth_flags["execution_gap"]
+            or depth_flags["missing_book"]
+        )
+        record["no_imputation"] = True
+        record["no_imputation_assertion"] = "No rows are forward-filled, inferred, or imputed."
+        record["unresolved_exit"] = False
+        record["unresolved_exit_count"] = 0
+        records.append(record)
+        normalized_reasons = tuple(sorted(set(reasons)))
+        for reason in normalized_reasons:
+            exclusion_reasons[reason] = exclusion_reasons.get(reason, 0) + 1
+        if normalized_reasons:
+            excluded_ids.append(market_id)
+        else:
+            eligible_ids.append(market_id)
+            eligible_rows.extend(row for _, row in market_rows)
+
+    bounded_records = records[:_PREDICTION_PATH_MANIFEST_LIMIT]
+    omitted_paths = max(0, len(records) - len(bounded_records))
+    summary: dict[str, Any] = {
+        "schema_version": "prediction-path-manifest-v1",
+        "mode": mode.value if isinstance(mode, PredictionResearchMode) else None,
+        "lookback": lookback,
+        "holding_period": int(holding_period),
+        "required_observations": required,
+        "max_gap_policy": dict(policy),
+        "expected_market_ids": list(expected_order[:_PREDICTION_PATH_MANIFEST_LIMIT]),
+        "eligible_market_ids": list(eligible_ids[:_PREDICTION_PATH_MANIFEST_LIMIT]),
+        "excluded_market_ids": list(excluded_ids[:_PREDICTION_PATH_MANIFEST_LIMIT]),
+        "expected_market_count": len(expected_order),
+        "eligible_market_count": len(eligible_ids),
+        "excluded_market_count": len(excluded_ids),
+        "excluded_path_count": len(excluded_ids),
+        "expected_row_count": len(rows),
+        "eligible_row_count": sum(len(grouped[item]) for item in eligible_ids),
+        "excluded_row_count": sum(len(grouped[item]) for item in excluded_ids),
+        "rows": len(rows),
+        "valid_rows": sum(len(grouped[item]) for item in eligible_ids),
+        "exclusion_reasons": dict(sorted(exclusion_reasons.items())),
+        "exclusion_counts": dict(sorted(exclusion_reasons.items())),
+        "blocker_counts": dict(sorted(exclusion_reasons.items())),
+        "paths": list(bounded_records),
+        "market_paths": list(bounded_records),
+        "omitted_path_count": omitted_paths,
+        "truncated": bool(omitted_paths),
+        "gap_count": sum(int(path.get("gap_count", 0)) for path in records),
+        "max_gap_seconds": max(
+            (float(path.get("max_gap_seconds", 0.0)) for path in records),
+            default=0.0,
+        ),
+        "partial": bool(excluded_ids),
+        "no_imputation": True,
+        "no_imputation_assertion": "No rows are forward-filled, inferred, or imputed.",
+        "forward_fill": False,
+        "unresolved_exit_accounting": {
+            "unresolved_exit_count": 0,
+            "unresolved_market_ids": [],
+            "open_position_count": 0,
+            "forced_closes": 0,
+            "forward_fills": 0,
+        },
+    }
+    return tuple(eligible_rows), summary
+
+
+def select_prediction_paths(
+    rows: Sequence[PredictionMarketSnapshot | Mapping[str, Any]],
+    strategy: StrategyDefinition | Mapping[str, Any] | str,
+    *,
+    mode: PredictionResearchMode | str | None = None,
+    holding_period: int = 1,
+    max_gap_policy: Mapping[str, Any] | int | float | timedelta | None = None,
+) -> dict[str, Any]:
+    """Return the P&L-independent structural path manifest for prediction research."""
+    definition = validate_strategy(strategy)
+    resolved_mode = _mode(mode)
+    _, summary = _select_prediction_paths(
+        rows,
+        definition,
+        mode=resolved_mode,
+        holding_period=holding_period,
+        max_gap_policy=max_gap_policy,
+    )
+    return summary
+
+
 
 
 
@@ -586,6 +997,7 @@ class PredictionMarketBacktester:
         holding_period: int = 1,
         observation_horizon: Mapping[str, Any] | int | None = None,
         exit_policy: str | Mapping[str, Any] = "fixed_holding_period",
+        max_gap_policy: Mapping[str, Any] | int | float | timedelta | None = None,
     ) -> BacktestResult:
         """Run the shared evaluator/portfolio loop.
 
@@ -649,11 +1061,30 @@ class PredictionMarketBacktester:
             normalized_exit_policy = dict(normalized_exit_policy)
             normalized_exit_policy["holding_period"] = holding_period
         normalized_rows = [_normalize_row(row) for row in snapshots]
-        if mode is not None:
-            _validate_temporal_rows(normalized_rows)
-            if mode is PredictionResearchMode.RECORDED_BOOK_REPLAY:
-                _validate_replay_rows(normalized_rows)
-        rows = sorted(normalized_rows, key=_sort_key)
+        definition_has_explicit_paths = (
+            mode is not None and _explicit_entry_predicate(definition) is not None
+        )
+        path_manifest: dict[str, Any] | None = None
+        if definition_has_explicit_paths and mode is PredictionResearchMode.RECORDED_BOOK_REPLAY:
+            _validate_explicit_replay_restrictions(normalized_rows)
+        if definition_has_explicit_paths:
+            eligible_rows, path_manifest = _select_prediction_paths(
+                normalized_rows,
+                definition,
+                mode=mode,
+                holding_period=holding_period,
+                max_gap_policy=max_gap_policy,
+            )
+            # Grouping and eligibility use source order.  Evaluation may
+            # interleave markets, but stable timestamp ordering retains that
+            # source order for equal timestamps.
+            rows = sorted(eligible_rows, key=_time)
+        else:
+            if mode is not None:
+                _validate_temporal_rows(normalized_rows)
+                if mode is PredictionResearchMode.RECORDED_BOOK_REPLAY:
+                    _validate_replay_rows(normalized_rows)
+            rows = sorted(normalized_rows, key=_sort_key)
         model_source = model if model is not None else model_document
         if model_source is None and isinstance(strategy, Mapping):
             model_source = strategy.get("model_document", strategy.get("model"))
@@ -756,6 +1187,10 @@ class PredictionMarketBacktester:
                     {"error": evaluator_error},
                 )
             score = evaluation.score
+            entry_eligible = evaluation.evidence.get("entry_eligible")
+            entry_allowed = bool(evaluation.actionable) and (
+                "entry_eligible" not in evaluation.evidence or entry_eligible is True
+            )
             history_by_market[market_id].append(active_snapshot)
             # Explicit resolutions and snapshot settlement become observable
             # only at their timestamp; a resolved market cannot be re-entered.
@@ -1063,6 +1498,7 @@ class PredictionMarketBacktester:
                 and not closed_now
                 and not has_pending_exit
                 and effective_state not in {SettlementState.VOID, SettlementState.UNKNOWN, "void", "unknown", SettlementState.RESOLVED_YES, SettlementState.RESOLVED_NO, "resolved_yes", "resolved_no"}
+                and entry_allowed
                 and score != 0
                 and market_id
                 and ask > 0
@@ -1169,6 +1605,7 @@ class PredictionMarketBacktester:
                 and not proxy_executed
                 and not resolved_now
                 and effective_state not in {SettlementState.VOID, SettlementState.UNKNOWN, "void", "unknown", SettlementState.RESOLVED_YES, SettlementState.RESOLVED_NO, "resolved_yes", "resolved_no"}
+                and entry_allowed
                 and score != 0
                 and market_id
                 and not proxy_pending.get(market_id)
@@ -1332,6 +1769,21 @@ class PredictionMarketBacktester:
                 }
             )
         unresolved = tuple(sorted({position.market_id or position.symbol for position in portfolio.positions.values() if position.market_type is MarketType.PREDICTION and position.quantity}))
+        unresolved_exit_items = [
+            pending
+            for pending_items in proxy_pending.values()
+            for pending in pending_items
+            if pending.get("kind") == "exit"
+        ]
+        unresolved_exit_market_ids = tuple(
+            sorted(
+                {
+                    _normalize_market_id(item.get("market_id"))
+                    for item in unresolved_exit_items
+                    if _normalize_market_id(item.get("market_id"))
+                }
+            )
+        )
         metrics = calculate_prediction_metrics(
             curve,
             fills=portfolio.fills,
@@ -1353,6 +1805,24 @@ class PredictionMarketBacktester:
                 "evaluator_prerequisite": None,
             },
         )
+        if path_manifest is not None:
+            path_manifest["unresolved_exit_accounting"] = {
+                "unresolved_exit_count": len(unresolved_exit_items),
+                "unresolved_market_ids": list(unresolved_exit_market_ids),
+                "open_position_count": len(unresolved),
+                "open_position_market_ids": list(unresolved),
+                "forced_closes": 0,
+                "forward_fills": 0,
+            }
+            for path in path_manifest.get("paths", ()):
+                market_id = _normalize_market_id(path.get("market_id"))
+                path["unresolved_exit"] = market_id in unresolved_exit_market_ids
+                path["unresolved_exit_count"] = sum(
+                    1
+                    for item in unresolved_exit_items
+                    if _normalize_market_id(item.get("market_id")) == market_id
+                )
+            metrics["path_manifest"] = path_manifest
         evaluation_metrics = metrics.get("evaluation")
         if isinstance(evaluation_metrics, dict):
             evaluation_metrics["reason_counts"] = _reason_counts(curve)
@@ -1394,6 +1864,7 @@ class PredictionMarketBacktester:
         holding_period: int = 1,
         observation_horizon: Mapping[str, Any] | int | None = None,
         exit_policy: str | Mapping[str, Any] = "fixed_holding_period",
+        max_gap_policy: Mapping[str, Any] | int | float | timedelta | None = None,
     ) -> BacktestResult:
         """Evaluate with explicit evidence when ``mode`` is provided.
 
@@ -1416,6 +1887,7 @@ class PredictionMarketBacktester:
             holding_period=holding_period,
             observation_horizon=observation_horizon,
             exit_policy=exit_policy,
+            max_gap_policy=max_gap_policy,
         )
 
     simulate = run
@@ -1442,6 +1914,7 @@ def run_prediction_research_mode(
     holding_period: int = 1,
     observation_horizon: Mapping[str, Any] | int | None = None,
     exit_policy: str | Mapping[str, Any] = "fixed_holding_period",
+    max_gap_policy: Mapping[str, Any] | int | float | timedelta | None = None,
 ) -> BacktestResult:
     """Stable orchestration entry point used by autonomous research.
 
@@ -1466,6 +1939,7 @@ def run_prediction_research_mode(
         observation_horizon=observation_horizon,
         holding_period=holding_period,
         exit_policy=exit_policy,
+        max_gap_policy=max_gap_policy,
     )
 __all__ = [
     "CANONICAL_EVALUATOR_VERSION",
@@ -1478,4 +1952,5 @@ __all__ = [
     "PredictionMarketBacktester",
     "PredictionMarketHistoricalSimulator",
     "run_prediction_research_mode",
+    "select_prediction_paths",
 ]

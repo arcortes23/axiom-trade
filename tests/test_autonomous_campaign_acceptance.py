@@ -209,6 +209,204 @@ class AutonomousCampaignAcceptanceTests(unittest.TestCase):
             self.assertNotIn("yes_bid", loaded_rows[0])
             self.assertNotIn("yes_ask", loaded_rows[0])
 
+    def test_v2_default_selects_only_exact_operational_configurations(self) -> None:
+        expected_ids = (
+            "momentum:lookback-1:threshold-0.05",
+            "mean_reversion:lookback-1:threshold-0.05",
+        )
+        with AxiomStore(":memory:") as store:
+            _save_attested_dataset(store, "v2-default", midpoint=0.50)
+            processor = AutonomousResearchProcessor(store, clock=lambda: T0)
+            state = processor.start_polymarket_campaign(
+                "polymarket-paper-campaign-v2:default",
+                dataset_id=DATASET_ID,
+                dataset_version="v2-default",
+                now=T0,
+            )
+            self.assertEqual(
+                [item["configuration_id"] for item in state["protocol"]["configuration_manifest"]],
+                list(expected_ids),
+            )
+            self.assertEqual(
+                [item["configuration_id"] for item in state["trials"]],
+                list(expected_ids),
+            )
+            self.assertEqual(set(state["protocol"]["operational_setups"]), set(expected_ids))
+            self.assertEqual(
+                {
+                    item.payload["campaign_configuration_id"]
+                    for item in processor.bus.list_campaign_trials(
+                        "polymarket-paper-campaign-v2:default",
+                        limit=100,
+                    )
+                },
+                {expected_ids[0]},
+            )
+
+    def test_v2_configuration_allowlist_is_exactly_two_operational_setups(self) -> None:
+        selected_ids = (
+            "momentum:lookback-1:threshold-0.05",
+            "mean_reversion:lookback-1:threshold-0.05",
+        )
+        campaign_id = "polymarket-paper-campaign-v2:allowlisted"
+        with AxiomStore(":memory:") as store:
+            _save_attested_dataset(store, "allowlisted-v1", midpoint=0.50)
+            processor = AutonomousResearchProcessor(store, clock=lambda: T0)
+            state = processor.start_polymarket_campaign(
+                campaign_id,
+                dataset_id=DATASET_ID,
+                dataset_version="allowlisted-v1",
+                configuration_allowlist=selected_ids,
+                now=T0,
+            )
+
+            self.assertEqual(state["fixed_configuration_count"], 2)
+            self.assertEqual(
+                [trial["configuration_id"] for trial in state["trials"]],
+                list(selected_ids),
+            )
+            setups = state["protocol"]["operational_setups"]
+            self.assertEqual(set(setups), set(selected_ids))
+            for trial in state["trials"]:
+
+                self.assertEqual(
+                    trial["operational_setup"],
+                    setups[trial["configuration_id"]]["operational_setup"],
+                )
+                self.assertEqual(
+                    trial["operational_setup_hash"],
+                    setups[trial["configuration_id"]]["operational_setup_hash"],
+                )
+
+            first = processor.bus.list_campaign_trials(campaign_id, limit=100)
+            self.assertEqual(len(first), 1)
+            self.assertEqual(first[0].payload["campaign_configuration_id"], selected_ids[0])
+            self.assertEqual(
+                first[0].payload["operational_setup_hash"],
+                state["trials"][0]["operational_setup_hash"],
+            )
+
+            processor._advance_campaign_after_result(
+                first[0],
+                {
+                    "accepted": False,
+                    "reason_code": "NEGATIVE_VALIDATION_EXPECTANCY",
+                    "stage": "REJECTED",
+                    "candidate_id": "allowlisted-candidate-0",
+                },
+                T0 + timedelta(minutes=1),
+            )
+            second = processor.bus.list_campaign_trials(campaign_id, limit=100)
+            self.assertEqual(
+                {item.payload["campaign_configuration_id"] for item in second},
+                set(selected_ids),
+            )
+            self.assertEqual(len(store.list_experiment_plans(limit=100)), 2)
+ 
+    def test_v2_allowlist_rejects_generic_grid_configuration(self) -> None:
+        with AxiomStore(":memory:") as store:
+            processor = AutonomousResearchProcessor(store, clock=lambda: T0)
+            with self.assertRaises(ValueError):
+                processor.start_polymarket_campaign(
+                    "polymarket-paper-campaign-v2:generic",
+                    protocol_id="polymarket-paper-campaign-v2",
+                    configuration_allowlist=("momentum:lookback-3:threshold-0.05",),
+                    now=T0,
+                )
+            self.assertEqual(
+                processor.bus.list_campaign_trials("polymarket-paper-campaign-v2:generic"),
+                (),
+            )
+
+    def test_campaign_configuration_allowlist_rejects_invalid_inputs(self) -> None:
+        with AxiomStore(":memory:") as store:
+            processor = AutonomousResearchProcessor(store, clock=lambda: T0)
+            known_id = processor.campaign_configurations()[0]["configuration_id"]
+            grid_ids = [item["configuration_id"] for item in processor.campaign_configurations()]
+            invalid_allowlists = (
+                "not-a-sequence",
+                {"configuration_ids": [known_id]},
+                1,
+                [""],
+                [known_id, known_id],
+                ["unknown:configuration"],
+                [*grid_ids, known_id],
+            )
+            for index, allowlist in enumerate(invalid_allowlists):
+                with self.assertRaises(ValueError):
+                    processor.start_polymarket_campaign(
+                        f"invalid-allowlist-{index}",
+                        configuration_allowlist=allowlist,
+                        now=T0,
+                    )
+                self.assertEqual(
+                    processor.bus.list_campaign_trials(f"invalid-allowlist-{index}"),
+                    (),
+                )
+
+    def test_v2_configuration_allowlist_applies_prior_filter_and_exhaustion(self) -> None:
+        selected_ids = (
+            "momentum:lookback-1:threshold-0.05",
+            "mean_reversion:lookback-1:threshold-0.05",
+        )
+        with AxiomStore(":memory:") as store:
+            _save_attested_dataset(store, "allowlisted-prior-v1", midpoint=0.50)
+            store.save_experiment_plan(
+                "allowlisted-prior-momentum",
+                {
+                    "template": "momentum",
+                    "parameters": {"lookback": [1], "threshold": [0.05]},
+                },
+                hypothesis_id="allowlisted-prior-momentum-hypothesis",
+                timestamp=T0,
+            )
+            processor = AutonomousResearchProcessor(store, clock=lambda: T0)
+            remaining = processor.start_polymarket_campaign(
+                "allowlisted-prior-omission",
+                dataset_id=DATASET_ID,
+                dataset_version="allowlisted-prior-v1",
+                configuration_allowlist=selected_ids,
+                now=T0,
+            )
+            self.assertEqual(remaining["fixed_configuration_count"], 1)
+            self.assertEqual(
+                [trial["configuration_id"] for trial in remaining["trials"]],
+                [selected_ids[1]],
+            )
+            self.assertEqual(
+                processor.bus.list_campaign_trials("allowlisted-prior-omission")[0]
+                .payload["campaign_configuration_id"],
+                selected_ids[1],
+            )
+
+            store.save_experiment_plan(
+                "allowlisted-prior-mean-reversion",
+                {
+                    "template": "mean_reversion",
+                    "parameters": {"lookback": [1], "threshold": [0.05]},
+                },
+                hypothesis_id="allowlisted-prior-mean-reversion-hypothesis",
+                timestamp=T0,
+            )
+            exhausted = processor.start_polymarket_campaign(
+                "allowlisted-prior-exhaustion",
+                dataset_id=DATASET_ID,
+                dataset_version="allowlisted-prior-v1",
+                configuration_allowlist=selected_ids,
+                now=T0,
+            )
+            self.assertEqual(
+                exhausted["status"],
+                "CAMPAIGN_EXHAUSTED_NO_QUALIFIED_STRATEGY",
+            )
+            self.assertEqual(exhausted["fixed_configuration_count"], 0)
+            self.assertEqual(exhausted["trials"], [])
+            self.assertEqual(exhausted["counts"]["planned"], 0)
+            self.assertEqual(
+                processor.bus.list_campaign_trials("allowlisted-prior-exhaustion"),
+                (),
+            )
+
     def test_campaign_rejects_unattested_history_before_queueing_work(self) -> None:
         rows = _rows(midpoint=0.50)
         with AxiomStore(":memory:") as store:

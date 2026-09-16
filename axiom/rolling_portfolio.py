@@ -212,6 +212,67 @@ _V2_IMMUTABLE_PROJECTION_FIELDS = frozenset(
     }
 )
 
+# Operational stage metrics are compatibility projections only.  Their
+# canonical persisted representation is the ``operational_evidence`` mapping;
+# ``completed_outcomes`` is intentionally excluded because the canonical
+# portfolio-accounting/evaluation count remains authoritative.
+_OPERATIONAL_STAGE_FIELDS = (
+    "valid_observations",
+    "entry_eligible_signals",
+    "genuine_entry_signals",
+    "risk_approved_paper_order_attempts",
+    "risk_approved_order_attempts",
+    "paper_order_attempts",
+    "policy_risk_rejects_by_reason",
+    "risk_rejects_by_reason",
+    "venue_minimum_blockers_by_reason",
+    "input_path_exclusions_by_reason",
+    "persistence_accounting_limits_by_reason",
+    "fills",
+    "partial_fills",
+    "managed_exit_attempts",
+    "managed_exit_fills",
+    "remaining_positions",
+    "remaining_position_ids",
+    "gross_result",
+    "realized_result",
+    "unrealized_result",
+    "net_result",
+    "negative_economics",
+    "economic_result_available",
+    "operational_gate_applied",
+)
+_OPERATIONAL_COUNT_FIELDS = frozenset(
+    {
+        "valid_observations",
+        "entry_eligible_signals",
+        "genuine_entry_signals",
+        "risk_approved_paper_order_attempts",
+        "risk_approved_order_attempts",
+        "paper_order_attempts",
+        "fills",
+        "partial_fills",
+        "managed_exit_attempts",
+        "managed_exit_fills",
+        "remaining_positions",
+    }
+)
+_OPERATIONAL_MAPPING_FIELDS = frozenset(
+    {
+        "policy_risk_rejects_by_reason",
+        "risk_rejects_by_reason",
+        "venue_minimum_blockers_by_reason",
+        "input_path_exclusions_by_reason",
+        "persistence_accounting_limits_by_reason",
+    }
+)
+_OPERATIONAL_DECIMAL_FIELDS = frozenset(
+    {"gross_result", "realized_result", "unrealized_result", "net_result"}
+)
+_OPERATIONAL_BOOLEAN_FIELDS = frozenset(
+    {"negative_economics", "economic_result_available", "operational_gate_applied"}
+)
+
 
 _MAX_OPEN_POSITIONS = 32
 
@@ -351,6 +412,98 @@ def _integer(value: Any, name: str, *, minimum: int | None = None, maximum: int 
     if maximum is not None and parsed > maximum:
         raise ValueError(f"{name} must be at most {maximum}")
     return parsed
+
+
+def _normalize_operational_value(name: str, value: Any) -> Any:
+    """Normalize one operational compatibility projection for reconciliation."""
+    if value is None:
+        return None
+    if name in _OPERATIONAL_COUNT_FIELDS:
+        return _integer(value, name, minimum=0)
+    if name in _OPERATIONAL_MAPPING_FIELDS:
+        if not isinstance(value, Mapping):
+            raise TypeError(f"{name} must be a mapping or None")
+        return dict(value)
+    if name in _OPERATIONAL_DECIMAL_FIELDS:
+        return _nullable_decimal(value, name)
+    if name in _OPERATIONAL_BOOLEAN_FIELDS:
+        if not isinstance(value, bool):
+            raise TypeError(f"{name} must be bool or None")
+        return value
+    if name == "remaining_position_ids":
+        if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+            raise TypeError("remaining_position_ids must be a sequence")
+        return tuple(_text(item, "remaining_position_id") for item in value)
+    return value
+
+
+def _operational_values_equal(name: str, left: Any, right: Any) -> bool:
+    try:
+        return _canonical(_normalize_operational_value(name, left)) == _canonical(
+            _normalize_operational_value(name, right)
+        )
+    except (TypeError, ValueError, ArithmeticError):
+        return False
+
+
+def _operational_payload(values: Mapping[str, Any] | Any) -> dict[str, Any]:
+    """Return the single sparse, namespaced operational evidence projection."""
+    if not isinstance(values, Mapping):
+        return {}
+    result: dict[str, Any] = {}
+    for name in _OPERATIONAL_STAGE_FIELDS:
+        value = values.get(name)
+        if value is None:
+            continue
+        result[name] = value
+    return result
+
+
+def _operational_nested_sources(
+    evaluation: Mapping[str, Any] | Any,
+    metrics: Mapping[str, Any] | Any,
+) -> tuple[Mapping[str, Any], ...]:
+    sources: list[Mapping[str, Any]] = []
+    for container in (evaluation, metrics):
+        if not isinstance(container, Mapping):
+            continue
+        candidate = container.get("operational_evidence")
+        if isinstance(candidate, Mapping):
+            sources.append(candidate)
+    if isinstance(metrics, Mapping):
+        candidate = metrics.get("evaluation")
+        if isinstance(candidate, Mapping):
+            nested = candidate.get("operational_evidence")
+            if isinstance(nested, Mapping):
+                sources.append(nested)
+    return tuple(sources)
+
+
+def _reconcile_operational_value(
+    name: str,
+    scalar_value: Any,
+    sources: Sequence[Mapping[str, Any]],
+) -> Any:
+    """Reconcile sparse namespaced evidence with a direct compatibility field."""
+    present = [
+        _normalize_operational_value(name, source[name])
+        for source in sources
+        if name in source and source[name] is not None
+    ]
+    if len(present) > 1 and any(
+        not _operational_values_equal(name, present[0], candidate)
+        for candidate in present[1:]
+    ):
+        raise ValueError(f"{name} conflicts between rolling evidence projections")
+    normalized_scalar = _normalize_operational_value(name, scalar_value)
+    if normalized_scalar is not None:
+        if any(
+            not _operational_values_equal(name, normalized_scalar, candidate)
+            for candidate in present
+        ):
+            raise ValueError(f"{name} conflicts between rolling evidence projections")
+        return normalized_scalar
+    return present[0] if present else None
 
 
 def _utc(value: Any, name: str, *, required: bool = False) -> datetime | None:
@@ -996,6 +1149,41 @@ class RollingEvidence:
     available_rows: int | None = None
     evaluated_rows: int | None = None
     model_resolution: Mapping[str, Any] | None = None
+    # Operational paper stages are optional so legacy evidence remains
+    # readable.  When present they are immutable, stage-specific projections.
+    valid_observations: int | None = None
+    entry_eligible_signals: int | None = None
+    genuine_entry_signals: int | None = None
+    risk_approved_paper_order_attempts: int | None = None
+    risk_approved_order_attempts: int | None = None
+    paper_order_attempts: int | None = None
+    policy_risk_rejects_by_reason: Mapping[str, Any] | None = None
+    risk_rejects_by_reason: Mapping[str, Any] | None = None
+    venue_minimum_blockers_by_reason: Mapping[str, Any] | None = None
+    input_path_exclusions_by_reason: Mapping[str, Any] | None = None
+    persistence_accounting_limits_by_reason: Mapping[str, Any] | None = None
+    fills: int | None = None
+    partial_fills: int | None = None
+    managed_exit_attempts: int | None = None
+    managed_exit_fills: int | None = None
+    remaining_positions: int | None = None
+    remaining_position_ids: Sequence[str] | None = None
+    gross_result: Decimal | None = None
+    realized_result: Decimal | None = None
+    unrealized_result: Decimal | None = None
+    net_result: Decimal | None = None
+    negative_economics: bool | None = None
+    economic_result_available: bool | None = None
+    operational_gate_applied: bool | None = None
+    operational_setup: Mapping[str, Any] | None = None
+    operational_setup_hash: str | None = None
+    active_settings: Mapping[str, Any] | None = None
+    settings_config_id: str | None = None
+    settings_generation: int | str | None = None
+    settings_config_hash: str | None = None
+    control_generation: int | str | None = None
+    operational_settings_available: bool | None = None
+    operational_settings_blocker: str | None = None
     _model_resolution_nested_only: bool = field(
         default=False,
         init=True,
@@ -1043,6 +1231,21 @@ class RollingEvidence:
             metrics_evaluation = self.metrics.get("evaluation")
             if isinstance(metrics_evaluation, Mapping):
                 nested_evaluation_projections.append(metrics_evaluation)
+        # Operational stage evidence is namespaced.  Direct fields are
+        # compatibility aliases only and may not override a canonical nested
+        # projection; sparse nested mappings are merged idempotently.
+        operational_sources = _operational_nested_sources(
+            self.evaluation,
+            self.metrics,
+        )
+        for name in _OPERATIONAL_STAGE_FIELDS:
+            resolved = _reconcile_operational_value(
+                name,
+                getattr(self, name),
+                operational_sources,
+            )
+            if resolved is not None:
+                object.__setattr__(self, name, resolved)
         metrics_accounting = (
             self.metrics.get("portfolio_accounting")
             if isinstance(self.metrics, Mapping)
@@ -1424,6 +1627,90 @@ class RollingEvidence:
         ):
             raise ValueError("valid_input_rows must not exceed loaded_rows")
         for name in (
+            "valid_observations",
+            "entry_eligible_signals",
+            "genuine_entry_signals",
+            "risk_approved_paper_order_attempts",
+            "risk_approved_order_attempts",
+            "paper_order_attempts",
+            "fills",
+            "partial_fills",
+            "managed_exit_attempts",
+            "managed_exit_fills",
+            "remaining_positions",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                object.__setattr__(self, name, _integer(value, name, minimum=0))
+        for name in (
+            "policy_risk_rejects_by_reason",
+            "risk_rejects_by_reason",
+            "venue_minimum_blockers_by_reason",
+            "input_path_exclusions_by_reason",
+            "persistence_accounting_limits_by_reason",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                if not isinstance(value, Mapping):
+                    raise TypeError(f"{name} must be a mapping or None")
+                object.__setattr__(self, name, _freeze(dict(value)))
+        if self.remaining_position_ids is not None:
+            if isinstance(self.remaining_position_ids, (str, bytes)):
+                raise TypeError("remaining_position_ids must be a sequence")
+            object.__setattr__(
+                self,
+                "remaining_position_ids",
+                tuple(_text(item, "remaining_position_id", max_length=MAX_ID_LENGTH) for item in self.remaining_position_ids),
+            )
+        for name in (
+            "gross_result",
+            "realized_result",
+            "unrealized_result",
+            "net_result",
+        ):
+            value = getattr(self, name)
+            object.__setattr__(
+                self,
+                name,
+                _nullable_decimal(value, name) if value is not None else None,
+            )
+        for name in ("negative_economics", "economic_result_available", "operational_gate_applied"):
+            value = getattr(self, name)
+            if value is not None and not isinstance(value, bool):
+                raise TypeError(f"{name} must be bool or None")
+        if self.operational_setup is not None:
+            if not isinstance(self.operational_setup, Mapping):
+                raise TypeError("operational_setup must be a mapping or None")
+            object.__setattr__(self, "operational_setup", _freeze(dict(self.operational_setup)))
+        for name in ("active_settings",):
+            value = getattr(self, name)
+            if value is not None:
+                if not isinstance(value, Mapping):
+                    raise TypeError(f"{name} must be a mapping or None")
+                object.__setattr__(self, name, _freeze(dict(value)))
+        for name in (
+            "operational_setup_hash",
+            "settings_config_id",
+            "settings_config_hash",
+        ):
+            value = _text(getattr(self, name), name, max_length=256, required=False)
+            object.__setattr__(self, name, value or None)
+        if self.operational_settings_available is not None and not isinstance(
+            self.operational_settings_available, bool
+        ):
+            raise TypeError("operational_settings_available must be bool or None")
+        object.__setattr__(
+            self,
+            "operational_settings_blocker",
+            _text(
+                self.operational_settings_blocker,
+                "operational_settings_blocker",
+                max_length=MAX_REASON_LENGTH,
+                required=False,
+            )
+            or None,
+        )
+        for name in (
             "evaluator_name",
             "evaluator_error",
             "evaluator_prerequisite",
@@ -1569,6 +1856,34 @@ class RollingEvidence:
                     "portfolio_accounting": self.portfolio_accounting,
                 }
             )
+        operational_payload = _operational_payload(
+            {name: getattr(self, name) for name in _OPERATIONAL_STAGE_FIELDS}
+        )
+        if operational_payload:
+            projection["operational_evidence"] = operational_payload
+        if (
+            self.evaluation_run_id is not None
+            or self.evaluation_version is not None
+            or self.evaluation_kind is not None
+            or self.supersedes_evidence_id is not None
+        ):
+            identity_payload = {
+                name: getattr(self, name)
+                for name in (
+                    "operational_setup",
+                    "operational_setup_hash",
+                    "active_settings",
+                    "settings_config_id",
+                    "settings_generation",
+                    "settings_config_hash",
+                    "control_generation",
+                    "operational_settings_available",
+                    "operational_settings_blocker",
+                )
+                if getattr(self, name) is not None
+            }
+            if identity_payload:
+                projection["operational_identity"] = identity_payload
         if self.model_resolution is not None:
             projection["model_resolution"] = self.model_resolution
         return projection
@@ -1764,7 +2079,118 @@ class RollingEvidence:
             "portfolio_accounting": self.portfolio_accounting,
             "evaluation": self.evaluation,
             "metrics": self.metrics,
+            "valid_observations": self.valid_observations,
+            "entry_eligible_signals": self.entry_eligible_signals,
+            "genuine_entry_signals": self.genuine_entry_signals,
+            "risk_approved_paper_order_attempts": self.risk_approved_paper_order_attempts,
+            "risk_approved_order_attempts": self.risk_approved_order_attempts,
+            "paper_order_attempts": self.paper_order_attempts,
+            "policy_risk_rejects_by_reason": self.policy_risk_rejects_by_reason,
+            "risk_rejects_by_reason": self.risk_rejects_by_reason,
+            "venue_minimum_blockers_by_reason": self.venue_minimum_blockers_by_reason,
+            "input_path_exclusions_by_reason": self.input_path_exclusions_by_reason,
+            "persistence_accounting_limits_by_reason": self.persistence_accounting_limits_by_reason,
+            "fills": self.fills,
+            "partial_fills": self.partial_fills,
+            "managed_exit_attempts": self.managed_exit_attempts,
+            "managed_exit_fills": self.managed_exit_fills,
+            "remaining_positions": self.remaining_positions,
+            "remaining_position_ids": self.remaining_position_ids,
+            "gross_result": self.gross_result,
+            "realized_result": self.realized_result,
+            "unrealized_result": self.unrealized_result,
+            "net_result": self.net_result,
+            "negative_economics": self.negative_economics,
+            "economic_result_available": self.economic_result_available,
+            "operational_gate_applied": self.operational_gate_applied,
+            "operational_evidence": {
+                name: getattr(self, name)
+                for name in (
+                    "valid_observations",
+                    "entry_eligible_signals",
+                    "genuine_entry_signals",
+                    "risk_approved_paper_order_attempts",
+                    "risk_approved_order_attempts",
+                    "paper_order_attempts",
+                    "policy_risk_rejects_by_reason",
+                    "risk_rejects_by_reason",
+                    "venue_minimum_blockers_by_reason",
+                    "input_path_exclusions_by_reason",
+                    "persistence_accounting_limits_by_reason",
+                    "fills",
+                    "partial_fills",
+                    "managed_exit_attempts",
+                    "managed_exit_fills",
+                    "remaining_positions",
+                    "remaining_position_ids",
+                    "gross_result",
+                    "realized_result",
+                    "unrealized_result",
+                    "net_result",
+                    "negative_economics",
+                    "economic_result_available",
+                    "operational_gate_applied",
+                )
+            },
+            "operational_identity": {
+                "operational_setup": self.operational_setup,
+                "operational_setup_hash": self.operational_setup_hash,
+                "active_settings": self.active_settings,
+                "settings_config_id": self.settings_config_id,
+                "settings_generation": self.settings_generation,
+                "settings_config_hash": self.settings_config_hash,
+                "control_generation": self.control_generation,
+                "operational_settings_available": self.operational_settings_available,
+                "operational_settings_blocker": self.operational_settings_blocker,
+            },
+            "operational_setup": self.operational_setup,
+            "operational_setup_hash": self.operational_setup_hash,
+            "active_settings": self.active_settings,
+            "settings_config_id": self.settings_config_id,
+            "settings_generation": self.settings_generation,
+            "settings_config_hash": self.settings_config_hash,
+            "control_generation": self.control_generation,
+            "operational_settings_available": self.operational_settings_available,
+            "operational_settings_blocker": self.operational_settings_blocker,
         }
+        # Keep operational evidence sparse and namespaced.  Direct aliases
+        # remain only when they carry the same value as the namespace.
+        operational_payload = _operational_payload(
+            {name: getattr(self, name) for name in _OPERATIONAL_STAGE_FIELDS}
+        )
+        if operational_payload:
+            payload["operational_evidence"] = operational_payload
+            for name, value in operational_payload.items():
+                payload[name] = value
+        else:
+            payload.pop("operational_evidence", None)
+        for name in _OPERATIONAL_STAGE_FIELDS:
+            if payload.get(name) is None:
+                payload.pop(name, None)
+        identity = payload.get("operational_identity")
+        if isinstance(identity, Mapping):
+            identity = {
+                name: item
+                for name, item in identity.items()
+                if item is not None
+            }
+            if identity:
+                payload["operational_identity"] = identity
+            else:
+                payload.pop("operational_identity", None)
+        for name in (
+            "operational_setup",
+            "operational_setup_hash",
+            "active_settings",
+            "settings_config_id",
+            "settings_generation",
+            "settings_config_hash",
+            "control_generation",
+            "operational_settings_available",
+            "operational_settings_blocker",
+        ):
+            if payload.get(name) is None:
+                payload.pop(name, None)
         if self.model_resolution is not None and not self._model_resolution_nested_only:
             payload["model_resolution"] = self.model_resolution
         return _plain(payload)
@@ -1784,6 +2210,26 @@ class RollingEvidence:
         metrics_evaluation = metrics_nested.get("evaluation")
         metrics_evaluation = (
             metrics_evaluation if isinstance(metrics_evaluation, Mapping) else {}
+        )
+        operational_nested = row.get("operational_evidence")
+        operational_nested = (
+            operational_nested if isinstance(operational_nested, Mapping) else {}
+        )
+        metrics_operational = metrics_nested.get("operational_evidence")
+        metrics_operational = (
+            metrics_operational if isinstance(metrics_operational, Mapping) else {}
+        )
+        evaluation_operational = evaluation_nested.get("operational_evidence")
+        evaluation_operational = (
+            evaluation_operational
+            if isinstance(evaluation_operational, Mapping)
+            else {}
+        )
+        metrics_evaluation_operational = metrics_evaluation.get("operational_evidence")
+        metrics_evaluation_operational = (
+            metrics_evaluation_operational
+            if isinstance(metrics_evaluation_operational, Mapping)
+            else {}
         )
         input_manifest = row.get("input_manifest")
         input_manifest = input_manifest if isinstance(input_manifest, Mapping) else {}
@@ -1909,6 +2355,29 @@ class RollingEvidence:
                     if name in _V2_IMMUTABLE_PROJECTION_FIELDS
                     else None
                 ),
+            )
+        operational_sources = (
+            row,
+            operational_nested,
+            metrics_operational,
+            evaluation_operational,
+            metrics_evaluation_operational,
+        )
+
+        def operational_value(name: str) -> Any:
+            return _reconcile_operational_value(name, None, operational_sources)
+        operational_identity = row.get("operational_identity")
+        operational_identity = (
+            operational_identity
+            if isinstance(operational_identity, Mapping)
+            else {}
+        )
+
+        def identity_value(name: str) -> Any:
+            return consistent_value(
+                name,
+                (row, operational_identity),
+                strict_null_conflict=True,
             )
 
 
@@ -2161,6 +2630,53 @@ class RollingEvidence:
                 )
             ),
             metrics=row.get("metrics"),
+            valid_observations=operational_value("valid_observations"),
+            entry_eligible_signals=operational_value("entry_eligible_signals"),
+            genuine_entry_signals=operational_value("genuine_entry_signals"),
+            risk_approved_paper_order_attempts=operational_value(
+                "risk_approved_paper_order_attempts"
+            ),
+            risk_approved_order_attempts=operational_value("risk_approved_order_attempts"),
+            paper_order_attempts=operational_value("paper_order_attempts"),
+            policy_risk_rejects_by_reason=operational_value(
+                "policy_risk_rejects_by_reason"
+            ),
+            risk_rejects_by_reason=operational_value("risk_rejects_by_reason"),
+            venue_minimum_blockers_by_reason=operational_value(
+                "venue_minimum_blockers_by_reason"
+            ),
+            input_path_exclusions_by_reason=operational_value(
+                "input_path_exclusions_by_reason"
+            ),
+            persistence_accounting_limits_by_reason=operational_value(
+                "persistence_accounting_limits_by_reason"
+            ),
+            fills=operational_value("fills"),
+            partial_fills=operational_value("partial_fills"),
+            managed_exit_attempts=operational_value("managed_exit_attempts"),
+            managed_exit_fills=operational_value("managed_exit_fills"),
+            remaining_positions=operational_value("remaining_positions"),
+            remaining_position_ids=operational_value("remaining_position_ids"),
+            gross_result=operational_value("gross_result"),
+            realized_result=operational_value("realized_result"),
+            unrealized_result=operational_value("unrealized_result"),
+            net_result=operational_value("net_result"),
+            negative_economics=operational_value("negative_economics"),
+            economic_result_available=operational_value("economic_result_available"),
+            operational_gate_applied=operational_value("operational_gate_applied"),
+            operational_setup=identity_value("operational_setup"),
+            operational_setup_hash=identity_value("operational_setup_hash"),
+            active_settings=identity_value("active_settings"),
+            settings_config_id=identity_value("settings_config_id"),
+            settings_generation=identity_value("settings_generation"),
+            settings_config_hash=identity_value("settings_config_hash"),
+            control_generation=identity_value("control_generation"),
+            operational_settings_available=identity_value(
+                "operational_settings_available"
+            ),
+            operational_settings_blocker=identity_value(
+                "operational_settings_blocker"
+            ),
             execution_feasibility=row.get(
                 "execution_feasibility",
                 row.get("execution_feasible"),

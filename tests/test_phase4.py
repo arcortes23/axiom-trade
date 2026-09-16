@@ -16,7 +16,7 @@ from axiom.experiment_plan import ExperimentPlan, ExperimentPlanError
 from axiom.forward import ForwardTestRegistry
 from axiom.lifecycle import CandidateLifecycleManager, CandidateStage, PromotionCriteria
 from axiom.paper import LiveExecutionDisabled, PaperTradingConfig
-from axiom.paper_engine import run_forward_paper
+from axiom.paper_engine import ForwardPaperEngine, OperationalPaperPolicy, run_forward_paper
 from axiom.research import ResearchReport, write_report
 from axiom.research_bus import DurableResearchBus, ResearchBusPermissionError, ResearchQueueStatus
 from axiom.storage import AxiomStore
@@ -190,6 +190,16 @@ class _BuyEverySnapshot:
     def to_dict(self) -> dict[str, object]:
         return {"id": "buy-every-snapshot"}
 
+
+class _SwitchingSide:
+    def __init__(self) -> None:
+        self.side = "buy_yes"
+
+    def signal(self, context: object) -> dict[str, object]:
+        return {"side": self.side, "quantity": 1.0}
+
+    def to_dict(self) -> dict[str, object]:
+        return {"id": "switching-side"}
 
 class _NoSignal:
     def signal(self, context: object) -> None:
@@ -601,6 +611,507 @@ class Phase4AutonomousLoopTests(unittest.TestCase):
             forward_config = executable_tests[0]["config"]
             self.assertEqual(forward_config["execution"], "paper_only")
             self.assertNotIn("live_execution", forward_config)
+
+    def test_forward_paper_initializes_legacy_and_operational_collaborators(self) -> None:
+        def run_once(policy: OperationalPaperPolicy | None) -> tuple[object, dict[str, object]]:
+            with AxiomStore(":memory:") as store:
+                strategy = _BuyEverySnapshot()
+                spec = ForwardTestRegistry(store).freeze(
+                    strategy=strategy,
+                    model={"field": "model_probability"},
+                    start_timestamp=T0,
+                    allowed_markets=("constructor-regression-market",),
+                )
+                cycle = run_forward_paper(
+                    spec,
+                    store=store,
+                    strategy=strategy,
+                    model={"field": "model_probability"},
+                    operational_policy=policy,
+                    observations=[_observation("constructor-regression-market", T0 + timedelta(hours=1))],
+                    now=T0 + timedelta(hours=1),
+                )
+                events = store.list_paper_execution_events(spec.experiment_id)
+                self.assertEqual(cycle.observations_processed, 1)
+                self.assertEqual(len(events), 1)
+                return cycle, events[0]["payload"]
+
+        legacy_cycle, legacy_payload = run_once(None)
+        self.assertGreaterEqual(legacy_cycle.fills_inserted, 1)
+        legacy_binding = legacy_payload["execution_binding"]
+        self.assertIsNone(legacy_binding["operational_policy"])
+        self.assertIsNone(legacy_binding["operational_policy_hash"])
+
+        policy_cycle, policy_payload = run_once(OperationalPaperPolicy())
+        self.assertEqual(policy_cycle.fills_inserted, 0)
+        policy_binding = policy_payload["execution_binding"]
+        self.assertEqual(
+            policy_binding["operational_policy"]["policy_version"],
+            "operational-paper-v1",
+        )
+        self.assertTrue(policy_binding["operational_policy_hash"])
+
+    def test_subthreshold_entry_predicate_is_recorded_and_cannot_submit(self) -> None:
+        class _PredicateIgnoringStrategy:
+            def __init__(self, definition: dict[str, object]) -> None:
+                self.definition = definition
+
+            def signal(self, context: object) -> dict[str, object]:
+                return {"side": "buy_yes", "quantity": 1.0}
+
+        strategy_document = {
+            "version": 1,
+            "market_type": "prediction",
+            "family": "momentum",
+            "parameters": {
+                "lookback": 1,
+                "threshold": 0.05,
+                "entry_predicate": {
+                    "version": "absolute-move-v1",
+                    "minimum_move": "0.05",
+                    "units": "probability",
+                    "boundary": "inclusive",
+                },
+            },
+            "probability_model": "test-model",
+            "resolution_aware": True,
+            "resolution_inputs": ["expiry", "settlement"],
+        }
+        with AxiomStore(":memory:") as store:
+            spec = ForwardTestRegistry(store).freeze(
+                strategy=strategy_document,
+                model={"field": "model_probability"},
+                start_timestamp=T0,
+                allowed_markets=("entry-predicate-market",),
+            )
+            runtime_strategy = _PredicateIgnoringStrategy(strategy_document)
+            start = T0 + timedelta(hours=1)
+            cycle = run_forward_paper(
+                spec,
+                store=store,
+                strategy=runtime_strategy,
+                model={"field": "model_probability"},
+                observations=[
+                    _observation("entry-predicate-market", start),
+                    _observation("entry-predicate-market", start + timedelta(minutes=1), yes_mid=0.52),
+                ],
+                now=start + timedelta(minutes=1),
+            )
+            self.assertEqual(cycle.observations_processed, 2)
+            self.assertEqual(cycle.fills_inserted, 0)
+            observations = store.list_paper_observations(spec.experiment_id)
+            self.assertEqual(observations[1]["payload"]["entry_eligible"], False)
+            self.assertAlmostEqual(observations[1]["payload"]["signal_strength"], 0.4)
+            events = store.list_paper_execution_events(spec.experiment_id)
+            self.assertEqual([event["status"] for event in events], ["NO_SIGNAL", "NO_SIGNAL"])
+            self.assertEqual(
+                events[1]["payload"]["evaluation"]["evidence"]["entry_eligible"],
+                False,
+            )
+            self.assertEqual(
+                events[1]["payload"]["evaluation_reason"],
+                "ENTRY_PREDICATE_NOT_SATISFIED",
+            )
+
+    def test_operational_policy_aliases_and_nested_limits_are_frozen(self) -> None:
+        source = {
+            "max_daily_loss_usd": "3.00",
+            "pending_orders": [{"metadata": {"labels": ["original"]}}],
+        }
+        policy = OperationalPaperPolicy.from_value(source)
+        source["pending_orders"][0]["metadata"]["labels"].append("mutated")
+        self.assertEqual(policy.realized_loss_entry_stop_usd, 3.0)
+        record = policy.as_record()
+        self.assertEqual(
+            record["pending_orders"][0]["metadata"]["labels"],
+            ["original"],
+        )
+        with self.assertRaises(AttributeError):
+            policy.pending_orders[0]["metadata"]["labels"].append("blocked")
+
+    def test_operational_counters_persist_quote_buy_totals(self) -> None:
+        with AxiomStore(":memory:") as store:
+            strategy = _BuyEverySnapshot()
+            spec = ForwardTestRegistry(store).freeze(
+                strategy=strategy,
+                model={"field": "model_probability"},
+                start_timestamp=T0,
+                allowed_markets=("counter-market",),
+            )
+            cycle = run_forward_paper(
+                spec,
+                store=store,
+                strategy=strategy,
+                model={"field": "model_probability"},
+                operational_policy=OperationalPaperPolicy(),
+                observations=[
+                    _observation(
+                        "counter-market",
+                        T0 + timedelta(hours=1),
+                        min_order_size=1.0,
+                        size_increment=1.0,
+                        min_notional=0.01,
+                        tick_size=0.01,
+                    )
+                ],
+                now=T0 + timedelta(hours=1),
+            )
+            self.assertEqual(cycle.fills_inserted, 1)
+            self.assertEqual(cycle.observations_processed, 1)
+            self.assertEqual(cycle.execution_events, 1)
+            events = store.list_paper_execution_events(spec.experiment_id)
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0]["status"], "FULL_FILL")
+            payload = events[0]["payload"]
+            self.assertTrue(payload["risk_approved"])
+            self.assertEqual(
+                payload["operational_evidence"]["reason_code"],
+                "RISK_APPROVED",
+            )
+            state = store.load_paper_state(spec.experiment_id)
+            assert state is not None
+            counters = state["state"]["operational_paper"]["counters"]
+            self.assertEqual(counters["buy_gross_today"], "0.51")
+            self.assertEqual(counters["buy_cumulative"], "0.51")
+            self.assertEqual(counters["market_buy"]["counter-market"], "0.51")
+            self.assertEqual(counters["event_buy"]["counter-market"], "0.51")
+
+
+    def test_operational_hydrates_unresolved_events_with_seeded_pending_and_rejects_bad_amounts(self) -> None:
+        with AxiomStore(":memory:") as store:
+            strategy = _BuyEverySnapshot()
+            spec = ForwardTestRegistry(store).freeze(
+                strategy=strategy,
+                model={"field": "model_probability"},
+                start_timestamp=T0,
+                allowed_markets=("hydrate-market",),
+            )
+            store.save_paper_execution_event(
+                "paper-event-accepted",
+                spec.experiment_id,
+                "observation-accepted",
+                "hydrate-market",
+                T0 + timedelta(hours=1),
+                "ACCEPTED",
+                {
+                    "side": "BUY",
+                    "requested_quantity": 1.0,
+                    "reference_price": 0.51,
+                },
+            )
+            engine = ForwardPaperEngine(
+                spec,
+                store=store,
+                strategy=strategy,
+                model={"field": "model_probability"},
+                operational_policy=OperationalPaperPolicy(
+                    pending_orders=(
+                        {"status": "PENDING", "side": "BUY", "quantity": 1.0, "price": 0.51},
+                    )
+                ),
+            )
+            pending = engine.operational_counters["pending_orders"]
+            self.assertEqual(len(pending), 2)
+            self.assertEqual({item["status"] for item in pending}, {"PENDING", "ACCEPTED"})
+
+            cycle = run_forward_paper(
+                spec,
+                store=store,
+                strategy=strategy,
+                model={"field": "model_probability"},
+                operational_policy=OperationalPaperPolicy(
+                    pending_orders=(
+                        {"status": "SUBMITTED", "side": "BUY", "quantity": -1.0, "price": 0.51},
+                    )
+                ),
+                observations=[
+                    _observation(
+                        "hydrate-market",
+                        T0 + timedelta(hours=2),
+                        min_order_size=1.0,
+                        size_increment=1.0,
+                        min_notional=0.01,
+                        tick_size=0.01,
+                    )
+                ],
+                now=T0 + timedelta(hours=2),
+            )
+            self.assertEqual(cycle.fills_inserted, 0)
+            events = store.list_paper_execution_events(spec.experiment_id)
+            event = next(item for item in events if item["status"] == "RISK_REJECTED")
+            self.assertEqual(event["payload"]["operational_evidence"]["reason_code"], "PENDING_COMMITMENT_INVALID")
+
+    def test_malformed_persisted_operational_counters_block_compatibility(self) -> None:
+        with AxiomStore(":memory:") as store:
+            strategy = _BuyEverySnapshot()
+            spec = ForwardTestRegistry(store).freeze(
+                strategy=strategy,
+                model={"field": "model_probability"},
+                start_timestamp=T0,
+                allowed_markets=("malformed-counter-market",),
+            )
+            store.save_paper_state(
+                spec.experiment_id,
+                {
+                    "operational_paper": {
+                        "counters": {
+                            "submitted_total": -1,
+                            "submitted_today": 0,
+                            "buy_gross_today": "0",
+                            "buy_cumulative": "0",
+                            "market_buy": {},
+                            "event_buy": {},
+                            "declared_loss_cumulative": "0",
+                            "pending_orders": [],
+                            "day": None,
+                        }
+                    }
+                },
+                timestamp=T0,
+            )
+            engine = ForwardPaperEngine(
+                spec,
+                store=store,
+                strategy=strategy,
+                model={"field": "model_probability"},
+                operational_policy=OperationalPaperPolicy(),
+            )
+            self.assertEqual(
+                engine.compatibility_blocker["blocker"],
+                "PAPER_STATE_OPERATIONAL_COUNTERS_INVALID",
+            )
+            cycle = engine.run(now=T0 + timedelta(hours=1))
+            self.assertEqual(cycle.blocker, "PAPER_STATE_OPERATIONAL_COUNTERS_INVALID")
+    def test_absent_or_empty_operational_counters_are_legacy_compatible(self) -> None:
+        state_variants = (
+            ("absent", {}),
+            ("section-empty", {"operational_paper": {}}),
+            ("counters-none", {"operational_paper": {"counters": None}}),
+            ("counters-empty", {"operational_paper": {"counters": {}}}),
+        )
+        for label, state in state_variants:
+            with self.subTest(state=label):
+                with AxiomStore(":memory:") as store:
+                    strategy = _BuyEverySnapshot()
+                    spec = ForwardTestRegistry(store).freeze(
+                        strategy=strategy,
+                        model={"field": "model_probability"},
+                        start_timestamp=T0,
+                        allowed_markets=("legacy-counter-market",),
+                    )
+                    if state:
+                        store.save_paper_state(
+                            spec.experiment_id,
+                            state,
+                            timestamp=T0,
+                            expected_version=-1,
+                        )
+                    engine = ForwardPaperEngine(
+                        spec,
+                        store=store,
+                        strategy=strategy,
+                        model={"field": "model_probability"},
+                        operational_policy=OperationalPaperPolicy(),
+                    )
+                    self.assertIsNone(engine.compatibility_blocker)
+
+    def test_operational_day_does_not_roll_back_for_delayed_observation(self) -> None:
+        with AxiomStore(":memory:") as store:
+            strategy = _BuyEverySnapshot()
+            spec = ForwardTestRegistry(store).freeze(
+                strategy=strategy,
+                model={"field": "model_probability"},
+                start_timestamp=T0,
+                allowed_markets=("day-market-a", "day-market-b"),
+            )
+            policy = OperationalPaperPolicy()
+            rules = {
+                "min_order_size": 1.0,
+                "size_increment": 1.0,
+                "min_notional": 0.01,
+                "tick_size": 0.01,
+            }
+            first = run_forward_paper(
+                spec,
+                store=store,
+                strategy=strategy,
+                model={"field": "model_probability"},
+                operational_policy=policy,
+                observations=[_observation("day-market-a", T0 + timedelta(days=2), **rules)],
+                now=T0 + timedelta(days=2),
+            )
+            self.assertEqual(first.fills_inserted, 1)
+            second = run_forward_paper(
+                spec,
+                store=store,
+                strategy=_BuyEverySnapshot(),
+                model={"field": "model_probability"},
+                operational_policy=policy,
+                observations=[_observation("day-market-b", T0 + timedelta(days=1), **rules)],
+                now=T0 + timedelta(days=2, hours=1),
+            )
+            self.assertEqual(second.fills_inserted, 1)
+            state = store.load_paper_state(spec.experiment_id)
+            assert state is not None
+            counters = state["state"]["operational_paper"]["counters"]
+            self.assertEqual(counters["day"], (T0 + timedelta(days=2)).date().isoformat())
+            self.assertEqual(counters["submitted_today"], 2)
+
+    def test_buy_reserves_exit_capacity_and_owned_sell_ignores_entry_caps(self) -> None:
+        with AxiomStore(":memory:") as store:
+            strategy = _SwitchingSide()
+            spec = ForwardTestRegistry(store).freeze(
+                strategy=strategy,
+                model={"field": "model_probability"},
+                start_timestamp=T0,
+                allowed_markets=("exit-cap-market",),
+            )
+            policy = OperationalPaperPolicy(
+                max_submitted_orders_per_day=3,
+                max_gross_daily_buy_usd=0.51,
+                per_market_buy_cap_usd=0.51,
+                cumulative_buy_cap_usd=0.51,
+            )
+            rules = {
+                "min_order_size": 1.0,
+                "size_increment": 1.0,
+                "min_notional": 0.01,
+                "tick_size": 0.01,
+            }
+            first = run_forward_paper(
+                spec,
+                store=store,
+                strategy=strategy,
+                model={"field": "model_probability"},
+                operational_policy=policy,
+                observations=[_observation("exit-cap-market", T0 + timedelta(hours=1), **rules)],
+                now=T0 + timedelta(hours=1),
+            )
+            self.assertEqual(first.fills_inserted, 1)
+            strategy.side = "sell_yes"
+            second = run_forward_paper(
+                spec,
+                store=store,
+                strategy=strategy,
+                model={"field": "model_probability"},
+                operational_policy=policy,
+                observations=[_observation("exit-cap-market", T0 + timedelta(hours=2), **rules)],
+                now=T0 + timedelta(hours=2),
+            )
+            self.assertEqual(second.fills_inserted, 1)
+            state = store.load_paper_state(spec.experiment_id)
+            assert state is not None
+            self.assertEqual(
+                state["state"]["operational_paper"]["counters"]["submitted_total"],
+                2,
+            )
+
+    def test_raw_tick_validation_allows_economic_slippage(self) -> None:
+        with AxiomStore(":memory:") as store:
+            strategy = _BuyEverySnapshot()
+            spec = ForwardTestRegistry(store).freeze(
+                strategy=strategy,
+                model={"field": "model_probability"},
+                config={"paper_assumptions": {"slippage": {"slippage_bps": "5"}}},
+                start_timestamp=T0,
+                allowed_markets=("tick-slippage-market",),
+            )
+            cycle = run_forward_paper(
+                spec,
+                store=store,
+                strategy=strategy,
+                model={"field": "model_probability"},
+                operational_policy=OperationalPaperPolicy(),
+                observations=[
+                    _observation(
+                        "tick-slippage-market",
+                        T0 + timedelta(hours=1),
+                        **{
+                            "min_order_size": 1.0,
+                            "size_increment": 1.0,
+                            "min_notional": 0.01,
+                            "tick_size": 0.01,
+                        },
+                    )
+                ],
+                now=T0 + timedelta(hours=1),
+            )
+            self.assertEqual(cycle.fills_inserted, 1)
+            fills = store.load_fills(strategy_id=spec.strategy_hash)
+            self.assertEqual(len(fills), 1)
+            self.assertAlmostEqual(fills[0].price, 0.51 * 1.0005, places=8)
+    def test_duplicate_observation_store_insert_skips_execution(self) -> None:
+        with AxiomStore(":memory:") as store:
+            strategy = _BuyEverySnapshot()
+            spec = ForwardTestRegistry(store).freeze(
+                strategy=strategy,
+                model={"field": "model_probability"},
+                start_timestamp=T0,
+                allowed_markets=("duplicate-market",),
+            )
+            observation = _observation(
+                "duplicate-market",
+                T0 + timedelta(hours=1),
+                min_order_size=1.0,
+                size_increment=1.0,
+                min_notional=0.01,
+                tick_size=0.01,
+            )
+            with patch.object(store, "save_paper_observation", return_value=False):
+                cycle = run_forward_paper(
+                    spec,
+                    store=store,
+                    strategy=strategy,
+                    model={"field": "model_probability"},
+                    operational_policy=OperationalPaperPolicy(),
+                    observations=[observation],
+                    now=T0 + timedelta(hours=1),
+                )
+            self.assertEqual(cycle.observations_processed, 0)
+            self.assertEqual(cycle.observations_skipped, 1)
+            self.assertEqual(cycle.fills_inserted, 0)
+            self.assertEqual(cycle.execution_events, 0)
+            self.assertEqual(store.list_paper_execution_events(spec.experiment_id), [])
+            state = store.load_paper_state(spec.experiment_id)
+            assert state is not None
+            counters = state["state"]["operational_paper"]["counters"]
+            self.assertEqual(counters["submitted_total"], 0)
+            self.assertEqual(counters["submitted_today"], 0)
+            self.assertEqual(counters["buy_gross_today"], "0")
+            self.assertEqual(counters["buy_cumulative"], "0")
+            self.assertEqual(counters["market_buy"], {})
+            self.assertEqual(counters["event_buy"], {})
+
+    def test_operational_rejection_records_attempt_without_reserving_counters(self) -> None:
+        with AxiomStore(":memory:") as store:
+            strategy = _BuyEverySnapshot()
+            spec = ForwardTestRegistry(store).freeze(
+                strategy=strategy,
+                model={"field": "model_probability"},
+                start_timestamp=T0,
+                allowed_markets=("rejected-market",),
+            )
+            cycle = run_forward_paper(
+                spec,
+                store=store,
+                strategy=strategy,
+                model={"field": "model_probability"},
+                operational_policy=OperationalPaperPolicy(),
+                observations=[_observation("rejected-market", T0 + timedelta(hours=1))],
+                now=T0 + timedelta(hours=1),
+            )
+            self.assertEqual(cycle.fills_inserted, 0)
+            events = store.list_paper_execution_events(spec.experiment_id)
+            self.assertEqual(len(events), 1)
+            payload = events[0]["payload"]
+            self.assertEqual(events[0]["status"], "RISK_REJECTED")
+            self.assertIn("ORDER_ATTEMPT", payload["outcomes"])
+            self.assertFalse(payload["risk_approved"])
+            state = store.load_paper_state(spec.experiment_id)
+            assert state is not None
+            counters = state["state"]["operational_paper"]["counters"]
+            self.assertEqual(counters["submitted_total"], 0)
+            self.assertEqual(counters["buy_gross_today"], "0")
 
     def test_forward_paper_evidence_reaches_human_review_gate_without_live_route(self) -> None:
         with AxiomStore(":memory:") as store:

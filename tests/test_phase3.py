@@ -10,11 +10,13 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from typing import Any
 from urllib.request import Request
 from axiom.collector import CollectorConfig, PolymarketCollector
 from axiom.data import InMemoryPredictionProvider, PolymarketAdapter
 from axiom.data._http import HTTPFetchError, fetch_json_strict
 from axiom.canary import CanaryService
+from axiom.canary_settings import CanarySettingsService
 from axiom.experiment_plan import normalize_market_scope
 from axiom.market_scope import resolve_market_scope
 from axiom.director import research_summary, validate_hermes_proposal
@@ -33,6 +35,7 @@ from axiom.domain import (
 from axiom.forward import (
     COMMON_PAPER_ASSUMPTIONS,
     ForwardTestRegistry,
+    _ABSOLUTE_MOVE_PREDICATE,
     _canonical_scope_config,
     _content_hash,
     _normalized_strategy_document,
@@ -44,6 +47,7 @@ from axiom.portfolio import Portfolio
 from axiom.paper import PredictionPaperTrader
 from axiom.paper_engine import (
     ForwardPaperEngine,
+    OperationalPaperPolicy,
     historical_replay_id,
     run_forward_paper,
     run_historical_replay,
@@ -1402,9 +1406,77 @@ class Phase3PaperAndRiskTests(unittest.TestCase):
                 model={"id": "model"},
             )
             self.assertIsNone(engine.compatibility_blocker)
+            self.assertEqual(engine._execution_mode, "forward")
+            self.assertEqual(engine._execution_strategy_id, spec.strategy_hash)
+            self.assertEqual(engine._research_mode, "PAPER_FORWARD")
             self.assertEqual(
                 engine.state["execution_binding"],
                 engine.execution_binding,
+            )
+
+    def test_constructor_identity_order_historical_legacy_and_operational(self) -> None:
+        with AxiomStore(":memory:") as store:
+            spec = ForwardTestRegistry(store).freeze(
+                strategy=_BuyStrategy(),
+                model={"id": "model"},
+                start_timestamp=T0,
+                allowed_markets=("m",),
+            )
+
+            legacy = ForwardPaperEngine(
+                spec,
+                store=store,
+                strategy=_BuyStrategy(),
+                model={"id": "model"},
+            )
+            self.assertEqual(legacy._execution_mode, "forward")
+            self.assertEqual(legacy._execution_strategy_id, spec.strategy_hash)
+            self.assertEqual(legacy._research_mode, "PAPER_FORWARD")
+            self.assertIsNone(legacy._operational_policy)
+            self.assertIsNone(legacy._operational_settings)
+
+            historical = ForwardPaperEngine(
+                spec,
+                store=store,
+                strategy=_BuyStrategy(),
+                model={"id": "model"},
+                storage_namespace="historical-constructor-regression",
+                execution_mode="historical_replay",
+            )
+            self.assertEqual(historical._execution_mode, "historical_replay")
+            self.assertEqual(historical._execution_strategy_id, spec.strategy_hash)
+            self.assertEqual(historical._research_mode, "RECORDED_BOOK_REPLAY")
+            self.assertEqual(
+                historical.execution_binding["research_mode"],
+                "RECORDED_BOOK_REPLAY",
+            )
+
+            settings = {
+                "config_id": "canary-constructor-regression",
+                "generation": 7,
+                "config_hash": "sha256:constructor-regression",
+            }
+            operational = ForwardPaperEngine(
+                spec,
+                store=store,
+                strategy=_BuyStrategy(),
+                model={"id": "model"},
+                operational_policy=OperationalPaperPolicy(),
+                operational_settings=settings,
+            )
+            self.assertEqual(operational._execution_mode, "forward")
+            self.assertEqual(operational._execution_strategy_id, spec.strategy_hash)
+            self.assertEqual(operational._research_mode, "PAPER_FORWARD")
+            self.assertIsNotNone(operational._operational_policy)
+            self.assertEqual(
+                operational.execution_binding["operational_settings"],
+                {**settings, "paper_only": True},
+            )
+            self.assertEqual(
+                operational.execution_binding["operational_policy"][
+                    "operational_settings"
+                ],
+                {**settings, "paper_only": True},
             )
 
     def test_unmaterialized_intent_and_terminal_first_cannot_execute_or_close(self) -> None:
@@ -2072,6 +2144,164 @@ class Phase3NodeDashboardTests(unittest.TestCase):
                 worker = next(row for row in store.list_worker_states() if row["worker_name"] == f"paper:{spec.experiment_id}")
                 self.assertEqual(worker["status"], "idle")
                 self.assertNotIn("frozen forward-test hashes", str(worker["payload"]))
+    def test_node_paper_worker_reaches_engine_with_explicit_model_free_document(self) -> None:
+        strategy_document = {
+            "version": 1,
+            "market_type": "prediction",
+            "family": "probability_mispricing",
+            "parameters": {},
+            "probability_model": "market",
+            "resolution_aware": True,
+            "resolution_inputs": ["expiry"],
+        }
+        model_document = {"model_required": False}
+        config = {
+            "execution": "paper_only",
+            "live_execution": False,
+            "strategy_document": strategy_document,
+            "model_document": model_document,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            db = str(Path(directory) / "model-free.sqlite")
+            with AxiomStore(db) as store:
+                spec = ForwardTestRegistry(store).freeze(
+                    strategy=strategy_document,
+                    model=model_document,
+                    config=config,
+                    start_timestamp=T0,
+                    allowed_markets=("m",),
+                    experiment_id="model-free-worker",
+                )
+                node = ResearchNode(
+                    NodeConfig(db, max_markets=1, crypto_enabled=False),
+                    provider=InMemoryPredictionProvider([market("m")]),
+                    store=store,
+                    clock=lambda: T0,
+                )
+                result = node._run_single_paper_worker(spec)
+                self.assertIsNotNone(result)
+                assert result is not None
+                self.assertNotIn("error", result)
+                worker = store.get_worker_state(f"paper:{spec.experiment_id}")
+                self.assertIsNotNone(worker)
+                assert worker is not None
+                self.assertEqual(worker["status"], "idle")
+    def test_node_paper_worker_accepts_legacy_config_hash_without_operational_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = str(Path(directory) / "legacy-config.sqlite")
+            with AxiomStore(db) as store:
+                CanarySettingsService(store, clock=lambda: T0)
+                spec = self._operational_worker_spec(
+                    store,
+                    experiment_id="legacy-config-worker",
+                    config_overrides={"config_hash": "legacy-config-hash"},
+                )
+                node = ResearchNode(
+                    NodeConfig(db, max_markets=1, crypto_enabled=False),
+                    provider=InMemoryPredictionProvider([market("m")]),
+                    store=store,
+                    clock=lambda: T0,
+                )
+                result = node._run_single_paper_worker(spec)
+                self.assertIsNotNone(result)
+                assert result is not None
+                self.assertNotIn("error", result)
+                worker = store.get_worker_state(f"paper:{spec.experiment_id}")
+                self.assertIsNotNone(worker)
+                assert worker is not None
+                self.assertEqual(worker["status"], "idle")
+                self.assertNotIn(
+                    "OPERATIONAL_SETTINGS_IDENTITY_MISMATCH",
+                    worker["payload"].get("errors", ()),
+                )
+
+
+    def _operational_worker_spec(
+        self,
+        store: AxiomStore,
+        *,
+        experiment_id: str,
+        config_overrides: dict[str, object],
+    ) -> Any:
+        strategy_document = {
+            "version": 1,
+            "market_type": "prediction",
+            "family": "momentum",
+            "parameters": {
+                "lookback": 1,
+                "threshold": 0.05,
+                "entry_predicate": dict(_ABSOLUTE_MOVE_PREDICATE),
+            },
+            "probability_model": "plan-model-probability",
+            "resolution_aware": True,
+            "resolution_inputs": ["expiry", "settlement"],
+        }
+        model_document = {"model_required": False}
+        config: dict[str, object] = {
+            "execution": "paper_only",
+            "live_execution": False,
+            "strategy_document": strategy_document,
+            "model_document": model_document,
+            **config_overrides,
+        }
+        return ForwardTestRegistry(store).freeze(
+            strategy=strategy_document,
+            model=model_document,
+            config=config,
+            start_timestamp=T0,
+            allowed_markets=("m",),
+            experiment_id=experiment_id,
+        )
+
+    def test_node_operational_identity_conflict_blocks_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = str(Path(directory) / "identity-conflict.sqlite")
+            with AxiomStore(db) as store:
+                settings = CanarySettingsService(store, clock=lambda: T0)
+                active = settings.snapshot(now=T0)
+                spec = self._operational_worker_spec(
+                    store,
+                    experiment_id="identity-conflict-worker",
+                    config_overrides={
+                        "operational_settings": {
+                            "config_id": active["config_id"],
+                            "generation": active["generation"],
+                            "config_hash": active["config_hash"],
+                            "expected": {
+                                "config_id": "different-operational-config",
+                            },
+                        },
+                    },
+                )
+                node = ResearchNode(
+                    NodeConfig(db, max_markets=1, crypto_enabled=False),
+                    provider=InMemoryPredictionProvider([market("m")]),
+                    store=store,
+                    clock=lambda: T0,
+                )
+                result = node._run_single_paper_worker(spec)
+                self.assertEqual(result["status"], "BLOCKED")
+                self.assertEqual(result["blocker"], "OPERATIONAL_SETTINGS_IDENTITY_MISMATCH")
+
+    def test_node_operational_identity_absence_blocks_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = str(Path(directory) / "identity-absent.sqlite")
+            with AxiomStore(db) as store:
+                CanarySettingsService(store, clock=lambda: T0)
+                spec = self._operational_worker_spec(
+                    store,
+                    experiment_id="identity-absent-worker",
+                    config_overrides={"operational_settings": {}},
+                )
+                node = ResearchNode(
+                    NodeConfig(db, max_markets=1, crypto_enabled=False),
+                    provider=InMemoryPredictionProvider([market("m")]),
+                    store=store,
+                    clock=lambda: T0,
+                )
+                result = node._run_single_paper_worker(spec)
+                self.assertEqual(result["status"], "BLOCKED")
+                self.assertEqual(result["blocker"], "OPERATIONAL_SETTINGS_IDENTITY_MISMATCH")
 
 
 

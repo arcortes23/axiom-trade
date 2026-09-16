@@ -11,6 +11,7 @@ from axiom.backtest.prediction import (
     PredictionMarketBacktester,
     _coerce_book,
     _complement_book,
+    select_prediction_paths,
 )
 from axiom.domain import Fill, MarketType, Side
 from axiom.metrics import calculate_prediction_metrics
@@ -310,6 +311,182 @@ class PredictionAccountingTests(unittest.TestCase):
         )
         self.assertNotEqual(with_explicit_entry["brier"], 0.0)
 
+
+    def test_explicit_evaluator_ignores_incomplete_markets_but_keeps_manifest(self) -> None:
+        strategy = _strategy()
+        strategy["parameters"] = {
+            **strategy["parameters"],
+            "entry_predicate": {
+                "version": "absolute-move-v1",
+                "minimum_move": "0.05",
+                "units": "probability",
+                "boundary": "inclusive",
+            },
+        }
+        rows = [
+            _price_row(0, "short", 0.40),
+            _price_row(0, "complete", 0.40),
+            _price_row(1, "complete", 0.60),
+            _price_row(2, "complete", 0.62),
+        ]
+        result = PredictionMarketBacktester().run(
+            rows,
+            strategy,
+            mode=PRICE_PROXY_RESEARCH,
+        )
+        manifest = result.metrics["path_manifest"]
+        self.assertEqual(manifest["expected_market_ids"], ["short", "complete"])
+        self.assertEqual(manifest["eligible_market_ids"], ["complete"])
+        self.assertEqual(manifest["excluded_market_ids"], ["short"])
+        self.assertEqual({fill.market_id for fill in result.fills}, {"complete"})
+        self.assertEqual({row["market_id"] for row in result.equity_curve}, {"complete"})
+        self.assertEqual(result.metrics["evaluation"]["evaluated_observations"], 3)
+
+    def test_explicit_replay_unresolved_exit_is_accounted_without_imputation(self) -> None:
+        strategy = _strategy()
+        strategy["parameters"] = {
+            **strategy["parameters"],
+            "entry_predicate": {
+                "version": "absolute-move-v1",
+                "minimum_move": "0.05",
+                "units": "probability",
+                "boundary": "inclusive",
+            },
+        }
+        rows = [_book_row(0, 0.40), _book_row(1, 0.60), _book_row(2, 0.62)]
+        assert isinstance(rows[-1]["order_book"], dict)
+        rows[-1]["order_book"]["bids"] = []
+        result = PredictionMarketBacktester(
+            initial_cash=100.0,
+            fee_bps=0.0,
+            slippage_bps=0.0,
+            allocation=0.50,
+        ).run(
+            rows,
+            strategy,
+            mode=RECORDED_BOOK_REPLAY,
+            holding_period=1,
+        )
+        accounting = result.metrics["path_manifest"]["unresolved_exit_accounting"]
+        self.assertEqual(accounting["unresolved_exit_count"], 1)
+        self.assertEqual(accounting["unresolved_market_ids"], ["market-1"])
+        self.assertEqual(accounting["forced_closes"], 0)
+        self.assertEqual(accounting["forward_fills"], 0)
+        self.assertTrue(result.metrics["path_manifest"]["no_imputation"])
+        self.assertEqual([fill.metadata["execution_kind"] for fill in result.fills], ["entry"])
+        self.assertEqual(result.metrics["portfolio_accounting"]["open_positions"], ["market-1"])
+
+
+    def test_entry_requires_canonical_entry_eligibility_and_actionability(self) -> None:
+        strategy = _strategy()
+        strategy["parameters"] = {
+            **strategy["parameters"],
+            "entry_predicate": {
+                "version": "absolute-move-v1",
+                "minimum_move": "0.05",
+                "units": "probability",
+                "boundary": "inclusive",
+            },
+        }
+        result = PredictionMarketBacktester().run(
+            [
+                _price_row(0, "subthreshold", 0.40),
+                _price_row(1, "subthreshold", 0.44),
+                _price_row(2, "subthreshold", 0.44),
+            ],
+            strategy,
+            mode=PRICE_PROXY_RESEARCH,
+        )
+        self.assertEqual(result.fills, ())
+        self.assertEqual(result.metrics["path_manifest"]["eligible_market_ids"], ["subthreshold"])
+        self.assertEqual(result.equity_curve[0]["reason_code"], "INSUFFICIENT_LOOKBACK")
+        self.assertEqual(
+            [row["reason_code"] for row in result.equity_curve[1:]],
+            ["ENTRY_PREDICATE_NOT_SATISFIED", "ENTRY_PREDICATE_NOT_SATISFIED"],
+        )
+
+    def test_terminal_replay_path_allows_missing_books_but_validates_supplied_books(self) -> None:
+        strategy = _strategy()
+        strategy["parameters"] = {
+            **strategy["parameters"],
+            "entry_predicate": {
+                "version": "absolute-move-v1",
+                "minimum_move": "0.05",
+                "units": "probability",
+                "boundary": "inclusive",
+            },
+        }
+        terminal = _price_row(2, "market-1", 0.62)
+        terminal["settlement"] = "resolved_yes"
+        result = PredictionMarketBacktester(
+            initial_cash=100.0,
+            fee_bps=0.0,
+            slippage_bps=0.0,
+            allocation=0.50,
+        ).run(
+            [_book_row(0, 0.40), _book_row(1, 0.60), terminal],
+            strategy,
+            mode=RECORDED_BOOK_REPLAY,
+            holding_period=1,
+        )
+        self.assertEqual(result.metrics["path_manifest"]["eligible_market_ids"], ["market-1"])
+        self.assertEqual([fill.metadata["execution_kind"] for fill in result.fills], ["entry"])
+        self.assertEqual(result.unresolved, ())
+
+        future_terminal = dict(terminal)
+        future_terminal["order_book"] = {
+            "timestamp": (T0 + timedelta(minutes=3)).isoformat(),
+            "bids": [[0.60, 10.0]],
+            "asks": [[0.61, 10.0]],
+        }
+        with self.assertRaisesRegex(ValueError, "future-dated"):
+            PredictionMarketBacktester().run(
+                [_book_row(0, 0.40), _book_row(1, 0.60), future_terminal],
+                strategy,
+                mode=RECORDED_BOOK_REPLAY,
+                holding_period=1,
+            )
+
+    def test_max_gap_observations_is_rejected_as_unsupported(self) -> None:
+        strategy = _strategy()
+        strategy["parameters"] = {
+            **strategy["parameters"],
+            "entry_predicate": {
+                "version": "absolute-move-v1",
+                "minimum_move": "0.05",
+                "units": "probability",
+                "boundary": "inclusive",
+            },
+            "max_gap_observations": 1,
+        }
+        with self.assertRaisesRegex(ValueError, "max_gap_observations.*unsupported"):
+            select_prediction_paths(
+                [_price_row(index, "market-1", 0.40 + index * 0.10) for index in range(3)],
+                strategy,
+                mode=PRICE_PROXY_RESEARCH,
+            )
+
+    def test_declared_max_gap_changes_only_structural_eligibility(self) -> None:
+        strategy = _strategy()
+        strategy["parameters"] = {
+            **strategy["parameters"],
+            "entry_predicate": {
+                "version": "absolute-move-v1",
+                "minimum_move": "0.05",
+                "units": "probability",
+                "boundary": "inclusive",
+            },
+            "max_gap_policy": {"max_gap_seconds": 30},
+        }
+        rows = [
+            _price_row(0, "short-gap", 0.40),
+            _price_row(1, "short-gap", 0.60),
+            _price_row(2, "short-gap", 0.62),
+        ]
+        manifest = select_prediction_paths(rows, strategy, mode=PRICE_PROXY_RESEARCH)
+        self.assertEqual(manifest["eligible_market_ids"], [])
+        self.assertEqual(manifest["excluded_market_ids"], ["short-gap"])
+        self.assertEqual(manifest["exclusion_reasons"], {"MAX_GAP_EXCEEDED": 1})
 
 if __name__ == "__main__":
     unittest.main()
