@@ -4260,6 +4260,77 @@ class TestRollingPortfolio(unittest.TestCase):
             self.assertEqual(resolution["model_hash"], _rolling_hash(model))
             self.assertEqual(after, before)
 
+    def test_plan_prefixed_source_trial_alias_resolves_as_plan_provenance(self) -> None:
+        with _store(self.tmp_path) as store:
+            strategy = self._legacy_model_lineage(
+                store,
+                model={"probability": 0.5},
+                strategy_version_id="sv-plan-source-trial",
+                candidate_id="candidate-plan-source-trial",
+                trial_id="research-trial-plan-source-trial",
+                plan_id="plan-plan-source-trial",
+            )
+            plan_id = "plan-plan-source-trial"
+            strategy_payload = dict(strategy)
+            strategy_payload.pop("plan_id", None)
+            strategy_payload["source_trial_id"] = plan_id
+            strategy_payload["provenance"] = {
+                **strategy_payload["provenance"],
+                "plan_id": None,
+                "source_trial_id": plan_id,
+            }
+            store.connection.execute(
+                "UPDATE strategy_versions SET payload_json=? WHERE strategy_version_id=?",
+                (
+                    json.dumps(strategy_payload, default=str),
+                    "sv-plan-source-trial",
+                ),
+            )
+            trial = store.load_research_trial("research-trial-plan-source-trial")
+            self.assertIsNotNone(trial)
+            assert trial is not None
+            trial_payload = dict(trial)
+            trial_payload.pop("plan_id", None)
+            trial_payload["source_trial_id"] = plan_id
+            store.connection.execute(
+                "UPDATE research_trials SET payload_json=? WHERE research_trial_id=?",
+                (
+                    json.dumps(trial_payload, default=str),
+                    "research-trial-plan-source-trial",
+                ),
+            )
+            candidate = store.load_candidate_lifecycle("candidate-plan-source-trial")
+            self.assertIsNotNone(candidate)
+            assert candidate is not None
+            candidate_payload = dict(candidate["payload"])
+            candidate_payload.pop("plan_id", None)
+            candidate_payload["source_trial_id"] = plan_id
+            store.connection.execute(
+                "UPDATE candidate_lifecycle SET payload_json=? WHERE candidate_id=? AND stage=?",
+                (
+                    json.dumps(candidate_payload, default=str),
+                    "candidate-plan-source-trial",
+                    "FROZEN",
+                ),
+            )
+
+            strategy_payload["research_trial_id"] = "research-trial-plan-source-trial"
+            strategy_payload["source_trial_id"] = plan_id
+            model, resolution = AutonomousResearchProcessor(
+                store,
+                clock=lambda: NOW,
+            )._resolve_rolling_model(strategy_payload)
+            self.assertEqual(model, {"probability": 0.5})
+            self.assertEqual(resolution["plan_id"], plan_id)
+
+            conflicting = dict(strategy_payload)
+            conflicting["source_trial_id"] = "research-trial-other"
+            with self.assertRaisesRegex(ValueError, "MODEL_LINEAGE_AMBIGUOUS"):
+                AutonomousResearchProcessor(
+                    store,
+                    clock=lambda: NOW,
+                )._resolve_rolling_model(conflicting)
+
     def test_legacy_experiment_plan_model_hash_mismatch_fails_closed(self) -> None:
         with _store(self.tmp_path) as store:
             strategy = self._legacy_model_lineage(
@@ -4625,7 +4696,132 @@ class TestRollingPortfolio(unittest.TestCase):
                 }
             },
         )
+
         self.assertNotEqual(changed.evidence_digest, evidence.evidence_digest)
+
+    def test_discovery_does_not_write_plan_id_as_source_trial_provenance(self) -> None:
+        candidate_id = "candidate-source-trial-plan-only"
+        plan_id = "plan-source-trial-plan-only"
+        strategy_document = {
+            "version": 1,
+            "market_type": "prediction",
+            "family": "probability_mispricing",
+            "parameters": {"threshold": 0.05},
+            "probability_model": "fixed-fixture",
+            "operations": [],
+            "resolution_aware": True,
+            "resolution_inputs": ["settlement"],
+        }
+        scope = normalize_market_scope(
+            {
+                "schema_version": "1",
+                "mode": "EXACT_MARKETS",
+                "instrument": "POLYMARKET",
+                "categories": [],
+                "market_ids": ["market-source-trial-plan-only"],
+                "filters": {},
+                "regime_restrictions": {},
+                "provenance": "canonical",
+            }
+        ).as_dict()
+        strategy_payload = {
+            "candidate_id": candidate_id,
+            "strategy_document": strategy_document,
+            "source_trial_id": plan_id,
+        }
+        lifecycle_payload = {
+            "candidate_id": candidate_id,
+            "source_trial_id": plan_id,
+            "market_scope": scope,
+        }
+        enrollments: list[Mapping[str, object]] = []
+
+        class DiscoveryStore:
+            def list_strategies(self, *, limit: int) -> list[dict[str, object]]:
+                return [
+                    {
+                        "strategy_id": candidate_id,
+                        "version": "1",
+                        "strategy": strategy_payload,
+                    }
+                ][:limit]
+
+            def load_candidate_lifecycle(self, *, limit: int) -> list[dict[str, object]]:
+                return [
+                    {
+                        "candidate_id": candidate_id,
+                        "stage": "FROZEN",
+                        "payload": lifecycle_payload,
+                    }
+                ][:limit]
+
+            def save_rolling_enrollment(self, record: Mapping[str, object]) -> None:
+                enrollments.append(record)
+
+        processor = AutonomousResearchProcessor.__new__(AutonomousResearchProcessor)
+        processor.store = DiscoveryStore()
+        documents = processor._rolling_strategy_documents()
+        self.assertEqual(len(documents), 1, enrollments)
+        self.assertEqual(documents[0]["plan_id"], plan_id)
+
+        self.assertIsNone(documents[0]["provenance"]["source_trial_id"])
+
+    def test_future_lineage_writer_roundtrips_source_plan_id_without_trial_alias(self) -> None:
+        plan_id = "plan-writer-source-plan"
+        strategy_document = {
+            "version": 1,
+            "market_type": "prediction",
+            "family": "probability_mispricing",
+            "parameters": {"threshold": 0.05},
+            "operations": [],
+            "probability_model": "fixed-fixture",
+            "resolution_aware": True,
+            "resolution_inputs": ["settlement"],
+        }
+
+        class CaptureStore:
+            def __init__(self) -> None:
+                self.strategy: Mapping[str, object] | None = None
+                self.trial: Mapping[str, object] | None = None
+
+            def save_strategy_version(self, record: Mapping[str, object]) -> None:
+                self.strategy = record
+
+            def save_research_trial(self, record: Mapping[str, object]) -> None:
+                self.trial = record
+
+            def save_rolling_enrollment(self, _record: Mapping[str, object]) -> None:
+                return None
+
+        store = CaptureStore()
+        processor = AutonomousResearchProcessor.__new__(AutonomousResearchProcessor)
+        processor.store = store
+        persisted = processor._rolling_persist_strategy_lineage(
+            [
+                {
+                    "strategy_version_id": "sv-writer-source-plan",
+                    "strategy_hash": _rolling_hash(strategy_document),
+                    "candidate_id": "candidate-writer-source-plan",
+                    "strategy_document": strategy_document,
+                    "source_plan_id": plan_id,
+                    "provenance": {
+                        "source_plan_id": plan_id,
+                        "source_trial_id": plan_id,
+                    },
+                }
+            ],
+            NOW,
+        )
+        self.assertEqual(persisted[0]["source_plan_id"], plan_id)
+        self.assertIsNotNone(store.strategy)
+        self.assertIsNotNone(store.trial)
+        assert store.strategy is not None
+        assert store.trial is not None
+        self.assertEqual(store.strategy["source_plan_id"], plan_id)
+        self.assertEqual(store.strategy["provenance"]["source_plan_id"], plan_id)
+        self.assertNotIn("source_trial_id", store.strategy["provenance"])
+        self.assertEqual(store.trial["payload"]["provenance"]["source_plan_id"], plan_id)
+        self.assertNotIn("source_trial_id", store.trial["payload"]["provenance"])
 
     def test_manifest_only_model_resolution_roundtrips_as_explicit_top_level(self) -> None:
         resolution = {

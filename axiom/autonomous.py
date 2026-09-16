@@ -227,7 +227,7 @@ _ROLLING_MODEL_HYPOTHESIS_FIELDS = (
     "plan_hypothesis_id",
     "source_hypothesis_id",
 )
-_ROLLING_MODEL_ID_FIELDS = ("plan_id", "experiment_plan_id")
+_ROLLING_MODEL_ID_FIELDS = ("plan_id", "experiment_plan_id", "source_plan_id")
 _ROLLING_MODEL_DOCUMENT_FIELDS = frozenset(
     {"probability", "yes_probability", "field"}
 )
@@ -3910,11 +3910,41 @@ class AutonomousResearchProcessor:
                         pending.append((child, depth + 1))
             return values
 
+        def source_plan_value(payload: Mapping[str, Any]) -> str | None:
+            direct = source_value(payload, *_ROLLING_MODEL_ID_FIELDS)
+            if direct:
+                return direct
+            values = {
+                normalized
+                for raw in source_values(payload, "source_trial_id")
+                for normalized in [_binding_value(raw)]
+                if normalized is not None and normalized.startswith("plan-")
+            }
+            return next(iter(values)) if len(values) == 1 else None
+
+        def source_trial_value(payload: Mapping[str, Any]) -> str | None:
+            direct = source_value(
+                payload,
+                "research_trial_id",
+                "trial_id",
+                "forward_test_id",
+                "experiment_id",
+            )
+            if direct:
+                return direct
+            values = {
+                normalized
+                for raw in source_values(payload, "source_trial_id")
+                for normalized in [_binding_value(raw)]
+                if normalized is not None and not normalized.startswith("plan-")
+            }
+            return next(iter(values)) if len(values) == 1 else None
+
         def declarations_conflict(
             *payloads: Mapping[str, Any],
         ) -> tuple[bool, str | None]:
             for names in (
-                ("plan_id", "experiment_plan_id"),
+                _ROLLING_MODEL_ID_FIELDS,
                 _ROLLING_PLAN_HASH_FIELDS,
                 _ROLLING_MODEL_HASH_FIELDS,
                 _ROLLING_MODEL_HYPOTHESIS_FIELDS,
@@ -3928,6 +3958,42 @@ class AutonomousResearchProcessor:
                 ]
                 if len(set(values)) > 1:
                     return True, names[0]
+            plan_values = {
+                normalized
+                for payload in payloads
+                for raw in source_values(payload, "source_trial_id")
+                for normalized in [_binding_value(raw)]
+                if normalized is not None and normalized.startswith("plan-")
+            }
+            if len(plan_values) > 1:
+                return True, "source_trial_id"
+            declared_plan_values = {
+                normalized
+                for payload in payloads
+                for raw in source_values(payload, *_ROLLING_MODEL_ID_FIELDS)
+                for normalized in [_binding_value(raw)]
+                if normalized is not None
+            }
+            if plan_values and declared_plan_values and not plan_values.issubset(
+                declared_plan_values
+            ):
+                return True, "source_trial_id"
+            trial_values = {
+                normalized
+                for payload in payloads
+                for raw in source_values(
+                    payload,
+                    "research_trial_id",
+                    "trial_id",
+                    "source_trial_id",
+                    "forward_test_id",
+                    "experiment_id",
+                )
+                for normalized in [_binding_value(raw)]
+                if normalized is not None and not normalized.startswith("plan-")
+            }
+            if len(trial_values) > 1:
+                return True, "source_trial_id"
             model_documents = [
                 raw
                 for payload in payloads
@@ -3986,16 +4052,8 @@ class AutonomousResearchProcessor:
                 "research_mode": "RESEARCH",
                 "predecessor_candidate_id": candidate,
                 "source_candidate_id": candidate,
-                "source_trial_id": source_value(
-                    payload,
-                    "research_trial_id",
-                    "trial_id",
-                    "source_trial_id",
-                    "forward_test_id",
-                    "experiment_id",
-                    "plan_id",
-                ),
-                "plan_id": source_value(payload, "plan_id", "experiment_plan_id"),
+                "source_trial_id": source_trial_value(payload),
+                "plan_id": source_plan_value(payload),
                 "plan_hash": source_value(payload, *_ROLLING_PLAN_HASH_FIELDS),
                 "hypothesis_id": source_value(payload, *_ROLLING_MODEL_HYPOTHESIS_FIELDS),
                 "model_hash": source_value(
@@ -4035,7 +4093,7 @@ class AutonomousResearchProcessor:
                 "rolling_research": True,
                 "predecessor_candidate_id": candidate,
                 "source_candidate_id": candidate,
-                "plan_id": source_value(payload, "plan_id", "experiment_plan_id"),
+                "plan_id": source_plan_value(payload),
                 "plan_hash": source_value(payload, *_ROLLING_PLAN_HASH_FIELDS),
                 "hypothesis_id": source_value(payload, *_ROLLING_MODEL_HYPOTHESIS_FIELDS),
                 "model_hash": source_value(
@@ -4046,15 +4104,7 @@ class AutonomousResearchProcessor:
                     "frozen_model_document_hash",
                     "version_model_hash",
                 ),
-                "source_trial_id": source_value(
-                    payload,
-                    "research_trial_id",
-                    "trial_id",
-                    "source_trial_id",
-                    "forward_test_id",
-                    "experiment_id",
-                    "plan_id",
-                ),
+                "source_trial_id": source_trial_value(payload),
                 "source_config_hash": source_value(
                     payload,
                     "config_hash",
@@ -4296,15 +4346,7 @@ class AutonomousResearchProcessor:
                         "rolling_research": True,
                         "predecessor_candidate_id": candidate,
                         "source_candidate_id": sorted(strategy_candidates),
-                        "source_trial_id": source_value(
-                            lifecycle_payload,
-                            "research_trial_id",
-                            "trial_id",
-                            "source_trial_id",
-                            "forward_test_id",
-                            "experiment_id",
-                            "plan_id",
-                        ),
+                        "source_trial_id": source_trial_value(lifecycle_payload),
                         "original_economic_outcome": {
                             key: compact(lifecycle_payload[key])
                             for key in ("result", "outcome", "economic_result", "economic_outcome")
@@ -4883,6 +4925,7 @@ class AutonomousResearchProcessor:
                     "scope_hash",
                     "scope_version",
                     "plan_id",
+                    "source_plan_id",
                     "plan_hash",
                     "hypothesis_id",
                     "model_hash",
@@ -4895,6 +4938,34 @@ class AutonomousResearchProcessor:
                 # contradiction must remain visible to the source-boundary
                 # validator rather than being silently overwritten here.
                 provenance_values.setdefault(field_name, value)
+            top_plan_ids = {
+                normalized
+                for field_name in _ROLLING_MODEL_ID_FIELDS
+                for normalized in [_binding_value(source_fields.get(field_name))]
+                if normalized is not None
+            }
+            nested_plan_ids = {
+                normalized
+                for field_name in _ROLLING_MODEL_ID_FIELDS
+                for normalized in [_binding_value(provenance_values.get(field_name))]
+                if normalized is not None
+            }
+            all_plan_ids = top_plan_ids | nested_plan_ids
+            if len(all_plan_ids) > 1:
+                raise ValueError("plan lineage identity conflicts")
+            linked_plan_id = next(iter(all_plan_ids), None)
+            provenance_source_trial = _binding_value(
+                provenance_values.get("source_trial_id")
+            )
+            if (
+                provenance_source_trial is not None
+                and provenance_source_trial.startswith("plan-")
+                and provenance_source_trial == linked_plan_id
+            ):
+                # A legacy plan reference was historically persisted under
+                # source_trial_id.  Keep it as plan provenance, never as a
+                # trial identity, once the linked plan is explicit.
+                provenance_values.pop("source_trial_id", None)
             provenance = _rolling_provenance_bound(
                 {
                     **provenance_values,
@@ -6106,13 +6177,37 @@ class AutonomousResearchProcessor:
             if not values:
                 return None
             return next(iter(values))
+        legacy_plan_ids: set[str] = set()
+
+        def typed_trial_values(value: Any) -> tuple[set[str], bool]:
+            trial_values, trial_invalid = identity_values(
+                value,
+                ("research_trial_id", "trial_id"),
+            )
+            source_values, source_invalid = identity_values(
+                value,
+                ("source_trial_id",),
+            )
+            legacy_plan_ids.update(
+                source_id
+                for source_id in source_values
+                if source_id.startswith("plan-")
+            )
+            trial_values.update(
+                source_id
+                for source_id in source_values
+                if not source_id.startswith("plan-")
+            )
+            return trial_values, trial_invalid or source_invalid
+
 
         candidate_id = one_identity(
             ("candidate_id", "candidate", "strategy_candidate_id", "source_candidate_id")
         )
-        trial_id = one_identity(
-            ("research_trial_id", "trial_id", "source_trial_id")
-        )
+        trial_values, trial_invalid = typed_trial_values(strategy)
+        if trial_invalid or len(trial_values) > 1:
+            raise ValueError("MODEL_LINEAGE_AMBIGUOUS")
+        trial_id = next(iter(trial_values), None)
         strategy_version_id = one_identity(("strategy_version_id",))
 
         def load_one(
@@ -6184,7 +6279,10 @@ class AutonomousResearchProcessor:
                 "version": (strategy_version_id, ("strategy_version_id",)),
             }
             for field_name, (identity, names) in expected.items():
-                values, truncated = identity_values(record, names)
+                if field_name == "trial":
+                    values, truncated = typed_trial_values(record)
+                else:
+                    values, truncated = identity_values(record, names)
                 if truncated or (values and identity is not None and values != {identity}):
                     raise ValueError("MODEL_LINEAGE_MISMATCH")
                 if values and identity is None:
@@ -6196,6 +6294,10 @@ class AutonomousResearchProcessor:
 
         for role, record in lineage_records:
             validate_linkage(role, record)
+        for _role, record in lineage_records:
+            _trial_values, invalid = typed_trial_values(record)
+            if invalid:
+                raise ValueError("MODEL_LINEAGE_AMBIGUOUS")
 
         def named_values(
             value: Any,
@@ -6340,6 +6442,7 @@ class AutonomousResearchProcessor:
             if truncated:
                 raise ValueError("MODEL_LINEAGE_AMBIGUOUS")
             plan_values.update(values)
+        plan_values.update(legacy_plan_ids)
         if len(plan_values) > 1:
             raise ValueError("MODEL_LINEAGE_AMBIGUOUS")
         plan_id = next(iter(plan_values), None)
