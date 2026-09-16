@@ -13,6 +13,7 @@ import hashlib
 import inspect
 import json
 import math
+import sqlite3
 import re
 from itertools import islice, product
 from statistics import mean
@@ -157,6 +158,7 @@ _ROLLING_STATE_RESULT_KEYS = (
     "accounting_unavailable_reason",
     "admitted",
     "admission_reasons",
+    "model_resolution",
     "source_digest",
     "accounting_digest",
     "evidence_digest",
@@ -195,10 +197,43 @@ _ROLLING_IMMUTABLE_SOURCE_BLOCKERS = frozenset(
         "PAPER_IDENTITY_UNPROVEN",
         "PRICE_PROXY_ACCOUNTING_UNAVAILABLE",
         "REPLAY_BOOK_REQUIRED",
+        "MODEL_INPUT_MISSING",
+        "MODEL_INPUT_INVALID",
+        "MODEL_HASH_MISSING",
+        "MODEL_LINEAGE_AMBIGUOUS",
+        "MODEL_LINEAGE_INCOMPLETE",
+        "MODEL_LINEAGE_MISMATCH",
+        "MODEL_PLAN_MISSING",
+        "MODEL_PLAN_NOT_EXECUTABLE",
+        "MODEL_PLAN_HASH_MISMATCH",
     }
 )
 _ROLLING_PAPER_IDENTITY_MAX_DEPTH = 8
 _ROLLING_PAPER_IDENTITY_MAX_NODES = 8192
+_ROLLING_MODEL_HASH_FIELDS = (
+    "model_hash",
+    "frozen_model_hash",
+    "model_document_hash",
+    "frozen_model_document_hash",
+    "version_model_hash",
+)
+_ROLLING_PLAN_HASH_FIELDS = (
+    "plan_hash",
+    "experiment_plan_hash",
+    "frozen_plan_hash",
+)
+_ROLLING_MODEL_HYPOTHESIS_FIELDS = (
+    "hypothesis_id",
+    "plan_hypothesis_id",
+    "source_hypothesis_id",
+)
+_ROLLING_MODEL_ID_FIELDS = ("plan_id", "experiment_plan_id")
+_ROLLING_MODEL_DOCUMENT_FIELDS = frozenset(
+    {"probability", "yes_probability", "field"}
+)
+_ROLLING_MODEL_OVERRIDE_FIELDS = frozenset(
+    {"model_probability", "probability", "predicted_probability", "p"}
+)
 
 
 def _rolling_reason_is_immutable(reason: Any) -> bool:
@@ -907,6 +942,77 @@ def _rolling_actual_ledger_accounting(
         "available_through": available_through.isoformat(),
     }
 
+def _rolling_model_document_error(model: Any) -> str | None:
+    """Return a stable failure reason for one persisted model document."""
+    if not isinstance(model, Mapping):
+        return "MODEL_INPUT_MISSING"
+    unknown = set(str(key) for key in model) - _ROLLING_MODEL_DOCUMENT_FIELDS
+    if unknown:
+        return "MODEL_PLAN_NOT_EXECUTABLE"
+    if not any(key in model for key in _ROLLING_MODEL_DOCUMENT_FIELDS):
+        return "MODEL_INPUT_MISSING"
+    if "field" in model:
+        field_name = model.get("field")
+        if not isinstance(field_name, str) or not field_name.strip():
+            return "MODEL_INPUT_INVALID"
+    if "probability" in model or "yes_probability" in model:
+        if evaluate_model_document_probability(model, {}) is None:
+            return "MODEL_INPUT_INVALID"
+    return None
+
+def _rolling_model_document_hash(model: Mapping[str, Any]) -> str:
+    try:
+        return _content_hash(dict(model))
+    except (TypeError, ValueError, OverflowError, RecursionError) as exc:
+        raise ValueError("MODEL_PLAN_NOT_EXECUTABLE") from exc
+
+def _rolling_model_resolution_record(
+    source_type: str,
+    model_hash: str,
+    *,
+    plan_id: str | None = None,
+) -> dict[str, Any]:
+    """Keep model provenance intentionally small and hash-addressable."""
+    return {
+        "source_type": str(source_type),
+        "plan_id": plan_id,
+        "model_hash": str(model_hash),
+    }
+
+def _rolling_model_authoritative_row(
+    value: Any,
+    *,
+    verified_field: str | None = None,
+) -> dict[str, Any]:
+    """Strip unverified model aliases while preserving wrapped observations."""
+    if not isinstance(value, Mapping):
+        return {}
+    wrappers = {
+        "payload",
+        "snapshot",
+        "data",
+        "observation",
+        "result",
+        "outcome",
+    }
+    result: dict[str, Any] = {}
+    for key, child in value.items():
+        normalized = str(key).strip().lower()
+        if normalized in _ROLLING_MODEL_OVERRIDE_FIELDS:
+            if verified_field is not None and str(key) == verified_field:
+                result[key] = child
+            continue
+        if normalized in wrappers and isinstance(child, Mapping):
+            result[key] = _rolling_model_authoritative_row(
+                child,
+                verified_field=verified_field,
+            )
+        else:
+            # Order-book/market payloads are intentionally opaque here:
+            # their ``p`` and ``probability`` fields are legitimate prices.
+            result[key] = child
+    return result
+
 def _rolling_timestamp(value: Any) -> datetime | None:
     if isinstance(value, datetime):
         return ensure_utc(value)
@@ -1145,6 +1251,7 @@ def _rolling_prerequisite_fingerprint(
     source_class: str,
     *,
     source_rows: Sequence[Mapping[str, Any]] = (),
+    store: Any | None = None,
 ) -> str:
     """Fingerprint immutable inputs used to suppress unchanged blockers."""
     provenance = strategy.get("provenance")
@@ -1184,6 +1291,56 @@ def _rolling_prerequisite_fingerprint(
                 "row_digest": _rolling_hash(view),
             }
         )
+    plan_id = None
+    for owner in (strategy, provenance):
+        for name in _ROLLING_MODEL_ID_FIELDS:
+            plan_id = _binding_value(owner.get(name))
+            if plan_id is not None:
+                break
+        if plan_id is not None:
+            break
+    if store is None:
+        linked_plan = {"status": "STORE_UNAVAILABLE"}
+    elif plan_id is None:
+        linked_plan = {"status": "PLAN_ID_MISSING"}
+    else:
+        plan_loader = getattr(store, "load_experiment_plan", None)
+        if not callable(plan_loader):
+            linked_plan = {"status": "PLAN_LOADER_UNAVAILABLE"}
+        else:
+            try:
+                loaded_plan = plan_loader(plan_id)
+            except Exception as exc:
+                linked_plan = {
+                    "status": "LOAD_FAILED",
+                    "error": type(exc).__name__,
+                }
+            else:
+                if not isinstance(loaded_plan, Mapping):
+                    linked_plan = {"status": "MISSING"}
+                else:
+                    plan_hashes = sorted(
+                        {
+                            normalized
+                            for name in _ROLLING_PLAN_HASH_FIELDS
+                            for normalized in [_binding_value(loaded_plan.get(name))]
+                            if normalized is not None
+                        }
+                    )
+                    hypothesis_ids = sorted(
+                        {
+                            normalized
+                            for name in _ROLLING_MODEL_HYPOTHESIS_FIELDS
+                            for normalized in [_binding_value(loaded_plan.get(name))]
+                            if normalized is not None
+                        }
+                    )
+                    linked_plan = {
+                        "status": "PRESENT",
+                        "plan_id": plan_id,
+                        "plan_hashes": plan_hashes,
+                        "hypothesis_ids": hypothesis_ids,
+                    }
     return _rolling_hash(
         {
             "schema": "rolling-prerequisites-v1",
@@ -1191,16 +1348,15 @@ def _rolling_prerequisite_fingerprint(
             "strategy_version_id": strategy.get("strategy_version_id"),
             "research_trial_id": strategy.get("research_trial_id"),
             "candidate_id": strategy.get("candidate_id"),
-            "dataset_id": binding.get("dataset_id", provenance.get("dataset_id")),
-            "dataset_version": binding.get(
-                "dataset_version",
-                binding.get("version", provenance.get("dataset_version")),
-            ),
             "strategy_state": {
                 name: strategy.get(name)
                 for name in (
                     "strategy_document",
                     "model_document",
+                    "model_hash",
+                    "plan_id",
+                    "plan_hash",
+                    "hypothesis_id",
                     "config",
                     "paper_assumptions",
                     "materialized_experiment_id",
@@ -1208,6 +1364,18 @@ def _rolling_prerequisite_fingerprint(
                 )
                 if strategy.get(name) is not None
             },
+            "model_lineage": {
+                name: provenance.get(name)
+                for name in (
+                    "plan_id",
+                    "plan_hash",
+                    "hypothesis_id",
+                    "model_hash",
+                    "source_trial_id",
+                )
+                if provenance.get(name) is not None
+            },
+            "linked_plan": linked_plan,
             "source_class": _rolling_source_name(source_class),
             "source_binding": binding,
             "source_bounds": {
@@ -3703,13 +3871,80 @@ class AutonomousResearchProcessor:
                 value = _binding_value(payload.get(name))
                 if value:
                     return value
-            for name in ("provenance", "forward_evidence", "result", "outcome", "config"):
+            for name in (
+                "provenance",
+                "experiment_plan",
+                "forward_evidence",
+                "result",
+                "outcome",
+                "config",
+                "frozen",
+                "payload",
+                "lineage",
+            ):
                 child = payload.get(name)
                 if isinstance(child, Mapping):
                     value = source_value(child, *names)
                     if value:
                         return value
             return None
+
+        def source_values(payload: Mapping[str, Any], *names: str) -> list[Any]:
+            """Collect all declarations instead of silently selecting the first."""
+            wanted = {str(name) for name in names}
+            values: list[Any] = []
+            seen: set[int] = set()
+            pending: list[tuple[Any, int]] = [(payload, 0)]
+            while pending:
+                item, depth = pending.pop()
+                if not isinstance(item, Mapping):
+                    continue
+                marker = id(item)
+                if marker in seen or depth > _ROLLING_MAX_PROVENANCE_DEPTH:
+                    continue
+                seen.add(marker)
+                for key, child in item.items():
+                    if str(key) in wanted and child is not None:
+                        values.append(child)
+                    if isinstance(child, Mapping):
+                        pending.append((child, depth + 1))
+            return values
+
+        def declarations_conflict(
+            *payloads: Mapping[str, Any],
+        ) -> tuple[bool, str | None]:
+            for names in (
+                ("plan_id", "experiment_plan_id"),
+                _ROLLING_PLAN_HASH_FIELDS,
+                _ROLLING_MODEL_HASH_FIELDS,
+                _ROLLING_MODEL_HYPOTHESIS_FIELDS,
+            ):
+                values = [
+                    normalized
+                    for payload in payloads
+                    for raw in source_values(payload, *names)
+                    for normalized in [_binding_value(raw)]
+                    if normalized is not None
+                ]
+                if len(set(values)) > 1:
+                    return True, names[0]
+            model_documents = [
+                raw
+                for payload in payloads
+                for raw in source_values(payload, "model_document")
+                if raw is not None
+            ]
+            model_keys: set[str] = set()
+            for model in model_documents:
+                if not isinstance(model, Mapping):
+                    return True, "model_document"
+                try:
+                    model_keys.add(_canonical_binding(model))
+                except (TypeError, ValueError, OverflowError):
+                    return True, "model_document"
+            if len(model_keys) > 1:
+                return True, "model_document"
+            return False, None
 
         def provenance(
             *,
@@ -3760,6 +3995,17 @@ class AutonomousResearchProcessor:
                     "experiment_id",
                     "plan_id",
                 ),
+                "plan_id": source_value(payload, "plan_id", "experiment_plan_id"),
+                "plan_hash": source_value(payload, *_ROLLING_PLAN_HASH_FIELDS),
+                "hypothesis_id": source_value(payload, *_ROLLING_MODEL_HYPOTHESIS_FIELDS),
+                "model_hash": source_value(
+                    payload,
+                    "model_hash",
+                    "frozen_model_hash",
+                    "model_document_hash",
+                    "frozen_model_document_hash",
+                    "version_model_hash",
+                ),
                 "source_config_hash": source_value(
                     payload,
                     "config_hash",
@@ -3789,6 +4035,17 @@ class AutonomousResearchProcessor:
                 "rolling_research": True,
                 "predecessor_candidate_id": candidate,
                 "source_candidate_id": candidate,
+                "plan_id": source_value(payload, "plan_id", "experiment_plan_id"),
+                "plan_hash": source_value(payload, *_ROLLING_PLAN_HASH_FIELDS),
+                "hypothesis_id": source_value(payload, *_ROLLING_MODEL_HYPOTHESIS_FIELDS),
+                "model_hash": source_value(
+                    payload,
+                    "model_hash",
+                    "frozen_model_hash",
+                    "model_document_hash",
+                    "frozen_model_document_hash",
+                    "version_model_hash",
+                ),
                 "source_trial_id": source_value(
                     payload,
                     "research_trial_id",
@@ -4061,9 +4318,28 @@ class AutonomousResearchProcessor:
                     },
                 )
                 return None
+            conflicting, field_name = declarations_conflict(
+                strategy_payload,
+                lifecycle_payload,
+            )
+            if conflicting:
+                decision(
+                    candidate=candidate,
+                    status="EXCLUDED",
+                    reason="MODEL_LINEAGE_AMBIGUOUS",
+                    origin={
+                        "rolling_research": True,
+                        "predecessor_candidate_id": candidate,
+                        "source_candidate_id": candidate,
+                        "lineage_conflict_field": field_name,
+                    },
+                )
+                return None
+            lineage_payload = dict(strategy_payload)
+            lineage_payload.update(lifecycle_payload)
             base_origin = origin_base(
                 candidate=candidate,
-                payload=lifecycle_payload,
+                payload=lineage_payload,
                 strategy_row=strategy_row,
             )
             stage = str(lifecycle_row.get("stage", "")).strip().upper()
@@ -4270,7 +4546,7 @@ class AutonomousResearchProcessor:
                 return None
             origin = provenance(
                 candidate=candidate,
-                payload=lifecycle_payload,
+                payload=lineage_payload,
                 strategy_row=strategy_row,
                 scope=scope_policy.as_dict(),
                 entry=dict(entry_value),
@@ -4332,6 +4608,10 @@ class AutonomousResearchProcessor:
             return {
                 "strategy_document": document,
                 "model_document": model_document,
+                "plan_id": _binding_value(origin.get("plan_id")),
+                "model_hash": _binding_value(origin.get("model_hash")),
+                "plan_hash": _binding_value(origin.get("plan_hash")),
+                "hypothesis_id": _binding_value(origin.get("hypothesis_id")),
                 "strategy_id": _binding_value(strategy_row.get("strategy_id")) or definition.id,
                 "version": str(strategy_row.get("version") or definition.version),
                 "strategy_hash": strategy_hash,
@@ -4602,6 +4882,10 @@ class AutonomousResearchProcessor:
                     "scope",
                     "scope_hash",
                     "scope_version",
+                    "plan_id",
+                    "plan_hash",
+                    "hypothesis_id",
+                    "model_hash",
                 )
                 if field_name in item and item[field_name] is not None
             }
@@ -5745,6 +6029,424 @@ class AutonomousResearchProcessor:
                 row.setdefault("dataset_version", selected_version)
             return selected_rows, selected_catalog
         raise ValueError("REPLAY_DATASET_UNAVAILABLE")
+    def _resolve_rolling_model(
+        self,
+        strategy: Mapping[str, Any],
+    ) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+        """Resolve one executable model under immutable rolling lineage.
+
+        A model embedded in the frozen row is preferred, but only after its
+        canonical hash agrees with every frozen hash carried by the available
+        candidate/trial/version records.  Legacy rows may instead point at
+        exactly one immutable experiment plan; the plan's model is accepted
+        only after the same hash proof.
+        """
+        if not isinstance(strategy, Mapping):
+            raise ValueError("MODEL_INPUT_MISSING")
+
+        def identity_values(
+            value: Any,
+            names: Sequence[str],
+        ) -> tuple[set[str], bool]:
+            values: set[str] = set()
+            invalid = False
+            pending: list[tuple[Any, int, str | None]] = [(value, 0, None)]
+            seen: set[int] = set()
+            visited = 0
+            wanted = frozenset(names)
+            while pending:
+                item, depth, parent = pending.pop()
+                if isinstance(item, Mapping):
+                    marker = id(item)
+                    if marker in seen:
+                        continue
+                    seen.add(marker)
+                    visited += 1
+                    if visited > _ROLLING_PAPER_IDENTITY_MAX_NODES:
+                        invalid = True
+                        break
+                    if depth > _ROLLING_PAPER_IDENTITY_MAX_DEPTH:
+                        invalid = True
+                        continue
+                    for name in wanted:
+                        if name not in item:
+                            continue
+                        raw = item[name]
+                        if isinstance(raw, (Mapping, list, tuple, set, frozenset)):
+                            invalid = True
+                            continue
+                        text = _binding_value(raw)
+                        if text:
+                            values.add(text)
+                    for key, child in item.items():
+                        key_name = str(key).strip().lower()
+                        if isinstance(child, (list, tuple, set, frozenset)):
+                            if key_name in _ROLLING_NON_AUTHORITATIVE_ARRAY_KEYS:
+                                continue
+                            pending.append((child, depth + 1, key_name))
+                        elif isinstance(child, Mapping):
+                            pending.append((child, depth + 1, key_name))
+                elif isinstance(item, (list, tuple, set, frozenset)):
+                    if parent in _ROLLING_NON_AUTHORITATIVE_ARRAY_KEYS:
+                        continue
+                    if len(item) > 128:
+                        invalid = True
+                    for child in list(item)[:128]:
+                        pending.append((child, depth + 1, parent))
+            return values, invalid
+
+        def one_identity(
+            names: Sequence[str],
+            *,
+            missing_reason: str = "MODEL_LINEAGE_INCOMPLETE",
+        ) -> str | None:
+            values, truncated = identity_values(strategy, names)
+            if truncated or len(values) > 1:
+                raise ValueError("MODEL_LINEAGE_AMBIGUOUS")
+            if not values:
+                return None
+            return next(iter(values))
+
+        candidate_id = one_identity(
+            ("candidate_id", "candidate", "strategy_candidate_id", "source_candidate_id")
+        )
+        trial_id = one_identity(
+            ("research_trial_id", "trial_id", "source_trial_id")
+        )
+        strategy_version_id = one_identity(("strategy_version_id",))
+
+        def load_one(
+            role: str,
+            identifier: str | None,
+        ) -> tuple[Mapping[str, Any] | None, bool]:
+            if not identifier:
+                return None, False
+            names = {
+                "candidate": "load_candidate_lifecycle",
+                "trial": "load_research_trial",
+                "version": "load_strategy_version",
+            }
+            loader = getattr(self.store, names[role], None)
+            if not callable(loader):
+                return None, False
+            try:
+                value = loader(identifier)
+            except TypeError:
+                try:
+                    keyword = {
+                        "candidate": "candidate_id",
+                        "trial": "research_trial_id",
+                        "version": "strategy_version_id",
+                    }[role]
+                    value = loader(**{keyword: identifier})
+                except (TypeError, ValueError):
+                    return None, False
+                except (RuntimeError, sqlite3.Error) as exc:
+                    raise ValueError("MODEL_LINEAGE_LOAD_FAILED") from exc
+            except ValueError:
+                return None, False
+            except (RuntimeError, sqlite3.Error) as exc:
+                raise ValueError("MODEL_LINEAGE_LOAD_FAILED") from exc
+            if isinstance(value, Mapping):
+                return value, True
+            if isinstance(value, (list, tuple)):
+                records = [item for item in value if isinstance(item, Mapping)]
+                if len(records) == 1:
+                    return records[0], True
+                if len(records) > 1:
+                    raise ValueError("MODEL_LINEAGE_AMBIGUOUS")
+            return None, False
+
+        lineage_records: list[tuple[str, Mapping[str, Any]]] = [
+            ("version", strategy)
+        ]
+        loaded_records: dict[str, bool] = {}
+        for role, identifier in (
+            ("version", strategy_version_id),
+            ("trial", trial_id),
+            ("candidate", candidate_id),
+        ):
+            if not identifier:
+                loaded_records[role] = False
+                continue
+            loaded, available = load_one(role, identifier)
+            loaded_records[role] = available
+            if loaded is not None:
+                lineage_records.append((role, loaded))
+
+        def validate_linkage(
+            role: str,
+            record: Mapping[str, Any],
+        ) -> None:
+            expected = {
+                "candidate": (candidate_id, ("candidate_id", "candidate", "strategy_candidate_id", "source_candidate_id")),
+                "trial": (trial_id, ("research_trial_id", "trial_id", "source_trial_id")),
+                "version": (strategy_version_id, ("strategy_version_id",)),
+            }
+            for field_name, (identity, names) in expected.items():
+                values, truncated = identity_values(record, names)
+                if truncated or (values and identity is not None and values != {identity}):
+                    raise ValueError("MODEL_LINEAGE_MISMATCH")
+                if values and identity is None:
+                    raise ValueError("MODEL_LINEAGE_MISMATCH")
+            if role == "trial" and strategy_version_id:
+                values, truncated = identity_values(record, ("strategy_version_id",))
+                if truncated or values != {strategy_version_id}:
+                    raise ValueError("MODEL_LINEAGE_MISMATCH")
+
+        for role, record in lineage_records:
+            validate_linkage(role, record)
+
+        def named_values(
+            value: Any,
+            names: Sequence[str],
+        ) -> tuple[set[str], bool]:
+            values: set[str] = set()
+            invalid = False
+            pending: list[tuple[Any, int, str | None]] = [(value, 0, None)]
+            seen: set[int] = set()
+            visited = 0
+            wanted = frozenset(names)
+            while pending:
+                item, depth, parent = pending.pop()
+                if isinstance(item, Mapping):
+                    marker = id(item)
+                    if marker in seen:
+                        continue
+                    seen.add(marker)
+                    visited += 1
+                    if visited > 512 or depth > _ROLLING_MAX_PROVENANCE_DEPTH:
+                        invalid = True
+                        continue
+                    for name in wanted:
+                        if name not in item:
+                            continue
+                        raw = item[name]
+                        if isinstance(raw, (Mapping, list, tuple, set, frozenset)):
+                            invalid = True
+                            continue
+                        text = _binding_value(raw)
+                        if text:
+                            values.add(text)
+                    children = list(item.items())
+                    if len(children) > 512:
+                        invalid = True
+                        children = children[:512]
+                    for key, child in reversed(children):
+                        key_name = str(key).strip().lower()
+                        if isinstance(child, (list, tuple, set, frozenset)):
+                            if key_name in _ROLLING_NON_AUTHORITATIVE_ARRAY_KEYS:
+                                continue
+                            if len(child) > 128:
+                                invalid = True
+                            pending.append((child, depth + 1, key_name))
+                        elif isinstance(child, Mapping):
+                            pending.append((child, depth + 1, key_name))
+                elif isinstance(item, (list, tuple, set, frozenset)):
+                    if parent in _ROLLING_NON_AUTHORITATIVE_ARRAY_KEYS:
+                        continue
+                    for child in list(item)[:128]:
+                        pending.append((child, depth + 1, parent))
+            return values, invalid
+
+        frozen_hashes: set[str] = set()
+        for _role, record in lineage_records:
+            values, invalid = named_values(record, _ROLLING_MODEL_HASH_FIELDS)
+            if invalid:
+                raise ValueError("MODEL_LINEAGE_AMBIGUOUS")
+            frozen_hashes.update(values)
+        frozen_plan_hashes: set[str] = set()
+        for _role, record in lineage_records:
+            values, invalid = named_values(record, _ROLLING_PLAN_HASH_FIELDS)
+            if invalid:
+                raise ValueError("MODEL_LINEAGE_AMBIGUOUS")
+            frozen_plan_hashes.update(values)
+
+        def embedded_models(
+            value: Any,
+            origin: str,
+            *,
+            depth: int = 0,
+            seen: set[int] | None = None,
+        ) -> list[tuple[Mapping[str, Any], str]]:
+            if seen is None:
+                seen = set()
+            if not isinstance(value, Mapping) or depth > _ROLLING_MAX_PROVENANCE_DEPTH:
+                return []
+            marker = id(value)
+            if marker in seen:
+                return []
+            seen.add(marker)
+            result: list[tuple[Mapping[str, Any], str]] = []
+            if "model_document" in value:
+                raw_model = value.get("model_document")
+                if raw_model is not None:
+                    if not isinstance(raw_model, Mapping):
+                        raise ValueError("MODEL_PLAN_NOT_EXECUTABLE")
+                    result.append((dict(raw_model), origin))
+            for key in (
+                "payload",
+                "provenance",
+                "config",
+                "forward_config",
+                "frozen",
+                "lineage",
+                "forward_evidence",
+                "result",
+                "outcome",
+            ):
+                child = value.get(key)
+                if isinstance(child, Mapping):
+                    result.extend(
+                        embedded_models(child, f"{origin}.{key}", depth=depth + 1, seen=seen)
+                    )
+            return result
+
+        candidates: list[tuple[Mapping[str, Any], str]] = []
+        for role, record in lineage_records:
+            candidates.extend(embedded_models(record, f"{role}.embedded"))
+        unique_models: list[tuple[Mapping[str, Any], str]] = []
+        for model, origin in candidates:
+            try:
+                identity = _canonical_binding(model)
+            except (TypeError, ValueError, OverflowError, RecursionError) as exc:
+                raise ValueError("MODEL_PLAN_NOT_EXECUTABLE") from exc
+            if any(_canonical_binding(existing) == identity for existing, _ in unique_models):
+                continue
+            unique_models.append((model, origin))
+        if len(unique_models) > 1:
+            raise ValueError("MODEL_LINEAGE_AMBIGUOUS")
+        embedded_error: str | None = None
+        if unique_models:
+            embedded_model, _origin = unique_models[0]
+            embedded_error = _rolling_model_document_error(embedded_model)
+            if embedded_error is None:
+                model_hash = _rolling_model_document_hash(embedded_model)
+                if not frozen_hashes or frozen_hashes == {model_hash}:
+                    return (
+                        dict(embedded_model),
+                        _rolling_model_resolution_record(
+                            "embedded",
+                            model_hash,
+                        ),
+                    )
+                embedded_error = "MODEL_LINEAGE_MISMATCH"
+            if embedded_error is not None:
+                raise ValueError(embedded_error)
+
+        plan_values: set[str] = set()
+        for _role, record in lineage_records:
+            values, truncated = identity_values(record, _ROLLING_MODEL_ID_FIELDS)
+            if truncated:
+                raise ValueError("MODEL_LINEAGE_AMBIGUOUS")
+            plan_values.update(values)
+        if len(plan_values) > 1:
+            raise ValueError("MODEL_LINEAGE_AMBIGUOUS")
+        plan_id = next(iter(plan_values), None)
+        if not plan_id:
+            if embedded_error is not None:
+                raise ValueError(embedded_error)
+            raise ValueError("MODEL_INPUT_MISSING")
+        if not candidate_id or not trial_id or not strategy_version_id:
+            raise ValueError("MODEL_LINEAGE_INCOMPLETE")
+        if any(not loaded_records.get(role, False) for role in ("candidate", "trial", "version")):
+            raise ValueError("MODEL_LINEAGE_INCOMPLETE")
+
+        plan_loader = getattr(self.store, "load_experiment_plan", None)
+        if not callable(plan_loader):
+            raise ValueError("MODEL_PLAN_MISSING")
+        try:
+            plan_record = plan_loader(plan_id)
+        except (TypeError, ValueError):
+            plan_record = None
+        except (RuntimeError, sqlite3.Error) as exc:
+            raise ValueError("MODEL_LINEAGE_LOAD_FAILED") from exc
+        if not isinstance(plan_record, Mapping):
+            raise ValueError("MODEL_PLAN_MISSING")
+        declared_plan_id = _binding_value(plan_record.get("plan_id"))
+        if declared_plan_id and declared_plan_id != plan_id:
+            raise ValueError("MODEL_LINEAGE_MISMATCH")
+        raw_plan = plan_record.get("plan")
+        if not isinstance(raw_plan, Mapping):
+            raise ValueError("MODEL_PLAN_NOT_EXECUTABLE")
+        plan_identity_values, plan_identity_invalid = identity_values(
+            plan_record,
+            _ROLLING_MODEL_ID_FIELDS,
+        )
+        if plan_identity_invalid or plan_identity_values != {plan_id}:
+            raise ValueError("MODEL_LINEAGE_MISMATCH")
+        plan_hypothesis_id = _binding_value(plan_record.get("hypothesis_id"))
+        lineage_hypotheses: set[str] = set()
+        for _role, record in lineage_records:
+            values, invalid = named_values(record, _ROLLING_MODEL_HYPOTHESIS_FIELDS)
+            if invalid:
+                raise ValueError("MODEL_LINEAGE_AMBIGUOUS")
+            lineage_hypotheses.update(values)
+        if len(lineage_hypotheses) > 1:
+            raise ValueError("MODEL_LINEAGE_MISMATCH")
+        if (
+            plan_hypothesis_id
+            and lineage_hypotheses
+            and lineage_hypotheses != {plan_hypothesis_id}
+        ):
+            raise ValueError("MODEL_LINEAGE_MISMATCH")
+        raw_plan_hypotheses, raw_plan_hypotheses_invalid = identity_values(
+            raw_plan,
+            _ROLLING_MODEL_HYPOTHESIS_FIELDS,
+        )
+        if raw_plan_hypotheses_invalid or len(raw_plan_hypotheses) > 1:
+            raise ValueError("MODEL_LINEAGE_MISMATCH")
+        if (
+            plan_hypothesis_id
+            and raw_plan_hypotheses
+            and raw_plan_hypotheses != {plan_hypothesis_id}
+        ):
+            raise ValueError("MODEL_LINEAGE_MISMATCH")
+        declared_plan_hash = _binding_value(plan_record.get("plan_hash"))
+        try:
+            canonical_plan_hash = _rolling_hash(raw_plan)
+        except (TypeError, ValueError, OverflowError, RecursionError) as exc:
+            raise ValueError("MODEL_PLAN_NOT_EXECUTABLE") from exc
+        if (
+            not declared_plan_hash
+            or not declared_plan_hash.startswith("sha256:")
+            or declared_plan_hash != declared_plan_hash.lower()
+            or declared_plan_hash != canonical_plan_hash
+        ):
+            raise ValueError("MODEL_PLAN_HASH_MISMATCH")
+        if frozen_plan_hashes and frozen_plan_hashes != {canonical_plan_hash}:
+            raise ValueError("MODEL_LINEAGE_MISMATCH")
+        raw_model = raw_plan.get("model_document")
+        if raw_model is None and any(
+            key in raw_plan for key in _ROLLING_MODEL_DOCUMENT_FIELDS
+        ):
+            raw_model = {
+                key: raw_plan[key]
+                for key in _ROLLING_MODEL_DOCUMENT_FIELDS
+                if key in raw_plan
+            }
+        if not isinstance(raw_model, Mapping):
+            raise ValueError("MODEL_INPUT_MISSING")
+        model = dict(raw_model)
+        model_error = _rolling_model_document_error(model)
+        if model_error is not None:
+            raise ValueError(model_error)
+        model_hash = _rolling_model_document_hash(model)
+        if not frozen_hashes:
+            raise ValueError("MODEL_HASH_MISSING")
+        if frozen_hashes != {model_hash}:
+            raise ValueError("MODEL_LINEAGE_MISMATCH")
+        return (
+            model,
+            _rolling_model_resolution_record(
+                "experiment_plan",
+                model_hash,
+                plan_id=plan_id,
+            ),
+        )
+
+    _resolve_rolling_model_document = _resolve_rolling_model
+
 
     def _ensure_rolling_paper_observation(
         self,
@@ -5760,18 +6462,8 @@ class AutonomousResearchProcessor:
         strategy_document = strategy.get("strategy_document", strategy.get("canonical_strategy"))
         if not candidate_id or not strategy_version_id or not trial_id or not isinstance(strategy_document, Mapping):
             raise ValueError("PAPER_OBSERVATION_BINDING_INCOMPLETE")
+        model_document, model_resolution = self._resolve_rolling_model(strategy)
         registry = ForwardTestRegistry(self.store)
-        model_document = strategy.get("model_document")
-        if not isinstance(model_document, Mapping):
-            raise ValueError("MODEL_INPUT_MISSING")
-        if "probability" in model_document or "yes_probability" in model_document:
-            if evaluate_model_document_probability(model_document, {}) is None:
-                raise ValueError("MODEL_INPUT_INVALID")
-        elif not (
-            isinstance(model_document.get("field"), str)
-            and model_document["field"].strip()
-        ):
-            raise ValueError("MODEL_INPUT_MISSING")
         source_binding = _rolling_source_binding(strategy)
         scope = source_binding.get("market_scope", source_binding.get("scope", {}))
         scope = scope if isinstance(scope, Mapping) else {}
@@ -5810,9 +6502,8 @@ class AutonomousResearchProcessor:
             "source_strategy_hash": strategy.get("strategy_hash"),
             "rolling_strategy_hash": strategy.get("strategy_hash"),
             "strategy_document": dict(strategy_document),
-            "model_document": (
-                dict(model_document) if isinstance(model_document, Mapping) else None
-            ),
+            "model_document": dict(model_document),
+            "model_resolution": dict(model_resolution),
             "dataset_selector": selector,
             "dataset_version": selector.get("dataset_version"),
             "market_scope": dict(scope),
@@ -5826,9 +6517,7 @@ class AutonomousResearchProcessor:
         expected_strategy_hash = _content_hash(
             _normalized_strategy_document(strategy_document)
         )
-        expected_model_hash = _content_hash(
-            dict(model_document) if isinstance(model_document, Mapping) else {}
-        )
+        expected_model_hash = str(model_resolution["model_hash"])
         intent = None
         for existing in registry.list_observation_intents():
             existing_config = existing.config if isinstance(existing.config, Mapping) else {}
@@ -5896,6 +6585,7 @@ class AutonomousResearchProcessor:
             "strategy_version_id": strategy_version_id,
             "research_trial_id": trial_id,
             "market_ids": identifiers,
+            "model_resolution": dict(model_resolution),
         }
 
     def _rolling_source_rows(
@@ -6634,7 +7324,8 @@ class AutonomousResearchProcessor:
         )
         source_digest = _rolling_hash(valid_rows)
         document = strategy.get("strategy_document", strategy.get("canonical_strategy"))
-        model_document = strategy.get("model_document")
+        model_document: Mapping[str, Any] | None = None
+        model_resolution: Mapping[str, Any] | None = None
 
         def run_identity(material: Mapping[str, Any]) -> str:
             return (
@@ -6701,22 +7392,35 @@ class AutonomousResearchProcessor:
                 "accounting_available": False,
                 "accounting_complete": False,
                 "accounting_partial": True,
-                "accounting_unavailable_reason": "STRATEGY_DOCUMENT_REQUIRED",
             }
         model_error: str | None = None
-        if not isinstance(model_document, Mapping):
-            model_error = "MODEL_INPUT_MISSING"
-        elif "probability" in model_document or "yes_probability" in model_document:
-            if evaluate_model_document_probability(model_document, {}) is None:
-                model_error = "MODEL_INPUT_INVALID"
-        else:
-            field_name = model_document.get("field")
-            if not isinstance(field_name, str) or not field_name.strip():
-                model_error = "MODEL_INPUT_MISSING"
+        try:
+            model_document, model_resolution = self._resolve_rolling_model(strategy)
+        except (TypeError, ValueError, RuntimeError) as exc:
+            model_error = str(exc).split(":", 1)[0].strip() or "MODEL_INPUT_MISSING"
+        verified_field: str | None = None
+        if (
+            isinstance(model_document, Mapping)
+            and "probability" not in model_document
+            and "yes_probability" not in model_document
+        ):
+            field_value = model_document.get("field")
+            if isinstance(field_value, str) and field_value.strip():
+                verified_field = field_value.strip()
+        valid_rows = [
+            _rolling_model_authoritative_row(
+                row,
+                verified_field=verified_field,
+            )
+            for row in valid_rows
+        ]
+        source_digest = _rolling_hash(valid_rows)
+        evaluator_invoked = False
         try:
             if model_error is not None:
                 raise ValueError(model_error)
             definition = load_strategy(document)
+            evaluator_invoked = True
             result = run_prediction_research_mode(
                 valid_rows,
                 definition,
@@ -6729,7 +7433,7 @@ class AutonomousResearchProcessor:
             error = str(exc) or type(exc).__name__
             evaluation = {
                 "evaluation_kind": "CANONICAL_SIMULATION",
-                "evaluator_invoked": True,
+                "evaluator_invoked": evaluator_invoked,
                 "evaluator_completed": False,
                 "evaluated_observations": 0,
                 "signal_count": 0,
@@ -6737,9 +7441,24 @@ class AutonomousResearchProcessor:
                 "evaluator_name": None,
                 "evaluator_error": error,
                 "evaluator_prerequisite": (
-                    error if error in {"MODEL_INPUT_MISSING", "MODEL_INPUT_INVALID"} else None
+                    error
+                    if error in {
+                        "MODEL_INPUT_MISSING",
+                        "MODEL_INPUT_INVALID",
+                        "MODEL_HASH_MISSING",
+                        "MODEL_LINEAGE_AMBIGUOUS",
+                        "MODEL_LINEAGE_INCOMPLETE",
+                        "MODEL_LINEAGE_MISMATCH",
+                        "MODEL_LINEAGE_LOAD_FAILED",
+                        "MODEL_PLAN_MISSING",
+                        "MODEL_PLAN_NOT_EXECUTABLE",
+                        "MODEL_PLAN_HASH_MISMATCH",
+                    }
+                    else None
                 ),
             }
+            if model_resolution is not None:
+                evaluation["model_resolution"] = dict(model_resolution)
             portfolio_accounting = {
                 "accounting_available": False,
                 "initial_cash": None,
@@ -6770,14 +7489,13 @@ class AutonomousResearchProcessor:
                 "source_digest": source_digest,
                 "loaded_rows": len(rows),
                 "valid_input_rows": len(valid_rows),
-                "evaluator_invoked": True,
+                "evaluator_invoked": evaluator_invoked,
                 "evaluator_completed": False,
                 "evaluated_observations": 0,
                 "signal_count": 0,
                 "diagnostic_summary_count": 1,
-                "evaluator_name": None,
+                "evaluator_prerequisite": evaluation.get("evaluator_prerequisite"),
                 "evaluator_error": error,
-                "evaluator_prerequisite": None,
                 "portfolio_accounting": portfolio_accounting,
                 "evaluation": evaluation,
                 "metrics": {
@@ -6799,6 +7517,8 @@ class AutonomousResearchProcessor:
         )
         evaluation = dict(raw_evaluation) if isinstance(raw_evaluation, Mapping) else {}
         evaluation.setdefault("evaluation_kind", "CANONICAL_SIMULATION")
+        if model_resolution is not None:
+            evaluation["model_resolution"] = dict(model_resolution)
 
         # V2 status is authoritative only when the evaluator emitted both
         # nested boolean fields.  A result curve is not an evaluator
@@ -7568,12 +8288,42 @@ class AutonomousResearchProcessor:
                         catalog_binding.get("dataset_version")
                     )
                     break
+        manifest_rows = (
+            [
+                _rolling_model_authoritative_row(row)
+                if isinstance(row, Mapping)
+                else {}
+                for row in rows
+            ]
+            if canonical_required
+            else rows
+        )
         input_manifest = _rolling_input_manifest(
-            rows,
+            manifest_rows,
             source=requested_source,
             dataset_id=dataset_id,
             dataset_version=dataset_version,
         )
+        resolved_provenance = evaluation_map.get("model_resolution")
+        if not isinstance(resolved_provenance, Mapping):
+            for nested in (
+                canonical_evaluation,
+                nested_metrics.get("evaluation"),
+            ):
+                if isinstance(nested, Mapping) and isinstance(
+                    nested.get("model_resolution"), Mapping
+                ):
+                    resolved_provenance = nested["model_resolution"]
+                    break
+        if isinstance(resolved_provenance, Mapping):
+            compact_resolution = {
+                key: resolved_provenance.get(key)
+                for key in ("source_type", "plan_id", "model_hash")
+            }
+            evaluation_map["model_resolution"] = compact_resolution
+            canonical_evaluation.setdefault("model_resolution", compact_resolution)
+            input_manifest = dict(input_manifest)
+            input_manifest["model_resolution"] = compact_resolution
         signal_count = evaluation_map.get(
             "signal_count", canonical_evaluation.get("signal_count", 0)
         )
@@ -8163,7 +8913,11 @@ class AutonomousResearchProcessor:
             }
             work_key = _rolling_work_key(strategy, days, source)
             try:
-                pre_fingerprint = _rolling_prerequisite_fingerprint(strategy, source)
+                pre_fingerprint = _rolling_prerequisite_fingerprint(
+                    strategy,
+                    source,
+                    store=self.store,
+                )
             except (TypeError, ValueError, RuntimeError):
                 pre_fingerprint = _rolling_hash(
                     {
@@ -8313,7 +9067,10 @@ class AutonomousResearchProcessor:
                     )
                 try:
                     fingerprint = _rolling_prerequisite_fingerprint(
-                        strategy, source, source_rows=rows
+                        strategy,
+                        source,
+                        source_rows=rows,
+                        store=self.store,
                     )
                 except (TypeError, ValueError, RuntimeError):
                     fingerprint = ""
@@ -8420,12 +9177,20 @@ class AutonomousResearchProcessor:
                                     strategy,
                                     days,
                                     source,
-                                    status="PARTIAL",
+                                    status=(
+                                        "BLOCKED"
+                                        if _rolling_reason_is_immutable(canonical_reason)
+                                        else "PARTIAL"
+                                    ),
                                     reason=canonical_reason,
                                     blocker_fingerprint=fingerprint,
-                                    terminal=False,
-                                    retryable=True,
-                                    next_attempt_at=(current + timedelta(minutes=5)).isoformat(),
+                                    terminal=_rolling_reason_is_immutable(canonical_reason),
+                                    retryable=not _rolling_reason_is_immutable(canonical_reason),
+                                    next_attempt_at=(
+                                        None
+                                        if _rolling_reason_is_immutable(canonical_reason)
+                                        else (current + timedelta(minutes=5)).isoformat()
+                                    ),
                                 )
                             )
                     predecessor_lookup_error: AutonomousResearchError | None = None

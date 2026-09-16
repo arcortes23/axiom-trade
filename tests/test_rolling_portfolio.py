@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import json
@@ -33,6 +34,7 @@ from axiom.autonomous import (
     _rolling_cursor_index,
     _rolling_cursor_record,
     _rolling_hash,
+    _rolling_prerequisite_fingerprint,
     _rolling_inject_source_binding,
     _rolling_rule_scope_market_ids,
     _rolling_work_items,
@@ -4153,3 +4155,646 @@ class TestRollingPortfolio(unittest.TestCase):
                 store.load_current_portfolio_selection()["portfolio_selection_id"],
                 "selection-rolling",
             )
+    def _legacy_model_lineage(
+        self,
+        store: AxiomStore,
+        *,
+        model: Mapping[str, object] | None = None,
+        model_hash: str | None = None,
+        plan_id: str = "plan-legacy-model",
+        extra_plan_ids: Sequence[str] = (),
+        strategy_version_id: str = "sv-legacy-model",
+        candidate_id: str = "candidate-legacy-model",
+        trial_id: str = "trial-legacy-model",
+        hypothesis_id: str = "hypothesis-legacy-model",
+    ) -> dict[str, object]:
+        resolved_model = dict(model or {})
+        resolved_hash = model_hash or _rolling_hash(resolved_model)
+        strategy_document = {
+            "version": 1,
+            "market_type": "prediction",
+            "family": "probability_mispricing",
+            "parameters": {"threshold": 0.05},
+            "operations": [],
+            "probability_model": "legacy-fixture",
+            "resolution_aware": True,
+            "resolution_inputs": ["settlement"],
+        }
+        provenance: dict[str, object] = {
+            "candidate_id": candidate_id,
+            "research_trial_id": trial_id,
+            "plan_id": plan_id,
+            "hypothesis_id": hypothesis_id,
+            "model_hash": resolved_hash,
+        }
+        for index, alternate in enumerate(extra_plan_ids):
+            provenance[f"alternate_{index}"] = {"plan_id": alternate}
+        strategy = {
+            "strategy_version_id": strategy_version_id,
+            "strategy_id": "legacy-model",
+            "version": "1",
+            "strategy_hash": _rolling_hash(strategy_document),
+            "config_hash": "config:legacy-model",
+            "candidate_id": candidate_id,
+            "hypothesis_id": hypothesis_id,
+            "research_trial_id": trial_id,
+            "plan_id": plan_id,
+            "model_hash": resolved_hash,
+            "strategy_document": strategy_document,
+            "model_document": None,
+            "provenance": provenance,
+        }
+        store.save_strategy_version(strategy)
+        store.save_research_trial(
+            {
+                "research_trial_id": trial_id,
+                "hypothesis_id": hypothesis_id,
+                "strategy_version_id": strategy_version_id,
+                "candidate_id": candidate_id,
+                "plan_id": plan_id,
+                "model_hash": resolved_hash,
+            }
+        )
+        store.save_candidate_lifecycle(
+            candidate_id,
+            "IDEA",
+            {"candidate_id": candidate_id},
+            timestamp=NOW,
+        )
+        store.save_candidate_lifecycle(
+            candidate_id,
+            "FROZEN",
+            {
+                "candidate_id": candidate_id,
+                "strategy_version_id": strategy_version_id,
+                "research_trial_id": trial_id,
+                "plan_id": plan_id,
+                "hypothesis_id": hypothesis_id,
+                "model_hash": resolved_hash,
+            },
+            from_stage="IDEA",
+            timestamp=NOW,
+        )
+        store.save_experiment_plan(
+            plan_id,
+            resolved_model,
+            hypothesis_id=hypothesis_id,
+            timestamp=NOW,
+        )
+        return strategy
+
+    def test_legacy_experiment_plan_model_resolves_under_exact_hash_proof(self) -> None:
+        with _store(self.tmp_path) as store:
+            strategy = self._legacy_model_lineage(
+                store,
+                model={"probability": 0.5},
+            )
+            before = store.load_strategy_version(strategy["strategy_version_id"])
+            processor = AutonomousResearchProcessor(store, clock=lambda: NOW)
+            model, resolution = processor._resolve_rolling_model(strategy)
+            after = store.load_strategy_version(strategy["strategy_version_id"])
+
+            self.assertEqual(model, {"probability": 0.5})
+            self.assertEqual(resolution["source_type"], "experiment_plan")
+            self.assertEqual(resolution["plan_id"], "plan-legacy-model")
+            self.assertEqual(resolution["model_hash"], _rolling_hash(model))
+            self.assertEqual(after, before)
+
+    def test_legacy_experiment_plan_model_hash_mismatch_fails_closed(self) -> None:
+        with _store(self.tmp_path) as store:
+            strategy = self._legacy_model_lineage(
+                store,
+                model={"probability": 0.6},
+                model_hash=_rolling_hash({"probability": 0.5}),
+            )
+            processor = AutonomousResearchProcessor(store, clock=lambda: NOW)
+            with self.assertRaisesRegex(ValueError, "MODEL_LINEAGE_MISMATCH"):
+                processor._resolve_rolling_model(strategy)
+
+    def test_legacy_model_plan_absent_or_ambiguous_fails_closed(self) -> None:
+        with _store(self.tmp_path) as store:
+            strategy = self._legacy_model_lineage(
+                store,
+                model={"probability": 0.5},
+            )
+            store.connection.execute(
+                "DELETE FROM experiment_plans WHERE plan_id=?",
+                ("plan-legacy-model",),
+            )
+            processor = AutonomousResearchProcessor(store, clock=lambda: NOW)
+            with self.assertRaisesRegex(ValueError, "MODEL_PLAN_MISSING"):
+                processor._resolve_rolling_model(strategy)
+
+            ambiguous = self._legacy_model_lineage(
+                store,
+                model={"probability": 0.5},
+                plan_id="plan-legacy-a",
+                extra_plan_ids=("plan-legacy-b",),
+                strategy_version_id="sv-ambiguous-model",
+                candidate_id="candidate-ambiguous-model",
+                trial_id="trial-ambiguous-model",
+            )
+            with self.assertRaisesRegex(ValueError, "MODEL_LINEAGE_AMBIGUOUS"):
+                processor._resolve_rolling_model(ambiguous)
+
+    def test_embedded_current_model_remains_preferred_without_plan_lookup(self) -> None:
+        with _store(self.tmp_path) as store:
+            strategy = _strategy(
+                "sv-embedded-model",
+                candidate_id="candidate-embedded-model",
+                research_trial_id="trial-embedded-model",
+                model_document={"probability": 0.4},
+                model_hash=_rolling_hash({"probability": 0.4}),
+                plan_id="missing-plan-is-irrelevant",
+            )
+            processor = AutonomousResearchProcessor(store, clock=lambda: NOW)
+            model, resolution = processor._resolve_rolling_model(strategy)
+
+            self.assertEqual(model, {"probability": 0.4})
+            self.assertEqual(resolution["source_type"], "embedded")
+            self.assertIsNone(resolution["plan_id"])
+
+    def test_canonical_verified_model_overrides_all_row_probability_hints(self) -> None:
+        with _store(self.tmp_path) as store:
+            model = {"probability": 0.5}
+            strategy = _strategy(
+                "sv-row-model-conflict",
+                strategy_document={
+                    "version": 1,
+                    "market_type": "prediction",
+                    "family": "probability_mispricing",
+                    "parameters": {"threshold": 0.05},
+                    "operations": [],
+                    "probability_model": "embedded-fixture",
+                    "resolution_aware": True,
+                    "resolution_inputs": ["settlement"],
+                },
+                model_document=model,
+                model_hash=_rolling_hash(model),
+            )
+            evaluation = AutonomousResearchProcessor(
+                store,
+                clock=lambda: NOW,
+            )._rolling_canonical_evaluation(
+                strategy,
+                [
+                    {
+                        "snapshot": {
+                            "yes_mid": 0.4,
+                            "model_probability": 0.1,
+                            "probability": 0.1,
+                            "predicted_probability": 0.1,
+                            "p": 0.1,
+                            "settlement": "YES",
+                        },
+                        "timestamp": NOW.isoformat(),
+                        "market_id": "market-row-model-conflict",
+                        "yes_mid": 0.4,
+                        "model_probability": 0.1,
+                        "probability": 0.1,
+                        "predicted_probability": 0.1,
+                        "p": 0.1,
+                        "settlement": "YES",
+                    }
+                ],
+                "HISTORICAL",
+            )
+            self.assertIsNotNone(evaluation)
+            assert evaluation is not None
+            self.assertTrue(evaluation["evaluator_completed"])
+            self.assertEqual(evaluation["signal_count"], 1)
+            self.assertEqual(
+                evaluation["evaluation"]["model_resolution"]["model_hash"],
+                _rolling_hash(model),
+            )
+
+
+    def test_verified_model_field_preserves_named_row_alias_only(self) -> None:
+        with _store(self.tmp_path) as store:
+            model = {"field": "model_probability"}
+            strategy = _strategy(
+                "sv-row-model-field",
+                strategy_document={
+                    "version": 1,
+                    "market_type": "prediction",
+                    "family": "probability_mispricing",
+                    "parameters": {"threshold": 0.05},
+                    "operations": [],
+                    "probability_model": "field-fixture",
+                    "resolution_aware": True,
+                    "resolution_inputs": ["settlement"],
+                },
+                model_document=model,
+                model_hash=_rolling_hash(model),
+            )
+            evaluation = AutonomousResearchProcessor(
+                store,
+                clock=lambda: NOW,
+            )._rolling_canonical_evaluation(
+                strategy,
+                [
+                    {
+                        "snapshot": {
+                            "yes_mid": 0.4,
+                            "model_probability": 0.5,
+                            "probability": 0.1,
+                            "predicted_probability": 0.1,
+                            "p": 0.1,
+                        },
+                        "timestamp": NOW.isoformat(),
+                        "market_id": "market-row-model-field",
+                        "yes_mid": 0.4,
+                        "model_probability": 0.1,
+                        "probability": 0.1,
+                        "predicted_probability": 0.1,
+                        "p": 0.1,
+                        "settlement": "YES",
+                    }
+                ],
+                "HISTORICAL",
+            )
+            self.assertIsNotNone(evaluation)
+            assert evaluation is not None
+            self.assertTrue(evaluation["evaluator_completed"])
+            self.assertEqual(evaluation["signal_count"], 1)
+    def test_row_model_probability_cannot_bypass_missing_immutable_model(self) -> None:
+        with _store(self.tmp_path) as store:
+            strategy = _strategy(
+                "sv-row-model-probability",
+                strategy_document={
+                    "version": 1,
+                    "market_type": "prediction",
+                    "family": "probability_mispricing",
+                    "parameters": {"threshold": 0.05},
+                    "operations": [],
+                },
+                model_document=None,
+                provenance={
+                    "candidate_id": "candidate-sv-row-model-probability",
+                    "research_trial_id": "trial-row-model-probability",
+                },
+            )
+            rows = [
+                {
+                    "timestamp": NOW.isoformat(),
+                    "market_id": "market-row-model-probability",
+                    "yes_mid": 0.4,
+                    "model_probability": 0.9,
+                    "settlement": "YES",
+                }
+            ]
+            processor = AutonomousResearchProcessor(store, clock=lambda: NOW)
+            evaluation = processor._rolling_canonical_evaluation(
+                strategy,
+                rows,
+                "HISTORICAL",
+            )
+
+            assert evaluation is not None
+            self.assertFalse(evaluation["evaluator_invoked"])
+            self.assertFalse(evaluation["evaluator_completed"])
+            self.assertEqual(
+                evaluation["evaluator_prerequisite"],
+                "MODEL_INPUT_MISSING",
+            )
+
+    def test_plan_hash_must_be_lowercase_canonical_sha256(self) -> None:
+        with _store(self.tmp_path) as store:
+            strategy = self._legacy_model_lineage(
+                store,
+                model={"probability": 0.5},
+            )
+            plan = store.load_experiment_plan("plan-legacy-model")
+            assert plan is not None
+            store.connection.execute(
+                "UPDATE experiment_plans SET plan_hash=? WHERE plan_id=?",
+                (str(plan["plan_hash"]).upper(), "plan-legacy-model"),
+            )
+            with self.assertRaisesRegex(ValueError, "MODEL_PLAN_HASH_MISMATCH"):
+                AutonomousResearchProcessor(
+                    store,
+                    clock=lambda: NOW,
+                )._resolve_rolling_model(strategy)
+
+    def test_plan_hypothesis_must_match_frozen_lineage(self) -> None:
+        with _store(self.tmp_path) as store:
+            strategy = self._legacy_model_lineage(
+                store,
+                model={"probability": 0.5},
+            )
+            store.connection.execute(
+                "UPDATE research_trials SET payload_json=? WHERE research_trial_id=?",
+                (
+                    json.dumps(
+                        {
+                            "research_trial_id": "trial-legacy-model",
+                            "hypothesis_id": "hypothesis-other",
+                        }
+                    ),
+                    "trial-legacy-model",
+                ),
+            )
+            with self.assertRaisesRegex(ValueError, "MODEL_LINEAGE_MISMATCH"):
+                AutonomousResearchProcessor(
+                    store,
+                    clock=lambda: NOW,
+                )._resolve_rolling_model(strategy)
+
+    def test_invalid_embedded_model_does_not_fall_back_to_legacy_plan(self) -> None:
+        with _store(self.tmp_path) as store:
+            model = {"probability": 2.0}
+            strategy = _strategy(
+                "sv-invalid-embedded-model",
+                candidate_id="candidate-invalid-embedded-model",
+                research_trial_id="trial-invalid-embedded-model",
+                plan_id="legacy-plan-that-must-not-be-used",
+                model_document=model,
+                model_hash=_rolling_hash(model),
+            )
+            with self.assertRaisesRegex(ValueError, "MODEL_INPUT_INVALID"):
+                AutonomousResearchProcessor(
+                    store,
+                    clock=lambda: NOW,
+                )._resolve_rolling_model(strategy)
+
+    def test_nested_model_resolution_is_persisted_in_manifest_and_evidence(self) -> None:
+        with _store(self.tmp_path) as store:
+            model = {"probability": 0.5}
+            strategy = _strategy(
+                "sv-nested-model-resolution",
+                candidate_id="candidate-nested-model-resolution",
+                research_trial_id="trial-nested-model-resolution",
+                model_document=model,
+                model_hash=_rolling_hash(model),
+                strategy_document={
+                    "version": 1,
+                    "market_type": "prediction",
+                    "family": "probability_mispricing",
+                    "parameters": {"threshold": 0.05},
+                    "operations": [],
+                },
+            )
+            resolution = {
+                "source_type": "embedded",
+                "plan_id": None,
+                "model_hash": _rolling_hash(model),
+            }
+            evidence = AutonomousResearchProcessor(
+                store,
+                clock=lambda: NOW,
+            )._rolling_evidence_record(
+                strategy,
+                [
+                    {
+                        "timestamp": NOW.isoformat(),
+                        "market_id": "market-nested-model-resolution",
+                        "yes_mid": 0.4,
+                    }
+                ],
+                "HISTORICAL",
+                7,
+                NOW,
+                evaluation={
+                    "evaluation_kind": "CANONICAL_SIMULATION",
+                    "evaluator_invoked": False,
+                    "evaluator_completed": False,
+                    "evaluation": {
+                        "evaluation_kind": "CANONICAL_SIMULATION",
+                        "evaluator_invoked": False,
+                        "evaluator_completed": False,
+                        "model_resolution": resolution,
+                    },
+                    "portfolio_accounting": {
+                        "accounting_available": False,
+                        "open_positions": [],
+                    },
+                },
+            )
+
+            self.assertIsNotNone(evidence)
+            assert evidence is not None
+            self.assertEqual(evidence["input_manifest"]["model_resolution"], resolution)
+            self.assertEqual(evidence["evaluation"]["model_resolution"], resolution)
+
+            tampered = dict(evidence)
+            tampered_manifest = dict(tampered["input_manifest"])
+            tampered_resolution = dict(resolution)
+            tampered_resolution["model_hash"] = _rolling_hash({"probability": 0.4})
+            tampered_manifest["model_resolution"] = tampered_resolution
+            tampered["input_manifest"] = tampered_manifest
+            tampered_evaluation = dict(tampered["evaluation"])
+            tampered_evaluation["model_resolution"] = tampered_resolution
+            tampered["evaluation"] = tampered_evaluation
+            tampered_metrics = dict(tampered["metrics"])
+            tampered_metrics_evaluation = dict(tampered_metrics["evaluation"])
+            tampered_metrics_evaluation["model_resolution"] = tampered_resolution
+            tampered_metrics["evaluation"] = tampered_metrics_evaluation
+            tampered["metrics"] = tampered_metrics
+            with self.assertRaisesRegex(ValueError, "evidence_digest"):
+                store.save_strategy_evidence_window(tampered)
+
+    def test_direct_nested_model_resolution_binds_digest_without_shape_promotion(self) -> None:
+        model_hash = _rolling_hash({"probability": 0.5})
+        resolution = {
+            "source_type": "experiment_plan",
+            "plan_id": "plan-direct-nested",
+            "model_hash": model_hash,
+        }
+        evidence = RollingEvidence(
+            strategy_version_id="sv-direct-nested",
+            evidence_window_id="window-direct-nested",
+            source_class="HISTORICAL",
+            evaluation={"model_resolution": resolution},
+        )
+        self.assertEqual(evidence.model_resolution, resolution)
+        serialized = evidence.as_dict()
+        self.assertNotIn("model_resolution", serialized)
+        self.assertEqual(serialized["evaluation"]["model_resolution"], resolution)
+        self.assertEqual(
+            RollingEvidence.from_mapping(serialized).evidence_digest,
+            evidence.evidence_digest,
+        )
+        changed = RollingEvidence(
+            strategy_version_id="sv-direct-nested",
+            evidence_window_id="window-direct-nested",
+            source_class="HISTORICAL",
+            evaluation={
+                "model_resolution": {
+                    **resolution,
+                    "model_hash": _rolling_hash({"probability": 0.6}),
+                }
+            },
+        )
+        self.assertNotEqual(changed.evidence_digest, evidence.evidence_digest)
+
+    def test_manifest_only_model_resolution_roundtrips_as_explicit_top_level(self) -> None:
+        resolution = {
+            "source_type": "experiment_plan",
+            "plan_id": "plan-manifest-only",
+            "model_hash": _rolling_hash({"probability": 0.5}),
+        }
+        record = _evidence(
+            "sv-manifest-only",
+            "window-manifest-only",
+            input_manifest={"model_resolution": resolution},
+        )
+        evidence = RollingEvidence.from_mapping(record)
+        serialized = evidence.as_dict()
+        self.assertEqual(serialized["model_resolution"], resolution)
+        restored = RollingEvidence.from_mapping(serialized)
+        self.assertEqual(restored.model_resolution, resolution)
+        self.assertEqual(restored.evidence_digest, evidence.evidence_digest)
+
+    def test_discovery_rejects_conflicting_lineage_declarations_before_merge(self) -> None:
+        candidate_id = "candidate-conflicting-lineage"
+        strategy_document = {
+            "version": 1,
+            "market_type": "prediction",
+            "family": "probability_mispricing",
+            "parameters": {"threshold": 0.05},
+            "operations": [],
+        }
+        strategy_payload = {
+            "candidate_id": candidate_id,
+            "strategy_document": strategy_document,
+            "plan_id": "plan-conflicting-lineage",
+            "plan_hash": "sha256:strategy-plan",
+        }
+        lifecycle_payload = {
+            "candidate_id": candidate_id,
+            "plan_id": "plan-conflicting-lineage",
+            "plan_hash": "sha256:lifecycle-plan",
+        }
+        enrollments: list[Mapping[str, object]] = []
+
+        class DiscoveryStore:
+            def list_strategies(self, *, limit: int) -> list[dict[str, object]]:
+                return [
+                    {
+                        "strategy_id": candidate_id,
+                        "version": "1",
+                        "strategy": strategy_payload,
+                    }
+                ][:limit]
+
+            def load_candidate_lifecycle(self, *, limit: int) -> list[dict[str, object]]:
+                return [
+                    {
+                        "candidate_id": candidate_id,
+                        "stage": "FROZEN",
+                        "payload": lifecycle_payload,
+                    }
+                ][:limit]
+
+            def save_rolling_enrollment(self, record: Mapping[str, object]) -> None:
+                enrollments.append(record)
+
+        processor = AutonomousResearchProcessor.__new__(AutonomousResearchProcessor)
+        processor.store = DiscoveryStore()
+        self.assertEqual(processor._rolling_strategy_documents(), ())
+        self.assertEqual(len(enrollments), 1)
+        self.assertEqual(enrollments[0]["reason"], "MODEL_LINEAGE_AMBIGUOUS")
+
+
+    def test_database_lineage_failure_is_explicit_and_fail_closed(self) -> None:
+        class BrokenLineageStore:
+            def load_strategy_version(self, _identifier):
+                raise sqlite3.OperationalError("database is unavailable")
+
+            def load_research_trial(self, _identifier):
+                raise sqlite3.OperationalError("database is unavailable")
+
+            def load_candidate_lifecycle(self, _identifier):
+                raise sqlite3.OperationalError("database is unavailable")
+
+        strategy = _strategy(
+            "sv-database-lineage-failure",
+            candidate_id="candidate-database-lineage-failure",
+            research_trial_id="trial-database-lineage-failure",
+            strategy_document={"family": "probability_mispricing"},
+            model_document=None,
+            plan_id="plan-database-lineage-failure",
+        )
+        with self.assertRaisesRegex(ValueError, "MODEL_LINEAGE_LOAD_FAILED"):
+            AutonomousResearchProcessor(
+                BrokenLineageStore(),
+                clock=lambda: NOW,
+            )._resolve_rolling_model(strategy)
+
+    def test_prerequisite_fingerprint_tracks_plan_hash_and_hypothesis(self) -> None:
+        strategy = _strategy(
+            "sv-fingerprint-lineage",
+            plan_id="plan-fingerprint",
+            plan_hash="sha256:plan-a",
+            hypothesis_id="hypothesis-a",
+            provenance={
+                "plan_id": "plan-fingerprint",
+                "plan_hash": "sha256:plan-a",
+                "hypothesis_id": "hypothesis-a",
+            },
+        )
+        changed_plan = dict(strategy)
+        changed_plan["plan_hash"] = "sha256:plan-b"
+        changed_plan["provenance"] = {
+            **strategy["provenance"],
+            "plan_hash": "sha256:plan-b",
+        }
+        changed_hypothesis = dict(strategy)
+        changed_hypothesis["hypothesis_id"] = "hypothesis-b"
+        changed_hypothesis["provenance"] = {
+            **strategy["provenance"],
+            "hypothesis_id": "hypothesis-b",
+        }
+
+        baseline = _rolling_prerequisite_fingerprint(strategy, "REPLAY")
+        self.assertNotEqual(
+            baseline,
+            _rolling_prerequisite_fingerprint(changed_plan, "REPLAY"),
+        )
+        self.assertNotEqual(
+            baseline,
+            _rolling_prerequisite_fingerprint(changed_hypothesis, "REPLAY"),
+        )
+
+    def test_loaded_plan_hash_alias_must_match_frozen_lineage(self) -> None:
+        with _store(self.tmp_path) as store:
+            strategy = self._legacy_model_lineage(
+                store,
+                model={"probability": 0.5},
+            )
+            candidate = store.load_candidate_lifecycle("candidate-legacy-model")
+            self.assertIsNotNone(candidate)
+            assert candidate is not None
+            payload = dict(candidate["payload"])
+            payload["experiment_plan_hash"] = "sha256:wrong-plan"
+            store.connection.execute(
+                "UPDATE candidate_lifecycle SET payload_json=? WHERE candidate_id=? AND stage=?",
+                (json.dumps(payload), "candidate-legacy-model", "FROZEN"),
+            )
+            with self.assertRaisesRegex(ValueError, "MODEL_LINEAGE_MISMATCH"):
+                AutonomousResearchProcessor(
+                    store,
+                    clock=lambda: NOW,
+                )._resolve_rolling_model(strategy)
+
+    def test_prerequisite_fingerprint_tracks_loaded_plan_presence_and_hash(self) -> None:
+        with _store(self.tmp_path) as store:
+            strategy = self._legacy_model_lineage(
+                store,
+                model={"probability": 0.5},
+            )
+            present = _rolling_prerequisite_fingerprint(
+                strategy,
+                "REPLAY",
+                store=store,
+            )
+            store.connection.execute(
+                "DELETE FROM experiment_plans WHERE plan_id=?",
+                ("plan-legacy-model",),
+            )
+            absent = _rolling_prerequisite_fingerprint(
+                strategy,
+                "REPLAY",
+                store=store,
+            )
+            self.assertNotEqual(present, absent)

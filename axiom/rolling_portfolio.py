@@ -995,6 +995,13 @@ class RollingEvidence:
     requested_rows: int | None = None
     available_rows: int | None = None
     evaluated_rows: int | None = None
+    model_resolution: Mapping[str, Any] | None = None
+    _model_resolution_nested_only: bool = field(
+        default=False,
+        init=True,
+        repr=False,
+        compare=False,
+    )
     def __post_init__(self) -> None:
         evaluation_run_id = (
             _text(
@@ -1042,6 +1049,35 @@ class RollingEvidence:
             and isinstance(self.metrics.get("portfolio_accounting"), Mapping)
             else None
         )
+        nested_model_resolution_present = False
+        model_resolution_sources: list[Mapping[str, Any]] = []
+        if self.model_resolution is not None:
+            if not isinstance(self.model_resolution, Mapping):
+                raise TypeError("model_resolution must be a mapping or None")
+            model_resolution_sources.append(self.model_resolution)
+        for projection in nested_evaluation_projections:
+            candidate = projection.get("model_resolution")
+            if candidate is not None:
+                nested_model_resolution_present = True
+                if not isinstance(candidate, Mapping):
+                    raise TypeError("model_resolution must be a mapping")
+                model_resolution_sources.append(candidate)
+        if isinstance(self.metrics, Mapping):
+            candidate = self.metrics.get("model_resolution")
+            if candidate is not None:
+                nested_model_resolution_present = True
+                if not isinstance(candidate, Mapping):
+                    raise TypeError("model_resolution must be a mapping")
+                model_resolution_sources.append(candidate)
+        resolved_model_resolution: Mapping[str, Any] | None = None
+        if model_resolution_sources:
+            resolved_model_resolution = model_resolution_sources[0]
+            expected_resolution = _canonical(resolved_model_resolution)
+            if any(
+                _canonical(candidate) != expected_resolution
+                for candidate in model_resolution_sources[1:]
+            ):
+                raise ValueError("model_resolution projections conflict")
 
         def reconcile_immutable_projection(
             name: str,
@@ -1399,6 +1435,44 @@ class RollingEvidence:
                 required=False,
             )
             object.__setattr__(self, name, value or None)
+        model_resolution = resolved_model_resolution
+        if model_resolution is not None:
+            if not isinstance(model_resolution, Mapping):
+                raise TypeError("model_resolution must be a mapping or None")
+            allowed_resolution_fields = {"source_type", "plan_id", "model_hash"}
+            if any(key not in allowed_resolution_fields for key in model_resolution):
+                raise ValueError("model_resolution contains unsupported fields")
+            model_resolution = {
+                "source_type": _text(
+                    model_resolution.get("source_type"),
+                    "model_resolution.source_type",
+                ),
+                "plan_id": _text(
+                    model_resolution.get("plan_id"),
+                    "model_resolution.plan_id",
+                    required=False,
+                )
+                or None,
+                "model_hash": _text(
+                    model_resolution.get("model_hash"),
+                    "model_resolution.model_hash",
+                ),
+            }
+        object.__setattr__(
+            self,
+            "_model_resolution_nested_only",
+            bool(self._model_resolution_nested_only)
+            or (
+                self.model_resolution is None
+                and nested_model_resolution_present
+                and model_resolution is not None
+            ),
+        )
+        object.__setattr__(
+            self,
+            "model_resolution",
+            _freeze(model_resolution) if model_resolution is not None else None,
+        )
         for name in ("portfolio_accounting", "evaluation", "metrics"):
             value = getattr(self, name)
             if value is not None and not isinstance(value, Mapping):
@@ -1495,6 +1569,8 @@ class RollingEvidence:
                     "portfolio_accounting": self.portfolio_accounting,
                 }
             )
+        if self.model_resolution is not None:
+            projection["model_resolution"] = self.model_resolution
         return projection
 
     @property
@@ -1633,7 +1709,7 @@ class RollingEvidence:
         )
 
     def as_dict(self) -> dict[str, Any]:
-        return _plain({
+        payload = {
             "candidate_id": self.candidate_id,
             "research_trial_id": self.research_trial_id,
             "strategy_version_id": self.strategy_version_id,
@@ -1688,7 +1764,10 @@ class RollingEvidence:
             "portfolio_accounting": self.portfolio_accounting,
             "evaluation": self.evaluation,
             "metrics": self.metrics,
-        })
+        }
+        if self.model_resolution is not None and not self._model_resolution_nested_only:
+            payload["model_resolution"] = self.model_resolution
+        return _plain(payload)
 
     to_dict = as_dict
     serialize = as_dict
@@ -1706,6 +1785,29 @@ class RollingEvidence:
         metrics_evaluation = (
             metrics_evaluation if isinstance(metrics_evaluation, Mapping) else {}
         )
+        input_manifest = row.get("input_manifest")
+        input_manifest = input_manifest if isinstance(input_manifest, Mapping) else {}
+        model_resolution_sources = [
+            candidate
+            for candidate in (
+                row.get("model_resolution"),
+                input_manifest.get("model_resolution"),
+                evaluation_nested.get("model_resolution"),
+                metrics_evaluation.get("model_resolution"),
+            )
+            if candidate is not None
+        ]
+        model_resolution: Mapping[str, Any] | None = None
+        if model_resolution_sources:
+            if any(not isinstance(candidate, Mapping) for candidate in model_resolution_sources):
+                raise TypeError("model_resolution must be a mapping")
+            model_resolution = model_resolution_sources[0]
+            expected_resolution = _canonical(model_resolution)
+            if any(
+                _canonical(candidate) != expected_resolution
+                for candidate in model_resolution_sources[1:]
+            ):
+                raise ValueError("model_resolution projections conflict")
         accounting_sources: list[Mapping[str, Any]] = []
         row_accounting = row.get("portfolio_accounting")
         if isinstance(row_accounting, Mapping):
@@ -2046,6 +2148,17 @@ class RollingEvidence:
                 row.get("evaluation")
                 if isinstance(row.get("evaluation"), Mapping)
                 else evaluation_nested
+            ),
+            model_resolution=model_resolution,
+            _model_resolution_nested_only=(
+                not isinstance(row.get("model_resolution"), Mapping)
+                and any(
+                    isinstance(candidate, Mapping)
+                    for candidate in (
+                        evaluation_nested.get("model_resolution"),
+                        metrics_evaluation.get("model_resolution"),
+                    )
+                )
             ),
             metrics=row.get("metrics"),
             execution_feasibility=row.get(
