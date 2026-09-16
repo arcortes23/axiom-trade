@@ -11,6 +11,7 @@ from decimal import Decimal
 import hashlib
 import ipaddress
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -2952,6 +2953,108 @@ class OperatorControlPlane:
         configured = self.store.get_operator_config("hermes_research_job_id", self.hermes_job_id)
         selected = configured if isinstance(configured, str) and configured else self.hermes_job_id
         return HermesOperatorAdapter(self.store, selected)
+    def _shadow_jobs_status(self) -> dict[str, Any]:
+        """Return a bounded, read-only status view of persisted shadow jobs."""
+        loader = getattr(self.store, "list_shadow_jobs", None)
+        if not callable(loader):
+            rows: list[Any] = []
+        else:
+            try:
+                rows = loader(limit=128)
+            except TypeError:
+                try:
+                    rows = loader(None, 128)
+                except (AttributeError, TypeError, ValueError, sqlite3.Error):
+                    rows = []
+            except (AttributeError, TypeError, ValueError, sqlite3.Error):
+                rows = []
+        statuses = ("REGISTERED", "RUNNING", "WAITING_FOR_DATA", "COMPLETED", "BLOCKED", "STOPPED")
+        counts = {name: 0 for name in statuses}
+        jobs: list[dict[str, Any]] = []
+        for row in rows if isinstance(rows, (list, tuple)) else []:
+            if not isinstance(row, Mapping):
+                continue
+            status = str(row.get("status") or "UNKNOWN").strip().upper()
+            if status not in counts:
+                status = "UNKNOWN"
+            if status in counts:
+                counts[status] += 1
+            state = row.get("state")
+            raw_blockers = state.get("blockers")
+            blockers = []
+            for value in (raw_blockers if isinstance(raw_blockers, (list, tuple)) else []):
+                text = str(value).strip()[:256]
+                if text:
+                    blockers.append(text.split(":", 1)[0].strip()[:128])
+            blockers = blockers[:16]
+            last_blocker_text = str(state.get("last_blocker") or "").strip()[:256]
+            last_blocker = (
+                last_blocker_text.split(":", 1)[0].strip()[:128]
+                if last_blocker_text
+                else (blockers[-1] if blockers else None)
+            )
+            stop = state.get("stop")
+            stop = stop if isinstance(stop, Mapping) else {}
+            def nonnegative_int(value: Any) -> int | None:
+                if isinstance(value, bool):
+                    return None
+                try:
+                    parsed = int(value)
+                except (TypeError, ValueError, OverflowError):
+                    return None
+                return parsed if parsed >= 0 else None
+            cycles = nonnegative_int(state.get("cycles")) or 0
+            observations = nonnegative_int(state.get("public_observations")) or 0
+            cycle_limit = nonnegative_int(stop.get("max_cycles"))
+            observation_limit = nonnegative_int(stop.get("max_observations"))
+            jobs.append(
+                {
+                    "job_id": str(row.get("job_id") or "").strip()[:256] or None,
+                    "status": status,
+                    "cycles": cycles,
+                    "public_observations": observations,
+                    "max_cycles": cycle_limit,
+                    "max_observations": observation_limit,
+                    "stop_at": stop.get("stop_at"),
+                    "stop_reached": stop.get("reached") is True,
+                    "stop_reason": str(stop.get("reason") or "").strip()[:256] or None,
+                    "blocker": last_blocker,
+                    "blockers": blockers,
+                    "next_evaluation_at": row.get("next_evaluation_at") or state.get("next_evaluation_at"),
+                    "updated_at": row.get("updated_at"),
+                    "next_action": (
+                        "WAIT_FOR_SHADOW_WORKER"
+                        if status == "REGISTERED"
+                        else "WAIT_FOR_NEXT_EVALUATION"
+                        if status == "RUNNING"
+                        else "WAIT_FOR_DATA"
+                        if status == "WAITING_FOR_DATA"
+                        else "REVIEW_BLOCKER"
+                        if status == "BLOCKED"
+                        else "NO_ACTION_COMPLETED"
+                        if status == "COMPLETED"
+                        else "NO_ACTION_STOPPED"
+                        if status == "STOPPED"
+                        else "REVIEW_SHADOW_JOB"
+                    ),
+                }
+            )
+        active_statuses = {"REGISTERED", "RUNNING", "WAITING_FOR_DATA"}
+        current = next((item for item in jobs if item["status"] in active_statuses), None)
+        return {
+            "total": len(jobs),
+            "active": sum(1 for item in jobs if item["status"] in active_statuses),
+            "status_counts": counts,
+            "current_job_id": current.get("job_id") if current else None,
+            "current_status": current.get("status") if current else None,
+            "current_job": dict(current) if current else None,
+            "next_evaluation_at": current.get("next_evaluation_at") if current else None,
+            "next_action": current.get("next_action") if current else None,
+            "jobs": jobs,
+            "read_only": True,
+            "paper_only": True,
+            "live_execution": False,
+        }
 
     def status(self) -> dict[str, Any]:
         hermes = self._hermes()
@@ -3201,6 +3304,72 @@ class OperatorControlPlane:
             execution_report.get("real_execution_events", execution_report.get("event_count", 0)),
         )
         worker_status = worker("autonomous-canary")
+        shadow_worker = worker("shadow-assessment")
+        shadow_worker["worker_name"] = "shadow-assessment"
+        shadow_worker["paper_only"] = True
+        shadow_worker["live_execution"] = False
+        raw_shadow_worker = worker_map.get("shadow-assessment", {})
+        shadow_payload = (
+            raw_shadow_worker.get("payload")
+            if isinstance(raw_shadow_worker, Mapping)
+            and isinstance(raw_shadow_worker.get("payload"), Mapping)
+            else {}
+        )
+        for field in (
+            "configured_interval_seconds",
+            "jobs_per_cycle",
+            "active_job_count",
+            "due_job_count",
+            "selected_job_count",
+            "processed_jobs",
+            "successful_jobs",
+            "blocked_jobs",
+            "waiting_for_data_jobs",
+            "completed_jobs",
+            "failed_jobs",
+            "next_evaluation_at",
+            "next_work",
+        ):
+            if field not in shadow_payload:
+                continue
+            value = shadow_payload.get(field)
+            if field == "next_work":
+                shadow_worker[field] = str(value).strip()[:256] if value is not None else None
+            elif field.endswith("_at"):
+                shadow_worker[field] = value
+            else:
+                try:
+                    number = float(value)
+                    if not math.isfinite(number) or number < 0:
+                        continue
+                    shadow_worker[field] = int(number) if number.is_integer() else number
+                except (TypeError, ValueError, OverflowError):
+                    continue
+        raw_worker_blockers = shadow_payload.get("blockers")
+        if isinstance(raw_worker_blockers, (list, tuple)):
+            projected_blockers = []
+            for value in raw_worker_blockers[:16]:
+                text = str(value).strip()[:256]
+                if text:
+                    projected_blockers.append(text.split(":", 1)[0].strip()[:128])
+            shadow_worker["blockers"] = projected_blockers
+        raw_job_statuses = shadow_payload.get("job_statuses")
+        if isinstance(raw_job_statuses, (list, tuple)):
+            projected_jobs = []
+            for item in raw_job_statuses[:64]:
+                if not isinstance(item, Mapping):
+                    continue
+                blocker_text = str(item.get("blocker") or "").strip()[:256]
+                projected_jobs.append(
+                    {
+                        "job_id": str(item.get("job_id") or "").strip()[:256] or None,
+                        "status": str(item.get("status") or "UNKNOWN").strip().upper(),
+                        "blocker": blocker_text.split(":", 1)[0].strip()[:128] if blocker_text else None,
+                        "next_evaluation_at": item.get("next_evaluation_at"),
+                    }
+                )
+            shadow_worker["job_statuses"] = projected_jobs
+        shadow_jobs = self._shadow_jobs_status()
         latest_connectivity = _stored_connectivity_projection(
             self.store.get_operator_config(CANARY_CONNECTIVITY_CONFIG_KEY, None)
         )
@@ -3241,8 +3410,9 @@ class OperatorControlPlane:
             else None
         )
         if isinstance(effective_settings, Mapping):
-            canary_status["risk_limits"] = dict(effective_settings)
-            canary_status["risk_envelope"] = dict(effective_settings)
+            current_limits = dict(effective_settings)
+            canary_status["risk_envelope"] = current_limits
+            canary_status["risk_limits"] = dict(current_limits)
         try:
             rolling_state = self.rolling_portfolio_state()
         except Exception as exc:
@@ -3273,6 +3443,17 @@ class OperatorControlPlane:
             "paper": {**worker("paper-engine"), "read_only": True, "live_execution": False},
             "research": worker("research-engine"),
             "autonomous_canary_worker": worker_status,
+            "shadow_worker": shadow_worker,
+            "shadow_jobs": shadow_jobs,
+            "shadow": {
+                "worker": dict(shadow_worker),
+                "jobs": dict(shadow_jobs),
+                "current_job_id": shadow_jobs.get("current_job_id"),
+                "next_action": shadow_jobs.get("next_action"),
+                "read_only": True,
+                "paper_only": True,
+                "live_execution": False,
+            },
             "rolling_portfolio": dict(rolling_state),
             "rolling_portfolio_worker": rolling_worker,
             "market_scope_funnel": market_scope_funnel,

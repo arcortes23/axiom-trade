@@ -59,6 +59,15 @@ from .strategy import evaluate_signal_record, load_strategy
 from .auto_canary import AutonomousCanaryWorker
 from .canary import CanaryBlocked, CanaryService
 from .canary_settings import CanarySettingsService
+from .shadow import (
+    SHADOW_STATUS_BLOCKED,
+    SHADOW_STATUS_COMPLETED,
+    SHADOW_STATUS_REGISTERED,
+    SHADOW_STATUS_RUNNING,
+    SHADOW_STATUS_STOPPED,
+    SHADOW_STATUS_WAITING_FOR_DATA,
+    ShadowAssessmentService,
+)
 
 POLYMARKET_HISTORICAL_JOB_NAME = "polymarket-historical-refresh"
 POLYMARKET_AUTONOMY_JOB_NAME = "polymarket-autonomy"
@@ -67,6 +76,8 @@ POLYMARKET_AUTONOMY_PROTOCOL_V2_ID = CAMPAIGN_PROTOCOL_V2_ID
 POLYMARKET_AUTONOMY_PROTOCOL_ID = POLYMARKET_AUTONOMY_PROTOCOL_V2_ID
 POLYMARKET_REPLAY_DATASET_ID = "Polymarket-recorded-book-replay"
 POLYMARKET_REPLAY_MAX_ROWS = 10_000
+_MAX_SHADOW_INTERVAL_SECONDS = 86_400.0
+_MAX_SHADOW_JOBS_PER_CYCLE = 100
 
 
 class _HistoricalRequestBudget:
@@ -376,6 +387,9 @@ class NodeConfig:
     historical_refresh_market_budget: int = 4
     paper_candidates_per_cycle: int = 4
     paper_observations_per_candidate: int = 64
+    shadow_enabled: bool = False
+    shadow_interval: float = 60.0
+    shadow_jobs_per_cycle: int = 1
     research_lease_seconds: float = 300.0
     experiment_total_limit: int = 1000
     experiment_family_limit: int = 250
@@ -434,13 +448,34 @@ class NodeConfig:
             raise ValueError("worker_name is required")
         if not str(self.crypto_symbol).strip():
             raise ValueError("crypto_symbol is required")
-        if not isinstance(self.crypto_enabled, bool):
-            raise ValueError("crypto_enabled must be boolean")
         interval = float(self.interval_seconds)
         cooldown = float(self.failure_cooldown_seconds)
         auto_interval = float(self.auto_canary_interval_seconds)
+        shadow_interval = float(self.shadow_interval)
         rolling_evidence_interval = float(self.rolling_evidence_interval_seconds)
         rolling_interval = float(self.rolling_review_interval_seconds)
+        if not isinstance(self.shadow_enabled, bool):
+            raise ValueError("shadow_enabled must be boolean")
+        if not isinstance(self.crypto_enabled, bool):
+            raise ValueError("crypto_enabled must be boolean")
+        if (
+            not math.isfinite(shadow_interval)
+            or shadow_interval <= 0
+            or shadow_interval > _MAX_SHADOW_INTERVAL_SECONDS
+        ):
+            raise ValueError(
+                "shadow_interval must be finite, positive, and no greater than "
+                f"{_MAX_SHADOW_INTERVAL_SECONDS:g} seconds"
+            )
+        if (
+            isinstance(self.shadow_jobs_per_cycle, bool)
+            or not isinstance(self.shadow_jobs_per_cycle, int)
+            or not 1 <= self.shadow_jobs_per_cycle <= _MAX_SHADOW_JOBS_PER_CYCLE
+        ):
+            raise ValueError(
+                "shadow_jobs_per_cycle must be an integer between one and "
+                f"{_MAX_SHADOW_JOBS_PER_CYCLE}"
+            )
         if not math.isfinite(auto_interval) or auto_interval <= 0:
             raise ValueError("auto_canary_interval_seconds must be finite and positive")
         if not math.isfinite(rolling_evidence_interval) or rolling_evidence_interval <= 0:
@@ -750,6 +785,12 @@ class ResearchNode:
                 )
             self.historical_provider = selected_historical_provider
         self.provider = selected_provider
+        self.shadow_service = ShadowAssessmentService(
+            self.store,
+            clock=clock,
+            max_markets=min(config.max_markets, 1_000),
+            max_observations=min(config.paper_observations_per_candidate, 10_000),
+        )
         self.opportunity_model = opportunity_model
         self.sleep = sleep
         self.clock = clock
@@ -792,9 +833,11 @@ class ResearchNode:
         self._historical_refresh_thread: threading.Thread | None = None
         self._auto_canary_thread: threading.Thread | None = None
         self._rolling_portfolio_thread: threading.Thread | None = None
+        self._shadow_assessment_thread: threading.Thread | None = None
         self._historical_thread: threading.Thread | None = None
         self._worker_runtime_lock = threading.RLock()
         self._worker_runtime: dict[str, dict[str, Any]] = {}
+        self._shadow_cycle_evidence: dict[str, Any] = self._shadow_evidence_template()
         self._worker_restart_counts: dict[str, int] = {}
         self._worker_fatal: set[str] = set()
         self._health_passes = 0
@@ -866,6 +909,34 @@ class ResearchNode:
             ),
             clock=clock,
         )
+
+    def _shadow_evidence_template(self) -> dict[str, Any]:
+        return {
+            "enabled": bool(self.config.shadow_enabled),
+            "configured_interval_seconds": float(self.config.shadow_interval),
+            "jobs_per_cycle": int(self.config.shadow_jobs_per_cycle),
+            "active_job_count": 0,
+            "due_job_count": 0,
+            "selected_job_count": 0,
+            "processed_jobs": 0,
+            "successful_jobs": 0,
+            "failed_jobs": 0,
+            "completed_jobs": 0,
+            "running_jobs": 0,
+            "waiting_for_data_jobs": 0,
+            "blocked_jobs": 0,
+            "status_counts": {},
+            "processed_job_ids": [],
+            "job_statuses": [],
+            "blockers": [],
+            "errors": [],
+            "next_evaluation_at": None,
+            "last_cycle_started_at": None,
+            "last_cycle_ended_at": None,
+            "next_work": "disabled" if not self.config.shadow_enabled else "evaluate_due_shadow_jobs",
+            "paper_only": True,
+            "live_execution": False,
+        }
 
     @property
     def lock_path(self) -> Path:
@@ -1278,6 +1349,7 @@ class ResearchNode:
         self._historical_error = None
         with self._worker_runtime_lock:
             self._worker_runtime = {}
+        self._shadow_cycle_evidence = self._shadow_evidence_template()
         self._worker_restart_counts = {}
         self._worker_fatal.clear()
         self._health_passes = 0
@@ -1306,6 +1378,7 @@ class ResearchNode:
                     "started_at": self.started_at.isoformat(),
                     "paper_only": True,
                     "live_execution": False,
+                    "shadow_assessment": dict(self._shadow_cycle_evidence),
                     "crypto_paper": dict(self._crypto_status),
                 },
                 started_at=self.started_at,
@@ -1385,6 +1458,15 @@ class ResearchNode:
                     "live_execution": False,
                 },
             }
+            worker_start_states["shadow-assessment"] = {
+                **dict(self._shadow_cycle_evidence),
+                "next_work": (
+                    "evaluate_due_shadow_jobs"
+                    if self.config.shadow_enabled
+                    else "disabled"
+                ),
+                "worker_status": "IDLE" if self.config.shadow_enabled else "DISABLED",
+            }
             if self.config.historical_refresh_enabled:
                 worker_start_states[POLYMARKET_HISTORICAL_JOB_NAME] = {
                     "configured_interval_seconds": float(
@@ -1424,7 +1506,14 @@ class ResearchNode:
                                 worker_name == "autonomous-canary"
                                 and not self.config.mutation_enabled
                             )
-                            else ("idle" if max_cycles == 0 else "running")
+                            else (
+                                "disabled"
+                                if (
+                                    worker_name == "shadow-assessment"
+                                    and not self.config.shadow_enabled
+                                )
+                                else ("idle" if max_cycles == 0 else "running")
+                            )
                         )
                     ),
                 )
@@ -1496,6 +1585,7 @@ class ResearchNode:
                 self._historical_refresh_thread,
                 self._auto_canary_thread,
                 self._rolling_portfolio_thread,
+                self._shadow_assessment_thread,
                 self._historical_thread,
             ):
                 if worker is not None:
@@ -1506,6 +1596,7 @@ class ResearchNode:
             self._health_thread = None
             self._historical_refresh_thread = None
             self._auto_canary_thread = None
+            self._shadow_assessment_thread = None
             self._rolling_portfolio_thread = None
             self._historical_thread = None
             try:
@@ -1516,6 +1607,7 @@ class ResearchNode:
                         "attempts": self._collection_count - self._run_cycle_base,
                         "restart_count": self._restart_count,
                         "crypto_paper": dict(self._crypto_status),
+                        "shadow_assessment": dict(self._shadow_cycle_evidence),
                     },
                 )
             except Exception:
@@ -1572,6 +1664,13 @@ class ResearchNode:
                 name=f"{self.config.worker_name}-historical-refresh",
                 daemon=True,
             )
+        self._shadow_assessment_thread = None
+        if self.config.shadow_enabled:
+            self._shadow_assessment_thread = threading.Thread(
+                target=self._shadow_assessment_worker_loop,
+                name=f"{self.config.worker_name}-shadow-assessment",
+                daemon=True,
+            )
         self._auto_canary_thread = None
         self._rolling_portfolio_thread = threading.Thread(
             target=self._rolling_portfolio_worker_loop,
@@ -1586,6 +1685,8 @@ class ResearchNode:
             )
         self._historical_thread = self._historical_refresh_thread
         self._collector_thread.start()
+        if self._shadow_assessment_thread is not None:
+            self._shadow_assessment_thread.start()
         self._research_thread.start()
         self._health_thread.start()
         if self._historical_refresh_thread is not None:
@@ -1603,6 +1704,11 @@ class ResearchNode:
             "research-engine": ("_research_thread", self._research_worker_loop),
             "health-monitor": ("_health_thread", self._health_worker_loop),
         }
+        if self.config.shadow_enabled:
+            specs["shadow-assessment"] = (
+                "_shadow_assessment_thread",
+                self._shadow_assessment_worker_loop,
+            )
         if self.config.historical_refresh_enabled:
             specs[POLYMARKET_HISTORICAL_JOB_NAME] = (
                 "_historical_refresh_thread",
@@ -1685,6 +1791,284 @@ class ResearchNode:
             setattr(self, attribute, replacement)
             replacement.start()
         return True
+    def _run_shadow_assessment_tick(
+        self,
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Run one bounded tick and publish its coherent progress snapshot."""
+        current = ensure_utc(now or self.clock())
+        worker_name = "shadow-assessment"
+        self._worker_tick_started(
+            worker_name,
+            next_work="evaluate_due_shadow_jobs",
+            timestamp=current,
+        )
+        active_statuses = (
+            SHADOW_STATUS_REGISTERED,
+            SHADOW_STATUS_RUNNING,
+            SHADOW_STATUS_WAITING_FOR_DATA,
+        )
+        rows_by_id: dict[str, Mapping[str, Any]] = {}
+        for status in active_statuses:
+            rows = self.shadow_service.list(status=status, limit=1_000)
+            for row in rows:
+                if not isinstance(row, Mapping):
+                    continue
+                job_id = str(row.get("job_id") or "").strip()
+                if job_id:
+                    rows_by_id[job_id] = row
+
+        def sort_key(row: Mapping[str, Any]) -> tuple[Any, ...]:
+            next_at = parse_timestamp(row.get("next_evaluation_at"))
+            updated_at = parse_timestamp(row.get("updated_at"))
+            status = str(row.get("status") or "").strip().upper()
+            status_order = {
+                SHADOW_STATUS_REGISTERED: 0,
+                SHADOW_STATUS_RUNNING: 1,
+                SHADOW_STATUS_WAITING_FOR_DATA: 2,
+            }.get(status, 99)
+            return (
+                next_at is not None,
+                next_at or datetime.min.replace(tzinfo=current.tzinfo),
+                status_order,
+                updated_at or datetime.min.replace(tzinfo=current.tzinfo),
+                str(row.get("job_id") or ""),
+            )
+
+        active_rows = list(rows_by_id.values())
+        due_rows = [
+            row
+            for row in active_rows
+            if (
+                (next_at := parse_timestamp(row.get("next_evaluation_at"))) is None
+                or next_at <= current
+            )
+        ]
+        due_rows.sort(key=sort_key)
+        selected = due_rows[: self.config.shadow_jobs_per_cycle]
+        states: dict[str, dict[str, Any]] = {}
+        for row in active_rows:
+            job_id = str(row.get("job_id") or "").strip()
+            state = row.get("state")
+            state_mapping = state if isinstance(state, Mapping) else {}
+            states[job_id] = {
+                "job_id": job_id,
+                "status": str(row.get("status") or "").strip().upper(),
+                "blocker": (
+                    str(state_mapping.get("last_blocker") or "").strip()
+                    or None
+                ),
+                "next_evaluation_at": (
+                    row.get("next_evaluation_at")
+                    if row.get("next_evaluation_at") is not None
+                    else state_mapping.get("next_evaluation_at")
+                ),
+            }
+
+        processed_ids: list[str] = []
+        blockers: list[str] = []
+        errors: list[str] = []
+        successful_jobs = 0
+        failed_jobs = 0
+        for row in selected:
+            job_id = str(row.get("job_id") or "").strip()
+            if not job_id:
+                continue
+            processed_ids.append(job_id)
+            try:
+                result = self.shadow_service.tick(
+                    job_id,
+                    self.provider,
+                    now=current,
+                    interval_seconds=float(self.config.shadow_interval),
+                )
+                if not isinstance(result, Mapping):
+                    raise RuntimeError("shadow service returned an invalid tick result")
+                result_status = str(result.get("status") or "").strip().upper()
+                if not result_status:
+                    raise RuntimeError("shadow service returned no job status")
+                result_state = result.get("state")
+                result_state_mapping = (
+                    result_state if isinstance(result_state, Mapping) else {}
+                )
+                blocker = (
+                    str(
+                        result.get("blocker")
+                        or result_state_mapping.get("last_blocker")
+                        or ""
+                    ).strip()
+                    or None
+                )
+                states[job_id] = {
+                    "job_id": job_id,
+                    "status": result_status,
+                    "blocker": blocker,
+                    "next_evaluation_at": result.get("next_evaluation_at")
+                    if result.get("next_evaluation_at") is not None
+                    else result_state_mapping.get("next_evaluation_at"),
+                }
+                successful_jobs += 1
+                if blocker and blocker not in blockers:
+                    blockers.append(blocker)
+            except BaseException as exc:
+                failed_jobs += 1
+                message = f"{job_id}: {exc}"
+                errors.append(message)
+                blocker = type(exc).__name__.upper()
+                if blocker not in blockers:
+                    blockers.append(blocker)
+                states[job_id] = {
+                    **states.get(job_id, {"job_id": job_id}),
+                    "blocker": blocker,
+                }
+
+        status_counts: dict[str, int] = {}
+        for item in states.values():
+            status = str(item.get("status") or "UNKNOWN").upper()
+            status_counts[status] = status_counts.get(status, 0) + 1
+        active_current = {
+            SHADOW_STATUS_REGISTERED,
+            SHADOW_STATUS_RUNNING,
+            SHADOW_STATUS_WAITING_FOR_DATA,
+        }
+        next_values = [
+            parsed
+            for item in states.values()
+            if str(item.get("status") or "").upper() in active_current
+            and (parsed := parse_timestamp(item.get("next_evaluation_at"))) is not None
+            and parsed > current
+        ]
+        next_evaluation = (
+            min(next_values)
+            if next_values
+            else current + timedelta(seconds=float(self.config.shadow_interval))
+        )
+        selected_states = [
+            states[job_id]
+            for job_id in processed_ids
+            if job_id in states
+        ]
+        for item in selected_states:
+            if item.get("blocker") and item["blocker"] not in blockers:
+                blockers.append(str(item["blocker"]))
+        ended_at = ensure_utc(self.clock())
+        evidence = {
+            "enabled": True,
+            "configured_interval_seconds": float(self.config.shadow_interval),
+            "jobs_per_cycle": int(self.config.shadow_jobs_per_cycle),
+            "active_job_count": len(active_rows),
+            "due_job_count": len(due_rows),
+            "selected_job_count": len(selected),
+            "processed_jobs": len(processed_ids),
+            "successful_jobs": successful_jobs,
+            "failed_jobs": failed_jobs,
+            "completed_jobs": sum(
+                1
+                for item in selected_states
+                if item.get("status") == SHADOW_STATUS_COMPLETED
+            ),
+            "running_jobs": sum(
+                1
+                for item in states.values()
+                if item.get("status") == SHADOW_STATUS_RUNNING
+            ),
+            "waiting_for_data_jobs": sum(
+                1
+                for item in states.values()
+                if item.get("status") == SHADOW_STATUS_WAITING_FOR_DATA
+            ),
+            "blocked_jobs": sum(
+                1
+                for item in selected_states
+                if item.get("status") == SHADOW_STATUS_BLOCKED
+            ),
+            "status_counts": status_counts,
+            "processed_job_ids": processed_ids[:_MAX_SHADOW_JOBS_PER_CYCLE],
+            "job_statuses": selected_states[:_MAX_SHADOW_JOBS_PER_CYCLE],
+            "blockers": blockers[:64],
+            "errors": errors[:64],
+            "next_evaluation_at": next_evaluation.isoformat(),
+            "last_cycle_started_at": current.isoformat(),
+            "last_cycle_ended_at": ended_at.isoformat(),
+            "next_work": next_evaluation.isoformat(),
+            "paper_only": True,
+            "live_execution": False,
+        }
+        with self._worker_runtime_lock:
+            runtime = self._worker_runtime.setdefault(worker_name, {"errors": []})
+            for key, value in evidence.items():
+                if key != "errors":
+                    runtime[key] = value
+        self._shadow_cycle_evidence = dict(evidence)
+        self.store.set_scheduler_state(worker_name, dict(evidence))
+        self._worker_tick_completed(
+            worker_name,
+            successful=not failed_jobs,
+            successful_candidates=processed_ids,
+            decision="SHADOW_CYCLE_COMPLETE",
+            next_work=evidence["next_work"],
+            error="; ".join(errors) if errors else None,
+            extra=evidence,
+        )
+        try:
+            self._heartbeat(
+                "running",
+                {"shadow_assessment": dict(evidence)},
+            )
+        except Exception as exc:
+            self._log(
+                logging.WARNING,
+                "shadow root evidence update failed: %s",
+                exc,
+            )
+        return evidence
+
+    def _shadow_assessment_worker_loop(self) -> None:
+        """Schedule bounded, paper-only shadow service ticks."""
+        worker_name = "shadow-assessment"
+        interval = float(self.config.shadow_interval)
+        status = "idle"
+        try:
+            while not self.stop_event.is_set():
+                try:
+                    evidence = self._run_shadow_assessment_tick()
+                    status = "degraded" if evidence["failed_jobs"] else "idle"
+                except BaseException as exc:
+                    status = "degraded"
+                    self._worker_tick_failed(
+                        worker_name,
+                        exc,
+                        fatal=False,
+                        next_work="retry_shadow_assessment",
+                    )
+                    self._log(logging.ERROR, "shadow worker tick failed: %s", exc)
+                if self.stop_event.wait(interval):
+                    break
+        except BaseException as exc:
+            status = "degraded"
+            self._worker_tick_failed(
+                worker_name,
+                exc,
+                fatal=False,
+                next_work="operator_review_required",
+            )
+            self._log(logging.ERROR, "shadow worker loop failed: %s", exc)
+        finally:
+            try:
+                self._persist_worker_runtime(
+                    worker_name,
+                    "stopped" if self.stop_event.is_set() else status,
+                    extra={
+                        "next_work": "stopped",
+                        "shadow_assessment": dict(self._shadow_cycle_evidence),
+                    },
+                )
+            except Exception:
+                pass
+            with self._worker_condition:
+                self._worker_condition.notify_all()
+
     def _auto_canary_worker_loop(self) -> None:
         """Run isolated ticks with bounded recovery and truthful boundaries."""
         if self._auto_canary_fatal:
@@ -3761,6 +4145,16 @@ class ResearchNode:
                 status = "stale" if lock_exists or pid_marker_exists else "stopped"
         elif status not in {"stopped", "closed", "stale"} and health_degraded:
             status = "degraded"
+        persisted_shadow = (
+            worker_payload.get("shadow_assessment")
+            if isinstance(worker_payload, Mapping)
+            else None
+        )
+        shadow_evidence = (
+            dict(persisted_shadow)
+            if isinstance(persisted_shadow, Mapping)
+            else dict(self._shadow_cycle_evidence)
+        )
         payload = {
             "worker_name": self.config.worker_name,
             "status": status,
@@ -3790,6 +4184,7 @@ class ResearchNode:
             "paper_only": True,
             "live_execution": False,
             "crypto_paper": dict(self._crypto_status),
+            "shadow_assessment": shadow_evidence,
             "autonomous_research": {
                 "enabled": self.config.research_enabled,
                 "queue": self.store.research_queue_stats(),
@@ -4011,9 +4406,24 @@ class ResearchNode:
                 "last_error": str(exc),
             }
             self._log(logging.ERROR, "crypto paper cycle failed: %s", exc)
+    def _select_opportunity_estimate(
+        self,
+        market_id: str,
+        record: Mapping[str, Any],
+    ) -> Any:
+        model = self.opportunity_model
+        if isinstance(model, Mapping):
+            return model.get(market_id)
+        if callable(model):
+            return model(record)
+        return None
     def _run_persisted_opportunity_pipeline(self, started: datetime) -> bool:
         """Scan the collector's newest evidence without issuing a second sweep."""
-        if self.opportunity_model is not None and not isinstance(self.opportunity_model, Mapping):
+        if (
+            self.opportunity_model is not None
+            and not isinstance(self.opportunity_model, Mapping)
+            and not callable(self.opportunity_model)
+        ):
             return False
         collector_state = self.store.get_collector_state("polymarket") or {}
         has_completed_collection = bool(collector_state.get("last_cycle_ended_at"))
@@ -4090,17 +4500,20 @@ class ResearchNode:
                 quality = str(record.get("research_quality") or "PRICE_PROXY")
                 uncertainty = 1.0
             else:
-                estimate = self.opportunity_model.get(market_id)
+                estimate = self._select_opportunity_estimate(market_id, record)
                 version = "configured-model"
                 quality = "MODEL_ESTIMATE"
                 uncertainty = 0.0
             if isinstance(estimate, Mapping):
-                probability_value = estimate.get("probability", estimate.get("yes_probability", estimate.get("prediction")))
+                probability_value = estimate.get(
+                    "probability",
+                    estimate.get("yes_probability", estimate.get("prediction")),
+                )
                 version = str(estimate.get("model_version", version))
                 quality = str(estimate.get("research_quality", quality))
                 uncertainty = float(estimate.get("uncertainty", uncertainty) or 0.0)
             else:
-                probability_value = estimate
+                probability_value = getattr(estimate, "probability", estimate)
             try:
                 probability = float(probability_value)
                 uncertainty = float(uncertainty)
@@ -4353,6 +4766,7 @@ class ResearchNode:
                     ),
                 }
                 evidence_by_market[market_id] = evidence
+                features: Mapping[str, Any] = {}
                 if self.opportunity_model is None:
                     estimate = record.get("yes_mid")
                     if estimate is None:
@@ -4360,29 +4774,28 @@ class ResearchNode:
                     version = "market-price-baseline-v1"
                     quality = "PRICE_PROXY"
                     uncertainty = 1.0
-                    features: Mapping[str, Any] = {}
-                elif isinstance(self.opportunity_model, Mapping):
-                    estimate = self.opportunity_model.get(market_id)
+                    probability_value = estimate
+                else:
+                    estimate = self._select_opportunity_estimate(market_id, record)
                     version = "configured-model"
                     quality = "MODEL_ESTIMATE"
                     uncertainty = 0.0
-                    features = {}
-                else:
-                    estimate = self.opportunity_model(market)
-                    version = str(getattr(estimate, "model_version", "configured-model"))
-                    quality = str(getattr(estimate, "research_quality", "MODEL_ESTIMATE"))
-                    uncertainty = float(getattr(estimate, "uncertainty", 0.0) or 0.0)
-                    features_value = getattr(estimate, "features", {})
-                    features = features_value if isinstance(features_value, Mapping) else {}
-                if isinstance(estimate, Mapping):
-                    probability_value = estimate.get("probability", estimate.get("yes_probability", estimate.get("prediction")))
-                    version = str(estimate.get("model_version", version))
-                    quality = str(estimate.get("research_quality", quality))
-                    uncertainty = float(estimate.get("uncertainty", uncertainty) or 0.0)
-                    features_value = estimate.get("features", {})
-                    features = features_value if isinstance(features_value, Mapping) else features
-                else:
-                    probability_value = getattr(estimate, "probability", estimate)
+                    if isinstance(estimate, Mapping):
+                        probability_value = estimate.get(
+                            "probability",
+                            estimate.get("yes_probability", estimate.get("prediction")),
+                        )
+                        version = str(estimate.get("model_version", version))
+                        quality = str(estimate.get("research_quality", quality))
+                        uncertainty = float(estimate.get("uncertainty", uncertainty) or 0.0)
+                        features_value = estimate.get("features", {})
+                        features = (
+                            features_value
+                            if isinstance(features_value, Mapping)
+                            else features
+                        )
+                    else:
+                        probability_value = getattr(estimate, "probability", estimate)
                 try:
                     probability = float(probability_value)
                     uncertainty = float(uncertainty)
@@ -4495,6 +4908,10 @@ class ResearchNode:
                 and not (
                     bool((spec.config if isinstance(spec.config, Mapping) else {}).get("observation_intent"))
                     and not spec.allowed_markets
+                )
+                and not (
+                    bool((spec.config if isinstance(spec.config, Mapping) else {}).get("shadow_assessment"))
+                    or bool((spec.config if isinstance(spec.config, Mapping) else {}).get("shadow_only"))
                 )
             ),
             key=lambda spec: (spec.start_timestamp, spec.experiment_id),
@@ -5514,7 +5931,6 @@ class ResearchNode:
         logger.addHandler(handler)
         self._logger, self._handler = logger, handler
         self._log(logging.INFO, "node started pid=%s db=%s", os.getpid(), self.config.db_path)
-
     def _log(self, level: int, message: str, *args: Any) -> None:
         if self._logger is not None:
             self._logger.log(level, message, *args)
@@ -5536,9 +5952,13 @@ class ResearchNode:
             "pid_path": str(self.pid_path),
             "lock_path": str(self.lock_path),
             "log_path": str(self.log_path),
-            "stale_after_seconds": max(float(self.config.interval_seconds) * 3.0, float(self.config.failure_cooldown_seconds)),
+            "stale_after_seconds": max(
+                float(self.config.interval_seconds) * 3.0,
+                float(self.config.failure_cooldown_seconds),
+            ),
             "paper_only": True,
             "live_execution": False,
+            "shadow_assessment": dict(self._shadow_cycle_evidence),
         }
         self.store.save_worker_state(
             self.config.worker_name,

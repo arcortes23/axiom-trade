@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 from typing import Any
 from urllib.request import Request
 from axiom.collector import CollectorConfig, PolymarketCollector
@@ -52,10 +53,11 @@ from axiom.paper_engine import (
     run_forward_paper,
     run_historical_replay,
 )
+from axiom.shadow import ShadowCompositeModel, ShadowCompositeStrategy
 from axiom.research_bus import DurableResearchBus, ResearchBusPermissionError, ResearchQueueStatus
 from axiom.risk import RiskEngine, RiskLimits
 from axiom.storage import AxiomStore
-from axiom.strategy import validate_strategy
+from axiom.strategy import load_strategy, validate_strategy
 
 
 T0 = datetime(2025, 1, 1, tzinfo=timezone.utc)
@@ -1099,6 +1101,289 @@ class Phase3PaperAndRiskTests(unittest.TestCase):
             self.assertEqual(len(store.load_fills(strategy_id=spec.strategy_hash)), 1)
             state = store.load_paper_state(spec.experiment_id)
             self.assertEqual(state["state"]["fill_count"], 1)
+    def test_legacy_fill_restore_accepts_exact_bounded_count(self) -> None:
+        with AxiomStore(":memory:") as store:
+            spec = ForwardTestRegistry(store).freeze(
+                strategy=_BuyStrategy(),
+                model={"id": "model"},
+                start_timestamp=T0,
+                bankroll=10.0,
+                allowed_markets=("m",),
+            )
+            store.save_paper_state(
+                spec.experiment_id,
+                {"experiment_id": spec.experiment_id, "processed_observations": []},
+                timestamp=T0,
+            )
+            fills = [
+                Fill(
+                    T0,
+                    MarketType.PREDICTION,
+                    "m",
+                    Side.BUY,
+                    1.0,
+                    0.5,
+                    0.0,
+                    0.0,
+                    spec.strategy_hash,
+                    f"legacy-{index}",
+                    market_id="m",
+                    metadata={"paper_experiment_id": spec.experiment_id},
+                )
+                for index in range(2)
+            ]
+            with (
+                patch("axiom.paper_engine._MAX_PAPER_FILL_ROWS", 2),
+                patch.object(store, "count_paper_fills", return_value=2),
+                patch.object(store, "list_paper_fills", return_value=fills),
+            ):
+                engine = ForwardPaperEngine(
+                    spec,
+                    store=store,
+                    strategy=_BuyStrategy(),
+                    model={"id": "model"},
+                )
+            self.assertEqual([fill.order_id for fill in engine.portfolio.fills], ["legacy-0", "legacy-1"])
+
+    def test_legacy_fill_restore_rejects_overflow_or_count_mismatch_before_apply(self) -> None:
+        with AxiomStore(":memory:") as store:
+            spec = ForwardTestRegistry(store).freeze(
+                strategy=_BuyStrategy(),
+                model={"id": "model"},
+                start_timestamp=T0,
+                bankroll=10.0,
+                allowed_markets=("m",),
+            )
+            store.save_paper_state(
+                spec.experiment_id,
+                {"experiment_id": spec.experiment_id, "processed_observations": []},
+                timestamp=T0,
+            )
+            external = Portfolio(spec.bankroll)
+            list_calls: list[int] = []
+
+            def list_fills(*_args: Any, **_kwargs: Any) -> list[Fill]:
+                list_calls.append(1)
+                return []
+
+            with (
+                patch("axiom.paper_engine._MAX_PAPER_FILL_ROWS", 2),
+                patch.object(store, "count_paper_fills", return_value=3),
+                patch.object(store, "list_paper_fills", side_effect=list_fills),
+            ):
+                with self.assertRaisesRegex(ValueError, "PAPER_STATE_FILL_RESTORE_OVERFLOW"):
+                    ForwardPaperEngine(
+                        spec,
+                        store=store,
+                        strategy=_BuyStrategy(),
+                        model={"id": "model"},
+                        portfolio=external,
+                    )
+            self.assertEqual(list_calls, [])
+            self.assertEqual(external.fills, [])
+            self.assertEqual(external.positions, {})
+
+            with (
+                patch("axiom.paper_engine._MAX_PAPER_FILL_ROWS", 2),
+                patch.object(store, "count_paper_fills", return_value=2),
+                patch.object(store, "list_paper_fills", return_value=[]),
+            ):
+                with self.assertRaisesRegex(ValueError, "PAPER_STATE_FILL_RESTORE_COUNT_MISMATCH"):
+                    ForwardPaperEngine(
+                        spec,
+                        store=store,
+                        strategy=_BuyStrategy(),
+                        model={"id": "model"},
+                        portfolio=external,
+                    )
+            self.assertEqual(external.fills, [])
+            self.assertEqual(external.positions, {})
+
+    def test_legacy_shadow_lot_migration_rejects_overflow_before_snapshot_apply(self) -> None:
+        strategy = {"family": "shadow_composite"}
+        with AxiomStore(":memory:") as store:
+            spec = ForwardTestRegistry(store).freeze(
+                strategy=strategy,
+                model={"id": "model"},
+                start_timestamp=T0,
+                bankroll=10.0,
+                allowed_markets=("m",),
+            )
+            store.save_paper_state(
+                spec.experiment_id,
+                {
+                    "experiment_id": spec.experiment_id,
+                    "processed_observations": [],
+                    "portfolio": {
+                        "cash": spec.bankroll - 1.0,
+                        "positions": {},
+                        "fees": 0.0,
+                        "slippage": 0.0,
+                    },
+                },
+                timestamp=T0,
+            )
+            external = Portfolio(spec.bankroll)
+            with (
+                patch("axiom.paper_engine._MAX_PAPER_FILL_ROWS", 2),
+                patch.object(store, "count_paper_fills", return_value=3),
+                patch.object(store, "list_paper_fills", side_effect=AssertionError("must not load")),
+            ):
+                with self.assertRaisesRegex(ValueError, "PAPER_STATE_FILL_RESTORE_OVERFLOW"):
+                    ForwardPaperEngine(
+                        spec,
+                        store=store,
+                        strategy=strategy,
+                        model={"id": "model"},
+                        portfolio=external,
+                    )
+            self.assertEqual(external.cash, spec.bankroll)
+            self.assertEqual(external.fills, [])
+            self.assertEqual(external.positions, {})
+
+    def test_compact_restart_restores_shadow_member_open_lots_for_holding_exit(self) -> None:
+        def member(family: str, candidate_id: str) -> dict[str, Any]:
+            strategy_document = load_strategy(
+                {
+                    "version": 1,
+                    "market_type": "prediction",
+                    "family": family,
+                    "parameters": {"lookback": 1, "threshold": 0.05},
+                    "operations": [],
+                    "probability_model": "constant_baseline",
+                    "resolution_aware": True,
+                    "resolution_inputs": ["settlement"],
+                    "strategy_id": candidate_id,
+                }
+            ).to_dict()
+            return {
+                "shadow_member_id": f"{family}:{candidate_id}",
+                "candidate_id": candidate_id,
+                "family": family,
+                "setup_id": f"setup-{family}",
+                "setup_hash": f"sha256:setup-{family}",
+                "strategy": strategy_document,
+                "strategy_hash": f"sha256:strategy-{family}",
+                "model": {"kind": "constant_baseline", "probability": 0.8},
+                "model_hash": f"sha256:model-{family}",
+                "scope": {},
+                "scope_hash": "sha256:scope",
+                "scope_version": "1",
+                "exit_policy": {"type": "fixed_holding_period", "holding_period": 1},
+                "cost_provenance": {},
+                "rejection_evidence": {},
+            }
+
+        members = [member("momentum", "member-m"), member("mean_reversion", "member-r")]
+        composite = ShadowCompositeStrategy(members)
+        composite_model = ShadowCompositeModel(composite.members)
+        # Freeze the same declarative docs that the composite runtime exposes.
+        composite.definition = dict(composite.definition)
+        composite_model.document = dict(composite_model.document)
+
+        def observation(stamp: datetime, yes_mid: float, member_id: str) -> dict[str, Any]:
+            return {
+                "market_id": "shadow-restart-market",
+                "timestamp": stamp,
+                "yes_mid": yes_mid,
+                "yes_bid": yes_mid - 0.01,
+                "yes_ask": yes_mid + 0.01,
+                "no_mid": 1.0 - yes_mid,
+                "no_bid": 1.0 - yes_mid - 0.01,
+                "no_ask": 1.0 - yes_mid + 0.01,
+                "settlement": "open",
+                "shadow_member_id": member_id,
+                "shadow_group_id": f"group-{stamp.isoformat()}",
+                "shadow_assessment": True,
+                "paper_only": True,
+                "live_execution": False,
+            }
+
+        with AxiomStore(":memory:") as store:
+            spec = ForwardTestRegistry(store).freeze(
+                strategy=composite.definition,
+                model=composite_model.document,
+                start_timestamp=T0,
+                bankroll=1.0,
+                allowed_markets=("shadow-restart-market",),
+            )
+            first = ForwardPaperEngine(
+                spec,
+                store=store,
+                strategy=composite,
+                model=composite_model,
+            )
+            composite.portfolio = first.portfolio
+            first.run(
+                [
+                    observation(T0 + timedelta(hours=1), 0.40, "momentum:member-m"),
+                    observation(T0 + timedelta(hours=1), 0.40, "mean_reversion:member-r"),
+                ],
+                now=T0 + timedelta(hours=1),
+            )
+            entered = first.run(
+                [
+                    observation(T0 + timedelta(hours=2), 0.55, "momentum:member-m"),
+                    observation(T0 + timedelta(hours=2), 0.55, "mean_reversion:member-r"),
+                ],
+                now=T0 + timedelta(hours=2),
+            )
+            self.assertEqual(entered.fills_inserted, 2)
+            persisted = store.load_paper_state(spec.experiment_id)
+            assert persisted is not None
+            open_lots = persisted["state"]["portfolio"]["open_lots"]
+            self.assertEqual(
+                {item["shadow_member_id"] for item in open_lots},
+                {"momentum:member-m", "mean_reversion:member-r"},
+            )
+            self.assertTrue(all(item["side"] == "buy" for item in open_lots))
+            self.assertTrue(all(float(item["remaining_quantity"]) > 0 for item in open_lots))
+
+            restarted_composite = ShadowCompositeStrategy(members)
+            restarted_model = ShadowCompositeModel(restarted_composite.members)
+            restarted = ForwardPaperEngine(
+                spec,
+                store=store,
+                strategy=restarted_composite,
+                model=restarted_model,
+            )
+            restarted_composite.portfolio = restarted.portfolio
+            self.assertEqual(
+                {
+                    fill.metadata.get("shadow_member_id")
+                    for fill in restarted.portfolio.fills
+                },
+                {"momentum:member-m", "mean_reversion:member-r"},
+            )
+            exited = restarted.run(
+                [
+                    observation(T0 + timedelta(hours=3), 0.60, "momentum:member-m"),
+                    observation(T0 + timedelta(hours=3), 0.60, "mean_reversion:member-r"),
+                ],
+                now=T0 + timedelta(hours=3),
+            )
+            self.assertEqual(exited.fills_inserted, 2)
+            fills = store.list_paper_fills(
+                spec.experiment_id,
+                strategy_id=spec.strategy_hash,
+                limit=16,
+            )
+            self.assertEqual(
+                sorted(
+                    [
+                        (fill.side.value, fill.metadata.get("shadow_member_id"))
+                        for fill in fills
+                    ]
+                ),
+                sorted(
+                    [
+                        ("buy", "mean_reversion:member-r"),
+                        ("buy", "momentum:member-m"),
+                        ("sell", "momentum:member-m"),
+                        ("sell", "mean_reversion:member-r"),
+                    ]
+                ),
+            )
     def test_forward_assumptions_are_materialized_into_execution_and_identity(self) -> None:
         strategy = _BuyStrategy()
         model = {"id": "model"}

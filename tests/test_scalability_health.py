@@ -92,6 +92,27 @@ class ScalabilityHealthTests(unittest.TestCase):
         )
         node._run_opportunity_pipeline()
         return store
+    def test_callable_opportunity_model_is_invoked_for_scalar_estimate(self) -> None:
+        provider = _HealthProvider(T0, T0)
+        calls: list[dict[str, object]] = []
+
+        def model(record: dict[str, object]) -> float:
+            calls.append(record)
+            return 0.8
+
+        with AxiomStore(":memory:") as store:
+            node = ResearchNode(
+                NodeConfig(":memory:", crypto_enabled=False, max_markets=1),
+                provider=provider,
+                opportunity_model=model,
+                store=store,
+                clock=lambda: T0,
+                sleep=lambda _: None,
+            )
+            self.assertTrue(node._run_opportunity_pipeline())
+            self.assertEqual([record["market_id"] for record in calls], ["health-market"])
+            self.assertTrue(store.list_opportunity_snapshots(limit=10))
+
     def test_opportunity_pipeline_reuses_fresh_forward_evidence_without_resweep(self) -> None:
         provider = _HealthProvider(T0, T0)
         with AxiomStore(":memory:") as store:

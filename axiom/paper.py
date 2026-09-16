@@ -46,6 +46,37 @@ PAPER_EXECUTION_STATUSES = (
     "RISK_REJECTED",
     "RESOLUTION",
 )
+ 
+SHADOW_METADATA_KEYS = (
+    "shadow_job_id",
+    "shadow_member_id",
+    "shadow_group_id",
+    "shadow_assessment",
+    "synthetic_fixture",
+)
+
+
+def _shadow_metadata(value: Any) -> dict[str, Any]:
+    """Return the shared shadow identity carried by an observation.
+
+    Ordinary paper runs do not carry these fields and therefore retain their
+    existing order/fill/event payloads byte-for-byte.  Shadow callers pass the
+    fields directly on the canonical observation mapping; accepting a nested
+    metadata mapping as a fallback keeps custom providers from having to
+    duplicate the projection.
+    """
+
+    if isinstance(value, Mapping):
+        source: Mapping[str, Any] = value
+        nested = value.get("metadata")
+        if isinstance(nested, Mapping):
+            source = {**dict(nested), **dict(value)}
+        return {
+            key: source[key]
+            for key in SHADOW_METADATA_KEYS
+            if key in source and source[key] is not None
+        }
+    return {}
 
 
 def _finite_number(value: Any) -> float | None:
@@ -95,9 +126,7 @@ class PaperTradingConfig:
         if not isinstance(self.live, bool):
             raise ValueError("live must be a boolean")
         if self.live:
-            raise LiveExecutionDisabled("live execution is disabled by policy")
-
-
+            raise LiveExecutionDisabled("paper traders cannot enable live execution")
 @dataclass(frozen=True, slots=True)
 class PaperOrder:
     order_id: str
@@ -110,6 +139,7 @@ class PaperOrder:
     strategy_id: str
     market_id: str | None = None
     outcome: str | None = None
+    metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.quantity <= 0 or not math.isfinite(self.quantity):
@@ -118,6 +148,9 @@ class PaperOrder:
             raise ValueError("reference_price must be finite and non-negative")
         if self.outcome is not None and self.outcome.lower() not in {"yes", "no"}:
             raise ValueError("prediction outcome must be yes or no")
+        if not isinstance(self.metadata, Mapping):
+            raise TypeError("order metadata must be a mapping")
+        object.__setattr__(self, "metadata", dict(self.metadata))
         object.__setattr__(self, "requested_at", ensure_utc(self.requested_at))
 
 
@@ -167,7 +200,13 @@ class PaperTrader:
             event["outcomes"] = ["NO_SIGNAL"]
         return event
 
-    def _begin_execution_event(self, *, market_id: str, timestamp: datetime) -> None:
+    def _begin_execution_event(
+        self,
+        *,
+        market_id: str,
+        timestamp: datetime,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> None:
         self._last_execution_event = {
             "market_id": str(market_id),
             "timestamp": ensure_utc(timestamp).isoformat(),
@@ -178,6 +217,9 @@ class PaperTrader:
             "requested_quantity": 0.0,
             "filled_quantity": 0.0,
         }
+        shadow = _shadow_metadata(metadata)
+        if shadow:
+            self._last_execution_event.update(shadow)
 
     def _execution_transition(self, status: str, **fields: Any) -> None:
         normalized = str(status).strip().upper()
@@ -440,20 +482,27 @@ class PaperTrader:
         outcome: str | None = None,
         group: str | None = None,
         event_id: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
     ) -> Fill:
         slippage = abs(price - reference)
         fee = abs(price * quantity) * self.config.fee_rate
-        metadata: dict[str, Any] = {
+        fill_metadata: dict[str, Any] = {
             "paper": True,
             "simulation_quality": self.config.quality.value,
             "reference_price": reference,
         }
         if outcome is not None:
-            metadata["outcome"] = outcome
+            fill_metadata["outcome"] = outcome
         if group is not None and str(group).strip():
-            metadata["group"] = str(group).strip()
+            fill_metadata["group"] = str(group).strip()
         if event_id is not None and str(event_id).strip():
-            metadata["event_id"] = str(event_id).strip()
+            fill_metadata["event_id"] = str(event_id).strip()
+        shadow = _shadow_metadata(metadata)
+        if shadow:
+            fill_metadata.update(shadow)
+            for key in ("paper_only", "live_execution"):
+                if isinstance(metadata, Mapping) and key in metadata:
+                    fill_metadata[key] = metadata[key]
         return Fill(
             timestamp=ensure_utc(timestamp),
             market_type=self.market_type,
@@ -468,7 +517,7 @@ class PaperTrader:
             market_id=market_id,
             expected_probability=expected_probability,
             executable_probability=price if self.market_type is MarketType.PREDICTION else None,
-            metadata=metadata,
+            metadata=fill_metadata,
         )
 
     def _run_observation(
@@ -488,12 +537,22 @@ class PaperTrader:
     ) -> Fill | None:
         # Operational paper policies install a pure pre-submission decision
         # callback on the trader.  Diagnostic paper execution leaves this unset.
-        event_market_id = str(market_id or symbol)
-        self._begin_execution_event(market_id=event_market_id, timestamp=timestamp)
-
         def value(name: str, default: Any = None) -> Any:
-            return observation.get(name, default) if isinstance(observation, Mapping) else getattr(observation, name, default)
+            return (
+                observation.get(name, default)
+                if isinstance(observation, Mapping)
+                else getattr(observation, name, default)
+            )
 
+        # Shadow identity is additive: the ordinary paper context/event shape
+        # remains unchanged when an observation carries no shadow metadata.
+        shadow_metadata = _shadow_metadata(observation)
+        event_market_id = str(market_id or symbol)
+        self._begin_execution_event(
+            market_id=event_market_id,
+            timestamp=timestamp,
+            metadata=shadow_metadata,
+        )
         liquidity = value("liquidity")
         initial_bid = book.best_bid if book is not None else value("yes_bid", value("bid"))
         initial_ask = book.best_ask if book is not None else value("yes_ask", value("ask"))
@@ -536,6 +595,11 @@ class PaperTrader:
             "expected_loss": value("expected_loss"),
             "paper": True,
         }
+        if shadow_metadata:
+            context.update(shadow_metadata)
+            context["metadata"] = dict(shadow_metadata)
+            if "shadow_group_id" in shadow_metadata:
+                context["group"] = shadow_metadata["shadow_group_id"]
         if not self._update_risk_equity(context, timestamp):
             self._execution_transition("RISK_REJECTED", reason="risk_equity_update_failed", risk_rejected=True)
             return None
@@ -550,6 +614,14 @@ class PaperTrader:
                 SettlementState.RESOLVED_NO,
                 SettlementState.VOID,
             }:
+                resolution_fields: dict[str, Any] = {"resolution": state.value}
+                # Resolution provenance is additive for shadow members only.
+                # Ordinary paper events retain their legacy payload shape.
+                if shadow_metadata and state in {
+                    SettlementState.RESOLVED_YES,
+                    SettlementState.RESOLVED_NO,
+                }:
+                    resolution_fields["settlement"] = state.value
                 if self.portfolio is not None and market_id:
                     try:
                         self.portfolio.resolve(
@@ -563,7 +635,7 @@ class PaperTrader:
                     except (TypeError, ValueError):
                         self._execution_transition(
                             "RESOLUTION",
-                            resolution=state.value,
+                            **resolution_fields,
                             invariant_violation=True,
                             reason="portfolio_resolution_failed",
                         )
@@ -571,12 +643,12 @@ class PaperTrader:
                     if not self._update_risk_equity(context, timestamp):
                         self._execution_transition(
                             "RESOLUTION",
-                            resolution=state.value,
+                            **resolution_fields,
                             risk_rejected=True,
                             reason="risk_equity_update_failed_after_resolution",
                         )
                         return None
-                self._execution_transition("RESOLUTION", resolution=state.value)
+                self._execution_transition("RESOLUTION", **resolution_fields)
                 return None
         signal_input = signal_observation if signal_observation is not None else observation
 
@@ -628,6 +700,11 @@ class PaperTrader:
             "expected_loss": signal_value("expected_loss"),
             "paper": True,
         }
+        if shadow_metadata:
+            signal_context.update(shadow_metadata)
+            signal_context["metadata"] = dict(shadow_metadata)
+            if "shadow_group_id" in shadow_metadata:
+                signal_context["group"] = shadow_metadata["shadow_group_id"]
         signal = self._strategy_signal(signal_input, signal_context)
         normalized = self._normalize_signal(signal)
         if normalized is None:
@@ -792,6 +869,9 @@ class PaperTrader:
             self._execution_transition("SIGNAL", reason="zero_sized_signal")
             return None
         requested_quantity = float(quantity)
+        order_metadata = dict(shadow_metadata)
+        if shadow_metadata:
+            order_metadata.update({"paper_only": True, "live_execution": False})
         order = PaperOrder(
             order_id=self._order_id(symbol, timestamp, side),
             market_type=self.market_type,
@@ -803,6 +883,7 @@ class PaperTrader:
             strategy_id=self.strategy_id,
             market_id=market_id,
             outcome=outcome,
+            metadata=order_metadata,
         )
         spread_paid = max(0.0, float(spread)) if spread is not None and math.isfinite(float(spread)) else 0.0
         # Record the order attempt before validating executable depth.  A
@@ -952,6 +1033,7 @@ class PaperTrader:
             event_id=context.get("event_id"),
             expected_probability=trade_probability,
             order_id=order.order_id,
+            metadata=order.metadata,
         )
         execution_metadata = {
             "execution_status": execution_status,
@@ -1169,6 +1251,7 @@ def paper_prediction(provider: Any, strategy: Any, risk: Any | None = None, port
 
 __all__ = [
     "PAPER_EXECUTION_STATUSES",
+    "SHADOW_METADATA_KEYS",
     "LiveExecutionDisabled", "PaperTradingConfig", "PaperOrder", "PaperTrader",
     "CryptoPaperTrader", "PredictionPaperTrader", "PaperCryptoTrader", "PaperPredictionTrader",
     "CryptoPaperTrading", "PredictionPaperTrading", "paper_crypto", "paper_prediction",
