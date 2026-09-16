@@ -11104,6 +11104,22 @@ class AutonomousResearchProcessor:
         if not value or len(value) > 128:
             raise ValueError("campaign_id must be bounded non-empty text")
         return f"polymarket-research-campaign:{value}"
+    @staticmethod
+    def _campaign_plan_id(campaign_id: str, trial_id: str) -> str:
+        """Return a bounded plan identity while preserving short legacy IDs."""
+        campaign = str(campaign_id).strip()
+        trial = str(trial_id).strip()
+        candidate = f"campaign-plan:{campaign}:{trial}"
+        if re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", candidate):
+            return candidate
+        # Hash the complete source IDs so truncating the readable prefix cannot
+        # make distinct long campaign/trial pairs collide.
+        digest = _hash_document(
+            {"campaign_id": campaign, "trial_id": trial}
+        ).split(":", 1)[-1][:24]
+        canonical = re.sub(r"[^A-Za-z0-9._:-]+", "-", candidate)
+        return f"{canonical[:103]}:{digest}"
+
 
     @staticmethod
     def campaign_configurations() -> tuple[Mapping[str, Any], ...]:
@@ -11258,6 +11274,535 @@ class AutonomousResearchProcessor:
                         )
         return keys
     @staticmethod
+    def _campaign_v2_protocol(value: Any) -> bool:
+        """Recognize only an unambiguous, canonical V2 protocol envelope."""
+        if not isinstance(value, Mapping):
+            return False
+        schema_version = str(value.get("schema_version", "")).strip()
+        protocol_id = str(value.get("protocol_id", "")).strip()
+        # Do not let a single forged marker upgrade a V1/legacy document.
+        return (
+            schema_version == CAMPAIGN_SCHEMA_V2
+            and protocol_id == CAMPAIGN_PROTOCOL_V2_ID
+        )
+
+    @staticmethod
+    def _campaign_protocol_digest(value: Mapping[str, Any]) -> str | None:
+        digest = str(value.get("protocol_hash", "")).strip()
+        if len(digest) != 71 or not digest.startswith("sha256:"):
+            return None
+        try:
+            int(digest[7:], 16)
+        except (TypeError, ValueError):
+            return None
+        return digest if digest == digest.lower() else None
+
+    @staticmethod
+    def _campaign_operational_setup_binding(
+        value: Mapping[str, Any],
+    ) -> tuple[str, str] | None:
+        setup = value.get("operational_setup")
+        setup_hash = str(value.get("operational_setup_hash", "")).strip()
+        if not isinstance(setup, Mapping) or not setup_hash:
+            return None
+        setup_id = str(setup.get("setup_id", "")).strip()
+        family = str(setup.get("family", "")).strip().lower()
+        if family not in {"momentum", "mean_reversion"}:
+            return None
+        if setup_id != f"{family}:absolute-move-v1:L1:H1":
+            return None
+        if (
+            str(setup.get("contract_schema", "")).strip() != "axiom-operational-setup"
+            or str(setup.get("contract_version", "")).strip() != "1"
+            or str(setup.get("market_type", "")).strip().lower() != "prediction"
+        ):
+            return None
+        manifest = setup.get("assessment_manifest_ref")
+        if not isinstance(manifest, Mapping):
+            return None
+        # A V2 setup is not durable evidence without an immutable attestation
+        # identity.  Boundary-only setups must remain eligible for reruns.
+        if not str(manifest.get("attestation_hash", "")).strip():
+            return None
+        if not str(manifest.get("dataset_id", "")).strip() or not str(
+            manifest.get("dataset_version", "")
+        ).strip():
+            return None
+        try:
+            canonical_hash = _operational_setup_hash(setup)
+        except (RecursionError, TypeError, ValueError, OverflowError):
+            return None
+        if setup_hash != canonical_hash:
+            return None
+        return setup_id, setup_hash
+
+    @staticmethod
+    def _campaign_exact_configuration_identity(
+        value: Mapping[str, Any],
+        configuration_id: Any,
+    ) -> bool:
+        """Require one canonical scalar member of the V2 operational grid."""
+        configuration = str(configuration_id or "").strip()
+        if configuration not in _OPERATIONAL_CAMPAIGN_CONFIGURATION_IDS:
+            return False
+        family, separator, suffix = configuration.partition(":")
+        if not separator or suffix != "lookback-1:threshold-0.05":
+            return False
+        declared_configuration = value.get("configuration_id")
+        if (
+            declared_configuration is not None
+            and str(declared_configuration).strip() != configuration
+        ):
+            return False
+        template = str(value.get("template", "")).strip().lower()
+        if template != family:
+            return False
+        experiment_family = value.get("experiment_family")
+        if (
+            experiment_family is not None
+            and str(experiment_family).strip().lower() != family
+        ):
+            return False
+        parameters = value.get("parameters")
+        if not isinstance(parameters, Mapping):
+            return False
+        if (
+            len(parameters) != 2
+            or {str(name).strip().lower() for name in parameters}
+            != {"lookback", "threshold"}
+        ):
+            return False
+
+        def scalar(parameter: Any) -> Any:
+            if isinstance(parameter, (list, tuple)):
+                if len(parameter) != 1:
+                    return None
+                return parameter[0]
+            return parameter
+
+        lookback = scalar(parameters.get("lookback"))
+        threshold = scalar(parameters.get("threshold"))
+        if (
+            isinstance(lookback, bool)
+            or not isinstance(lookback, (int, float))
+            or not math.isfinite(float(lookback))
+            or float(lookback) != 1.0
+            or isinstance(threshold, bool)
+            or not isinstance(threshold, (int, float))
+            or not math.isfinite(float(threshold))
+            or abs(float(threshold) - 0.05) > 1e-12
+        ):
+            return False
+        return True
+
+
+    @staticmethod
+    def _campaign_setup_matches_configuration(
+        setup_value: Mapping[str, Any],
+        configuration_id: Any,
+    ) -> bool:
+        configuration = str(configuration_id or "").strip()
+        if configuration not in _OPERATIONAL_CAMPAIGN_CONFIGURATION_IDS:
+            return False
+        setup = setup_value.get("operational_setup")
+        if not isinstance(setup, Mapping):
+            return False
+        family = configuration.split(":", 1)[0]
+        return (
+            str(setup.get("family", "")).strip().lower() == family
+            and str(setup.get("setup_id", "")).strip()
+            == f"{family}:absolute-move-v1:L1:H1"
+        )
+
+    @staticmethod
+    def _campaign_setup_matches_boundary(
+        setup_value: Mapping[str, Any],
+        boundary: Mapping[str, Any] | None,
+    ) -> bool:
+        if not isinstance(boundary, Mapping):
+            return True
+        setup = setup_value.get("operational_setup")
+        manifest = setup.get("assessment_manifest_ref") if isinstance(setup, Mapping) else None
+        if not isinstance(manifest, Mapping):
+            return False
+        for field in ("dataset_id", "dataset_version"):
+            expected = str(boundary.get(field, "")).strip()
+            if expected and str(manifest.get(field, "")).strip() != expected:
+                return False
+        expected_digest = str(
+            boundary.get("ordered_row_manifest_digest", boundary.get("content_hash", ""))
+        ).strip()
+        if expected_digest and str(manifest.get("manifest_digest", "")).strip() != expected_digest:
+            return False
+        expected_attestation = str(boundary.get("attestation_hash", "")).strip()
+        if expected_attestation and str(manifest.get("attestation_hash", "")).strip() != expected_attestation:
+            return False
+        return True
+
+    def _campaign_plan_evidence_binding(
+        self,
+        record: Mapping[str, Any] | None,
+        plan: Mapping[str, Any],
+        setup_value: Mapping[str, Any],
+        *,
+        boundary: Mapping[str, Any] | None = None,
+        expected_protocol_hash: str | None = None,
+    ) -> tuple[str, str] | None:
+        """Validate a setup carried by one immutable experiment-plan source."""
+        protocol = plan.get("campaign_protocol")
+        if not self._campaign_v2_protocol(protocol):
+            return None
+        assert isinstance(protocol, Mapping)
+        protocol_hash = self._campaign_protocol_digest(protocol)
+        if protocol_hash is None or (
+            expected_protocol_hash is not None and protocol_hash != expected_protocol_hash
+        ):
+            return None
+        campaign_id = str(plan.get("campaign_id", "")).strip()
+        trial_id = str(plan.get("campaign_trial_id", "")).strip()
+        configuration_id = str(plan.get("campaign_configuration_id", "")).strip()
+        if not campaign_id or not trial_id or not configuration_id:
+            return None
+        if str(protocol.get("campaign_id", "")).strip() != campaign_id:
+            return None
+        # Setup identity is not enough: a copied setup must remain tied to the
+        # exact scalar configuration declared by this immutable plan.
+        if not self._campaign_exact_configuration_identity(plan, configuration_id):
+            return None
+        selector = plan.get("dataset_selector")
+        setup = setup_value.get("operational_setup")
+        setup_manifest = setup.get("assessment_manifest_ref") if isinstance(setup, Mapping) else None
+        if (
+            not isinstance(selector, Mapping)
+            or not isinstance(setup_manifest, Mapping)
+            or str(selector.get("dataset_id", "")).strip()
+            != str(setup_manifest.get("dataset_id", "")).strip()
+            or str(selector.get("dataset_version", "")).strip()
+            != str(setup_manifest.get("dataset_version", "")).strip()
+        ):
+            return None
+        if not self._campaign_setup_matches_configuration(setup_value, configuration_id):
+            return None
+        binding = self._campaign_operational_setup_binding(setup_value)
+        if binding is None or not self._campaign_setup_matches_boundary(setup_value, boundary):
+            return None
+        template = str(plan.get("template", plan.get("experiment_family", ""))).strip().lower()
+        raw_parameters = plan.get("parameters")
+        parameters = dict(raw_parameters) if isinstance(raw_parameters, Mapping) else {}
+        normalized_parameters = {
+            str(name): (
+                value[0] if isinstance(value, (list, tuple)) and len(value) == 1 else value
+            )
+            for name, value in parameters.items()
+        }
+        expected_template = configuration_id.split(":", 1)[0]
+        if template != expected_template:
+            return None
+        manifest = plan.get("configuration_manifest")
+        if isinstance(manifest, Mapping):
+            expected_manifest = {
+                "configuration_id": configuration_id,
+                "template": template,
+                "parameters": normalized_parameters,
+            }
+            try:
+                manifest_matches = _canonical_binding(manifest) == _canonical_binding(
+                    expected_manifest
+                )
+            except (RecursionError, TypeError, ValueError, OverflowError):
+                return None
+            if not manifest_matches:
+                return None
+        if record is not None:
+            stored_plan_id = str(record.get("plan_id", "")).strip()
+            stored_hash = str(record.get("plan_hash", "")).strip()
+            plan_id = str(plan.get("plan_id", "")).strip()
+            if not stored_plan_id or not stored_hash:
+                return None
+            if plan_id and plan_id != stored_plan_id:
+                return None
+            if stored_hash != _hash_document(plan):
+                return None
+            stored_hypothesis = str(record.get("hypothesis_id", "")).strip()
+            plan_hypothesis = str(plan.get("hypothesis_id", "")).strip()
+            if not stored_hypothesis or (plan_hypothesis and stored_hypothesis != plan_hypothesis):
+                return None
+        return binding
+
+    def _campaign_queue_evidence_binding(
+        self,
+        record: Mapping[str, Any],
+        *,
+        expected_protocol_hash: str | None = None,
+    ) -> tuple[str, str] | None:
+        payload = record.get("payload")
+        if not isinstance(payload, Mapping):
+            return None
+        plan = payload.get("experiment_plan")
+        setup = payload if isinstance(payload, Mapping) else None
+        if not isinstance(plan, Mapping) or not isinstance(setup, Mapping):
+            return None
+        protocol = plan.get("campaign_protocol")
+        if not isinstance(protocol, Mapping):
+            return None
+        protocol_hash = self._campaign_protocol_digest(protocol)
+        if (
+            protocol_hash is None
+            or (
+                expected_protocol_hash is not None
+                and protocol_hash != expected_protocol_hash
+            )
+            or str(payload.get("campaign_protocol_hash", "")).strip() != protocol_hash
+        ):
+            return None
+        campaign_id = str(payload.get("campaign_id", "")).strip()
+        trial_id = str(payload.get("campaign_trial_id", "")).strip()
+        configuration_id = str(payload.get("campaign_configuration_id", "")).strip()
+        if (
+            not campaign_id
+            or not trial_id
+            or not configuration_id
+            or str(plan.get("campaign_id", "")).strip() != campaign_id
+            or str(plan.get("campaign_trial_id", "")).strip() != trial_id
+            or str(plan.get("campaign_configuration_id", "")).strip() != configuration_id
+        ):
+            return None
+        payload_dataset_id = str(payload.get("dataset_id", "")).strip()
+        payload_dataset_version = str(payload.get("dataset_version", "")).strip()
+        if not payload_dataset_id or not payload_dataset_version:
+            return None
+        selector = plan.get("dataset_selector")
+        if isinstance(selector, Mapping) and (
+            str(selector.get("dataset_id", "")).strip() != payload_dataset_id
+            or str(selector.get("dataset_version", "")).strip() != payload_dataset_version
+        ):
+            return None
+        plan_boundary = plan.get("dataset_boundary")
+        boundary = dict(plan_boundary) if isinstance(plan_boundary, Mapping) else {}
+        boundary["dataset_id"] = payload_dataset_id
+        boundary["dataset_version"] = payload_dataset_version
+        plan_id = str(plan.get("plan_id", "")).strip()
+        loader = getattr(self.store, "load_experiment_plan", None)
+        if not plan_id or not callable(loader):
+            return None
+        try:
+            persisted = loader(plan_id)
+        except Exception:
+            return None
+        if not isinstance(persisted, Mapping) or not isinstance(persisted.get("plan"), Mapping):
+            return None
+        persisted_plan = persisted["plan"]
+        if _canonical_binding(persisted_plan) != _canonical_binding(plan):
+            return None
+        if (
+            str(persisted.get("plan_hash", "")).strip() != _hash_document(plan)
+            or (
+                str(payload.get("hypothesis_id", "")).strip()
+                and str(payload.get("hypothesis_id", "")).strip()
+                != str(persisted.get("hypothesis_id", "")).strip()
+            )
+        ):
+            return None
+        return self._campaign_plan_evidence_binding(
+            persisted,
+            plan,
+            setup,
+            boundary=boundary,
+            expected_protocol_hash=protocol_hash,
+        )
+
+    def _campaign_prior_operational_setup_bindings(self) -> set[tuple[str, str]]:
+        """Return setup identities from fully bound V2 durable evidence only."""
+        bindings: set[tuple[str, str]] = set()
+
+        lister = getattr(self.store, "list_experiment_plans", None)
+        if callable(lister):
+            try:
+                records = lister(limit=10_000, newest_first=False)
+            except TypeError:
+                records = lister(limit=10_000)
+            except Exception:
+                records = ()
+            for record in records or ():
+                if not isinstance(record, Mapping):
+                    continue
+                plan = record.get("plan")
+                if not isinstance(plan, Mapping):
+                    continue
+                if self._campaign_v2_protocol(plan.get("campaign_protocol")):
+                    binding = self._campaign_plan_evidence_binding(record, plan, plan)
+                    if binding is not None:
+                        bindings.add(binding)
+
+        try:
+            queued = self.store.list_research_items(limit=10_000)
+        except Exception:
+            queued = ()
+        for record in queued or ():
+            if not isinstance(record, Mapping):
+                continue
+            binding = self._campaign_queue_evidence_binding(record)
+            if binding is not None:
+                bindings.add(binding)
+
+        job_lister = getattr(self.store, "list_operator_jobs", None)
+        if callable(job_lister):
+            try:
+                jobs = job_lister(
+                    job_prefix="polymarket-research-campaign:",
+                    limit=10_000,
+                )
+            except TypeError:
+                try:
+                    jobs = job_lister(limit=10_000)
+                except Exception:
+                    jobs = ()
+            except Exception:
+                jobs = ()
+            for record in jobs or ():
+                if not isinstance(record, Mapping):
+                    continue
+                payload = record.get("payload")
+                if not isinstance(payload, Mapping):
+                    continue
+                job_name = str(record.get("job_name", "")).strip()
+                job_campaign_id = job_name.removeprefix("polymarket-research-campaign:")
+                if job_campaign_id != str(payload.get("campaign_id", "")).strip():
+                    continue
+                protocol = payload.get("protocol")
+                if not self._campaign_v2_protocol(protocol) or not isinstance(protocol, Mapping):
+                    continue
+                protocol_hash = _hash_document(protocol)
+                if (
+                    str(payload.get("protocol_hash", "")).strip() != protocol_hash
+                    or self._campaign_protocol_digest({"protocol_hash": protocol_hash}) is None
+                    or str(payload.get("schema_version", "")).strip() != CAMPAIGN_SCHEMA_V2
+                    or str(payload.get("protocol_id", "")).strip() != CAMPAIGN_PROTOCOL_V2_ID
+                    or str(payload.get("campaign_id", "")).strip()
+                    != str(protocol.get("campaign_id", "")).strip()
+                ):
+                    continue
+                boundary = protocol.get("dataset_boundary")
+                reassessment_boundaries = payload.get("reassessment_boundaries")
+                trials = payload.get("trials")
+                if not isinstance(trials, Sequence) or isinstance(trials, (str, bytes)):
+                    continue
+                operational_setups = protocol.get("operational_setups")
+                if not isinstance(operational_setups, Mapping):
+                    continue
+                for trial in trials:
+                    if not isinstance(trial, Mapping):
+                        continue
+                    configuration_id = str(trial.get("configuration_id", "")).strip()
+                    trial_id = str(trial.get("trial_id", "")).strip()
+                    trial_configuration = trial.get("configuration")
+                    if (
+                        not trial_id
+                        or not isinstance(trial_configuration, Mapping)
+                        or str(trial_configuration.get("configuration_id", "")).strip()
+                        != configuration_id
+                        or str(trial_configuration.get("template", "")).strip().lower()
+                        != configuration_id.split(":", 1)[0]
+                        or not self._campaign_exact_configuration_identity(
+                            trial_configuration,
+                            configuration_id,
+                        )
+                    ):
+                        continue
+                    reassessment_of = str(trial.get("reassessment_of", "")).strip()
+                    trial_boundary = boundary
+                    if reassessment_of:
+                        trial_boundary = (
+                            reassessment_boundaries.get(trial_id)
+                            if isinstance(reassessment_boundaries, Mapping)
+                            else None
+                        )
+                    if not isinstance(trial_boundary, Mapping):
+                        continue
+                    setup = (
+                        {
+                            "operational_setup": trial.get("operational_setup"),
+                            "operational_setup_hash": trial.get("operational_setup_hash"),
+                        }
+                        if isinstance(trial.get("operational_setup"), Mapping)
+                        else None
+                    )
+                    declared = operational_setups.get(configuration_id)
+                    if (
+                        setup is None
+                        or self._campaign_operational_setup_binding(setup) is None
+                        or (
+                            not reassessment_of
+                            and (
+                                not isinstance(declared, Mapping)
+                                or _canonical_binding(setup) != _canonical_binding(declared)
+                            )
+                        )
+                    ):
+                        continue
+                    if not self._campaign_setup_matches_configuration(setup, configuration_id):
+                        continue
+                    if not self._campaign_setup_matches_boundary(setup, trial_boundary):
+                        continue
+                    # A job trial consumes a setup only after its plan and
+                    # queue references resolve to the same immutable source.
+                    plan_id = str(trial.get("plan_id", "")).strip()
+                    plan_hash = str(trial.get("plan_hash", "")).strip()
+                    queue_item_id = str(trial.get("queue_item_id", "")).strip()
+                    loader = getattr(self.store, "load_experiment_plan", None)
+                    queue_loader = getattr(self.store, "get_research_item", None)
+                    if (
+                        not plan_id
+                        or not plan_hash
+                        or not queue_item_id
+                        or not callable(loader)
+                        or not callable(queue_loader)
+                    ):
+                        continue
+                    try:
+                        persisted = loader(plan_id)
+                        queue_record = queue_loader(queue_item_id)
+                    except Exception:
+                        continue
+                    if (
+                        not isinstance(persisted, Mapping)
+                        or not isinstance(persisted.get("plan"), Mapping)
+                        or str(persisted.get("plan_hash", "")).strip() != plan_hash
+                        or not isinstance(queue_record, Mapping)
+                    ):
+                        continue
+                    persisted_plan = persisted["plan"]
+                    trial_binding = self._campaign_plan_evidence_binding(
+                        persisted,
+                        persisted_plan,
+                        setup,
+                        boundary=trial_boundary,
+                        expected_protocol_hash=protocol_hash,
+                    )
+                    if trial_binding is None:
+                        continue
+                    queue_payload = queue_record.get("payload")
+                    if not isinstance(queue_payload, Mapping):
+                        continue
+                    if (
+                        str(queue_payload.get("campaign_id", "")).strip()
+                        != str(payload.get("campaign_id", "")).strip()
+                        or str(queue_payload.get("campaign_trial_id", "")).strip()
+                        != str(trial.get("trial_id", "")).strip()
+                        or str(queue_payload.get("campaign_configuration_id", "")).strip()
+                        != configuration_id
+                    ):
+                        continue
+                    queue_binding = self._campaign_queue_evidence_binding(
+                        queue_record,
+                        expected_protocol_hash=protocol_hash,
+                    )
+                    if queue_binding == trial_binding:
+                        bindings.add(queue_binding)
+        return bindings
+
+
+    @staticmethod
     def _campaign_split_manifests(rows: Sequence[Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
         """Return compact split commitments, not the historical row lists."""
         return dict(_campaign_compact_row_provenance(rows)["split_boundaries"])
@@ -11275,6 +11820,7 @@ class AutonomousResearchProcessor:
         observation_horizon: int,
         protocol_id: str = CAMPAIGN_PROTOCOL_V1_ID,
         attestation_hash: str | None = None,
+        dataset_attestation: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         provenance = _campaign_compact_row_provenance(rows)
         manifests = dict(provenance["split_boundaries"])
@@ -11306,6 +11852,20 @@ class AutonomousResearchProcessor:
             else ["timestamp", "market_id", "yes_mid", "yes_bid", "yes_ask", "settlement"]
         )
         versioned_setup = protocol_identity == CAMPAIGN_PROTOCOL_V2_ID
+        canonical_attestation = (
+            _operational_attestation_binding(dataset_attestation)
+            if isinstance(dataset_attestation, Mapping)
+            else {}
+        )
+        supplied_attestation_hash = str(attestation_hash or "").strip()
+        if supplied_attestation_hash:
+            if (
+                canonical_attestation
+                and str(canonical_attestation.get("attestation_hash", "")).strip()
+                not in {"", supplied_attestation_hash}
+            ):
+                raise ValueError("dataset attestation hash does not match its bounded identity")
+            canonical_attestation.setdefault("attestation_hash", supplied_attestation_hash)
         if versioned_setup:
             invalid_ids = {
                 str(configuration.get("configuration_id", "")).strip()
@@ -11371,6 +11931,10 @@ class AutonomousResearchProcessor:
                         "market_scope": setup_scope,
                         "dataset_id": dataset_id,
                         "dataset_version": dataset_version,
+                        # Keep the bounded attestation separate from the
+                        # row boundary; the setup manifest must commit to
+                        # attestation rotation even when rows are unchanged.
+                        "dataset_attestation": canonical_attestation,
                         "dataset_boundary": boundary,
                     },
                 )
@@ -11388,6 +11952,7 @@ class AutonomousResearchProcessor:
         }
         return {
             "schema_version": schema_version,
+            **({"protocol_id": protocol_identity} if versioned_setup else {}),
             "campaign_id": campaign_id,
             "scientific_rationale": (
                 "Test whether short price-path momentum or mean-reversion "
@@ -11644,6 +12209,8 @@ class AutonomousResearchProcessor:
             "budget_version": protocol.get("budget_version"),
             "reassessment_version": protocol.get("reassessment_version"),
         }
+        if self._campaign_v2_protocol(protocol):
+            expected_reference["protocol_id"] = CAMPAIGN_PROTOCOL_V2_ID
         # ExperimentPlan normalizes the compact reference by copying the
         # separately persisted trial fields into ``campaign_protocol``.  Bind
         # the protocol identity itself exactly, while leaving those bounded
@@ -11821,6 +12388,8 @@ class AutonomousResearchProcessor:
             "budget_version": protocol.get("budget_version"),
             "reassessment_version": protocol.get("reassessment_version"),
         }
+        if self._campaign_v2_protocol(protocol):
+            protocol_reference["protocol_id"] = CAMPAIGN_PROTOCOL_V2_ID
         family = str(config.get("template", "")).strip().lower()
         raw_parameters = config.get("parameters")
         parameters = dict(raw_parameters) if isinstance(raw_parameters, Mapping) else {}
@@ -11844,7 +12413,7 @@ class AutonomousResearchProcessor:
         )
         plan_document.update(
             {
-                "plan_id": f"campaign-plan:{campaign_id}:{trial_id}",
+                "plan_id": self._campaign_plan_id(campaign_id, trial_id),
                 "hypothesis_id": f"campaign-hypothesis:{campaign_id}:{trial_id}",
                 "campaign_id": campaign_id,
                 "campaign_trial_id": trial_id,
@@ -12239,32 +12808,67 @@ class AutonomousResearchProcessor:
                 "SOFTWARE_OR_INPUT_ERROR",
                 "campaign dataset rows do not match the attested catalog count",
             )
-        prior = self._campaign_prior_configuration_keys(resolved_protocol_id)
         if canonical_configurations is None:
-            configurations = [
+            candidate_configurations = [
                 dict(item)
                 for item in self.campaign_configurations()
-                if _campaign_configuration_key(item) not in prior
             ]
         else:
-            configurations = [
+            candidate_configurations = [
                 dict(item)
                 for item in canonical_configurations
                 if str(item.get("configuration_id", "")) in selected_configuration_ids
-                and _campaign_configuration_key(item) not in prior
             ]
-        protocol = self._campaign_default_protocol(
-            campaign_id=campaign,
-            dataset_id=resolved_dataset_id,
-            dataset_version=resolved_dataset_version,
-            rows=rows,
-            configurations=configurations,
-            qualification_gates=qualification_gates,
-            finalist_count=int(finalist_count),
-            observation_horizon=int(observation_horizon),
-            protocol_id=resolved_protocol_id,
-            attestation_hash=str(attestation.get("attestation_hash", "")).strip(),
-        )
+        if resolved_protocol_id == CAMPAIGN_PROTOCOL_V2_ID:
+            candidate_protocol = self._campaign_default_protocol(
+                campaign_id=campaign,
+                dataset_id=resolved_dataset_id,
+                dataset_version=resolved_dataset_version,
+                rows=rows,
+                configurations=candidate_configurations,
+                qualification_gates=qualification_gates,
+                finalist_count=int(finalist_count),
+                observation_horizon=int(observation_horizon),
+                protocol_id=resolved_protocol_id,
+                attestation_hash=str(attestation.get("attestation_hash", "")).strip(),
+                dataset_attestation=attestation,
+            )
+            candidate_setups = candidate_protocol.get("operational_setups")
+            candidate_setups = candidate_setups if isinstance(candidate_setups, Mapping) else {}
+            prior_setups = self._campaign_prior_operational_setup_bindings()
+            configurations = []
+            for item in candidate_configurations:
+                setup = candidate_setups.get(str(item.get("configuration_id", "")).strip())
+                binding = (
+                    self._campaign_operational_setup_binding(setup)
+                    if isinstance(setup, Mapping)
+                    else None
+                )
+                if binding is None or binding not in prior_setups:
+                    configurations.append(item)
+        else:
+            prior = self._campaign_prior_configuration_keys(resolved_protocol_id)
+            configurations = [
+                item
+                for item in candidate_configurations
+                if _campaign_configuration_key(item) not in prior
+            ]
+        if resolved_protocol_id == CAMPAIGN_PROTOCOL_V2_ID and len(configurations) == len(candidate_configurations):
+            protocol = candidate_protocol
+        else:
+            protocol = self._campaign_default_protocol(
+                campaign_id=campaign,
+                dataset_id=resolved_dataset_id,
+                dataset_version=resolved_dataset_version,
+                rows=rows,
+                configurations=configurations,
+                qualification_gates=qualification_gates,
+                finalist_count=int(finalist_count),
+                observation_horizon=int(observation_horizon),
+                protocol_id=resolved_protocol_id,
+                attestation_hash=str(attestation.get("attestation_hash", "")).strip(),
+                dataset_attestation=attestation,
+            )
         protocol_hash = _hash_document(protocol)
         operational_setups = protocol.get("operational_setups", {})
         operational_setups = operational_setups if isinstance(operational_setups, Mapping) else {}
@@ -12719,6 +13323,8 @@ class AutonomousResearchProcessor:
         for version in candidates:
             if not version or version in seen or version == current_version:
                 continue
+
+
             seen.add(version)
             if callable(catalog_loader):
                 try:
@@ -12740,6 +13346,89 @@ class AutonomousResearchProcessor:
             ):
                 return resolved_id, version
         return resolved_id, current_version
+    def _campaign_reassessment_operational_setup(
+        self,
+        trial: Mapping[str, Any],
+        *,
+        dataset_id: str,
+        dataset_version: str,
+        dataset_attestation: Mapping[str, Any],
+        dataset_boundary: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], str]:
+        """Rebind a V2 trial's exact setup to reassessed evidence."""
+        configuration_id = str(trial.get("configuration_id", "")).strip()
+        configuration = trial.get("configuration")
+        if (
+            not isinstance(configuration, Mapping)
+            or not self._campaign_exact_configuration_identity(
+                configuration,
+                configuration_id,
+            )
+        ):
+            raise AutonomousResearchError(
+                "CAMPAIGN_PROTOCOL_INVALID",
+                "V2 reassessment trial configuration is not canonical",
+            )
+        family = configuration_id.split(":", 1)[0]
+        raw_parameters = configuration.get("parameters")
+        assert isinstance(raw_parameters, Mapping)
+
+        def scalar(value: Any) -> Any:
+            return value[0] if isinstance(value, (list, tuple)) else value
+
+        strategy_document = {
+            "version": 1,
+            "market_type": MarketType.PREDICTION.value,
+            "family": family,
+            "parameters": {
+                "lookback": 1,
+                "threshold": 0.05,
+                "entry_predicate": dict(_ABSOLUTE_MOVE_PREDICATE),
+            },
+            "probability_model": "plan-model-probability",
+            "resolution_aware": True,
+            "resolution_inputs": ["expiry", "settlement"],
+            "metadata": {
+                "operational_setup_id": configuration_id,
+                "model_required": False,
+            },
+        }
+        # Keep this assertion close to the canonical construction so a future
+        # grid edit cannot accidentally make the setup independent of its
+        # declared scalar configuration.
+        if (
+            scalar(raw_parameters.get("lookback")) != 1
+            or float(scalar(raw_parameters.get("threshold"))) != 0.05
+        ):
+            raise AutonomousResearchError(
+                "CAMPAIGN_PROTOCOL_INVALID",
+                "V2 reassessment trial scalar configuration changed",
+            )
+        setup = _operational_setup_for_strategy(
+            strategy_document,
+            {
+                "market_scope": {
+                    "mode": "RULE_BASED_MARKETS",
+                    "instrument": "POLYMARKET",
+                    "filters": {},
+                    "regime_restrictions": {},
+                    "provenance": "canonical",
+                },
+                "dataset_id": dataset_id,
+                "dataset_version": dataset_version,
+                "dataset_attestation": _operational_attestation_binding(
+                    dataset_attestation
+                ),
+                "dataset_boundary": dataset_boundary,
+            },
+        )
+        if setup is None:
+            raise AutonomousResearchError(
+                "CAMPAIGN_PROTOCOL_INVALID",
+                "V2 reassessment operational setup could not be constructed",
+            )
+        canonical_setup = _canonical_operational_document(setup)
+        return canonical_setup, _operational_setup_hash(canonical_setup)
     @staticmethod
     def _campaign_boundary_for_dataset(
         dataset_id: str,
@@ -12895,22 +13584,36 @@ class AutonomousResearchProcessor:
             for item in trials
         }
         appended = 0
+        v2_reassessment = self._campaign_v2_protocol(protocol)
         for old in waiting:
             reassessment_id = f"{old.get('trial_id')}:reassessment-1"
             if reassessment_id in existing_trial_ids:
                 continue
-            trials.append(
-                {
-                    "trial_id": reassessment_id,
-                    "configuration_id": old.get("configuration_id"),
-                    "configuration": dict(old.get("configuration", {})),
-                    "status": "PLANNED",
-                    "reassessment_of": old.get("trial_id"),
-                    "dataset_id": resolved_dataset_id,
-                    "dataset_version": resolved_dataset_version,
-                    "result": None,
-                }
-            )
+            reassessment_trial = {
+                "trial_id": reassessment_id,
+                "configuration_id": old.get("configuration_id"),
+                "configuration": dict(old.get("configuration", {})),
+                "status": "PLANNED",
+                "reassessment_of": old.get("trial_id"),
+                "dataset_id": resolved_dataset_id,
+                "dataset_version": resolved_dataset_version,
+                "result": None,
+            }
+            if v2_reassessment:
+                setup, setup_hash = self._campaign_reassessment_operational_setup(
+                    reassessment_trial,
+                    dataset_id=resolved_dataset_id,
+                    dataset_version=resolved_dataset_version,
+                    dataset_attestation=reassessment_attestation,
+                    dataset_boundary=reassessment_boundary,
+                )
+                reassessment_trial.update(
+                    {
+                        "operational_setup": setup,
+                        "operational_setup_hash": setup_hash,
+                    }
+                )
+            trials.append(reassessment_trial)
             reassessment_boundaries[reassessment_id] = dict(reassessment_boundary)
             existing_trial_ids.add(reassessment_id)
             appended += 1

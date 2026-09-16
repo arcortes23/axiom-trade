@@ -9,6 +9,9 @@ from unittest.mock import patch
 from axiom.autonomous import (
     AutonomousResearchError,
     AutonomousResearchProcessor,
+    CAMPAIGN_PROTOCOL_V1_ID,
+    CAMPAIGN_PROTOCOL_V2_ID,
+    CAMPAIGN_SCHEMA_V2,
     _hash_document,
 )
 from axiom.storage import AxiomStore
@@ -17,6 +20,12 @@ from axiom.storage import AxiomStore
 UTC = timezone.utc
 T0 = datetime(2025, 1, 1, tzinfo=UTC)
 SYNTHETIC_LABEL = "SYNTHETIC_CAMPAIGN_ACCEPTANCE"
+_V2_OPERATIONAL_CONFIGURATION_IDS = (
+    "momentum:lookback-1:threshold-0.05",
+    "mean_reversion:lookback-1:threshold-0.05",
+)
+
+
 DATASET_ID = "synthetic-polymarket-campaign-history"
 
 
@@ -139,6 +148,77 @@ def _save_catalog_attested_dataset(
     return attestation
 
 
+def _v2_protocol_with_setups(
+    store: AxiomStore,
+    processor: AutonomousResearchProcessor,
+    *,
+    dataset_version: str,
+    attestation_hash: str,
+) -> dict[str, object]:
+    rows = processor._campaign_dataset_rows(store, DATASET_ID, dataset_version)
+    configurations = tuple(
+        configuration
+        for configuration in processor.campaign_configurations()
+        if str(configuration.get("configuration_id", "")).strip()
+        in _V2_OPERATIONAL_CONFIGURATION_IDS
+    )
+    assert tuple(
+        str(configuration.get("configuration_id", "")).strip()
+        for configuration in configurations
+    ) == _V2_OPERATIONAL_CONFIGURATION_IDS
+    dataset_attestation = store.load_dataset_integrity_attestation(DATASET_ID, dataset_version)
+    assert isinstance(dataset_attestation, Mapping)
+    return processor._campaign_default_protocol(
+        campaign_id="prior-v2",
+        dataset_id=DATASET_ID,
+        dataset_version=dataset_version,
+        rows=rows,
+        configurations=configurations,
+        qualification_gates=None,
+        finalist_count=1,
+        observation_horizon=1,
+        protocol_id=CAMPAIGN_PROTOCOL_V2_ID,
+        attestation_hash=attestation_hash,
+        dataset_attestation=dataset_attestation,
+    )
+
+
+def _v2_prior_plan(
+    protocol: Mapping[str, object],
+    configuration: Mapping[str, object],
+) -> dict[str, object]:
+    configuration_id = str(configuration["configuration_id"]).strip()
+    operational_setups = protocol["operational_setups"]
+    assert isinstance(operational_setups, Mapping)
+    setup = operational_setups[configuration_id]
+    assert isinstance(setup, Mapping)
+    campaign_protocol = {
+        key: protocol[key]
+        for key in (
+            "schema_version",
+            "protocol_id",
+            "campaign_id",
+            "budget_version",
+            "reassessment_version",
+        )
+    }
+    campaign_protocol["protocol_hash"] = _hash_document(protocol)
+    boundary = protocol["dataset_boundary"]
+    assert isinstance(boundary, Mapping)
+    return {
+        **dict(configuration),
+        "campaign_id": str(protocol["campaign_id"]),
+        "campaign_trial_id": f"trial:{protocol['campaign_id']}:{configuration_id}",
+        "campaign_configuration_id": configuration_id,
+        "campaign_protocol": campaign_protocol,
+        "dataset_selector": {
+            "dataset_id": DATASET_ID,
+            "dataset_version": str(boundary["dataset_version"]),
+        },
+        **dict(setup),
+    }
+
+
 class AutonomousCampaignAcceptanceTests(unittest.TestCase):
     def test_large_campaign_uses_compact_locked_provenance(self) -> None:
         with AxiomStore(":memory:") as store:
@@ -242,6 +322,554 @@ class AutonomousCampaignAcceptanceTests(unittest.TestCase):
                 },
                 {expected_ids[0]},
             )
+    def test_v2_ignores_legacy_and_v1_scalar_priors(self) -> None:
+        expected_ids = {
+            "momentum:lookback-1:threshold-0.05",
+            "mean_reversion:lookback-1:threshold-0.05",
+        }
+        with AxiomStore(":memory:") as store:
+            _save_attested_dataset(store, "v2-legacy-priors", midpoint=0.50)
+            store.save_experiment_plan(
+                "legacy-scalar-momentum",
+                {
+                    "template": "momentum",
+                    "parameters": {"lookback": [1], "threshold": [0.05]},
+                },
+                hypothesis_id="legacy-scalar-momentum-hypothesis",
+                timestamp=T0,
+            )
+            store.save_experiment_plan(
+                "v1-scalar-mean-reversion",
+                {
+                    "template": "mean_reversion",
+                    "parameters": {"lookback": [1], "threshold": [0.05]},
+                    "campaign_protocol": {"schema_version": "polymarket-finite-campaign-v1"},
+                },
+                hypothesis_id="v1-scalar-mean-reversion-hypothesis",
+                timestamp=T0,
+            )
+            processor = AutonomousResearchProcessor(store, clock=lambda: T0)
+            state = processor.start_polymarket_campaign(
+                "polymarket-paper-campaign-v2:legacy-priors",
+                dataset_id=DATASET_ID,
+                dataset_version="v2-legacy-priors",
+                now=T0,
+            )
+            self.assertEqual(state["fixed_configuration_count"], 2)
+            self.assertEqual(
+                {trial["configuration_id"] for trial in state["trials"]},
+                expected_ids,
+            )
+
+    def test_v2_conflicting_schema_and_protocol_markers_do_not_suppress(self) -> None:
+        with AxiomStore(":memory:") as store:
+            attestation = _save_attested_dataset(store, "v2-conflicting-markers", midpoint=0.50)
+            processor = AutonomousResearchProcessor(store, clock=lambda: T0)
+            protocol = _v2_protocol_with_setups(
+                store,
+                processor,
+                dataset_version="v2-conflicting-markers",
+                attestation_hash=str(attestation["attestation_hash"]),
+            )
+            configuration = next(
+                item
+                for item in processor.campaign_configurations()
+                if item["configuration_id"] == _V2_OPERATIONAL_CONFIGURATION_IDS[0]
+            )
+            prior = _v2_prior_plan(protocol, configuration)
+            prior_protocol = prior["campaign_protocol"]
+            assert isinstance(prior_protocol, dict)
+            prior_protocol["protocol_id"] = CAMPAIGN_PROTOCOL_V1_ID
+            store.save_experiment_plan(
+                "v2-conflicting-markers-plan",
+                prior,
+                hypothesis_id="v2-conflicting-markers-hypothesis",
+                timestamp=T0,
+            )
+            state = processor.start_polymarket_campaign(
+                "polymarket-paper-campaign-v2:conflicting-markers",
+                dataset_id=DATASET_ID,
+                dataset_version="v2-conflicting-markers",
+                now=T0,
+            )
+            self.assertEqual(state["fixed_configuration_count"], 2)
+
+    def test_v2_bad_or_copied_setup_does_not_suppress(self) -> None:
+        for mutation in ("bad_hash", "copied_setup", "copied_setup_lookback_3"):
+            with self.subTest(mutation=mutation), AxiomStore(":memory:") as store:
+                attestation = _save_attested_dataset(
+                    store,
+                    f"v2-{mutation}-setup",
+                    midpoint=0.50,
+                )
+                processor = AutonomousResearchProcessor(store, clock=lambda: T0)
+                protocol = _v2_protocol_with_setups(
+                    store,
+                    processor,
+                    dataset_version=f"v2-{mutation}-setup",
+                    attestation_hash=str(attestation["attestation_hash"]),
+                )
+                configurations = protocol["configuration_manifest"]
+                assert isinstance(configurations, list)
+                momentum = configurations[0]
+                assert isinstance(momentum, Mapping)
+                prior = _v2_prior_plan(protocol, momentum)
+                if mutation == "bad_hash":
+                    prior["operational_setup_hash"] = "sha256:" + ("0" * 64)
+                elif mutation == "copied_setup":
+                    setups = protocol["operational_setups"]
+                    assert isinstance(setups, Mapping)
+                    copied = setups[_V2_OPERATIONAL_CONFIGURATION_IDS[1]]
+                    assert isinstance(copied, Mapping)
+                    prior["operational_setup"] = copied["operational_setup"]
+                    prior["operational_setup_hash"] = copied["operational_setup_hash"]
+                else:
+                    # The setup remains an exact momentum setup while its
+                    # declared scalar configuration is a non-operational
+                    # lookback.  Setup copying must never erase that mismatch.
+                    prior["parameters"] = {"lookback": 3, "threshold": 0.05}
+                store.save_experiment_plan(
+                    f"v2-{mutation}-setup-plan",
+                    prior,
+                    hypothesis_id=f"v2-{mutation}-setup-hypothesis",
+                    timestamp=T0,
+                )
+                state = processor.start_polymarket_campaign(
+                    f"polymarket-paper-campaign-v2:{mutation}-setup",
+                    dataset_id=DATASET_ID,
+                    dataset_version=f"v2-{mutation}-setup",
+                    now=T0,
+                )
+                self.assertEqual(state["fixed_configuration_count"], 2)
+                if mutation == "copied_setup_lookback_3":
+                    queued = processor.bus.list_campaign_trials(
+                        f"polymarket-paper-campaign-v2:{mutation}-setup",
+                        limit=10,
+                    )
+                    self.assertEqual(len(queued), 1)
+                    plan_id = queued[0].payload["experiment_plan"]["plan_id"]
+                    self.assertRegex(plan_id, r"^[A-Za-z0-9._:-]{1,128}$")
+
+    def test_v2_attestation_rotation_changes_setup_identity(self) -> None:
+        rows = [{"timestamp": T0.isoformat(), "market_id": "rotation", "yes_mid": 0.50}]
+        configurations = (
+            {
+                "configuration_id": _V2_OPERATIONAL_CONFIGURATION_IDS[0],
+                "template": "momentum",
+                "parameters": {"lookback": 1, "threshold": 0.05},
+            },
+        )
+        old = AutonomousResearchProcessor._campaign_default_protocol(
+            campaign_id="v2-rotation",
+            dataset_id=DATASET_ID,
+            dataset_version="same-boundary",
+            rows=rows,
+            configurations=configurations,
+            qualification_gates=None,
+            finalist_count=1,
+            observation_horizon=1,
+            protocol_id=CAMPAIGN_PROTOCOL_V2_ID,
+            attestation_hash="sha256:" + ("1" * 64),
+            dataset_attestation={"attestation_hash": "sha256:" + ("1" * 64)},
+        )
+        rotated = AutonomousResearchProcessor._campaign_default_protocol(
+            campaign_id="v2-rotation",
+            dataset_id=DATASET_ID,
+            dataset_version="same-boundary",
+            rows=rows,
+            configurations=configurations,
+            qualification_gates=None,
+            finalist_count=1,
+            observation_horizon=1,
+            protocol_id=CAMPAIGN_PROTOCOL_V2_ID,
+            attestation_hash="sha256:" + ("2" * 64),
+            dataset_attestation={"attestation_hash": "sha256:" + ("2" * 64)},
+        )
+        old_setup = old["operational_setups"][_V2_OPERATIONAL_CONFIGURATION_IDS[0]]
+        rotated_setup = rotated["operational_setups"][_V2_OPERATIONAL_CONFIGURATION_IDS[0]]
+        self.assertNotEqual(
+            old_setup["operational_setup_hash"],
+            rotated_setup["operational_setup_hash"],
+        )
+        self.assertEqual(
+            old_setup["operational_setup"]["assessment_manifest_ref"]["attestation_hash"],
+            "sha256:" + ("1" * 64),
+        )
+        self.assertEqual(
+            rotated_setup["operational_setup"]["assessment_manifest_ref"]["attestation_hash"],
+            "sha256:" + ("2" * 64),
+        )
+
+    def test_v2_excludes_an_exact_prior_setup_and_resumes_idempotently(self) -> None:
+        momentum_id = _V2_OPERATIONAL_CONFIGURATION_IDS[0]
+        mean_reversion_id = _V2_OPERATIONAL_CONFIGURATION_IDS[1]
+        with AxiomStore(":memory:") as store:
+            attestation = _save_attested_dataset(store, "v2-exact-prior", midpoint=0.50)
+            processor = AutonomousResearchProcessor(store, clock=lambda: T0)
+            protocol = _v2_protocol_with_setups(
+                store,
+                processor,
+                dataset_version="v2-exact-prior",
+                attestation_hash=str(attestation["attestation_hash"]),
+            )
+            configuration = next(
+                configuration
+                for configuration in processor.campaign_configurations()
+                if str(configuration.get("configuration_id", "")).strip() == momentum_id
+            )
+            store.save_experiment_plan(
+                "v2-exact-prior-momentum",
+                _v2_prior_plan(protocol, configuration),
+                hypothesis_id="v2-exact-prior-momentum-hypothesis",
+                timestamp=T0,
+            )
+            state = processor.start_polymarket_campaign(
+                "polymarket-paper-campaign-v2:exact-prior",
+                dataset_id=DATASET_ID,
+                dataset_version="v2-exact-prior",
+                now=T0,
+            )
+            self.assertEqual(state["fixed_configuration_count"], 1)
+            self.assertEqual(
+                [trial["configuration_id"] for trial in state["trials"]],
+                [mean_reversion_id],
+            )
+            resumed = processor.start_polymarket_campaign(
+                "polymarket-paper-campaign-v2:exact-prior",
+                dataset_id=DATASET_ID,
+                dataset_version="v2-exact-prior",
+                now=T0,
+            )
+            self.assertEqual(resumed, state)
+
+    def test_v2_reassessment_rebinds_rotated_setup_for_future_campaign(self) -> None:
+        campaign_id = "polymarket-paper-campaign-v2:rotated-reassessment"
+        with AxiomStore(":memory:") as store:
+            first_attestation = _save_attested_dataset(store, "v2-reassessment-v1", midpoint=0.50)
+            rotated_attestation = _save_attested_dataset(store, "v2-reassessment-v2", midpoint=0.52)
+            processor = AutonomousResearchProcessor(store, clock=lambda: T0)
+            initial = processor.start_polymarket_campaign(
+                campaign_id,
+                dataset_id=DATASET_ID,
+                dataset_version="v2-reassessment-v1",
+                now=T0,
+            )
+            self.assertEqual(
+                initial["trials"][0]["operational_setup"]["assessment_manifest_ref"][
+                    "attestation_hash"
+                ],
+                first_attestation["attestation_hash"],
+            )
+            initial_queue = processor.bus.list_campaign_trials(campaign_id, limit=10)
+            self.assertEqual(len(initial_queue), 1)
+            old_setup_hash = initial["trials"][0]["operational_setup_hash"]
+            processor._advance_campaign_after_result(
+                initial_queue[0],
+                {
+                    "accepted": False,
+                    "reason_code": "INSUFFICIENT_DATA",
+                    "candidate_id": "rotated-reassessment-candidate",
+                },
+                now=T0 + timedelta(minutes=1),
+            )
+            waiting = processor.campaign_state(campaign_id)
+            self.assertEqual(waiting["status"], "WAITING_FOR_DATA")
+
+            reassessed = processor.reassess_campaign(
+                campaign_id,
+                evidence_identity=str(rotated_attestation["attestation_hash"]),
+                dataset_id=DATASET_ID,
+                dataset_version="v2-reassessment-v2",
+                now=T0 + timedelta(minutes=2),
+            )
+            reassessment_trial = next(
+                trial
+                for trial in reassessed["trials"]
+                if str(trial.get("reassessment_of", "")).strip()
+            )
+            self.assertEqual(reassessment_trial["status"], "RUNNING")
+            self.assertNotEqual(reassessment_trial["operational_setup_hash"], old_setup_hash)
+            self.assertEqual(
+                reassessment_trial["operational_setup"]["assessment_manifest_ref"]["attestation_hash"],
+                rotated_attestation["attestation_hash"],
+            )
+            reassessment_queue = next(
+                item
+                for item in processor.bus.list_campaign_trials(campaign_id, limit=10)
+                if item.payload["campaign_trial_id"] == reassessment_trial["trial_id"]
+            )
+            self.assertEqual(
+                reassessment_queue.payload["operational_setup_hash"],
+                reassessment_trial["operational_setup_hash"],
+            )
+            self.assertEqual(
+                reassessment_queue.payload["operational_setup"]["assessment_manifest_ref"][
+                    "attestation_hash"
+                ],
+                rotated_attestation["attestation_hash"],
+            )
+            self.assertEqual(
+                reassessment_queue.payload["experiment_plan"]["dataset_selector"]["dataset_version"],
+                "v2-reassessment-v2",
+            )
+            self.assertRegex(
+                reassessment_queue.payload["experiment_plan"]["plan_id"],
+                r"^[A-Za-z0-9._:-]{1,128}$",
+            )
+
+            later = processor.start_polymarket_campaign(
+                "polymarket-paper-campaign-v2:later-rotated-reassessment",
+                dataset_id=DATASET_ID,
+                dataset_version="v2-reassessment-v2",
+                now=T0 + timedelta(minutes=3),
+            )
+            self.assertEqual(later["fixed_configuration_count"], 1)
+            self.assertEqual(
+                [trial["configuration_id"] for trial in later["trials"]],
+                [_V2_OPERATIONAL_CONFIGURATION_IDS[1]],
+            )
+
+
+
+    def test_v2_job_prior_requires_matching_trial_and_queue_attestation_binding(self) -> None:
+        configuration_id = _V2_OPERATIONAL_CONFIGURATION_IDS[0]
+        campaign_id = "prior-v2"
+        trial_id = f"trial:{campaign_id}:{configuration_id}"
+
+        def run_case(
+            *,
+            trial_setup_source: str,
+            queue_setup_source: str,
+            expected_count: int,
+            expected_status: str,
+        ) -> None:
+            with AxiomStore(":memory:") as store:
+                first_attestation = _save_attested_dataset(
+                    store,
+                    "v2-job-binding",
+                    midpoint=0.50,
+                )
+                processor = AutonomousResearchProcessor(store, clock=lambda: T0)
+                protocol_a = _v2_protocol_with_setups(
+                    store,
+                    processor,
+                    dataset_version="v2-job-binding",
+                    attestation_hash=str(first_attestation["attestation_hash"]),
+                )
+                rotated_input = dict(first_attestation)
+                rotated_input["policy_version"] = (
+                    f"{first_attestation['policy_version']}-rotated"
+                )
+                rotated_input.pop("attestation_hash", None)
+                self.assertTrue(
+                    store.save_dataset_integrity_attestation(
+                        DATASET_ID,
+                        "v2-job-binding",
+                        rotated_input,
+                    )
+                )
+                second_attestation = store.load_dataset_integrity_attestation(
+                    DATASET_ID,
+                    "v2-job-binding",
+                )
+                self.assertIsInstance(second_attestation, Mapping)
+                assert isinstance(second_attestation, Mapping)
+                self.assertNotEqual(
+                    first_attestation["attestation_hash"],
+                    second_attestation["attestation_hash"],
+                )
+                protocol_b = _v2_protocol_with_setups(
+                    store,
+                    processor,
+                    dataset_version="v2-job-binding",
+                    attestation_hash=str(second_attestation["attestation_hash"]),
+                )
+
+                protocols = {"A": protocol_a, "B": protocol_b}
+                setups = {
+                    name: protocols[name]["operational_setups"][configuration_id]
+                    for name in protocols
+                }
+                protocol = protocols[trial_setup_source]
+                protocol["dataset_boundary"].pop("attestation_hash", None)
+                protocol_hash = _hash_document(protocol)
+                trial_setup = setups[trial_setup_source]
+                queue_setup = setups[queue_setup_source]
+                self.assertIsNotNone(
+                    processor._campaign_operational_setup_binding(trial_setup)
+                )
+                self.assertIsNotNone(
+                    processor._campaign_operational_setup_binding(queue_setup)
+                )
+
+                plan_id = f"prior-v2-job-binding:{trial_setup_source}:{queue_setup_source}"
+                hypothesis_id = f"{plan_id}:hypothesis"
+                plan = _v2_prior_plan(
+                    protocol,
+                    next(
+                        configuration
+                        for configuration in processor.campaign_configurations()
+                        if configuration["configuration_id"] == configuration_id
+                    ),
+                )
+                plan["plan_id"] = plan_id
+                plan["hypothesis_id"] = hypothesis_id
+                store.save_experiment_plan(
+                    plan_id,
+                    plan,
+                    hypothesis_id=hypothesis_id,
+                    timestamp=T0,
+                )
+                persisted = store.load_experiment_plan(plan_id)
+                self.assertIsNotNone(persisted)
+                assert persisted is not None
+                queue_payload = {
+                    "proposal_id": hypothesis_id,
+                    "hypothesis_id": hypothesis_id,
+                    "statement": "Finite Polymarket campaign",
+                    "source": "axiom-finite-campaign",
+                    "dataset_id": DATASET_ID,
+                    "dataset_version": "v2-job-binding",
+                    "experiment_plan": plan,
+                    "campaign_id": campaign_id,
+                    "campaign_trial_id": trial_id,
+                    "campaign_configuration_id": configuration_id,
+                    "campaign_protocol_hash": protocol_hash,
+                    "paper_only": True,
+                    "operational_setup": queue_setup["operational_setup"],
+                    "operational_setup_hash": queue_setup["operational_setup_hash"],
+                }
+                queue_item = processor.bus.submit_campaign_trial(
+                    queue_payload,
+                    campaign_id=campaign_id,
+                    trial_id=trial_id,
+                    dedupe_key=f"campaign:{campaign_id}:{trial_id}",
+                    available_at=T0,
+                )
+                job_payload = {
+                    "schema_version": CAMPAIGN_SCHEMA_V2,
+                    "protocol_id": CAMPAIGN_PROTOCOL_V2_ID,
+                    "campaign_id": campaign_id,
+                    "status": "RUNNING",
+                    "protocol": protocol,
+                    "protocol_hash": protocol_hash,
+                    "reassessment_boundaries": {},
+                    "trials": [
+                        {
+                            "trial_id": trial_id,
+                            "configuration_id": configuration_id,
+                            "configuration": dict(
+                                next(
+                                    configuration
+                                    for configuration in processor.campaign_configurations()
+                                    if configuration["configuration_id"] == configuration_id
+                                )
+                            ),
+                            "operational_setup": trial_setup["operational_setup"],
+                            "operational_setup_hash": trial_setup["operational_setup_hash"],
+                            "status": "RUNNING",
+                            "result": None,
+                            "plan_id": plan_id,
+                            "plan_hash": persisted["plan_hash"],
+                            "queue_item_id": queue_item.item_id,
+                        }
+                    ],
+                }
+                store.set_operator_job(
+                    processor.campaign_job_name(campaign_id),
+                    "RUNNING",
+                    job_payload,
+                    resumable=True,
+                    timestamp=T0,
+                )
+
+                with (
+                    patch.object(store, "list_experiment_plans", return_value=[]),
+                    patch.object(store, "list_research_items", return_value=[]),
+                ):
+                    prior_bindings = processor._campaign_prior_operational_setup_bindings()
+                    later = processor.start_polymarket_campaign(
+                        f"polymarket-paper-campaign-v2:job-binding-{trial_setup_source}-{queue_setup_source}",
+                        dataset_id=DATASET_ID,
+                        dataset_version="v2-job-binding",
+                        configuration_allowlist=(configuration_id,),
+                        now=T0 + timedelta(minutes=1),
+                    )
+
+                expected_binding = processor._campaign_operational_setup_binding(
+                    queue_setup
+                )
+                assert expected_binding is not None
+                if trial_setup_source != queue_setup_source:
+                    self.assertNotIn(expected_binding, prior_bindings)
+                    self.assertEqual(later["fixed_configuration_count"], expected_count)
+                    self.assertEqual(later["status"], expected_status)
+                    queued_later = processor.bus.list_campaign_trials(
+                        later["campaign_id"],
+                        limit=10,
+                    )
+                    self.assertEqual(len(queued_later), 1)
+                    self.assertEqual(
+                        queued_later[0].payload["campaign_configuration_id"],
+                        configuration_id,
+                    )
+                else:
+                    self.assertIn(expected_binding, prior_bindings)
+                    self.assertEqual(later["fixed_configuration_count"], expected_count)
+                    self.assertEqual(later["status"], expected_status)
+                    self.assertEqual(
+                        processor.bus.list_campaign_trials(
+                            later["campaign_id"],
+                            limit=10,
+                        ),
+                        (),
+                    )
+
+        run_case(
+            trial_setup_source="A",
+            queue_setup_source="B",
+            expected_count=1,
+            expected_status="RUNNING",
+        )
+        run_case(
+            trial_setup_source="B",
+            queue_setup_source="B",
+            expected_count=0,
+            expected_status="CAMPAIGN_EXHAUSTED_NO_QUALIFIED_STRATEGY",
+        )
+
+
+    def test_v2_is_exhausted_after_both_exact_prior_setups_exist(self) -> None:
+        with AxiomStore(":memory:") as store:
+            attestation = _save_attested_dataset(store, "v2-exhausted-priors", midpoint=0.50)
+            processor = AutonomousResearchProcessor(store, clock=lambda: T0)
+            protocol = _v2_protocol_with_setups(
+                store,
+                processor,
+                dataset_version="v2-exhausted-priors",
+                attestation_hash=str(attestation["attestation_hash"]),
+            )
+            configurations = protocol["configuration_manifest"]
+            assert isinstance(configurations, list)
+            for configuration in configurations:
+                assert isinstance(configuration, Mapping)
+                configuration_id = str(configuration["configuration_id"]).strip()
+                store.save_experiment_plan(
+                    f"v2-exact-prior-{configuration_id.replace(':', '-')}",
+                    _v2_prior_plan(protocol, configuration),
+                    hypothesis_id=f"v2-exact-prior-{configuration_id}-hypothesis",
+                    timestamp=T0,
+                )
+            state = processor.start_polymarket_campaign(
+                "polymarket-paper-campaign-v2:exhausted-priors",
+                dataset_id=DATASET_ID,
+                dataset_version="v2-exhausted-priors",
+                now=T0,
+            )
+            self.assertEqual(state["status"], "CAMPAIGN_EXHAUSTED_NO_QUALIFIED_STRATEGY")
+            self.assertEqual(state["fixed_configuration_count"], 0)
+            self.assertEqual(state["trials"], [])
+            self.assertEqual(processor.bus.list_campaign_trials(state["campaign_id"]), ())
 
     def test_v2_configuration_allowlist_is_exactly_two_operational_setups(self) -> None:
         selected_ids = (
