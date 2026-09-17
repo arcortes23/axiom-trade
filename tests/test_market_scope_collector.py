@@ -218,6 +218,31 @@ class _HangingScopeProvider(_PagedProvider):
         return super().market_page(**kwargs)
 
 
+class _HangingScopeBookProvider(_PagedProvider):
+    def __init__(
+        self,
+        markets: tuple[PredictionMarketSnapshot, ...],
+        pages: tuple[dict[str, object], ...],
+    ) -> None:
+        super().__init__(markets, pages)
+        self.scope_entered = threading.Event()
+        self.scope_calls = 0
+        self._hang = threading.Event()
+
+    def order_book(self, market_id: str, depth: int = 20):
+        if "scope-hang" in str(market_id):
+            self.scope_calls += 1
+            self.scope_entered.set()
+            self._hang.wait()
+        return super().order_book(market_id, depth=depth)
+    def order_books(self, market_id: str, depth: int = 20):
+        if "scope-hang" in str(market_id):
+            self.scope_calls += 1
+            self.scope_entered.set()
+            self._hang.wait()
+        return super().order_books(market_id, depth=depth)
+
+
 class _AdvisoryLookupFailureProvider(_PagedProvider):
     def __init__(
         self,
@@ -2019,6 +2044,56 @@ class MarketScopeCollectorTests(unittest.TestCase):
         self.assertGreaterEqual(cycle.snapshots_inserted, 1)
         self.assertTrue(provider.market_calls)
         self.assertTrue(provider.book_calls)
+    def test_hung_scope_book_uses_isolated_pool_for_collection(self) -> None:
+        scope_market = replace(market("scope-hang"), order_book=None)
+        collect_market = market("collect-live")
+        provider = _HangingScopeBookProvider(
+            (scope_market, collect_market),
+            (
+                {"snapshots": (scope_market,), "next_cursor": None},
+                {"snapshots": (scope_market,), "next_cursor": None},
+            ),
+        )
+        store = _ScopeStore(
+            {
+                "scope-candidate": {
+                    "experiment_plan": {
+                        "market_scope": scope("EXACT_MARKETS", market_ids=("scope-hang",)),
+                        "suitability": {"required_capital": 1.0},
+                    }
+                }
+            }
+        )
+
+        class IsolatedScopeCollector(_ScopeCollector):
+            def _rolling_scope_market_ids(self) -> list[str]:
+                return ["collect-live"]
+
+        collector = IsolatedScopeCollector(
+            provider,
+            store,
+            CollectorConfig(
+                max_markets=1,
+                discovery_budget_per_cycle=1,
+                provider_timeout_seconds=0.15,
+                max_attempts=1,
+                backoff_initial_seconds=0,
+                jitter_seconds=0,
+                market_ids=("collect-live",),
+            ),
+            candidate_ids=("scope-candidate",),
+            clock=lambda: T0,
+            sleep=lambda _seconds: None,
+        )
+
+        first = collector.collect_once(now=T0)
+        self.assertTrue(provider.scope_entered.wait(timeout=0.2))
+        self.assertGreaterEqual(first.markets_attempted, 1)
+        self.assertGreaterEqual(first.snapshots_inserted, 1)
+
+        second = collector.collect_once(now=T0 + timedelta(seconds=1))
+        self.assertEqual(provider.scope_calls, 1)
+
 
     def test_selected_token_book_never_uses_wrong_singleton(self) -> None:
         base = market("exact-book")

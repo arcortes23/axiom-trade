@@ -5233,8 +5233,8 @@ class PolymarketCollector:
         endpoint: str,
         operation: Callable[[], Any],
     ) -> tuple[Future[Any], tuple[int, str]]:
-        key = (id(provider), str(endpoint))
         pool_name = "scope" if self._scope_phase_active else "collection"
+        key = (id(provider), f"{pool_name}:{endpoint}")
         with self._provider_executor_lock:
             if key in self._active_provider_calls:
                 existing = self._provider_futures.get(key)
