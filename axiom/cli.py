@@ -1,16 +1,17 @@
 """Command-line entry point for deterministic offline Axiom workflows."""
 from __future__ import annotations
 
-import getpass
+import hashlib
 import argparse
 import os
 from datetime import datetime, timedelta, timezone
-import hashlib
+import math
 import json
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 from decimal import Decimal
 import webbrowser
+import getpass
 
 from .collector import CollectorConfig, PolymarketCollector
 from .canary import (
@@ -19,6 +20,7 @@ from .canary import (
     CredentialStore,
     PolymarketClobV2Venue,
 )
+from .shadow import ShadowAssessmentService
 from .operator import OperatorControlPlane
 from .dashboard import DashboardData, DashboardServer
 from .data import BinanceAdapter, PolymarketAdapter, SyntheticCryptoProvider
@@ -484,11 +486,81 @@ def build_parser() -> argparse.ArgumentParser:
     summary.add_argument("--report")
     summary.add_argument("--db", default=DEFAULT_DB_PATH)
     queue = commands.add_parser("candidate-queue", help="list lifecycle candidates and frozen paper tests")
+    shadow_register = commands.add_parser(
+        "shadow-register",
+        help="register a bounded two-candidate paper-only shadow assessment",
+    )
+    shadow_register.add_argument("--db", default=DEFAULT_DB_PATH)
+    shadow_register.add_argument(
+        "--candidate",
+        "--candidate-id",
+        dest="candidate_ids",
+        action="append",
+        default=[],
+        help="candidate ID; repeat exactly twice",
+    )
+    shadow_register.add_argument("--budget", type=float, default=None, help="shared paper budget")
+    shadow_register.add_argument("--max-cycles", type=int)
+    shadow_register.add_argument("--max-observations", type=int)
+    shadow_register.add_argument("--stop-at")
+    shadow_register.add_argument(
+        "--interval",
+        "--interval-seconds",
+        dest="interval",
+        type=float,
+        default=60.0,
+        help="declared worker evaluation interval in seconds",
+    )
+    shadow_register.add_argument("--max-markets", type=int, default=100)
+    shadow_status = commands.add_parser(
+        "shadow-status",
+        help="show one shadow assessment or the latest/list read-only projection",
+    )
+    shadow_status.add_argument(
+        "selector",
+        nargs="?",
+        default="latest",
+        help="job ID, latest, or list",
+    )
+    shadow_status.add_argument("--db", default=DEFAULT_DB_PATH)
+    shadow_status.add_argument("--latest", action="store_true", help="show the latest job")
+    shadow_status.add_argument("--list", action="store_true", help="list recent jobs")
+    shadow_status.add_argument("--job-id", dest="job_id")
+    shadow_status.add_argument("--limit", type=int, default=100)
+    shadow_stop = commands.add_parser(
+        "shadow-stop",
+        help="idempotently stop one shadow assessment",
+    )
+    shadow_stop.add_argument("--db", default=DEFAULT_DB_PATH)
+    shadow_stop.add_argument("--latest", action="store_true", help="stop the latest job")
+    shadow_stop.add_argument("selector", nargs="?", help="job ID or latest")
+    shadow_stop.add_argument("--job-id", dest="job_id")
     queue.add_argument("--db", default=DEFAULT_DB_PATH)
     node_run = commands.add_parser("node-run", aliases=("run-research-node",), help="run the always-on public-data paper node")
     node_run.add_argument("--db", default=DEFAULT_DB_PATH)
     node_run.add_argument("--cycles", type=int, default=0, help="finite test cycles; 0 runs until stopped")
     node_run.add_argument("--isolated", action="store_true", help="deny production credentials and order/account transports")
+    node_run.add_argument(
+        "--shadow-enabled",
+        action="store_true",
+        help="enable the bounded paper-only shadow assessment worker",
+    )
+    node_run.add_argument(
+        "--shadow-interval",
+        "--shadow-interval-seconds",
+        dest="shadow_interval",
+        type=float,
+        default=60.0,
+        help="shadow worker evaluation interval in seconds",
+    )
+    node_run.add_argument(
+        "--shadow-jobs",
+        "--shadow-jobs-per-cycle",
+        dest="shadow_jobs_per_cycle",
+        type=int,
+        default=1,
+        help="maximum shadow jobs processed per node cycle",
+    )
     node_run.add_argument("--interval", type=float, default=60.0, help="collection interval in seconds")
     node_run.add_argument("--depth", type=int, default=20)
     node_run.add_argument("--max-markets", type=int, default=100)
@@ -1048,6 +1120,327 @@ def _validate_cli_node_resource_paths(args: argparse.Namespace) -> None:
         actual = os.path.normcase(os.path.abspath(os.path.expanduser(str(supplied))))
         if actual != expected:
             raise ValueError(f"node --{option} must be the canonical database marker {db_path}{suffix}")
+
+
+
+def _shadow_cli_projection(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the stable, read-only shadow job JSON projection."""
+    manifest = row.get("manifest")
+    manifest = manifest if isinstance(manifest, Mapping) else {}
+    state = row.get("state")
+    state = state if isinstance(state, Mapping) else {}
+    status = str(row.get("status") or "UNKNOWN").strip().upper()
+    shared = manifest.get("shared")
+    shared = shared if isinstance(shared, Mapping) else {}
+    state_members = state.get("members")
+    state_members = state_members if isinstance(state_members, Mapping) else {}
+
+    def text(value: Any) -> str | None:
+        if value is None:
+            return None
+        result = str(value).strip()
+        return result or None
+
+    def timestamp(value: Any) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value.isoformat()
+        return text(value)
+
+    raw_members = manifest.get("members")
+    raw_members = (
+        raw_members[:2]
+        if isinstance(raw_members, Sequence) and not isinstance(raw_members, (str, bytes))
+        else ()
+    )
+    members: list[dict[str, Any]] = []
+    for item in raw_members:
+        if not isinstance(item, Mapping):
+            continue
+        member_id = text(item.get("shadow_member_id"))
+        raw_stats = state_members.get(member_id) if member_id else None
+        stats = raw_stats if isinstance(raw_stats, Mapping) else {}
+        raw_accounting = stats.get("accounting")
+        raw_accounting = raw_accounting if isinstance(raw_accounting, Mapping) else {}
+        accounting: dict[str, Any] = {}
+        for field in (
+            "signals",
+            "declines",
+            "risk_rejections",
+            "fills",
+            "exits",
+            "buy_fills",
+            "sell_fills",
+            "filled_quantity",
+            "fees",
+        ):
+            value = stats.get(field, raw_accounting.get(field))
+            if value is not None:
+                accounting[field] = value
+        members.append(
+            {
+                "shadow_member_id": member_id,
+                "candidate_id": text(item.get("candidate_id")),
+                "family": text(item.get("family")),
+                "setup_id": text(item.get("setup_id")),
+                "setup_hash": text(item.get("setup_hash")),
+                "strategy_hash": text(item.get("strategy_hash")),
+                "model_hash": text(item.get("model_hash")),
+                "scope_hash": text(item.get("scope_hash")),
+                "scope_version": text(item.get("scope_version")),
+                "accounting": accounting,
+            }
+        )
+
+    declared_stop = manifest.get("stop_conditions")
+    declared_stop = declared_stop if isinstance(declared_stop, Mapping) else {}
+    state_stop = state.get("stop")
+    state_stop = state_stop if isinstance(state_stop, Mapping) else {}
+    stop_conditions = {
+        "max_cycles": declared_stop.get("max_cycles", state_stop.get("max_cycles")),
+        "max_observations": declared_stop.get(
+            "max_observations", state_stop.get("max_observations")
+        ),
+        "stop_at": timestamp(declared_stop.get("stop_at", state_stop.get("stop_at"))),
+        "reached": state_stop.get("reached") is True,
+        "reason": text(state_stop.get("reason")),
+    }
+    try:
+        cycles = max(0, int(state.get("cycles", 0) or 0))
+    except (TypeError, ValueError, OverflowError):
+        cycles = 0
+    try:
+        observations = max(0, int(state.get("public_observations", 0) or 0))
+    except (TypeError, ValueError, OverflowError):
+        observations = 0
+    try:
+        member_observations = max(0, int(state.get("member_observations", 0) or 0))
+    except (TypeError, ValueError, OverflowError):
+        member_observations = 0
+    cycle_limit = stop_conditions["max_cycles"]
+    observation_limit = stop_conditions["max_observations"]
+    cycle_fraction = (
+        min(1.0, cycles / int(cycle_limit))
+        if isinstance(cycle_limit, int) and cycle_limit > 0
+        else None
+    )
+    observation_fraction = (
+        min(1.0, observations / int(observation_limit))
+        if isinstance(observation_limit, int) and observation_limit > 0
+        else None
+    )
+    fractions = [value for value in (cycle_fraction, observation_fraction) if value is not None]
+    progress_fraction = (
+        max(fractions)
+        if fractions
+        else (1.0 if status in {"COMPLETED", "STOPPED"} else None)
+    )
+    progress = {
+        "cycles": cycles,
+        "public_observations": observations,
+        "member_observations": member_observations,
+        "cycle_limit": cycle_limit,
+        "observation_limit": observation_limit,
+        "cycle_fraction": cycle_fraction,
+        "observation_fraction": observation_fraction,
+        "fraction": progress_fraction,
+    }
+    next_evaluation_at = timestamp(row.get("next_evaluation_at") or state.get("next_evaluation_at"))
+    last_cycle = state.get("last_cycle")
+    last_cycle = last_cycle if isinstance(last_cycle, Mapping) else {}
+    cycle_summary = {
+        field: last_cycle.get(field)
+        for field in ("observations_processed", "events_written", "fills")
+        if last_cycle.get(field) is not None
+    }
+    blockers: list[str] = []
+    raw_blockers = state.get("blockers")
+    if isinstance(raw_blockers, Sequence) and not isinstance(raw_blockers, (str, bytes)):
+        for blocker in raw_blockers:
+            value = text(blocker)
+            if value and value not in blockers:
+                blockers.append(value.split(":", 1)[0])
+    last_blocker = text(state.get("last_blocker"))
+    if last_blocker and last_blocker.split(":", 1)[0] not in blockers:
+        blockers.append(last_blocker.split(":", 1)[0])
+    next_action = {
+        "REGISTERED": "WAIT_FOR_SHADOW_WORKER",
+        "RUNNING": "WAIT_FOR_NEXT_EVALUATION",
+        "WAITING_FOR_DATA": "WAIT_FOR_DATA",
+        "BLOCKED": "REVIEW_BLOCKER" if blockers else "REVIEW_SHADOW_JOB",
+        "COMPLETED": "NO_ACTION_COMPLETED",
+        "STOPPED": "NO_ACTION_STOPPED",
+    }.get(status, "REVIEW_SHADOW_JOB")
+    bankroll = shared.get("bankroll")
+    shared_budget: dict[str, Any] = {}
+    if bankroll is not None:
+        shared_budget["bankroll"] = bankroll
+        try:
+            shared_budget["allocated_capital"] = float(bankroll) / 2.0
+        except (TypeError, ValueError, OverflowError):
+            pass
+    accounting_members = [
+        {
+            "shadow_member_id": member.get("shadow_member_id"),
+            **dict(member.get("accounting") or {}),
+        }
+        for member in members
+    ]
+    return {
+        "job_id": text(row.get("job_id")),
+        "status": status,
+        "schema": text(manifest.get("schema") or state.get("schema")),
+        "paper_only": True,
+        "live_execution": False,
+        "read_only": True,
+        "created_at": timestamp(row.get("created_at")),
+        "updated_at": timestamp(row.get("updated_at")),
+        "next_evaluation_at": next_evaluation_at,
+        "next_evaluation": next_evaluation_at,
+        "version": row.get("version"),
+        "members": members,
+        "shared": {
+            "run_id": text(shared.get("run_id") or state.get("run_id")),
+            "scope_hash": text(shared.get("scope_hash")),
+            "scope_version": text(shared.get("scope_version")),
+        },
+        "shared_budget": shared_budget,
+        "accounting": {"members": accounting_members},
+        "progress": progress,
+        "progress_fraction": progress_fraction,
+        "stop_conditions": stop_conditions,
+        "blockers": blockers,
+        "last_blocker": blockers[-1] if blockers else None,
+        "last_cycle": cycle_summary or None,
+        "next_action": next_action,
+    }
+
+
+def _shadow_cli_print(payload: Mapping[str, Any]) -> None:
+    print(json.dumps(payload, sort_keys=True, indent=2, default=str, allow_nan=False))
+
+
+def _shadow_cli_selected_job(
+    service: ShadowAssessmentService,
+    selector: str | None,
+) -> Mapping[str, Any] | None:
+    value = str(selector or "latest").strip()
+    if value.lower() == "latest":
+        jobs = service.list(limit=1)
+        return jobs[0] if jobs else None
+    if value.lower() == "list":
+        raise ValueError("list is not a single shadow job")
+    row = service.load(value)
+    if row is None:
+        raise ValueError(f"unknown shadow job: {value}")
+    return row
+
+
+def _run_shadow_register(args: argparse.Namespace) -> int:
+    candidate_ids = list(getattr(args, "candidate_ids", ()) or ())
+    if len(candidate_ids) != 2:
+        raise ValueError("shadow registration requires exactly two candidate IDs")
+    if (
+        args.max_cycles is None
+        and args.max_observations is None
+        and args.stop_at is None
+    ):
+        raise ValueError(
+            "shadow registration requires at least one stop bound "
+            "(--max-cycles, --max-observations, or --stop-at)"
+        )
+    try:
+        interval = float(args.interval)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("shadow interval must be finite and positive") from None
+    if not math.isfinite(interval) or interval <= 0:
+        raise ValueError("shadow interval must be finite and positive")
+    now = utc_now()
+    stop_at = _parse_cli_timestamp(args.stop_at)
+    with AxiomStore(args.db) as store:
+        budget_derived = args.budget is None
+        budget = args.budget
+        service = ShadowAssessmentService(
+            store,
+            max_markets=args.max_markets,
+            max_observations=10_000,
+        )
+        row = service.register(
+            candidate_ids,
+            bankroll=budget,
+            max_cycles=args.max_cycles,
+            max_observations=args.max_observations,
+            stop_at=stop_at,
+            now=now,
+        )
+    payload = _shadow_cli_projection(row)
+    payload["budget_derived"] = budget_derived
+    payload["interval_seconds"] = interval
+    payload["registered"] = True
+    _shadow_cli_print(payload)
+    return 0
+
+
+def _run_shadow_status(args: argparse.Namespace) -> int:
+    if args.latest and args.list:
+        raise ValueError("shadow-status accepts only one of --latest or --list")
+    if (args.latest or args.list) and args.selector != "latest":
+        raise ValueError("shadow-status accepts one job selector")
+    if args.job_id and (args.selector != "latest" or args.latest or args.list):
+        raise ValueError("shadow-status accepts one job selector")
+    selector = args.job_id or ("list" if args.list else "latest")
+    with AxiomStore(args.db) as store:
+        service = ShadowAssessmentService(store)
+        if str(selector).lower() == "list":
+            jobs = service.list(limit=args.limit)
+            payload = {
+                "status": "LIST",
+                "count": len(jobs),
+                "jobs": [_shadow_cli_projection(row) for row in jobs],
+            }
+        else:
+            row = _shadow_cli_selected_job(service, selector)
+            if row is None:
+                payload = {
+                    "job_id": None,
+                    "status": "NONE",
+                    "progress": {},
+                    "next_evaluation_at": None,
+                    "next_evaluation": None,
+                    "stop_conditions": {},
+                    "shared_budget": {},
+                    "accounting": {},
+                    "blockers": [],
+                    "members": [],
+                    "paper_only": True,
+                    "live_execution": False,
+                }
+            else:
+                payload = _shadow_cli_projection(row)
+    _shadow_cli_print(payload)
+    return 0
+
+
+def _run_shadow_stop(args: argparse.Namespace) -> int:
+    if args.latest and args.selector:
+        raise ValueError("shadow-stop accepts one job selector")
+    if args.job_id and args.selector:
+        raise ValueError("shadow-stop accepts one job selector")
+    selector = args.job_id or ("latest" if args.latest else args.selector)
+    if not selector:
+        raise ValueError("shadow-stop requires a job ID or latest")
+    with AxiomStore(args.db) as store:
+        service = ShadowAssessmentService(store)
+        row = _shadow_cli_selected_job(service, selector)
+        if row is None:
+            raise ValueError("no shadow jobs are registered")
+        stopped = service.stop(str(row["job_id"]))
+        payload = _shadow_cli_projection(stopped)
+    payload["stopped"] = str(payload.get("status") or "").upper() == "STOPPED"
+    payload["idempotent"] = True
+    _shadow_cli_print(payload)
+    return 0
 
 def _main_impl(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
@@ -1616,6 +2009,12 @@ def _main_impl(argv: Sequence[str] | None = None) -> int:
             }
         print(json.dumps(payload, sort_keys=True, indent=2, default=str))
         return 0
+    if args.command == "shadow-register":
+        return _run_shadow_register(args)
+    if args.command == "shadow-status":
+        return _run_shadow_status(args)
+    if args.command == "shadow-stop":
+        return _run_shadow_stop(args)
     if args.command in {"node-run", "run-research-node"}:
         _validate_cli_node_resource_paths(args)
         if isolated:
@@ -1633,6 +2032,9 @@ def _main_impl(argv: Sequence[str] | None = None) -> int:
                 pid_path=args.pid,
                 log_path=args.log,
                 execution_profile=ISOLATED_EXECUTION_PROFILE if isolated else None,
+                shadow_enabled=args.shadow_enabled,
+                shadow_interval=args.shadow_interval,
+                shadow_jobs_per_cycle=args.shadow_jobs_per_cycle,
                 interval_seconds=args.interval,
                 depth=args.depth,
                 max_markets=args.max_markets,

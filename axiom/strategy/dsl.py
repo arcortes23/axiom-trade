@@ -156,6 +156,60 @@ def _validate_parameters(value: Any, path: str = "parameters") -> dict[str, Any]
     return result
 
 
+def _validate_entry_predicate(
+    parameters: Mapping[str, Any],
+    *,
+    market_type: MarketType,
+    family: str,
+) -> None:
+    """Validate the only versioned entry predicate currently supported."""
+    if "entry_predicate" not in parameters:
+        return
+    if market_type is not MarketType.PREDICTION or family not in {"momentum", "mean_reversion"}:
+        raise StrategyValidationError(
+            "parameters.entry_predicate is only valid for prediction momentum and mean_reversion strategies"
+        )
+    predicate = parameters["entry_predicate"]
+    if not isinstance(predicate, Mapping):
+        raise StrategyValidationError("parameters.entry_predicate must be an object")
+    required = {"version", "minimum_move", "units", "boundary"}
+    unknown = set(predicate) - required
+    missing = required - set(predicate)
+    if unknown:
+        raise StrategyValidationError(
+            f"parameters.entry_predicate has unknown fields: {sorted(unknown)}"
+        )
+    if missing:
+        raise StrategyValidationError(
+            f"parameters.entry_predicate is missing fields: {sorted(missing)}"
+        )
+    if predicate.get("version") != "absolute-move-v1":
+        raise StrategyValidationError(
+            "parameters.entry_predicate.version must be 'absolute-move-v1'"
+        )
+    minimum_move = predicate.get("minimum_move")
+    if isinstance(minimum_move, bool):
+        raise StrategyValidationError(
+            "parameters.entry_predicate.minimum_move must be finite and between 0 and 1"
+        )
+    try:
+        minimum_move_value = float(minimum_move)
+    except (TypeError, ValueError, OverflowError):
+        minimum_move_value = math.nan
+    if not math.isfinite(minimum_move_value) or not 0.0 <= minimum_move_value <= 1.0:
+        raise StrategyValidationError(
+            "parameters.entry_predicate.minimum_move must be finite and between 0 and 1"
+        )
+    if predicate.get("units") != "probability":
+        raise StrategyValidationError(
+            "parameters.entry_predicate.units must be 'probability'"
+        )
+    if predicate.get("boundary") != "inclusive":
+        raise StrategyValidationError(
+            "parameters.entry_predicate.boundary must be 'inclusive'"
+        )
+
+
 def _validate_operations(value: Any) -> tuple[Mapping[str, Any], ...]:
     if value is None:
         return ()
@@ -203,6 +257,7 @@ def validate_strategy(document: Mapping[str, Any] | StrategyDefinition) -> Strat
     if family not in valid_families:
         raise StrategyValidationError(f"family {family!r} is not valid for {market_type.value}")
     parameters = _validate_parameters(document.get("parameters", {}))
+    _validate_entry_predicate(parameters, market_type=market_type, family=family)
     operations = _validate_operations(document.get("operations"))
     for field_name in ("strategy_id", "name"):
         if field_name in document and not isinstance(document[field_name], str):

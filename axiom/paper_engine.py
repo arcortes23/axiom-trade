@@ -10,8 +10,9 @@ from datetime import date, datetime
 from enum import Enum
 import hashlib
 import math
+from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_UP
 from itertools import islice
-
+from types import MappingProxyType
 from typing import Any, Iterable, Mapping, Sequence
 from .domain import (
     Fill,
@@ -35,8 +36,8 @@ from .forward import (
     _paper_assumptions_explicit,
     _SUPPORTED_PAPER_SIZING_MODELS,
 )
-from .paper import PaperTrader, PaperTradingConfig
-from .portfolio import Portfolio
+from .paper import PaperTrader, PaperTradingConfig, SHADOW_METADATA_KEYS, _shadow_metadata
+from .portfolio import Portfolio, Position
 from .risk import RiskEngine, RiskLimits
 from .storage import AxiomStore
 from .strategy.signals import (
@@ -45,7 +46,241 @@ from .strategy.signals import (
 )
 
 _MAX_RUN_OBSERVATIONS = 100_000
+_MAX_PAPER_OPENING_ROWS = 100_000
+_MAX_PAPER_UNRESOLVED_EVENTS = 256
+_MAX_PAPER_FILL_ROWS = 100_000
 PAPER_STATE_EXECUTION_BINDING_MISMATCH = "PAPER_STATE_EXECUTION_BINDING_MISMATCH"
+PAPER_STATE_OPERATIONAL_COUNTERS_INVALID = "PAPER_STATE_OPERATIONAL_COUNTERS_INVALID"
+PAPER_STATE_FILL_RESTORE_OVERFLOW = "PAPER_STATE_FILL_RESTORE_OVERFLOW"
+PAPER_STATE_FILL_RESTORE_COUNT_MISMATCH = "PAPER_STATE_FILL_RESTORE_COUNT_MISMATCH"
+
+_UNRESOLVED_OPERATIONAL_STATUSES = frozenset(
+    {
+        "UNKNOWN",
+        "PENDING",
+        "NEW",
+        "OPEN",
+        "SUBMITTING",
+        "SUBMITTED",
+        "ACCEPTED",
+        "ACKNOWLEDGED",
+        "MATCHED",
+        "FILLED",
+        "PARTIAL",
+        "PARTIALLY_FILLED",
+        "PARTIAL_FILL",
+        "LIVE",
+        "DELAYED",
+        "PREPARED",
+        "RESERVED",
+        "HELD",
+        "ATTEMPTED",
+        "EXIT",
+        "EXIT_PENDING",
+        "EXIT_REQUESTED",
+        "RECONCILE",
+        "RECONCILE_PENDING",
+        "RECONCILIATION_PENDING",
+        "MANAGEMENT_BLOCKED",
+    }
+)
+_TERMINAL_OPERATIONAL_STATUSES = frozenset(
+    {
+        "REJECTED",
+        "FAILED",
+        "ERROR",
+        "CANCELLED",
+        "CANCELED",
+        "EXPIRED",
+        "SETTLED",
+        "RESOLVED",
+        "VOID",
+        "NO_SIGNAL",
+        "NO_FILL",
+        "RISK_REJECTED",
+        "FULL_FILL",
+    }
+)
+class _DuplicatePaperObservation(Exception):
+    """Store-level deduplication must skip execution atomically."""
+
+
+def _policy_number(value: Any, name: str, *, optional: bool = False) -> float | None:
+    if optional and value in (None, ""):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} must be numeric") from None
+    if not math.isfinite(number) or number < 0:
+        raise ValueError(f"{name} must be finite and non-negative")
+    return number
+
+
+def _policy_decimal_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return str(value)
+    if not parsed.is_finite():
+        return str(value)
+    return format(parsed.normalize(), "f")
+
+
+def _freeze_policy_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {key: _freeze_policy_value(item) for key, item in value.items()}
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_policy_value(item) for item in value)
+    if isinstance(value, set):
+        return frozenset(_freeze_policy_value(item) for item in value)
+    return value
+
+
+def _thaw_policy_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _thaw_policy_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_thaw_policy_value(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        return [_thaw_policy_value(item) for item in value]
+    return value
+
+def _nonnegative_finite(value: Any, *, integer: bool = False) -> bool:
+    if isinstance(value, bool):
+        return False
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if not math.isfinite(number) or number < 0:
+        return False
+    return not integer or number.is_integer()
+
+
+def _operational_state_blocker() -> dict[str, Any]:
+    return {
+        "status": "BLOCKED",
+        "blocker": PAPER_STATE_OPERATIONAL_COUNTERS_INVALID,
+        "reason_code": PAPER_STATE_OPERATIONAL_COUNTERS_INVALID,
+        "reason": "persisted operational paper counters are malformed",
+        "retryable": False,
+        "non_retryable": True,
+        "execution_skipped": True,
+    }
+
+
+@dataclass(frozen=True, slots=True)
+class OperationalPaperPolicy:
+    """Frozen monetary envelope for one isolated paper experiment.
+
+    The defaults intentionally mirror the active Polymarket canary envelope,
+    while remaining a paper-only decision input.  ``None`` is used only for
+    optional per-market/per-event/lifetime budgets.
+    """
+
+    max_all_in_buy_usd: float = 1.0
+    max_fee_reserve_usd: float = 0.01
+    max_gross_daily_buy_usd: float = 5.0
+    max_aggregate_open_cost_usd: float = 5.0
+    max_aggregate_exposure_usd: float = 5.0
+    max_positions: int = 3
+    max_submitted_orders_per_day: int = 5
+    realized_loss_entry_stop_usd: float = 2.0
+    equity_loss_entry_stop_usd: float = 2.0
+    per_market_buy_cap_usd: float | None = None
+    per_event_buy_cap_usd: float | None = None
+    cumulative_buy_cap_usd: float | None = None
+    cumulative_declared_loss_entry_stop_usd: float | None = None
+    pending_orders: tuple[Mapping[str, Any], ...] = ()
+    require_market_rules: bool = True
+    allow_strategy_overlap: bool = False
+    allow_event_overlap: bool = False
+
+    def __post_init__(self) -> None:
+        for name in (
+            "max_all_in_buy_usd",
+            "max_fee_reserve_usd",
+            "max_gross_daily_buy_usd",
+            "max_aggregate_open_cost_usd",
+            "max_aggregate_exposure_usd",
+            "realized_loss_entry_stop_usd",
+            "equity_loss_entry_stop_usd",
+        ):
+            value = _policy_number(getattr(self, name), name)
+            object.__setattr__(self, name, value)
+        for name in (
+            "per_market_buy_cap_usd",
+            "per_event_buy_cap_usd",
+            "cumulative_buy_cap_usd",
+            "cumulative_declared_loss_entry_stop_usd",
+        ):
+            value = _policy_number(getattr(self, name), name, optional=True)
+            object.__setattr__(self, name, value)
+        if isinstance(self.max_positions, bool) or int(self.max_positions) != self.max_positions or int(self.max_positions) < 1:
+            raise ValueError("max_positions must be a positive integer")
+        if isinstance(self.max_submitted_orders_per_day, bool) or int(self.max_submitted_orders_per_day) != self.max_submitted_orders_per_day or int(self.max_submitted_orders_per_day) < 1:
+            raise ValueError("max_submitted_orders_per_day must be a positive integer")
+        pending = tuple(_freeze_policy_value(item) for item in self.pending_orders)
+        object.__setattr__(self, "pending_orders", pending)
+        for name in ("require_market_rules", "allow_strategy_overlap", "allow_event_overlap"):
+            if not isinstance(getattr(self, name), bool):
+                raise TypeError(f"{name} must be a boolean")
+
+    @classmethod
+    def from_value(cls, value: Any) -> "OperationalPaperPolicy":
+        if isinstance(value, cls):
+            return value
+        source = value
+        active = getattr(source, "active_limits", None)
+        if callable(active):
+            source = active()
+        elif callable(getattr(source, "active_settings", None)):
+            source = source.active_settings()
+        if isinstance(source, Mapping):
+            source = source.get("values", source.get("limits", source))
+        if not isinstance(source, Mapping):
+            raise TypeError("operational_policy must be a mapping or policy object")
+        aliases = {
+            "target_notional_usd": "max_all_in_buy_usd",
+            "max_exposure_usd": "max_aggregate_exposure_usd",
+            "max_open_positions": "max_positions",
+            "max_orders_per_day": "max_submitted_orders_per_day",
+            "daily_buy_cap_usd": "max_gross_daily_buy_usd",
+            "aggregate_open_cost_usd": "max_aggregate_open_cost_usd",
+            "aggregate_exposure_usd": "max_aggregate_exposure_usd",
+            "orders_per_day": "max_submitted_orders_per_day",
+            "realized_loss_stop_usd": "realized_loss_entry_stop_usd",
+            "equity_loss_stop_usd": "equity_loss_entry_stop_usd",
+            "max_daily_loss_usd": "realized_loss_entry_stop_usd",
+            "cumulative_loss_entry_stop_usd": "cumulative_declared_loss_entry_stop_usd",
+        }
+        values: dict[str, Any] = {}
+        known = set(cls.__dataclass_fields__)
+        for raw_name, raw_value in source.items():
+            name = str(raw_name).strip().lower().replace("-", "_")
+            name = aliases.get(name, name)
+            if name in known:
+                values[name] = raw_value
+        return cls(**values)
+
+    def as_record(self) -> dict[str, Any]:
+        values = {
+            name: getattr(self, name)
+            for name in self.__dataclass_fields__
+        }
+        values["pending_orders"] = [
+            _thaw_policy_value(item) for item in self.pending_orders
+        ]
+        for name, value in tuple(values.items()):
+            if isinstance(value, float):
+                values[name] = _policy_decimal_text(value)
+        values["policy_version"] = "operational-paper-v1"
+        return values
 PAPER_OBSERVATION_AUTHORITY_REQUIRED = "PAPER_OBSERVATION_AUTHORITY_REQUIRED"
 def _paper_config_from_spec(
     spec: ForwardTestSpec,
@@ -107,6 +342,7 @@ def _paper_config_from_spec(
             depth=effective.depth,
             quality=effective.quality,
             live=effective.live,
+            operational_policy=effective.operational_policy,
         )
 
     allocated_capital: float | None = None
@@ -128,6 +364,30 @@ def _paper_config_from_spec(
             "paper_assumptions.sizing.allocated_capital must be positive"
         )
     return effective, allocated_capital
+def _operational_settings_identity(value: Mapping[str, Any] | Any) -> dict[str, Any]:
+    """Normalize the active settings identity carried by an operational run."""
+    if not isinstance(value, Mapping):
+        raise TypeError("operational_settings must be a mapping")
+    config_id = str(value.get("config_id", "")).strip()
+    config_hash = str(value.get("config_hash", "")).strip()
+    generation = value.get("generation")
+    if not config_id or not config_hash:
+        raise ValueError("operational settings identity requires config_id and config_hash")
+    if isinstance(generation, bool):
+        raise ValueError("operational settings generation must be a positive integer")
+    try:
+        generation = int(generation)
+    except (TypeError, ValueError):
+        raise ValueError("operational settings generation must be a positive integer") from None
+    if generation < 1:
+        raise ValueError("operational settings generation must be a positive integer")
+    return {
+        "config_id": config_id,
+        "generation": generation,
+        "config_hash": config_hash,
+        "paper_only": True,
+    }
+
 
 def paper_execution_binding(
     spec: ForwardTestSpec,
@@ -135,7 +395,10 @@ def paper_execution_binding(
     config: PaperTradingConfig | None = None,
     storage_namespace: str | None = None,
     execution_mode: str | None = None,
+    operational_policy: OperationalPaperPolicy | Mapping[str, Any] | Any | None = None,
+    operational_settings: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+
     """Build the immutable binding used by one paper execution namespace."""
     if not isinstance(spec, ForwardTestSpec):
         raise TypeError("spec must be a ForwardTestSpec")
@@ -149,8 +412,17 @@ def paper_execution_binding(
     ).strip().lower()
     if mode not in {"forward", "historical_replay", "isolated"}:
         raise ValueError("execution_mode is invalid")
+    policy_source = operational_policy
+    if policy_source is None:
+        policy_source = getattr(paper_config, "operational_policy", None)
+    policy = None if policy_source is None else OperationalPaperPolicy.from_value(policy_source)
     research_mode = "RECORDED_BOOK_REPLAY" if mode == "historical_replay" else "PAPER_FORWARD"
-    return {
+    operational_identity = (
+        _operational_settings_identity(operational_settings)
+        if operational_settings is not None
+        else None
+    )
+    binding = {
         "experiment_id": run_id,
         "spec_experiment_id": spec.experiment_id,
         "execution_mode": mode,
@@ -178,6 +450,25 @@ def paper_execution_binding(
             ).encode("utf-8")
         ).hexdigest(),
     }
+    if operational_identity is not None:
+        binding["operational_settings"] = dict(operational_identity)
+        binding["operational_config_id"] = operational_identity["config_id"]
+        binding["operational_config_generation"] = operational_identity["generation"]
+        binding["operational_config_hash"] = operational_identity["config_hash"]
+    if operational_identity is not None:
+        binding["paper_only"] = True
+    if policy is not None:
+        policy_record = policy.as_record()
+        if operational_identity is not None:
+            policy_record["operational_settings"] = dict(operational_identity)
+        binding["operational_policy"] = policy_record
+        binding["operational_policy_hash"] = hashlib.sha256(
+            _canonical_json(policy_record).encode("utf-8")
+        ).hexdigest()
+    else:
+        binding["operational_policy"] = None
+        binding["operational_policy_hash"] = None
+    return binding
 
 
 def paper_state_binding_blocker(
@@ -272,6 +563,8 @@ class ForwardPaperEngine:
         config: PaperTradingConfig | None = None,
         storage_namespace: str | None = None,
         execution_mode: str | None = None,
+        operational_policy: OperationalPaperPolicy | Mapping[str, Any] | Any | None = None,
+        operational_settings: Mapping[str, Any] | None = None,
     ) -> None:
         if not isinstance(spec, ForwardTestSpec):
             raise TypeError("spec must be a ForwardTestSpec")
@@ -287,24 +580,137 @@ class ForwardPaperEngine:
         self._run_id = str(storage_namespace or spec.experiment_id).strip()
         if not self._run_id:
             raise ValueError("storage_namespace must be non-empty")
-        self._execution_mode = str(execution_mode or ("forward" if storage_namespace is None else "isolated")).strip().lower()
+        self._execution_mode = str(
+            execution_mode
+            or ("forward" if storage_namespace is None else "isolated")
+        ).strip().lower()
         if self._execution_mode not in {"forward", "historical_replay", "isolated"}:
             raise ValueError("execution_mode is invalid")
         self._execution_strategy_id = spec.strategy_hash
-        self._research_mode = "RECORDED_BOOK_REPLAY" if self._execution_mode == "historical_replay" else "PAPER_FORWARD"
+        self._research_mode = (
+            "RECORDED_BOOK_REPLAY"
+            if self._execution_mode == "historical_replay"
+            else "PAPER_FORWARD"
+        )
+        # Operational policy/settings are a narrow extension of the original
+        # constructor.  Keep the legacy execution identity above initialized
+        # before normalizing these optional collaborators.
+        config_view = spec.config if isinstance(spec.config, Mapping) else {}
+        policy_source = operational_policy
+        if policy_source is None:
+            policy_source = getattr(self.config, "operational_policy", None)
+        if policy_source is None:
+            policy_source = config_view.get(
+                "operational_paper_policy",
+                config_view.get("operational_policy"),
+            )
+        self._operational_policy = (
+            None
+            if policy_source is None
+            else OperationalPaperPolicy.from_value(policy_source)
+        )
+        self._operational_settings = (
+            _operational_settings_identity(operational_settings)
+            if operational_settings is not None
+            else None
+        )
         self._execution_binding = paper_execution_binding(
             spec,
             config=self.config,
             storage_namespace=storage_namespace,
             execution_mode=execution_mode,
+            operational_policy=self._operational_policy,
+            operational_settings=self._operational_settings,
         )
         self.portfolio = portfolio or Portfolio(spec.bankroll)
         loaded_state = store.load_paper_state(self._run_id)
         self._state_version = int(loaded_state.get("state_version", 0)) if loaded_state is not None else -1
         raw_state = loaded_state.get("state", {}) if loaded_state is not None else {}
         self._state = dict(raw_state) if isinstance(raw_state, Mapping) else {}
-        persisted_binding = self._state.get("execution_binding")
         self._compatibility_blocker = None
+        try:
+            self._fill_count = max(0, int(self._state.get("fill_count", 0)))
+        except (TypeError, ValueError):
+            self._fill_count = 0
+        operational_state = self._state.get("operational_paper", {})
+        counters_present = isinstance(operational_state, Mapping) and "counters" in operational_state
+        counters_source = (
+            operational_state.get("counters")
+            if isinstance(operational_state, Mapping)
+            else None
+        )
+        self._operational_counters: dict[str, Any] = (
+            deepcopy(dict(counters_source))
+            if isinstance(counters_source, Mapping)
+            else {}
+        )
+        self._operational_counters.setdefault("submitted_total", 0)
+        self._operational_counters.setdefault("submitted_today", 0)
+        self._operational_counters.setdefault("buy_gross_today", "0")
+        self._operational_counters.setdefault("buy_cumulative", "0")
+        self._operational_counters.setdefault("market_buy", {})
+        self._operational_counters.setdefault("event_buy", {})
+        self._operational_counters.setdefault("declared_loss_cumulative", "0")
+        self._operational_counters.setdefault("pending_orders", [])
+        self._operational_counters.setdefault("day", None)
+        counters_shape_invalid = (
+            counters_present
+            and counters_source is not None
+            and not isinstance(counters_source, Mapping)
+        )
+        if (
+            ("operational_paper" in self._state and not isinstance(operational_state, Mapping))
+            or counters_shape_invalid
+            or not self._operational_counters_valid(self._operational_counters)
+        ):
+            self._compatibility_blocker = _operational_state_blocker()
+        if self._compatibility_blocker is None:
+            for name in ("submitted_total", "submitted_today"):
+                self._operational_counters[name] = int(float(self._operational_counters[name]))
+            if self._operational_counters.get("day") is not None:
+                self._operational_counters["day"] = date.fromisoformat(
+                    str(self._operational_counters["day"])
+                ).isoformat()
+        existing_market_buy = self._operational_counters.get("market_buy", {})
+        if isinstance(existing_market_buy, Mapping):
+            normalized_market_buy: dict[str, Any] = {}
+            for raw_market, amount in existing_market_buy.items():
+                market_key = str(raw_market)
+                if market_key.endswith("|yes") or market_key.endswith("|no"):
+                    market_key = market_key.rsplit("|", 1)[0]
+                combined = (
+                    (_finite_number(normalized_market_buy.get(market_key, 0.0)) or 0.0)
+                    + (_finite_number(amount) or 0.0)
+                )
+                if not math.isfinite(combined):
+                    self._compatibility_blocker = _operational_state_blocker()
+                    break
+                normalized_market_buy[market_key] = _policy_decimal_text(combined) or "0"
+            self._operational_counters["market_buy"] = normalized_market_buy
+        if (
+            self._compatibility_blocker is None
+            and self._operational_policy is not None
+            and not self._operational_counters.get("pending_orders")
+        ):
+            self._operational_counters["pending_orders"] = [
+                _thaw_policy_value(item)
+                for item in self._operational_policy.pending_orders
+            ]
+        if self._compatibility_blocker is None and self._operational_policy is not None:
+            self._hydrate_unresolved_events()
+        persisted_binding = self._state.get("execution_binding")
+        if (
+            loaded_state is not None
+            and isinstance(persisted_binding, Mapping)
+            and self._operational_policy is None
+            and "operational_policy" not in persisted_binding
+        ):
+            persisted_binding = {
+                **dict(persisted_binding),
+                "operational_policy": None,
+                "operational_policy_hash": None,
+            }
+            self._state["execution_binding"] = dict(persisted_binding)
         if loaded_state is not None and persisted_binding is None:
             # States written before execution bindings are valid when their
             # durable identity agrees with this namespace.  Adopt the current
@@ -364,6 +770,8 @@ class ForwardPaperEngine:
                 strategy_id=self._execution_strategy_id,
                 config=self.config,
             )
+            self.trader._operational_gate = self._operational_gate if self._operational_policy is not None else None
+            self.trader._operational_commit = self._commit_operational_counters
             return
         self._processed: set[str] = set(str(item) for item in self._state.get("processed_observations", ()))
         self._cursor: dict[str, datetime] = {
@@ -378,33 +786,49 @@ class ForwardPaperEngine:
             if (parsed := parse_timestamp(value)) is not None
         } if isinstance(raw_open_times, Mapping) else {}
         if loaded_state is not None and not self._observation_open_by_market:
-            # Pre-binding states only retained the last 512 signal inputs.
-            # Reconstruct the true opening boundary from the durable ledger
-            # before falling back to that bounded history.
+            # Pre-binding states did not persist an opening boundary.  Recover
+            # it with the store's bounded MIN(timestamp) scope aggregate,
+            # rather than hydrating the complete observation history.
+            opening_loader = getattr(self.store, "list_paper_observation_openings", None)
             try:
-                persisted_observations = self.store.list_paper_observations(
-                    self._run_id,
-                    limit=None,
-                )
+                if callable(opening_loader):
+                    persisted_openings = opening_loader(
+                        self._run_id,
+                        limit=_MAX_PAPER_OPENING_ROWS,
+                    )
+                else:
+                    persisted_openings = self.store.list_latest_paper_observations(
+                        self._run_id,
+                        per_market_limit=_MAX_PAPER_OPENING_ROWS,
+                        per_scope_limit=_MAX_PAPER_OPENING_ROWS,
+                    )
             except Exception:
-                persisted_observations = ()
-            for item in persisted_observations:
+                persisted_openings = ()
+            for item in persisted_openings:
                 if not isinstance(item, Mapping):
                     continue
                 payload = item.get("payload")
+                payload = payload if isinstance(payload, Mapping) else {}
                 market_id = str(
-                    item.get(
-                        "market_id",
-                        payload.get("market_id", "") if isinstance(payload, Mapping) else "",
-                    )
+                    item.get("market_id", payload.get("market_id", ""))
                 ).strip()
                 stamp = parse_timestamp(item.get("timestamp"))
-                if stamp is None and isinstance(payload, Mapping):
-                    stamp = _observation_timestamp(payload)
-                if market_id and stamp is not None:
-                    previous = self._observation_open_by_market.get(market_id)
-                    if previous is None or stamp < previous:
-                        self._observation_open_by_market[market_id] = stamp
+                if not market_id or stamp is None:
+                    continue
+                scope_observation = {
+                    key: item.get(key, payload.get(key))
+                    for key in (
+                        "shadow_job_id",
+                        "shadow_member_id",
+                        "shadow_assessment",
+                        "synthetic_fixture",
+                    )
+                    if item.get(key, payload.get(key)) is not None
+                }
+                scope_key = self._observation_scope_key(market_id, scope_observation)
+                previous = self._observation_open_by_market.get(scope_key)
+                if previous is None or stamp < previous:
+                    self._observation_open_by_market[scope_key] = stamp
         raw_source_cursors = self._state.get("source_cursor_by_market", {})
         self._source_cursor: dict[str, tuple[datetime, str]] = {
             str(key): (parsed, str(value.get("snapshot_id")).strip())
@@ -480,6 +904,12 @@ class ForwardPaperEngine:
             strategy_id=self._execution_strategy_id,
             config=self.config,
         )
+        self.trader._operational_commit = self._commit_operational_counters
+        self.trader._operational_gate = self._operational_gate if self._operational_policy is not None else None
+        # Compact restores retain only the open shadow lots needed by
+        # member-attribution strategies; expose those same fills through the
+        # trader facade as well as the caller-owned portfolio.
+        self.trader._fills = list(self.portfolio.fills)
         try:
             restored_sequence = int(self._state.get("order_sequence", 0))
         except (TypeError, ValueError):
@@ -489,6 +919,681 @@ class ForwardPaperEngine:
         self.trader._sequence = restored_sequence
         self._warm_strategy_state()
 
+
+    @staticmethod
+    def _market_rule_value(observation: Mapping[str, Any], book: Any, *names: str) -> Any:
+        for name in names:
+            if name in observation and observation.get(name) not in (None, ""):
+                return observation.get(name)
+        for name in names:
+            value = getattr(book, name, None) if book is not None else None
+            if value not in (None, ""):
+                return value
+        return None
+
+    def _operational_market_rules(self, context: Mapping[str, Any]) -> dict[str, Any]:
+        observation = context.get("observation")
+        observation = observation if isinstance(observation, Mapping) else {}
+        book = context.get("order_book")
+        rules = {
+            "min_order_size": self._market_rule_value(
+                observation, book, "min_order_size", "order_min_size",
+                "minimum_order_size", "min_size", "minimum_size",
+                "quantity_min", "minQuantity", "minOrderSize",
+            ),
+            "size_increment": self._market_rule_value(
+                observation, book, "size_increment", "quantity_step",
+                "order_size_increment", "step_size", "quantity_increment",
+                "sizeIncrement",
+            ),
+            "min_notional": self._market_rule_value(
+                observation, book, "min_notional", "minimum_notional",
+                "min_cost", "minimum_cost", "min_notional_usd",
+                "minimum_notional_usd", "minimum_cost_usd",
+                "min_order_value", "minimum_order_value", "minOrderValue",
+                "minNotional", "minimumNotional",
+            ),
+            "tick_size": self._market_rule_value(
+                observation, book, "tick_size", "tickSize",
+                "price_increment", "price_tick_size",
+                "order_price_min_tick_size", "orderPriceMinTickSize",
+            ),
+        }
+        # Per-outcome nested venue contexts are common in collected snapshots.
+        outcome = str(context.get("outcome") or "").strip().lower()
+        nested = observation.get(f"{outcome}_market_rules") if outcome else None
+        if isinstance(nested, Mapping):
+            for key in tuple(rules):
+                if rules[key] in (None, ""):
+                    rules[key] = nested.get(key)
+        return rules
+
+    def _operational_positions(self, *, prices: Mapping[str, Any] | None = None) -> tuple[float, float, float, int]:
+        snapshot = self.portfolio.snapshot(prices) if self.portfolio is not None else {}
+        open_cost = 0.0
+        active_markets: set[str] = set()
+        for key, position in getattr(self.portfolio, "positions", {}).items():
+            quantity = _finite_number(getattr(position, "quantity", 0.0)) or 0.0
+            if quantity <= 1e-12:
+                continue
+            market_id = str(
+                getattr(position, "market_id", None)
+                or getattr(position, "symbol", None)
+                or key
+            ).strip()
+            if market_id:
+                active_markets.add(market_id)
+            average = _finite_number(getattr(position, "average_price", 0.0)) or 0.0
+            open_cost += max(0.0, quantity * average)
+        exposure = _finite_number(snapshot.get("gross_exposure")) or 0.0
+        equity = _finite_number(snapshot.get("equity"))
+        if equity is None:
+            equity = _finite_number(getattr(self.portfolio, "cash", 0.0)) or 0.0
+        return open_cost, exposure, equity, len(active_markets)
+
+    def _operational_open_lots(self) -> int:
+        return sum(
+            1
+            for position in getattr(self.portfolio, "positions", {}).values()
+            if (_finite_number(getattr(position, "quantity", 0.0)) or 0.0) > 1e-12
+        )
+
+    @staticmethod
+    def _pending_commitments_checked(raw: Any) -> tuple[float, float, int, bool]:
+        if not isinstance(raw, (list, tuple)):
+            return 0.0, 0.0, 0, False
+        money = 0.0
+        buys = 0.0
+        count = 0
+        valid = True
+        for item in raw:
+            if not isinstance(item, Mapping):
+                valid = False
+                continue
+            status = str(item.get("status", "PENDING")).strip().upper() or "PENDING"
+            if status in _TERMINAL_OPERATIONAL_STATUSES:
+                continue
+            if status not in _UNRESOLVED_OPERATIONAL_STATUSES:
+                valid = False
+                continue
+            side = str(item.get("side", "BUY")).strip().upper()
+            if side not in {"BUY", "SELL"}:
+                valid = False
+                continue
+
+            quantity_raw = next(
+                (
+                    item[name]
+                    for name in ("remaining_quantity", "quantity", "size", "qty")
+                    if name in item
+                ),
+                None,
+            )
+            price_raw = next(
+                (
+                    item[name]
+                    for name in ("price", "reference_price", "quote")
+                    if name in item
+                ),
+                None,
+            )
+            fee_raw = next(
+                (
+                    item[name]
+                    for name in ("fee_reserve", "fee")
+                    if name in item
+                ),
+                0.0,
+            )
+            quantity = _finite_number(quantity_raw)
+            price = _finite_number(price_raw)
+            fee = _finite_number(fee_raw)
+            if (
+                quantity is None
+                or price is None
+                or fee is None
+                or quantity < 0
+                or price < 0
+                or fee < 0
+                or (quantity > 0 and price <= 0)
+            ):
+                valid = False
+                continue
+            notional = quantity * price
+            if not math.isfinite(notional):
+                valid = False
+                continue
+            if side == "BUY":
+                buy_cost = notional + fee
+                if not math.isfinite(buy_cost):
+                    valid = False
+                    continue
+                money += buy_cost
+                buys += buy_cost
+            count += 1
+        return money, buys, count, valid
+
+    @classmethod
+    def _pending_commitments(cls, raw: Any) -> tuple[float, float, int]:
+        money, buys, count, valid = cls._pending_commitments_checked(raw)
+        return (money, buys, count) if valid else (0.0, 0.0, 0)
+
+    @classmethod
+    def _operational_counters_valid(cls, raw: Any) -> bool:
+        if not isinstance(raw, Mapping):
+            return False
+        for name in ("submitted_total", "submitted_today"):
+            if not _nonnegative_finite(raw.get(name), integer=True):
+                return False
+        for name in ("buy_gross_today", "buy_cumulative", "declared_loss_cumulative"):
+            if not _nonnegative_finite(raw.get(name)):
+                return False
+        for name in ("market_buy", "event_buy"):
+            values = raw.get(name)
+            if not isinstance(values, Mapping):
+                return False
+            for key, amount in values.items():
+                if not str(key).strip() or not _nonnegative_finite(amount):
+                    return False
+        day = raw.get("day")
+        if day is not None:
+            try:
+                date.fromisoformat(str(day))
+            except (TypeError, ValueError):
+                return False
+        return cls._pending_commitments_checked(raw.get("pending_orders"))[3]
+
+    def _hydrate_unresolved_events(self) -> None:
+        statuses = tuple(_UNRESOLVED_OPERATIONAL_STATUSES)
+        bounded_loader = getattr(
+            self.store,
+            "list_unresolved_paper_execution_events",
+            None,
+        )
+        all_loader = getattr(self.store, "list_paper_execution_events", None)
+        if not callable(bounded_loader) and not callable(all_loader):
+            self._compatibility_blocker = _operational_state_blocker()
+            return
+        try:
+            if callable(bounded_loader):
+                count_loader = getattr(
+                    self.store,
+                    "count_unresolved_paper_execution_events",
+                    None,
+                )
+                if callable(count_loader) and count_loader(
+                    self._run_id,
+                    statuses=statuses,
+                ) > _MAX_PAPER_UNRESOLVED_EVENTS:
+                    # Refuse to hydrate a truncated obligation set.  Losing an
+                    # unresolved reservation would make the next submission
+                    # unsound, so fail closed instead.
+                    self._compatibility_blocker = _operational_state_blocker()
+                    return
+                prior_events = bounded_loader(
+                    self._run_id,
+                    statuses=statuses,
+                    limit=_MAX_PAPER_UNRESOLVED_EVENTS,
+                )
+            else:
+                prior_events = all_loader(
+                    self._run_id,
+                    limit=_MAX_PAPER_UNRESOLVED_EVENTS,
+                )
+        except Exception:
+            self._compatibility_blocker = _operational_state_blocker()
+            return
+        pending = self._operational_counters.setdefault("pending_orders", [])
+        if not isinstance(pending, list):
+            self._compatibility_blocker = _operational_state_blocker()
+            return
+        existing: set[str] = set()
+        for item in pending:
+            if not isinstance(item, Mapping):
+                continue
+            for name in ("event_id", "order_id", "observation_id"):
+                value = str(item.get(name, "")).strip()
+                if value:
+                    existing.add(name + ":" + value)
+        for prior in prior_events:
+            if not isinstance(prior, Mapping):
+                continue
+            payload = prior.get("payload", {})
+            payload = payload if isinstance(payload, Mapping) else {}
+            status = str(
+                prior.get("status", payload.get("status", ""))
+            ).strip().upper()
+            if status not in _UNRESOLVED_OPERATIONAL_STATUSES:
+                continue
+            fill_payload = payload.get("fill", {})
+            fill_payload = fill_payload if isinstance(fill_payload, Mapping) else {}
+            identity_values = (
+                ("event_id", prior.get("event_id")),
+                ("order_id", payload.get("order_id")),
+                ("observation_id", prior.get("observation_id")),
+            )
+            if any(
+                value not in (None, "")
+                and name + ":" + str(value).strip() in existing
+                for name, value in identity_values
+            ):
+                continue
+            hydrated = {
+                "status": status,
+                "side": payload.get("side", fill_payload.get("side", "BUY")),
+                "quantity": payload.get(
+                    "remaining_quantity",
+                    payload.get(
+                        "requested_quantity",
+                        payload.get("quantity", fill_payload.get("quantity", fill_payload.get("filled_quantity"))),
+                    ),
+                ),
+                "price": payload.get(
+                    "reference_price",
+                    payload.get("price", fill_payload.get("price")),
+                ),
+                "fee_reserve": payload.get(
+                    "fee_reserve",
+                    payload.get("fee", fill_payload.get("fees", 0)),
+                ),
+            }
+            for name, value in identity_values:
+                if value not in (None, ""):
+                    hydrated[name] = value
+                    existing.add(name + ":" + str(value).strip())
+            pending.append(hydrated)
+    def _commit_operational_counters(
+        self,
+        decision: Mapping[str, Any],
+        context: Mapping[str, Any],
+        order: Any,
+    ) -> None:
+        policy = self._operational_policy
+        reservation = decision.get("counter_reservation") if isinstance(decision, Mapping) else None
+        if policy is None or not isinstance(reservation, Mapping):
+            return
+        timestamp = ensure_utc(getattr(order, "requested_at", utc_now()))
+        order_day = timestamp.date()
+        counters = self._operational_counters
+        raw_day = counters.get("day")
+        try:
+            current_day = date.fromisoformat(str(raw_day)) if raw_day is not None else None
+        except (TypeError, ValueError):
+            current_day = None
+        if current_day is None or order_day > current_day:
+            counters["day"] = order_day.isoformat()
+            counters["submitted_today"] = 0
+            counters["buy_gross_today"] = "0"
+        counters["submitted_total"] = int(counters.get("submitted_total", 0)) + 1
+        counters["submitted_today"] = int(counters.get("submitted_today", 0)) + 1
+        if not bool(reservation.get("is_buy")):
+            return
+        all_in = _finite_number(reservation.get("all_in")) or 0.0
+        market_key = str(reservation.get("market_key") or "").strip()
+        event_key = str(reservation.get("event_key") or "").strip()
+        counters["buy_gross_today"] = _policy_decimal_text(
+            (_finite_number(counters.get("buy_gross_today", 0.0)) or 0.0) + all_in
+        ) or "0"
+        counters["buy_cumulative"] = _policy_decimal_text(
+            (_finite_number(counters.get("buy_cumulative", 0.0)) or 0.0) + all_in
+        ) or "0"
+        market_buys = dict(counters.get("market_buy", {}))
+        market_buys[market_key] = _policy_decimal_text(
+            (_finite_number(market_buys.get(market_key, 0.0)) or 0.0) + all_in
+        ) or "0"
+        counters["market_buy"] = market_buys
+        event_buys = dict(counters.get("event_buy", {}))
+        event_buys[event_key] = _policy_decimal_text(
+            (_finite_number(event_buys.get(event_key, 0.0)) or 0.0) + all_in
+        ) or "0"
+        counters["event_buy"] = event_buys
+        declared = _finite_number(reservation.get("declared_loss"))
+        if declared is not None and declared > 0:
+            counters["declared_loss_cumulative"] = _policy_decimal_text(
+                (_finite_number(counters.get("declared_loss_cumulative", 0.0)) or 0.0)
+                + declared
+            ) or "0"
+
+    def _operational_gate(self, order: Any, context: Mapping[str, Any]) -> dict[str, Any]:
+        policy = self._operational_policy
+        if policy is None:
+            return {"allowed": True}
+        timestamp = ensure_utc(getattr(order, "requested_at", utc_now()))
+        order_day = timestamp.date()
+        counters = self._operational_counters
+        try:
+            current_day = (
+                date.fromisoformat(str(counters.get("day")))
+                if counters.get("day") is not None
+                else None
+            )
+        except (TypeError, ValueError):
+            return {"allowed": False, "reason_code": PAPER_STATE_OPERATIONAL_COUNTERS_INVALID}
+        same_day = current_day is None or order_day <= current_day
+        submitted_today = int(counters.get("submitted_today", 0)) if same_day else 0
+        rules = self._operational_market_rules(context)
+        blockers: list[str] = []
+        parsed_rules: dict[str, float] = {}
+        if policy.require_market_rules:
+            for name in ("min_order_size", "size_increment", "min_notional", "tick_size"):
+                try:
+                    value = float(rules.get(name))
+                except (TypeError, ValueError):
+                    value = 0.0
+                if not math.isfinite(value) or value <= 0:
+                    blockers.append("VENUE_MARKET_RULES_MISSING")
+                else:
+                    parsed_rules[name] = value
+        else:
+            for name, value in rules.items():
+                try:
+                    number = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(number) and number > 0:
+                    parsed_rules[name] = number
+        if blockers:
+            return {
+                "allowed": False,
+                "reason_code": blockers[0],
+                "blockers": list(dict.fromkeys(blockers)),
+                "market_rules": dict(rules),
+                "policy_hash": self._execution_binding.get("operational_policy_hash"),
+            }
+        side = getattr(order, "side", Side.BUY)
+        is_buy = side is Side.BUY or str(getattr(side, "value", side)).lower() == "buy"
+        observation = context.get("observation")
+        if is_buy and isinstance(observation, Mapping) and observation.get("entry_eligible") is False:
+            return {
+                "allowed": False,
+                "reason_code": "ENTRY_PREDICATE_NOT_ELIGIBLE",
+                "signal_strength": observation.get("signal_strength"),
+                "entry_eligible": False,
+            }
+        quantity = _finite_number(getattr(order, "quantity", 0.0)) or 0.0
+        price = _finite_number(context.get("risk_price", context.get("reference_price"))) or 0.0
+        venue_quote = _finite_number(
+            context.get("venue_price", context.get("reference_price", price))
+        ) or 0.0
+        if quantity <= 0 or price <= 0 or venue_quote <= 0:
+            return {"allowed": False, "reason_code": "INVALID_ORDER_PARAMETERS"}
+        increment = parsed_rules.get("size_increment", 0.0) or 1.0
+        minimum = parsed_rules.get("min_order_size", 0.0)
+        min_notional = parsed_rules.get("min_notional", 0.0)
+        tick = parsed_rules.get("tick_size", 0.0)
+        tick_ratio = venue_quote / tick if tick > 0 else 0.0
+        if tick > 0 and abs(tick_ratio - round(tick_ratio)) > 1e-8:
+            return {
+                "allowed": False,
+                "reason_code": "VENUE_TICK_SIZE",
+                "market_rules": parsed_rules,
+                "price": venue_quote,
+            }
+        pending_money, pending_buys, pending_count, pending_valid = self._pending_commitments_checked(
+            counters.get("pending_orders", ())
+        )
+        if not pending_valid:
+            return {
+                "allowed": False,
+                "reason_code": "PENDING_COMMITMENT_INVALID",
+                "pending_commitments": pending_count,
+            }
+        exit_slots = self._operational_open_lots() if is_buy else 0
+        required_slots = pending_count + submitted_today + 1
+        if is_buy:
+            required_slots += exit_slots + 1
+        if required_slots > policy.max_submitted_orders_per_day:
+            return {
+                "allowed": False,
+                "reason_code": "SUBMITTED_ORDER_CAPACITY",
+                "pending_commitments": pending_count,
+                "required_slots": required_slots,
+                "exit_slots_reserved": exit_slots + 1 if is_buy else 0,
+            }
+        if not is_buy:
+            position = None
+            try:
+                position = self.portfolio.get_position(
+                    str(getattr(order, "symbol", "")),
+                    outcome=getattr(order, "outcome", None),
+                    market_id=getattr(order, "market_id", None),
+                )
+            except (TypeError, ValueError):
+                try:
+                    position = self.portfolio.get_position(
+                        str(getattr(order, "symbol", "")),
+                        outcome=getattr(order, "outcome", None),
+                    )
+                except (TypeError, ValueError):
+                    position = None
+            available = _finite_number(getattr(position, "quantity", 0.0)) if position is not None else 0.0
+            if available is None or available + 1e-12 < quantity:
+                return {
+                    "allowed": False,
+                    "reason_code": "OWNED_INVENTORY_REQUIRED",
+                    "owned_quantity": available or 0.0,
+                    "requested_quantity": quantity,
+                }
+        # Round only down to the venue increment.  A minimum that cannot fit
+        # inside the frozen $1 all-in cap is an explicit no-fill blocker.
+        minimum_quantity = max(
+            minimum,
+            math.ceil((min_notional / price) / increment - 1e-12) * increment,
+        )
+        candidate_quantity = quantity
+        if increment > 0:
+            candidate_quantity = math.floor(candidate_quantity / increment + 1e-12) * increment
+        if is_buy:
+            available_all_in = max(0.0, policy.max_all_in_buy_usd)
+            candidate_quantity = min(
+                candidate_quantity,
+                math.floor(
+                    max(0.0, available_all_in)
+                    / max(price * (1.0 + max(0.0, self.config.fee_rate)), 1e-12)
+                    / increment
+                    + 1e-12,
+                )
+                * increment,
+            )
+            fee = candidate_quantity * price * max(0.0, self.config.fee_rate)
+            if fee > policy.max_fee_reserve_usd + 1e-12:
+                blockers.append("FEE_RESERVE_CAP")
+            if candidate_quantity + 1e-12 < minimum_quantity:
+                blockers.append("VENUE_MINIMUM_INFEASIBLE")
+        if not is_buy and candidate_quantity + 1e-12 < minimum_quantity:
+            blockers.append("VENUE_MINIMUM_INFEASIBLE")
+        if candidate_quantity <= 0:
+            blockers.append("VENUE_MINIMUM_INFEASIBLE")
+        if blockers:
+            return {
+                "allowed": False,
+                "reason_code": blockers[0],
+                "blockers": list(dict.fromkeys(blockers)),
+                "market_rules": parsed_rules,
+                "requested_quantity": quantity,
+                "minimum_quantity": minimum_quantity,
+            }
+        notional = candidate_quantity * price
+        fee_reserve = notional * max(0.0, self.config.fee_rate)
+        all_in = notional + fee_reserve
+        open_cost, exposure, equity, open_positions = self._operational_positions(
+            prices=(
+                context.get("mark_prices")
+                if isinstance(context.get("mark_prices"), Mapping)
+                else None
+            )
+        )
+        declared = _finite_number(
+            context.get("declared_loss", context.get("expected_loss"))
+        ) or 0.0
+        if is_buy:
+            market_id = str(getattr(order, "market_id", None) or getattr(order, "symbol", "")).strip()
+            outcome = str(getattr(order, "outcome", "") or "").strip().lower()
+            market_key = market_id
+            event_key = str(context.get("event_id") or market_id).strip()
+            market_used = _finite_number(counters.get("market_buy", {}).get(market_key, 0.0)) or 0.0
+            event_used = _finite_number(counters.get("event_buy", {}).get(event_key, 0.0)) or 0.0
+            cumulative = _finite_number(counters.get("buy_cumulative", 0.0)) or 0.0
+            daily = (_finite_number(counters.get("buy_gross_today", 0.0)) or 0.0) if same_day else 0.0
+            reasons: list[str] = []
+            if all_in > policy.max_all_in_buy_usd + 1e-12:
+                reasons.append("MAX_ALL_IN_BUY")
+            if pending_money + open_cost + all_in > policy.max_aggregate_open_cost_usd + 1e-12:
+                reasons.append("AGGREGATE_OPEN_COST")
+            if pending_money + exposure + all_in > policy.max_aggregate_exposure_usd + 1e-12:
+                reasons.append("AGGREGATE_EXPOSURE")
+            if daily + pending_buys + all_in > policy.max_gross_daily_buy_usd + 1e-12:
+                reasons.append("GROSS_DAILY_BUY")
+            if policy.per_market_buy_cap_usd is not None and market_used + all_in > policy.per_market_buy_cap_usd + 1e-12:
+                reasons.append("PER_MARKET_BUY_CAP")
+            if policy.per_event_buy_cap_usd is not None and event_used + all_in > policy.per_event_buy_cap_usd + 1e-12:
+                reasons.append("PER_EVENT_BUY_CAP")
+            if policy.cumulative_buy_cap_usd is not None and cumulative + all_in > policy.cumulative_buy_cap_usd + 1e-12:
+                reasons.append("CUMULATIVE_BUY_CAP")
+            if open_positions >= policy.max_positions:
+                try:
+                    existing = self.portfolio.get_position(
+                        str(getattr(order, "symbol", "")),
+                        outcome=outcome or None,
+                        market_id=getattr(order, "market_id", None),
+                    )
+                except (TypeError, ValueError):
+                    existing = None
+                if existing is None or (_finite_number(getattr(existing, "quantity", 0.0)) or 0.0) <= 1e-12:
+                    reasons.append("MAX_POSITIONS")
+            if self._has_strategy_or_event_overlap(order, context, policy):
+                reasons.append("STRATEGY_EVENT_OVERLAP")
+            realized = max(0.0, -(_finite_number(self.portfolio.realized_pnl()) or 0.0))
+            equity_loss = max(0.0, (_finite_number(getattr(self.portfolio, "initial_cash", equity)) or equity) - equity)
+            declared_total = _finite_number(counters.get("declared_loss_cumulative", 0.0)) or 0.0
+            if realized >= policy.realized_loss_entry_stop_usd:
+                reasons.append("REALIZED_LOSS_ENTRY_STOP")
+            if equity_loss >= policy.equity_loss_entry_stop_usd:
+                reasons.append("EQUITY_LOSS_ENTRY_STOP")
+            if policy.cumulative_declared_loss_entry_stop_usd is not None and declared_total + max(0.0, declared or 0.0) >= policy.cumulative_declared_loss_entry_stop_usd:
+                reasons.append("CUMULATIVE_DECLARED_LOSS_ENTRY_STOP")
+            if reasons:
+                return {
+                    "allowed": False,
+                    "reason_code": reasons[0],
+                    "blockers": reasons,
+                    "notional": notional,
+                    "all_in": all_in,
+                    "fee_reserve": fee_reserve,
+                    "market_key": market_key,
+                    "event_key": event_key,
+                }
+        reservation: dict[str, Any] = {}
+        if is_buy:
+            reservation = {
+                "is_buy": True,
+                "all_in": all_in,
+                "market_key": market_key,
+                "event_key": event_key,
+                "declared_loss": max(0.0, declared or 0.0),
+            }
+        return {
+            "allowed": True,
+            "risk_approved": True,
+            "policy_hash": self._execution_binding.get("operational_policy_hash"),
+            "reason_code": "RISK_APPROVED",
+            "quantity": candidate_quantity,
+            "notional": notional,
+            "all_in": all_in,
+            "fee_reserve": fee_reserve,
+            "market_rules": parsed_rules,
+            "counter_reservation": reservation,
+        }
+    def _has_strategy_or_event_overlap(
+        self,
+        order: Any,
+        context: Mapping[str, Any],
+        policy: OperationalPaperPolicy,
+    ) -> bool:
+        """Reject overlap only when a matching net position is still open."""
+        market = str(getattr(order, "market_id", None) or getattr(order, "symbol", "")).strip()
+        strategy = str(getattr(order, "strategy_id", "")).strip()
+        event = str(context.get("event_id") or market).strip()
+        active_markets: set[str] = set()
+        for key, position in getattr(self.portfolio, "positions", {}).items():
+            quantity = _finite_number(getattr(position, "quantity", 0.0)) or 0.0
+            if quantity > 1e-12:
+                active_markets.add(
+                    str(
+                        getattr(position, "market_id", None)
+                        or getattr(position, "symbol", None)
+                        or key
+                    ).strip()
+                )
+        if not active_markets:
+            return False
+        if not policy.allow_strategy_overlap and market in active_markets:
+            return True
+        if not policy.allow_event_overlap and event in active_markets:
+            return True
+        strategy_net: dict[tuple[str, str], float] = {}
+        event_net: dict[tuple[str, str], float] = {}
+        fills = getattr(self.portfolio, "fills", ()) or ()
+        if fills:
+            for fill in fills:
+                fill_market = str(
+                    getattr(fill, "market_id", None) or getattr(fill, "symbol", "")
+                ).strip()
+                if fill_market not in active_markets:
+                    continue
+                quantity = _finite_number(getattr(fill, "quantity", 0.0)) or 0.0
+                side = getattr(fill, "side", None)
+                signed = (
+                    quantity
+                    if side is Side.BUY
+                    or str(getattr(side, "value", side)).lower() == "buy"
+                    else -quantity
+                )
+                fill_strategy = str(getattr(fill, "strategy_id", "")).strip()
+                strategy_net[(fill_strategy, fill_market)] = strategy_net.get(
+                    (fill_strategy, fill_market), 0.0
+                ) + signed
+                metadata = getattr(fill, "metadata", {}) or {}
+                fill_event = str(metadata.get("event_id") or fill_market).strip()
+                event_net[(fill_event, fill_market)] = event_net.get(
+                    (fill_event, fill_market), 0.0
+                ) + signed
+        else:
+            # A restart restores positions from the compact portfolio snapshot;
+            # recover overlap identity from an SQL aggregate rather than
+            # hydrating every historical fill into memory.
+            aggregator = getattr(self.store, "aggregate_paper_fill_exposure", None)
+            try:
+                aggregate_rows = (
+                    aggregator(self._run_id)
+                    if callable(aggregator)
+                    else ()
+                )
+            except Exception:
+                aggregate_rows = ()
+            for row in aggregate_rows:
+                if not isinstance(row, Mapping):
+                    continue
+                fill_market = str(row.get("market_id", "")).strip()
+                if fill_market not in active_markets:
+                    continue
+                signed = _finite_number(row.get("signed_notional")) or 0.0
+                fill_strategy = str(row.get("strategy_id", "")).strip()
+                strategy_net[(fill_strategy, fill_market)] = strategy_net.get(
+                    (fill_strategy, fill_market), 0.0
+                ) + signed
+                fill_event = str(row.get("event_id") or fill_market).strip()
+                event_net[(fill_event, fill_market)] = event_net.get(
+                    (fill_event, fill_market), 0.0
+                ) + signed
+        if not policy.allow_strategy_overlap and strategy_net.get((strategy, market), 0.0) > 1e-12:
+            return True
+        if not policy.allow_event_overlap and any(
+            fill_event == event and net > 1e-12
+            for (fill_event, _fill_market), net in event_net.items()
+        ):
+            return True
+        return False
     def _restore_risk_status(self) -> None:
         if self.risk is None:
             return
@@ -518,6 +1623,17 @@ class ForwardPaperEngine:
     def state(self) -> dict[str, Any]:
         return deepcopy(self._state)
     @property
+    def operational_policy(self) -> dict[str, Any] | None:
+        return (
+            deepcopy(self._operational_policy.as_record())
+            if self._operational_policy is not None
+            else None
+        )
+
+    @property
+    def operational_counters(self) -> dict[str, Any]:
+        return deepcopy(self._operational_counters)
+    @property
     def compatibility_blocker(self) -> dict[str, Any] | None:
         return deepcopy(self._compatibility_blocker)
 
@@ -525,8 +1641,40 @@ class ForwardPaperEngine:
     def execution_binding(self) -> dict[str, Any]:
         return deepcopy(self._execution_binding)
 
+    @staticmethod
+    def _observation_scope_key(market_id: str, observation: Any) -> str:
+        """Partition cursors/history by run, market and stable shadow member.
+
+        ``shadow_group_id`` identifies one scheduler cycle and is therefore
+        intentionally excluded.  A new group must continue the same member's
+        512-observation lookback; the member id is the durable identity for
+        concurrent shadow members.  The run namespace is supplied by the
+        owning engine/store state and is not part of this local key.
+        """
+
+        shadow = _shadow_metadata(observation)
+        member_id = shadow.get("shadow_member_id") if shadow else None
+        if member_id not in (None, ""):
+            return f"{market_id}|shadow-member:{str(member_id).strip()}"
+        if not shadow:
+            return str(market_id)
+        stable_shadow = {
+            key: value for key, value in shadow.items() if key != "shadow_group_id"
+        }
+        if not stable_shadow:
+            return str(market_id)
+        digest = hashlib.sha256(
+            _canonical_json(stable_shadow).encode("utf-8")
+        ).hexdigest()[:24]
+        return f"{market_id}|shadow:{digest}"
+
+    @staticmethod
+    def _scope_market_id(scope_key: str) -> str:
+        return str(scope_key).split("|shadow-member:", 1)[0].split("|shadow:", 1)[0]
+
     def _append_signal_history(self, market_id: str, observation: Mapping[str, Any]) -> None:
-        history = self._signal_history.setdefault(str(market_id), [])
+        scope_key = self._observation_scope_key(market_id, observation)
+        history = self._signal_history.setdefault(scope_key, [])
         history.append(dict(observation))
         if len(history) > 512:
             del history[:-512]
@@ -534,9 +1682,14 @@ class ForwardPaperEngine:
     def _warm_strategy_state(self) -> None:
         """Replay persisted signal inputs into stateful strategies without execution."""
         try:
-            rows = self.store.list_latest_paper_observations(self._run_id, per_market_limit=512)
+            rows = self.store.list_latest_paper_observations(
+                self._run_id,
+                per_market_limit=512,
+                per_scope_limit=512,
+            )
         except Exception:
             return
+        rows = [item for item in rows if isinstance(item, Mapping)]
         rows.sort(
             key=lambda item: _observation_sort_key(
                 item.get("payload"),
@@ -552,13 +1705,13 @@ class ForwardPaperEngine:
             if not market_id:
                 continue
             observation = dict(payload)
-            if not self._model_state_restored:
+            if not self._model_state_restored and not _is_terminal(observation.get("settlement")):
                 model_evaluation = _model_probability_evaluation(self.model, observation)
-                if model_evaluation.probability is not None:
+                if model_evaluation.probability is not None and "model_probability" not in observation:
                     observation["model_probability"] = model_evaluation.probability
                 observation["model_evaluation"] = model_evaluation.as_record()
-            history = rebuilt.setdefault(market_id, [])
-            observation.setdefault("source_type", str(item.get("source_type", "FORWARD_COLLECTED")).upper())
+            scope_key = self._observation_scope_key(market_id, observation)
+            history = rebuilt.setdefault(scope_key, [])
             warm_context = {
                 "market_type": MarketType.PREDICTION.value,
                 "symbol": market_id,
@@ -576,6 +1729,10 @@ class ForwardPaperEngine:
                 "paper": True,
                 "warmup": True,
             }
+            shadow_metadata = _shadow_metadata(observation)
+            if shadow_metadata:
+                warm_context.update(shadow_metadata)
+                warm_context["metadata"] = dict(shadow_metadata)
             if not _is_terminal(observation.get("settlement")):
                 try:
                     self.trader._strategy_signal(observation, warm_context)
@@ -668,8 +1825,10 @@ class ForwardPaperEngine:
                 errors.append("malformed prediction observation")
                 continue
             market_id, observation, yes_book, no_book = normalized
+            market_scope_key = self._observation_scope_key(market_id, observation)
             terminal = _is_terminal(observation.get("settlement"))
 
+            shadow_metadata = _shadow_metadata(observation)
             source_type = str(observation.get("source_type", "FORWARD_COLLECTED")).strip().upper() or "FORWARD_COLLECTED"
             observation["source_type"] = source_type
             if self._execution_mode == "historical_replay":
@@ -734,13 +1893,13 @@ class ForwardPaperEngine:
                 skipped += 1
                 errors.append(f"future order book for {market_id}")
                 continue
-            cursor = self._cursor.get(market_id)
+            cursor = self._cursor.get(market_scope_key)
             if cursor is not None and stamp < cursor:
                 skipped += 1
                 continue
-            if market_id in self._settled:
+            if market_scope_key in self._settled:
                 current_settlement = _settlement_value(observation.get("settlement"))
-                previous_settlement = _settlement_value(self._settlement_by_market.get(market_id))
+                previous_settlement = _settlement_value(self._settlement_by_market.get(market_scope_key))
                 if (
                     terminal
                     and previous_settlement
@@ -772,13 +1931,25 @@ class ForwardPaperEngine:
                     errors.append(f"model error for {market_id}: {exc}")
                     continue
             model_probability = model_evaluation.probability if model_evaluation is not None else None
-            if model_probability is not None:
+            if model_probability is not None and "model_probability" not in observation:
                 observation["model_probability"] = model_probability
             if model_evaluation is not None:
                 observation["model_evaluation"] = model_evaluation.as_record()
             strategy_evaluation = None
-            if not terminal and isinstance(self._strategy_document, Mapping):
-                signal_inputs = tuple(self._signal_history.get(market_id, ())) + (observation,)
+            strategy_record: Mapping[str, Any] | None = None
+            strategy_entry_eligible: Any = None
+            custom_shadow_strategy = bool(
+                shadow_metadata
+                and (
+                    callable(self.strategy)
+                    or any(
+                        callable(getattr(self.strategy, name, None))
+                        for name in ("signal", "decide", "generate_signal", "generate")
+                    )
+                )
+            )
+            if not terminal and isinstance(self._strategy_document, Mapping) and not custom_shadow_strategy:
+                signal_inputs = tuple(self._signal_history.get(market_scope_key, ())) + (observation,)
                 evaluation_data: dict[str, Any] = {
                     "observations": signal_inputs,
                     "snapshots": signal_inputs,
@@ -792,6 +1963,20 @@ class ForwardPaperEngine:
                     strategy_evaluation = evaluate_signal_evaluation(self._strategy_document, evaluation_data)
                 except (TypeError, ValueError):
                     strategy_evaluation = None
+            if strategy_evaluation is not None:
+                evaluated_record = strategy_evaluation.as_record()
+                strategy_record = evaluated_record if isinstance(evaluated_record, Mapping) else None
+                strategy_evidence = strategy_record.get("evidence") if strategy_record is not None else None
+                for field_name in ("signal_strength", "entry_eligible"):
+                    value = getattr(strategy_evaluation, field_name, None)
+                    if value is None and strategy_record is not None:
+                        value = strategy_record.get(field_name)
+                    if value is None and isinstance(strategy_evidence, Mapping):
+                        value = strategy_evidence.get(field_name)
+                    if value is not None:
+                        observation[field_name] = value
+                        if field_name == "entry_eligible":
+                            strategy_entry_eligible = value
             replay_missing_book = False
             if self._execution_mode == "historical_replay" and not terminal:
                 score = getattr(strategy_evaluation, "score", None)
@@ -810,11 +1995,11 @@ class ForwardPaperEngine:
                         and _explicit_book_timestamp(_raw_observation_book(raw, "yes"))
                         and _explicit_book_timestamp(_raw_observation_book(raw, "no"))
                     )
-            previous_cursor = self._cursor.get(market_id)
-            previous_source_cursor = self._source_cursor.get(market_id)
-            previous_open_timestamp = self._observation_open_by_market.get(market_id)
-            was_settled = market_id in self._settled
-            previous_settlement = self._settlement_by_market.get(market_id)
+            previous_cursor = self._cursor.get(market_scope_key)
+            previous_source_cursor = self._source_cursor.get(market_scope_key)
+            previous_open_timestamp = self._observation_open_by_market.get(market_scope_key)
+            was_settled = market_scope_key in self._settled
+            previous_settlement = self._settlement_by_market.get(market_scope_key)
             if (
                 model_evaluation is not None
                 and model_evaluation.probability is None
@@ -822,7 +2007,8 @@ class ForwardPaperEngine:
             ):
                 # Keep the distinction in persisted evidence; no default 0.50
                 # probability is ever synthesized.
-                observation["model_probability"] = None
+                if "model_probability" not in observation:
+                    observation["model_probability"] = None
             if model_evaluation is not None and model_evaluation.probability is None:
                 observation["model_evaluation"]["reason_code"] = model_evaluation.reason_code
             price = _reference_price(observation, yes_book, no_book)
@@ -831,7 +2017,7 @@ class ForwardPaperEngine:
             fill_saved = False
             settlement_saved = False
             inserted_observation = False
-            history_before = tuple(self._signal_history.get(market_id, ()))
+            history_before = tuple(self._signal_history.get(market_scope_key, ()))
             portfolio_before = deepcopy(self.portfolio)
             risk_before = deepcopy(self.risk)
             state_before = deepcopy(self._state)
@@ -841,6 +2027,8 @@ class ForwardPaperEngine:
             trader_sequence_before = self.trader._sequence
             strategy_state_before = _snapshot_object_state(self.strategy)
             execution_events_before = execution_events
+            operational_counters_before = deepcopy(self._operational_counters)
+            fill_count_before = self._fill_count
             try:
                 with self.store.transaction():
                     inserted_observation = self.store.save_paper_observation(
@@ -850,132 +2038,192 @@ class ForwardPaperEngine:
                         stamp,
                         observation,
                     )
-                    if inserted_observation:
-                        current_open = self._observation_open_by_market.get(market_id)
-                        if current_open is None or stamp < current_open:
-                            self._observation_open_by_market[market_id] = stamp
-                        if replay_missing_book:
-                            fill = None
-                            execution_event = {
-                                "status": "NO_FILL",
-                                "reason": "missing_observed_order_book",
-                                "liquidity_rejected": True,
-                            }
-                        elif missing_execution_quote:
-                            fill = None
-                            execution_event = {
-                                "status": "NO_FILL",
-                                "reason": "missing_executable_quote",
-                                "liquidity_rejected": True,
-                            }
-                        else:
-                            fill = self.trader._run_observation(
-                                symbol=market_id,
-                                observation=observation,
-                                book=yes_book,
-                                no_book=no_book,
-                                timestamp=stamp,
-                                reference=price,
-                                allocated_capital=self._allocated_capital,
-                                market_id=market_id,
-                                signal_history=history_before,
-                            )
-                        if fill is not None:
-                            fill = self._bind_fill(fill)
-                            if self.store.save_fill(
-                                fill,
-                                fill_id="paper-fill-" + self._run_id + "-" + fill.order_id,
-                            ):
-                                fill_saved = True
-                        execution_event = dict(
-                            execution_event
-                            if replay_missing_book or missing_execution_quote
-                            else self.trader.last_execution_event
+                    if not inserted_observation:
+                        raise _DuplicatePaperObservation()
+                    if self._observation_open_by_market.get(market_scope_key) is None:
+                        self._observation_open_by_market[market_scope_key] = stamp
+                    if replay_missing_book:
+                        fill = None
+                        execution_event = {
+                            "status": "NO_FILL",
+                            "reason": "missing_observed_order_book",
+                            "liquidity_rejected": True,
+                        }
+                    elif missing_execution_quote:
+                        fill = None
+                        execution_event = {
+                            "status": "NO_FILL",
+                            "reason": "missing_executable_quote",
+                            "liquidity_rejected": True,
+                        }
+                    else:
+                        fill = self.trader._run_observation(
+                            symbol=market_id,
+                            observation=observation,
+                            book=yes_book,
+                            no_book=no_book,
+                            timestamp=stamp,
+                            reference=price,
+                            allocated_capital=self._allocated_capital,
+                            market_id=market_id,
+                            signal_history=history_before,
                         )
-                        execution_event["observation_id"] = observation_id
-                        execution_event["experiment_id"] = self._run_id
-                        execution_event["paper_only"] = True
-                        execution_event["research_mode"] = self._research_mode
-                        execution_event["source_type"] = source_type
-                        execution_event["research_label"] = (
-                            "REPLAY" if self._execution_mode == "historical_replay" else "FORWARD"
-                        )
-                        execution_event["retrospective_replay"] = self._execution_mode == "historical_replay"
-                        execution_event["execution_binding"] = dict(self._execution_binding)
-                        if replay_missing_book or missing_execution_quote:
-                            execution_event["execution_blocked"] = True
-                        if strategy_evaluation is not None:
-                            evaluation_record = strategy_evaluation.as_record()
-                            execution_event["evaluation"] = evaluation_record
-                            execution_event["reason_code"] = strategy_evaluation.reason_code
-                            execution_event["evaluation_reason"] = strategy_evaluation.reason_code
-                            execution_event["evaluation_evidence"] = dict(strategy_evaluation.evidence)
-                            execution_event["evaluation_actionable"] = bool(strategy_evaluation.actionable)
-                        elif fill is not None:
-                            execution_event["reason_code"] = "SIGNAL_PRODUCED"
-                        elif str(execution_event.get("status", "")).upper() == "RESOLUTION":
-                            execution_event["reason_code"] = "RESOLUTION"
-                        else:
-                            execution_event["reason_code"] = "STRATEGY_EVALUATED_DECLINED"
-                        if fill is not None:
-                            execution_event["fill"] = to_record(fill)
-                            execution_event["fill_id"] = fill.order_id
-                            execution_event["fill_is_opening"] = not terminal
-                        if model_evaluation is not None:
-                            execution_event["model_evaluation"] = model_evaluation.as_record()
-                        event_status = str(execution_event.get("status", "NO_SIGNAL")).strip().upper() or "NO_SIGNAL"
-                        if self.store.save_paper_execution_event(
-                            "paper-execution-" + self._run_id + "-" + observation_id,
-                            self._run_id,
-                            observation_id,
-                            market_id,
-                            stamp,
-                            event_status,
-                            execution_event,
+                    if fill is not None:
+                        fill = self._bind_fill(fill)
+                        if self.store.save_fill(
+                            fill,
+                            fill_id="paper-fill-" + self._run_id + "-" + fill.order_id,
                         ):
-                            execution_events += 1
+                            fill_saved = True
+                            self._fill_count += 1
+                    execution_event = dict(
+                        execution_event
+                        if replay_missing_book or missing_execution_quote
+                        else self.trader.last_execution_event
+                    )
+                    execution_event["execution_binding"] = dict(self._execution_binding)
+                    execution_event["observation_id"] = observation_id
+                    execution_event["experiment_id"] = self._run_id
+                    execution_event["paper_only"] = True
+                    execution_event["research_mode"] = self._research_mode
+                    execution_event["source_type"] = source_type
+                    execution_event["research_label"] = (
+                        "REPLAY" if self._execution_mode == "historical_replay" else "FORWARD"
+                    )
+                    execution_event["retrospective_replay"] = self._execution_mode == "historical_replay"
+                    if shadow_metadata:
+                        execution_event.update(shadow_metadata)
+                        execution_event["live_execution"] = False
                         if terminal:
-                            settlement_saved = True
-                            self._settled.add(market_id)
-                            self._settlement_by_market[market_id] = str(observation.get("settlement"))
-                            if self.risk is not None:
-                                self.risk.reconcile_market(market_id, fills=self.portfolio.fills)
-                            open_timestamp = self._observation_open_by_market.get(market_id)
-                            # A terminal snapshot can be the first observation
-                            # for a market.  It establishes no completed
-                            # forward outcome, even if a stale fill exists.
-                            if open_timestamp is not None and open_timestamp < stamp:
-                                ledger = build_resolved_bet(
-                                    experiment_id=self._run_id,
-                                    market_id=market_id,
-                                    strategy_id=self._execution_strategy_id,
-                                    settlement=_settlement_value(observation.get("settlement")) or str(observation.get("settlement")),
-                                    resolved_at=stamp,
-                                    fills=self._stored_fills_for_market(market_id),
-                                    observation_open_timestamp=open_timestamp,
+                            settlement = _settlement_value(observation.get("settlement"))
+                            if settlement in {
+                                SettlementState.RESOLVED_YES.value,
+                                SettlementState.RESOLVED_NO.value,
+                            }:
+                                # Keep the resolution source tied to this
+                                # public snapshot; unresolved snapshots never
+                                # receive a synthesized settlement.
+                                execution_event["settlement"] = settlement
+                    if self._operational_settings is not None:
+                        execution_event["operational_settings"] = dict(
+                            self._operational_settings
+                        )
+                        execution_event["operational_config_id"] = self._operational_settings["config_id"]
+                        execution_event["operational_config_generation"] = self._operational_settings["generation"]
+                        execution_event["operational_config_hash"] = self._operational_settings["config_hash"]
+                    operational_evidence = execution_event.get("operational_evidence")
+                    if isinstance(operational_evidence, Mapping):
+                        execution_event["risk_approved"] = bool(
+                            operational_evidence.get("risk_approved", operational_evidence.get("allowed", False))
+                        )
+                        execution_event["operational_policy_hash"] = self._execution_binding.get(
+                            "operational_policy_hash"
+                        )
+                    if replay_missing_book or missing_execution_quote:
+                        execution_event["execution_blocked"] = True
+                    if strategy_evaluation is not None:
+                        evaluation_record = strategy_evaluation.as_record()
+                        if shadow_metadata and isinstance(evaluation_record, Mapping):
+                            evaluation_record = dict(evaluation_record)
+                            evaluation_record["evidence"] = {
+                                **(
+                                    dict(evaluation_record.get("evidence", {}))
+                                    if isinstance(evaluation_record.get("evidence"), Mapping)
+                                    else {}
+                                ),
+                                **shadow_metadata,
+                            }
+                        execution_event["evaluation"] = evaluation_record
+                        execution_event["evaluation_reason"] = strategy_evaluation.reason_code
+                        execution_event["evaluation_evidence"] = {
+                            **dict(strategy_evaluation.evidence),
+                            **shadow_metadata,
+                        }
+                        execution_event["evaluation_actionable"] = bool(strategy_evaluation.actionable)
+                        if "operational_evidence" not in execution_event:
+                            execution_event["reason_code"] = strategy_evaluation.reason_code
+                    elif fill is not None:
+                        execution_event["reason_code"] = "SIGNAL_PRODUCED"
+                    elif str(execution_event.get("status", "")).upper() == "RESOLUTION":
+                        execution_event["reason_code"] = "RESOLUTION"
+                    elif "reason_code" not in execution_event:
+                        execution_event["reason_code"] = "STRATEGY_EVALUATED_DECLINED"
+                    if fill is not None:
+                        execution_event["fill"] = to_record(fill)
+                        execution_event["fill_id"] = fill.order_id
+                        execution_event["fill_is_opening"] = not terminal
+                    if model_evaluation is not None:
+                        execution_event["model_evaluation"] = model_evaluation.as_record()
+                    event_status = str(execution_event.get("status", "NO_SIGNAL")).strip().upper() or "NO_SIGNAL"
+                    if self.store.save_paper_execution_event(
+                        "paper-execution-" + self._run_id + "-" + observation_id,
+                        self._run_id,
+                        observation_id,
+                        market_id,
+                        stamp,
+                        event_status,
+                        execution_event,
+                    ):
+                        execution_events += 1
+                    if terminal:
+                        settlement_saved = True
+                        self._settled.add(market_scope_key)
+                        self._settlement_by_market[market_scope_key] = str(observation.get("settlement"))
+                        scope_market_id = self._scope_market_id(market_scope_key)
+                        if self.risk is not None and not self._restore_risk_from_aggregates():
+                            self.risk.reconcile_market(
+                                scope_market_id,
+                                fills=self.portfolio.fills,
+                            )
+                        open_timestamp = self._observation_open_by_market.get(market_scope_key)
+                        # A terminal snapshot can be the first observation
+                        # for a market.  It establishes no completed
+                        # forward outcome, even if a stale fill exists.
+                        if open_timestamp is not None and open_timestamp < stamp:
+                            ledger = build_resolved_bet(
+                                experiment_id=self._run_id,
+                                market_id=market_id,
+                                strategy_id=self._execution_strategy_id,
+                                settlement=_settlement_value(observation.get("settlement")) or str(observation.get("settlement")),
+                                resolved_at=stamp,
+                                fills=self._stored_fills_for_market(
+                                    market_id,
+                                    start=open_timestamp,
+                                    end=stamp,
+                                ),
+                                observation_open_timestamp=open_timestamp,
+                            )
+                            if ledger is not None:
+                                ledger["execution_binding"] = dict(self._execution_binding)
+                                ledger["paper_experiment_id"] = self._run_id
+                                self.store.save_paper_bet_ledger(
+                                    ledger["bet_id"],
+                                    self._run_id,
+                                    market_id,
+                                    self._execution_strategy_id,
+                                    ledger["outcome"],
+                                    ledger["resolution"],
+                                    stamp,
+                                    ledger,
                                 )
-                                if ledger is not None:
-                                    ledger["execution_binding"] = dict(self._execution_binding)
-                                    ledger["paper_experiment_id"] = self._run_id
-                                    self.store.save_paper_bet_ledger(
-                                        ledger["bet_id"],
-                                        self._run_id,
-                                        market_id,
-                                        self._execution_strategy_id,
-                                        ledger["outcome"],
-                                        ledger["resolution"],
-                                        stamp,
-                                        ledger,
-                                    )
-                        self._cursor[market_id] = max(self._cursor.get(market_id, stamp), stamp)
-                        source_snapshot_id = str(observation.get("source_snapshot_id", "")).strip()
-                        if source_snapshot_id:
-                            source_cursor = (source_timestamp, source_snapshot_id)
-                            if previous_source_cursor is None or source_cursor > previous_source_cursor:
-                                self._source_cursor[market_id] = source_cursor
-                        self._processed.add(observation_id)
-                        self._append_signal_history(market_id, observation)
-                        self._persist_state(last_timestamp=stamp)
+                    self._cursor[market_scope_key] = max(
+                        self._cursor.get(market_scope_key, stamp),
+                        stamp,
+                    )
+                    source_snapshot_id = str(observation.get("source_snapshot_id", "")).strip()
+                    if source_snapshot_id:
+                        source_cursor = (source_timestamp, source_snapshot_id)
+                        if previous_source_cursor is None or source_cursor > previous_source_cursor:
+                            self._source_cursor[market_scope_key] = source_cursor
+                    self._processed.add(observation_id)
+                    self._append_signal_history(market_id, observation)
+                    self._persist_state(last_timestamp=stamp)
+            except _DuplicatePaperObservation:
+                _restore_object_state(self.model, model_state_before)
+                _restore_object_state(self.strategy, strategy_state_before)
+                self._reload_committed_state()
+                skipped += 1
+                continue
             except Exception as exc:
                 _restore_object_state(self.model, model_state_before)
                 _restore_object_state(self.strategy, strategy_state_before)
@@ -986,31 +2234,33 @@ class ForwardPaperEngine:
                 self.trader._fills = trader_fills_before
                 self.trader._sequence = trader_sequence_before
                 self._state_version = state_version_before
+                self._fill_count = fill_count_before
+                self._operational_counters = operational_counters_before
                 execution_events = execution_events_before
                 self._state = state_before
                 self._processed.discard(observation_id)
                 if previous_cursor is None:
-                    self._cursor.pop(market_id, None)
+                    self._cursor.pop(market_scope_key, None)
                 else:
-                    self._cursor[market_id] = previous_cursor
+                    self._cursor[market_scope_key] = previous_cursor
                 if previous_source_cursor is None:
-                    self._source_cursor.pop(market_id, None)
+                    self._source_cursor.pop(market_scope_key, None)
                 else:
-                    self._source_cursor[market_id] = previous_source_cursor
+                    self._source_cursor[market_scope_key] = previous_source_cursor
                 if previous_open_timestamp is None:
-                    self._observation_open_by_market.pop(market_id, None)
+                    self._observation_open_by_market.pop(market_scope_key, None)
                 else:
-                    self._observation_open_by_market[market_id] = previous_open_timestamp
+                    self._observation_open_by_market[market_scope_key] = previous_open_timestamp
                 if not was_settled:
-                    self._settled.discard(market_id)
+                    self._settled.discard(market_scope_key)
                 if previous_settlement is None:
-                    self._settlement_by_market.pop(market_id, None)
+                    self._settlement_by_market.pop(market_scope_key, None)
                 else:
-                    self._settlement_by_market[market_id] = previous_settlement
+                    self._settlement_by_market[market_scope_key] = previous_settlement
                 if signal_history_before:
-                    self._signal_history[market_id] = signal_history_before
+                    self._signal_history[market_scope_key] = signal_history_before
                 else:
-                    self._signal_history.pop(market_id, None)
+                    self._signal_history.pop(market_scope_key, None)
                 errors.append(f"{market_id}: {exc}")
                 continue
             if not inserted_observation:
@@ -1161,6 +2411,11 @@ class ForwardPaperEngine:
             "paper_experiment_id": self._run_id,
             "execution_binding": dict(self._execution_binding),
         }
+        shadow = _shadow_metadata(metadata)
+        if shadow:
+            metadata.update(shadow)
+            metadata["paper_only"] = True
+            metadata["live_execution"] = False
         tagged = replace(fill, metadata=metadata)
         fills = getattr(self.portfolio, "fills", None)
         if isinstance(fills, list):
@@ -1178,66 +2433,630 @@ class ForwardPaperEngine:
                             order_fills[index] = tagged
         return tagged
 
-
-    def _stored_fills_for_market(self, market_id: str) -> tuple[Fill, ...]:
+    def _reload_committed_state(self) -> None:
+        """Refresh all mutable state after losing a duplicate-observation race."""
+        loaded_state = self.store.load_paper_state(self._run_id)
+        if not isinstance(loaded_state, Mapping):
+            return
+        self._state_version = int(loaded_state.get("state_version", self._state_version))
+        raw_state = loaded_state.get("state", {})
+        self._state = dict(raw_state) if isinstance(raw_state, Mapping) else {}
         try:
-            fills = self.store.load_fills(strategy_id=self._execution_strategy_id)
+            self._fill_count = max(0, int(self._state.get("fill_count", self._fill_count)))
+        except (TypeError, ValueError):
+            self._fill_count = 0
+        self._processed = set(str(item) for item in self._state.get("processed_observations", ()))
+        self._cursor = {
+            str(key): parsed
+            for key, value in dict(self._state.get("cursor_by_market", {})).items()
+            if (parsed := parse_timestamp(value)) is not None
+        }
+        raw_open = self._state.get("observation_open_by_market", {})
+        self._observation_open_by_market = {
+            str(key): parsed
+            for key, value in raw_open.items()
+            if (parsed := parse_timestamp(value)) is not None
+        } if isinstance(raw_open, Mapping) else {}
+        raw_source = self._state.get("source_cursor_by_market", {})
+        self._source_cursor = {
+            str(key): (parsed, str(value.get("snapshot_id")).strip())
+            for key, value in raw_source.items()
+            if isinstance(value, Mapping)
+            and str(value.get("snapshot_id", "")).strip()
+            and (parsed := parse_timestamp(value.get("timestamp"))) is not None
+        } if isinstance(raw_source, Mapping) else {}
+        self._settled = set(str(item) for item in self._state.get("settled_markets", ()))
+        self._settlement_by_market = {
+            str(key): str(value)
+            for key, value in dict(self._state.get("settlement_by_market", {})).items()
+        }
+        stored_history = self._state.get("signal_history_by_market", {})
+        self._signal_history = {
+            str(key): list(value[-512:])
+            for key, value in stored_history.items()
+            if isinstance(value, (list, tuple))
+        } if isinstance(stored_history, Mapping) else {}
+        operational_state = self._state.get("operational_paper", {})
+        counters_present = isinstance(operational_state, Mapping) and "counters" in operational_state
+        counters_source = (
+            operational_state.get("counters")
+            if isinstance(operational_state, Mapping)
+            else None
+        )
+        counters = (
+            deepcopy(dict(counters_source))
+            if isinstance(counters_source, Mapping)
+            else {}
+        )
+        counters.setdefault("submitted_total", 0)
+        counters.setdefault("submitted_today", 0)
+        counters.setdefault("buy_gross_today", "0")
+        counters.setdefault("buy_cumulative", "0")
+        counters.setdefault("market_buy", {})
+        counters.setdefault("event_buy", {})
+        counters.setdefault("declared_loss_cumulative", "0")
+        counters.setdefault("pending_orders", [])
+        counters.setdefault("day", None)
+        counters_shape_invalid = (
+            counters_present
+            and counters_source is not None
+            and not isinstance(counters_source, Mapping)
+        )
+        if (
+            ("operational_paper" in self._state and not isinstance(operational_state, Mapping))
+            or counters_shape_invalid
+            or not self._operational_counters_valid(counters)
+        ):
+            self._compatibility_blocker = _operational_state_blocker()
+        self._operational_counters = counters
+        if self._compatibility_blocker is None and self._operational_policy is not None:
+            self._hydrate_unresolved_events()
+        if self._compatibility_blocker is not None:
+            return
+        self._restore_object_state(self.model, self._state.get("model_state"))
+        self.portfolio = Portfolio(self.spec.bankroll)
+        self._restore_ledger()
+        self.risk = RiskEngine(
+            RiskLimits(**dict(self.spec.risk_limits)),
+            initial_equity=self.spec.bankroll,
+        )
+        self._restore_risk_status()
+        self._restore_settlements()
+        self.trader.portfolio = self.portfolio
+        self.trader.risk = self.risk
+        self.trader._fills = list(self.portfolio.fills)
+        try:
+            self.trader._sequence = int(self._state.get("order_sequence", 0))
+        except (TypeError, ValueError):
+            self.trader._sequence = 0
+        self.trader._operational_gate = (
+            self._operational_gate if self._operational_policy is not None else None
+        )
+        self.trader._operational_commit = self._commit_operational_counters
+
+    def _shadow_open_lot_records(
+        self,
+        fills: Iterable[Fill] | None = None,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Project only still-open shadow BUY lots for compact restart state.
+
+        ShadowCompositeStrategy needs the opening fill identity (member,
+        market, outcome and timestamp) to choose a managed SELL after restart.
+        Reconstructing that identity from the compact position aggregate is
+        impossible, while persisting every historical fill defeats compaction.
+        FIFO-net the in-memory run ledger and retain only positive residual
+        BUY lots.  The list is bounded even if a malformed/custom portfolio
+        exposes an unexpectedly large fill collection.
+        """
+        lots: list[list[Any]] = []
+        shadow_seen = False
+        source_fills = (
+            getattr(self.portfolio, "fills", ()) if fills is None else fills
+        )
+        ordered = tuple(
+            fill
+            for fill in (source_fills or ())
+            if isinstance(fill, Fill)
+        )
+        for fill in ordered:
+            metadata = getattr(fill, "metadata", {})
+            if not isinstance(metadata, Mapping):
+                continue
+            member_id = str(metadata.get("shadow_member_id", "")).strip()
+            if not member_id:
+                continue
+            shadow_seen = True
+            market_id = str(getattr(fill, "market_id", None) or fill.symbol).strip()
+            outcome = str(metadata.get("outcome", "yes")).strip().lower() or "yes"
+            quantity = _finite_number(getattr(fill, "quantity", 0.0))
+            if not market_id or quantity is None or quantity <= 0:
+                continue
+            side = getattr(fill, "side", None)
+            side_value = str(getattr(side, "value", side)).strip().lower()
+            if side_value == Side.BUY.value:
+                lots.append([fill, quantity, member_id, market_id, outcome])
+                continue
+            if side_value != Side.SELL.value:
+                continue
+            remaining = quantity
+            for lot in lots:
+                if remaining <= 1e-12:
+                    break
+                if lot[2] != member_id or lot[3] != market_id or lot[4] != outcome:
+                    continue
+                consumed = min(remaining, float(lot[1]))
+                lot[1] = max(0.0, float(lot[1]) - consumed)
+                remaining -= consumed
+        records: list[dict[str, Any]] = []
+        for fill, remaining, member_id, market_id, outcome in lots:
+            quantity = _finite_number(remaining)
+            if quantity is None or quantity <= 1e-12:
+                continue
+            record = to_record(fill)
+            record["quantity"] = quantity
+            record["remaining_quantity"] = quantity
+            record["side"] = Side.BUY.value
+            record["market_id"] = market_id
+            metadata = dict(record.get("metadata", {}))
+            metadata["shadow_member_id"] = member_id
+            metadata["outcome"] = outcome
+            metadata["paper_experiment_id"] = self._run_id
+            record["paper_experiment_id"] = self._run_id
+            record["metadata"] = metadata
+            # Keep the attribution identity available without decoding the
+            # nested fill record; this is useful to bounded state consumers.
+            record["shadow_member_id"] = member_id
+            records.append(record)
+        return records[:_MAX_PAPER_FILL_ROWS], shadow_seen
+
+    def _restore_shadow_open_lots(
+        self,
+        raw_snapshot: Mapping[str, Any],
+        *,
+        target: Portfolio | None = None,
+    ) -> None:
+        """Hydrate persisted residual shadow BUY lots, never historical fills."""
+        raw_lots = raw_snapshot.get("open_lots")
+        if raw_lots is None:
+            raw_lots = self._state.get("open_lots")
+        if not isinstance(raw_lots, (list, tuple)):
+            return
+        seen_order_ids: set[str] = set()
+        restored_lots: list[Fill] = []
+        for raw_lot in raw_lots[:_MAX_PAPER_FILL_ROWS]:
+            if not isinstance(raw_lot, Mapping):
+                continue
+            nested = raw_lot.get("fill")
+            record = nested if isinstance(nested, Mapping) else raw_lot
+            metadata = record.get("metadata", {})
+            metadata = dict(metadata) if isinstance(metadata, Mapping) else {}
+            member_id = str(
+                raw_lot.get("shadow_member_id", metadata.get("shadow_member_id", ""))
+            ).strip()
+            if not member_id:
+                continue
+            persisted_run_id = str(
+                raw_lot.get("paper_experiment_id", metadata.get("paper_experiment_id", ""))
+            ).strip()
+            if persisted_run_id and persisted_run_id != self._run_id:
+                continue
+            side_value = str(raw_lot.get("side", record.get("side", ""))).strip().lower()
+            if side_value != Side.BUY.value:
+                continue
+            market_id = str(
+                raw_lot.get("market_id", record.get("market_id", record.get("symbol", "")))
+                or ""
+            ).strip()
+            order_id = str(record.get("order_id", "")).strip()
+            if not market_id or not order_id or order_id in seen_order_ids:
+                continue
+            quantity = _finite_number(
+                raw_lot.get("remaining_quantity", raw_lot.get("quantity", record.get("quantity")))
+            )
+            price = _finite_number(record.get("price"))
+            fees = _finite_number(record.get("fees", 0.0))
+            slippage = _finite_number(record.get("slippage", 0.0))
+            if (
+                quantity is None
+                or quantity <= 1e-12
+                or price is None
+                or price <= 0
+                or fees is None
+                or fees < 0
+                or slippage is None
+                or slippage < 0
+            ):
+                continue
+            metadata["shadow_member_id"] = member_id
+            metadata.setdefault("paper_experiment_id", self._run_id)
+            metadata.setdefault(
+                "outcome",
+                str(raw_lot.get("outcome", metadata.get("outcome", "yes"))).strip().lower() or "yes",
+            )
+            try:
+                restored_lots.append(
+                    Fill(
+                        timestamp=parse_timestamp(record.get("timestamp")) or self.spec.registration_timestamp,
+                        market_type=MarketType(
+                            str(record.get("market_type", MarketType.PREDICTION.value)).strip().lower()
+                        ),
+                        symbol=str(record.get("symbol") or market_id),
+                        side=Side.BUY,
+                        quantity=quantity,
+                        price=price,
+                        fees=fees,
+                        slippage=slippage,
+                        strategy_id=str(record.get("strategy_id", self._execution_strategy_id)),
+                        order_id=order_id,
+                        market_id=market_id,
+                        expected_probability=_finite_number(record.get("expected_probability")),
+                        executable_probability=_finite_number(record.get("executable_probability")),
+                        metadata=metadata,
+                    )
+                )
+                seen_order_ids.add(order_id)
+            except (TypeError, ValueError):
+                continue
+        (target or self.portfolio).fills.extend(restored_lots)
+
+
+
+    def _legacy_shadow_open_lot_migration_needed(
+        self,
+        raw_snapshot: Mapping[str, Any],
+    ) -> bool:
+        if "open_lots" in raw_snapshot or "open_lots" in self._state:
+            return False
+        definition = getattr(self.strategy, "definition", self.strategy)
+        return (
+            isinstance(definition, Mapping)
+            and str(definition.get("family", "")).strip().lower()
+            == "shadow_composite"
+        )
+
+    def _load_bounded_paper_fills(self) -> tuple[int, tuple[Fill, ...]]:
+        """Load a complete, bounded run ledger after an authoritative count."""
+        count_loader = getattr(self.store, "count_paper_fills", None)
+        if not callable(count_loader):
+            raise ValueError(f"{PAPER_STATE_FILL_RESTORE_COUNT_MISMATCH}: count unavailable")
+        try:
+            raw_count = count_loader(
+                self._run_id,
+                strategy_id=self._execution_strategy_id,
+            )
+            if isinstance(raw_count, bool):
+                raise TypeError("boolean count")
+            count = int(raw_count)
+            if isinstance(raw_count, float) and not raw_count.is_integer():
+                raise ValueError("non-integral count")
+        except Exception as exc:
+            raise ValueError(
+                f"{PAPER_STATE_FILL_RESTORE_COUNT_MISMATCH}: invalid count"
+            ) from exc
+        if count < 0:
+            raise ValueError(
+                f"{PAPER_STATE_FILL_RESTORE_COUNT_MISMATCH}: invalid count={count}"
+            )
+        if count > _MAX_PAPER_FILL_ROWS:
+            raise ValueError(
+                f"{PAPER_STATE_FILL_RESTORE_OVERFLOW}: count={count}, "
+                f"limit={_MAX_PAPER_FILL_ROWS}"
+            )
+        loader = getattr(self.store, "list_paper_fills", None)
+        if not callable(loader):
+            if count == 0:
+                return count, ()
+            raise ValueError(
+                f"{PAPER_STATE_FILL_RESTORE_COUNT_MISMATCH}: rows unavailable"
+            )
+        try:
+            fills = tuple(
+                loader(
+                    self._run_id,
+                    strategy_id=self._execution_strategy_id,
+                    limit=_MAX_PAPER_FILL_ROWS,
+                )
+            )
+        except Exception as exc:
+            raise ValueError(
+                f"{PAPER_STATE_FILL_RESTORE_COUNT_MISMATCH}: rows unavailable"
+            ) from exc
+        if len(fills) != count:
+            raise ValueError(
+                f"{PAPER_STATE_FILL_RESTORE_COUNT_MISMATCH}: "
+                f"count={count}, returned={len(fills)}"
+            )
+        return count, fills
+
+    def _restore_legacy_shadow_open_lots(
+        self,
+        raw_snapshot: Mapping[str, Any],
+        *,
+        fills: Sequence[Fill] | None = None,
+    ) -> None:
+        """Migrate old compact shadow snapshots with one bounded fill query."""
+        if not self._legacy_shadow_open_lot_migration_needed(raw_snapshot):
+            return
+        if fills is None:
+            _fill_count, fills = self._load_bounded_paper_fills()
+        records, _shadow_seen = self._shadow_open_lot_records(fills)
+        if records:
+            self._restore_shadow_open_lots({"open_lots": records})
+
+    def _restore_portfolio_snapshot(self) -> bool:
+        """Restore compact portfolio state without replaying every fill."""
+        raw_snapshot = self._state.get("portfolio")
+        if not isinstance(raw_snapshot, Mapping):
+            return False
+        try:
+            cash = float(raw_snapshot.get("cash", self.spec.bankroll))
+            if not math.isfinite(cash):
+                return False
+            raw_positions = raw_snapshot.get("positions", {})
+            if not isinstance(raw_positions, Mapping):
+                return False
+            restored = Portfolio(self.spec.bankroll, cash=cash)
+            for raw_key, raw_position in raw_positions.items():
+                if not isinstance(raw_position, Mapping):
+                    return False
+                key = str(raw_key)
+                market_type = MarketType(
+                    str(raw_position.get("market_type", MarketType.PREDICTION.value))
+                )
+                symbol = str(raw_position.get("symbol") or key.split("|", 1)[0])
+                outcome = raw_position.get("outcome")
+                outcome = str(outcome).strip().lower() if outcome is not None else None
+                market_id = (
+                    key.rsplit("|", 1)[0]
+                    if market_type is MarketType.PREDICTION and "|" in key
+                    else raw_position.get("market_id")
+                )
+                quantity = float(raw_position.get("quantity", 0.0))
+                average_price = float(raw_position.get("average_price", 0.0))
+                realized = float(raw_position.get("realized_pnl", 0.0))
+                fees = float(raw_position.get("fees", 0.0))
+                unrealized = float(raw_position.get("unrealized_pnl", 0.0))
+                values = (quantity, average_price, realized, fees, unrealized)
+                if not all(math.isfinite(value) for value in values):
+                    return False
+                last_price = (
+                    average_price + unrealized / quantity
+                    if abs(quantity) > 1e-12
+                    else average_price
+                )
+                restored.positions[key] = Position(
+                    symbol=symbol,
+                    market_type=market_type,
+                    quantity=quantity,
+                    average_price=average_price,
+                    realized_pnl=realized,
+                    fees=fees,
+                    market_id=(
+                        str(market_id).strip() if market_id not in (None, "") else None
+                    ),
+                    outcome=outcome,
+                    last_price=last_price,
+                )
+            restored.total_fees = float(raw_snapshot.get("fees", 0.0))
+            restored.total_slippage = float(raw_snapshot.get("slippage", 0.0))
+            if not math.isfinite(restored.total_fees) or not math.isfinite(
+                restored.total_slippage
+            ):
+                return False
+            restored._settled_markets.update(
+                self._scope_market_id(key) for key in self._settled
+            )
+        except (TypeError, ValueError):
+            return False
+        target = self.portfolio
+        target.initial_cash = restored.initial_cash
+        target.cash = restored.cash
+        target.currency = restored.currency
+        target.positions = restored.positions
+        target.fills = []
+        target.orders = {}
+        target.total_fees = restored.total_fees
+        target.total_slippage = restored.total_slippage
+        target._settled_markets = restored._settled_markets
+        self._restore_shadow_open_lots(raw_snapshot, target=target)
+        return True
+
+    def _restore_risk_from_aggregates(self) -> bool:
+        if self.risk is None:
+            return False
+        aggregator = getattr(self.store, "aggregate_paper_fill_exposure", None)
+        if not callable(aggregator):
+            return False
+        try:
+            rows = aggregator(
+                self._run_id,
+                strategy_id=self._execution_strategy_id,
+            )
+        except Exception:
+            return False
+        settled_markets = {
+            self._scope_market_id(key)
+            for key in self._settled
+        }
+        aggregate_fills: list[Fill] = []
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            market_id = str(row.get("market_id", "")).strip()
+            if not market_id or market_id in settled_markets:
+                continue
+            signed_notional = _finite_number(row.get("signed_notional")) or 0.0
+            price = _finite_number(row.get("price")) or 0.0
+            if abs(signed_notional) <= 1e-12 or price <= 0:
+                continue
+            try:
+                market_type = MarketType(str(row.get("market_type", "prediction")).lower())
+                timestamp = parse_timestamp(row.get("timestamp")) or self.spec.registration_timestamp
+                outcome = str(row.get("outcome", "yes")).strip().lower() or "yes"
+                metadata = {"outcome": outcome}
+                event_id = str(row.get("event_id", "")).strip()
+                if event_id:
+                    metadata["event_id"] = event_id
+                aggregate_fills.append(
+                    Fill(
+                        timestamp=timestamp,
+                        market_type=market_type,
+                        symbol=market_id,
+                        side=Side.BUY if signed_notional > 0 else Side.SELL,
+                        quantity=abs(signed_notional) / price,
+                        price=price,
+                        fees=0.0,
+                        slippage=0.0,
+                        strategy_id=str(row.get("strategy_id", self._execution_strategy_id)),
+                        order_id=(
+                            "paper-aggregate-"
+                            + market_id
+                            + "-"
+                            + str(len(aggregate_fills))
+                        ),
+                        market_id=market_id,
+                        metadata=metadata,
+                    )
+                )
+            except (TypeError, ValueError):
+                continue
+        self.risk.reconcile_fills(aggregate_fills)
+        return True
+
+    def _stored_fills_for_market(
+        self,
+        market_id: str,
+        *,
+        start: datetime | None = None,
+        end: datetime | None = None,
+    ) -> tuple[Fill, ...]:
+        loader = getattr(self.store, "list_paper_fills", None)
+        if callable(loader):
+            try:
+                return tuple(
+                    loader(
+                        self._run_id,
+                        strategy_id=self._execution_strategy_id,
+                        market_id=str(market_id),
+                        start=start,
+                        end=end,
+                        limit=_MAX_PAPER_FILL_ROWS,
+                    )
+                )
+            except Exception:
+                return ()
+        try:
+            fills = self.store.load_fills(
+                strategy_id=self._execution_strategy_id,
+                symbol=str(market_id),
+                start=start,
+                end=end,
+                limit=_MAX_PAPER_FILL_ROWS,
+            )
         except Exception:
             return ()
         return tuple(
             fill
             for fill in fills
             if str(fill.metadata.get("paper_experiment_id", "")) == self._run_id
-            and str(fill.market_id or fill.symbol) == str(market_id)
         )
+
     def _restore_ledger(self) -> None:
-        try:
-            fills = self.store.load_fills(strategy_id=self._execution_strategy_id)
-        except Exception:
-            fills = []
-        fills = [
-            fill
-            for fill in fills
-            if str(fill.metadata.get("paper_experiment_id", "")) == self._run_id
-        ]
+        raw_snapshot = self._state.get("portfolio")
+        prefetched_count: int | None = None
+        prefetched_fills: tuple[Fill, ...] | None = None
+        if (
+            isinstance(raw_snapshot, Mapping)
+            and self._legacy_shadow_open_lot_migration_needed(raw_snapshot)
+        ):
+            prefetched_count, prefetched_fills = self._load_bounded_paper_fills()
+        if self._restore_portfolio_snapshot():
+            if prefetched_count is None:
+                count_loader = getattr(self.store, "count_paper_fills", None)
+                if callable(count_loader):
+                    try:
+                        self._fill_count = max(
+                            self._fill_count,
+                            int(
+                                count_loader(
+                                    self._run_id,
+                                    strategy_id=self._execution_strategy_id,
+                                )
+                            ),
+                        )
+                    except Exception:
+                        pass
+            else:
+                self._fill_count = max(self._fill_count, prefetched_count)
+            self._restore_legacy_shadow_open_lots(
+                raw_snapshot if isinstance(raw_snapshot, Mapping) else {},
+                fills=prefetched_fills,
+            )
+            return
+        # Legacy state may not contain a compact portfolio projection.  Keep
+        # that migration path bounded and scoped to this paper run.
+        if prefetched_count is None or prefetched_fills is None:
+            prefetched_count, prefetched_fills = self._load_bounded_paper_fills()
+        self._fill_count = max(self._fill_count, prefetched_count)
         existing = {fill.order_id for fill in getattr(self.portfolio, "fills", ())}
-        for fill in fills:
-            if fill.order_id not in existing:
-                try:
-                    self.portfolio.apply_fill(fill)
-                except (TypeError, ValueError):
-                    continue
+        for fill in prefetched_fills:
+            if fill.order_id in existing:
+                continue
+            try:
+                self.portfolio.apply_fill(fill)
+            except (TypeError, ValueError):
+                continue
+
     def _restore_settlements(self) -> None:
         if not self._settlement_by_market:
             try:
-                observations = self.store.list_latest_paper_observations(self._run_id, per_market_limit=1)
+                observations = self.store.list_latest_paper_observations(
+                    self._run_id,
+                    per_market_limit=1,
+                    per_scope_limit=1,
+                )
             except Exception:
                 observations = []
             for item in observations:
-                payload = item.get("payload", {})
-                if isinstance(payload, Mapping) and _is_terminal(payload.get("settlement")):
-                    self._settlement_by_market[str(item["market_id"])] = str(payload["settlement"])
-        for market_id, raw_state in self._settlement_by_market.items():
+                if not isinstance(item, Mapping):
+                    continue
+                payload = item.get("payload")
+                if not isinstance(payload, Mapping) or not _is_terminal(
+                    payload.get("settlement")
+                ):
+                    continue
+                market_id = str(item.get("market_id", payload.get("market_id", "")))
+                scope_key = self._observation_scope_key(market_id, payload)
+                self._settlement_by_market[scope_key] = str(payload["settlement"])
+        for scope_key, raw_state in self._settlement_by_market.items():
             try:
-                state = raw_state if isinstance(raw_state, SettlementState) else SettlementState(str(raw_state).strip().lower())
+                state = (
+                    raw_state
+                    if isinstance(raw_state, SettlementState)
+                    else SettlementState(str(raw_state).strip().lower())
+                )
                 if not _is_terminal(state):
                     continue
                 self.portfolio.resolve(
                     ResolvedContract(
-                        market_id,
+                        self._scope_market_id(scope_key),
                         state,
                         self.spec.registration_timestamp,
                         "persisted paper settlement",
                     )
                 )
-                self._settled.add(market_id)
+                self._settled.add(scope_key)
             except (TypeError, ValueError):
                 continue
-        if self.risk is not None:
+        if self.risk is not None and not self._restore_risk_from_aggregates():
+            settled_market_ids = {
+                self._scope_market_id(key)
+                for key in self._settled
+            }
             self.risk.reconcile_fills(
                 fill
                 for fill in self.portfolio.fills
-                if str(fill.market_id or fill.symbol) not in self._settled
+                if str(fill.market_id or fill.symbol) not in settled_market_ids
             )
 
     def _persist_state(self, *, last_timestamp: datetime | None) -> None:
@@ -1254,6 +3073,12 @@ class ForwardPaperEngine:
         else:
             self._state["model_state"] = model_state
         portfolio_snapshot = self.portfolio.snapshot()
+        open_lots, shadow_seen = self._shadow_open_lot_records()
+        if shadow_seen:
+            # Keep attribution state beside the compact portfolio projection.
+            # Ordinary paper runs have no shadow fills and retain their
+            # historical snapshot shape.
+            portfolio_snapshot["open_lots"] = open_lots
         current_equity = _finite_number(portfolio_snapshot.get("equity"))
         if current_equity is None:
             current_equity = float(self.portfolio.initial_cash)
@@ -1265,38 +3090,66 @@ class ForwardPaperEngine:
         prior_drawdown = _finite_number(self._state.get("forward_max_drawdown")) or 0.0
         self._state["forward_peak_equity"] = peak_equity
         self._state["forward_max_drawdown"] = max(prior_drawdown, current_drawdown)
-        self._state.update(
-            {
-                "experiment_id": self._run_id,
-                "registration_timestamp": self.spec.registration_timestamp.isoformat(),
-                "execution_binding": dict(self._execution_binding),
-                "research_mode": self._research_mode,
-                "execution_strategy_id": self._execution_strategy_id,
-                "processed_observations": sorted(self._processed),
-                "cursor_by_market": {key: value.isoformat() for key, value in sorted(self._cursor.items())},
-                "observation_open_by_market": {
-                    key: value.isoformat()
-                    for key, value in sorted(self._observation_open_by_market.items())
-                },
-                "source_cursor_by_market": {
-                    key: {"timestamp": value[0].isoformat(), "snapshot_id": value[1]}
-                    for key, value in sorted(self._source_cursor.items())
-                },
-                "settled_markets": sorted(self._settled),
-                "signal_history_by_market": {
-                    key: list(value[-512:])
-                    for key, value in sorted(self._signal_history.items())
-                },
-                "settlement_by_market": dict(sorted(self._settlement_by_market.items())),
-                "portfolio": portfolio_snapshot,
-                "risk": risk_state,
-                "order_sequence": self.trader._sequence,
-                "fill_count": len(self.portfolio.fills),
-                "paper_only": True,
-                "live_execution": False,
-                "retrospective_replay": self._execution_mode == "historical_replay",
-            }
+        operational_policy_record = (
+            self._operational_policy.as_record()
+            if self._operational_policy is not None
+            else None
         )
+        if operational_policy_record is not None and self._operational_settings is not None:
+            operational_policy_record["operational_settings"] = dict(
+                self._operational_settings
+            )
+        state_record = {
+            "experiment_id": self._run_id,
+            "registration_timestamp": self.spec.registration_timestamp.isoformat(),
+            "execution_binding": dict(self._execution_binding),
+            "research_mode": self._research_mode,
+            "execution_strategy_id": self._execution_strategy_id,
+            "processed_observations": sorted(self._processed),
+            "cursor_by_market": {
+                key: value.isoformat() for key, value in sorted(self._cursor.items())
+            },
+            "observation_open_by_market": {
+                key: value.isoformat()
+                for key, value in sorted(self._observation_open_by_market.items())
+            },
+            "source_cursor_by_market": {
+                key: {"timestamp": value[0].isoformat(), "snapshot_id": value[1]}
+                for key, value in sorted(self._source_cursor.items())
+            },
+            "settled_markets": sorted(self._settled),
+            "signal_history_by_market": {
+                key: list(value[-512:])
+                for key, value in sorted(self._signal_history.items())
+            },
+            "settlement_by_market": dict(sorted(self._settlement_by_market.items())),
+            "portfolio": portfolio_snapshot,
+            "risk": risk_state,
+            "order_sequence": self.trader._sequence,
+            "fill_count": self._fill_count,
+            "paper_only": True,
+            "live_execution": False,
+            "retrospective_replay": self._execution_mode == "historical_replay",
+        }
+        # Operational counters are an additive policy extension.  Keep the
+        # legacy state shape untouched for ordinary paper runs, while retaining
+        # an existing operational section for compatibility migrations.
+        if (
+            self._operational_policy is not None
+            or self._operational_settings is not None
+            or "operational_paper" in self._state
+        ):
+            state_record["operational_paper"] = {
+                "policy": operational_policy_record,
+                "policy_hash": self._execution_binding.get("operational_policy_hash"),
+                "settings": (
+                    dict(self._operational_settings)
+                    if self._operational_settings is not None
+                    else None
+                ),
+                "counters": deepcopy(self._operational_counters),
+            }
+        self._state.update(state_record)
         self._state_version = self.store.save_paper_state(
             self._run_id,
             self._state,
@@ -1533,11 +3386,42 @@ def _normalize_observation(
         "settlement",
         "expiry",
         "resolution_criteria",
+        "event_id",
+        "event_key",
+        "event",
         "liquidity",
+        *SHADOW_METADATA_KEYS,
         "volume",
+        "fee_bps",
         "model_probability",
         "predicted_probability",
         "source_snapshot_id",
+        "min_order_size",
+        "order_min_size",
+        "minimum_order_size",
+        "min_size",
+        "minimum_size",
+        "quantity_min",
+        "minQuantity",
+        "min_notional",
+        "minimum_notional",
+        "min_cost",
+        "minimum_cost",
+        "min_notional_usd",
+        "minimum_notional_usd",
+        "minimum_cost_usd",
+        "min_order_value",
+        "minimum_order_value",
+        "minOrderValue",
+        "size_increment",
+        "quantity_step",
+        "order_size_increment",
+        "step_size",
+        "quantity_increment",
+        "price_increment",
+        "price_tick_size",
+        "tick_size",
+        "tickSize",
         "source_timestamp",
         "as_of_timestamp",
         "asof_timestamp",
@@ -1561,6 +3445,8 @@ def _normalize_observation(
     ):
         if key not in observation and key in raw:
             observation[key] = raw[key]
+    for key, value in _shadow_metadata(raw).items():
+        observation.setdefault(key, value)
     yes_raw = _raw_observation_book(raw, "yes")
     no_raw = _raw_observation_book(raw, "no")
     yes_book = _book(yes_raw, stamp)
@@ -1595,7 +3481,20 @@ def _book(raw: Any, fallback_timestamp: datetime) -> OrderBookSnapshot | None:
     if not bids and not asks:
         return None
     try:
-        return OrderBookSnapshot(parse_timestamp(raw.get("timestamp")) or fallback_timestamp, bids, asks, raw.get("token_id"))
+        return OrderBookSnapshot(
+            parse_timestamp(raw.get("timestamp")) or fallback_timestamp,
+            bids,
+            asks,
+            raw.get("token_id"),
+            raw.get("condition_id"),
+            parse_timestamp(raw.get("provider_timestamp")),
+            raw.get("book_hash"),
+            raw.get("min_order_size", raw.get("order_min_size", raw.get("minimum_order_size"))),
+            raw.get("tick_size", raw.get("tickSize")),
+            raw.get("neg_risk", raw.get("negRisk")),
+            bool(raw.get("available", True)),
+            str(raw.get("source", "")),
+        )
     except (TypeError, ValueError):
         return None
 
@@ -1742,7 +3641,7 @@ def _model_probability(model: Any | None, observation: Mapping[str, Any]) -> flo
 def _finite_number(value: Any) -> float | None:
     try:
         number = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return number if math.isfinite(number) else None
 
@@ -1800,6 +3699,8 @@ def run_forward_paper(
     portfolio: Portfolio | None = None,
     observations: Iterable[Any] | None = None,
     config: PaperTradingConfig | None = None,
+    operational_policy: OperationalPaperPolicy | Mapping[str, Any] | Any | None = None,
+    operational_settings: Mapping[str, Any] | None = None,
     now: datetime | None = None,
 ) -> PaperEngineCycle:
     """Run only post-registration observations for a frozen paper test."""
@@ -1812,6 +3713,8 @@ def run_forward_paper(
         risk=risk,
         portfolio=portfolio,
         config=config,
+        operational_policy=operational_policy,
+        operational_settings=operational_settings,
     ).run(observations, now=now)
 
 
@@ -1840,12 +3743,14 @@ def run_historical_replay(
         storage_namespace=historical_replay_id(spec, materialized),
         execution_mode="historical_replay",
     ).run(materialized, now=now)
-
-
 __all__ = [
     "ForwardPaperEngine",
+    "OperationalPaperPolicy",
     "PAPER_OBSERVATION_AUTHORITY_REQUIRED",
     "PAPER_STATE_EXECUTION_BINDING_MISMATCH",
+    "PAPER_STATE_OPERATIONAL_COUNTERS_INVALID",
+    "PAPER_STATE_FILL_RESTORE_OVERFLOW",
+    "PAPER_STATE_FILL_RESTORE_COUNT_MISMATCH",
     "PaperEngineCycle",
     "build_resolved_bet",
     "historical_replay_id",

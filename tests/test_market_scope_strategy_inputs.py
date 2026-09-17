@@ -4,10 +4,11 @@ from datetime import datetime, timedelta, timezone
 import unittest
 
 from axiom.backtest.prediction import PredictionMarketBacktester
-from axiom.strategy import SignalEvaluator
+from axiom.strategy import SignalEvaluator, StrategyValidationError
 from axiom.strategy.signals import (
     CONSTANT_BASELINE,
     DIRECTIONAL_OOS_TRADING,
+    ENTRY_PREDICATE_NOT_SATISFIED,
     INSUFFICIENT_LOOKBACK,
     MODEL_INPUT_MISSING,
     PROBABILITY_CALIBRATION_UNKNOWN,
@@ -33,6 +34,19 @@ def prediction_strategy(family: str, **parameters: object) -> dict[str, object]:
         "resolution_aware": True,
         "resolution_inputs": ["expiry", "settlement"],
     }
+
+
+def absolute_move_strategy(family: str, minimum_move: str = "0.05") -> dict[str, object]:
+    return prediction_strategy(
+        family,
+        lookback=1,
+        entry_predicate={
+            "version": "absolute-move-v1",
+            "minimum_move": minimum_move,
+            "units": "probability",
+            "boundary": "inclusive",
+        },
+    )
 
 
 def snapshot(market_id: str, stamp: datetime, yes: float, *, source: datetime | None = None, model: float | None = None) -> dict[str, object]:
@@ -73,6 +87,89 @@ class MarketScopeStrategyInputTests(unittest.TestCase):
         )
         self.assertTrue(all(record["market_id"] in {"a", "b"} for record in backtest.equity_curve))
         self.assertTrue(all(record["reason_code"] for record in backtest.equity_curve))
+
+    def test_absolute_move_boundary_is_inclusive_for_momentum_and_mean_reversion(self) -> None:
+        cases = {
+            "momentum": (
+                (0.5499999999995, 0.0499999999995, ENTRY_PREDICATE_NOT_SATISFIED, False),
+                (0.55, 0.05, SIGNAL_PRODUCED, True),
+                (0.5500000000005, 0.0500000000005, SIGNAL_PRODUCED, True),
+                (0.4500000000005, -0.0499999999995, ENTRY_PREDICATE_NOT_SATISFIED, False),
+                (0.45, -0.05, SIGNAL_PRODUCED, True),
+                (0.4499999999995, -0.0500000000005, SIGNAL_PRODUCED, True),
+            ),
+            "mean_reversion": (
+                (0.4500000000005, 0.0499999999995, ENTRY_PREDICATE_NOT_SATISFIED, False),
+                (0.45, 0.05, SIGNAL_PRODUCED, True),
+                (0.4499999999995, 0.0500000000005, SIGNAL_PRODUCED, True),
+                (0.5499999999995, -0.0499999999995, ENTRY_PREDICATE_NOT_SATISFIED, False),
+                (0.55, -0.05, SIGNAL_PRODUCED, True),
+                (0.5500000000005, -0.0500000000005, SIGNAL_PRODUCED, True),
+            ),
+        }
+        for family, family_cases in cases.items():
+            with self.subTest(family=family):
+                for current, expected_delta, expected_reason, expected_eligible in family_cases:
+                    evaluation = evaluate_signal_evaluation(
+                        absolute_move_strategy(family),
+                        {"market_id": "a", "observations": [snapshot("a", T0, 0.50), snapshot("a", T0 + timedelta(minutes=1), current)]},
+                    )
+                    self.assertEqual(evaluation.reason_code, expected_reason)
+                    self.assertEqual(evaluation.evidence["entry_eligible"], expected_eligible)
+                    self.assertAlmostEqual(evaluation.evidence["raw_delta"], expected_delta, places=12)
+                    self.assertEqual(evaluation.evidence["signal_strength"], evaluation.score)
+
+    def test_absolute_move_predicate_rejects_unknown_or_malformed_documents(self) -> None:
+        valid = absolute_move_strategy("momentum")
+        invalid_predicates = (
+            {"version": "absolute-move-v2", "minimum_move": 0.05, "units": "probability", "boundary": "inclusive"},
+            {"version": "absolute-move-v1", "minimum_move": 1.1, "units": "probability", "boundary": "inclusive"},
+            {"version": "absolute-move-v1", "minimum_move": 0.05, "units": "odds", "boundary": "inclusive"},
+            {"version": "absolute-move-v1", "minimum_move": 0.05, "units": "probability", "boundary": "exclusive"},
+            {"version": "absolute-move-v1", "minimum_move": 0.05, "units": "probability", "boundary": "inclusive", "extra": True},
+        )
+        for predicate in invalid_predicates:
+            with self.subTest(predicate=predicate):
+                with self.assertRaises(StrategyValidationError):
+                    evaluate_signal_evaluation({**valid, "parameters": {"entry_predicate": predicate}}, {"observations": []})
+        with self.assertRaises(StrategyValidationError):
+            evaluate_signal_evaluation(
+                prediction_strategy(
+                    "probability_mispricing",
+                    threshold=0.05,
+                    entry_predicate=valid["parameters"]["entry_predicate"],
+                ),
+                {"observations": []},
+            )
+
+    def test_absolute_move_negative_delta_buys_no(self) -> None:
+        evaluation = evaluate_signal_evaluation(
+            absolute_move_strategy("momentum"),
+            {"market_id": "a", "observations": [snapshot("a", T0, 0.60), snapshot("a", T0 + timedelta(minutes=1), 0.50)]},
+        )
+        self.assertEqual(evaluation.reason_code, SIGNAL_PRODUCED)
+        self.assertEqual(evaluation.side, "buy")
+        self.assertEqual(evaluation.evidence["outcome"], "no")
+        self.assertLess(evaluation.evidence["raw_delta"], 0.0)
+
+    def test_absolute_move_missing_probability_is_not_eligible(self) -> None:
+        missing = snapshot("a", T0 + timedelta(minutes=1), 0.50)
+        missing["yes_mid"] = None
+        missing.pop("yes_ask")
+        evaluation = evaluate_signal_evaluation(
+            absolute_move_strategy("mean_reversion"),
+            {"market_id": "a", "observations": [snapshot("a", T0, 0.40), missing]},
+        )
+        self.assertEqual(evaluation.reason_code, MODEL_INPUT_MISSING)
+        self.assertFalse(evaluation.evidence["entry_eligible"])
+
+    def test_legacy_probability_mispricing_keeps_tiny_edge_scale(self) -> None:
+        evaluation = evaluate_signal_evaluation(
+            prediction_strategy("probability_mispricing", threshold=0.05),
+            {"observations": [snapshot("a", T0, 0.50, model=0.500001)]},
+        )
+        self.assertEqual(evaluation.reason_code, SIGNAL_PRODUCED)
+        self.assertAlmostEqual(evaluation.score, 0.00002, places=8)
 
     def test_explicit_market_scope_with_no_rows_stays_warming_up(self) -> None:
         evaluation = evaluate_signal_evaluation(

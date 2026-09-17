@@ -138,6 +138,14 @@ from .bootstrap import (
     run_btc_historical_research,
 )
 from .research import ResearchReport, run_crypto_research, run_initial_research, run_prediction_research, write_report
+from .shadow import (
+    CompositeShadowStrategy,
+    ShadowAssessmentError,
+    ShadowAssessmentService,
+    ShadowBlocked,
+    ShadowCompositeModel,
+    ShadowCompositeStrategy,
+)
 
 __all__ = [
     "DashboardData",
@@ -324,5 +332,11 @@ __all__ = [
     "label_btc_regimes",
     "run_btc_historical_research",
     "walk_forward_splits",
+    "CompositeShadowStrategy",
+    "ShadowAssessmentError",
+    "ShadowAssessmentService",
+    "ShadowBlocked",
+    "ShadowCompositeModel",
+    "ShadowCompositeStrategy",
 ]
 

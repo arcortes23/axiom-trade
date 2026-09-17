@@ -187,6 +187,14 @@ class NodeConfigValidationTests(unittest.TestCase):
         self.assertEqual(config.failure_cooldown_seconds, 0)
         self.assertEqual(config.discovery_budget_per_cycle, 4)
         self.assertEqual(config.max_concurrency, 2)
+    def test_direct_construction_rejects_non_boolean_crypto_enabled(self) -> None:
+        for crypto_enabled in (None, 0, 1, "false", object()):
+            with self.subTest(crypto_enabled=crypto_enabled):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "^crypto_enabled must be boolean$",
+                ):
+                    NodeConfig(":memory:", crypto_enabled=crypto_enabled)  # type: ignore[arg-type]
 class HistoricalRefreshSchedulingTests(unittest.TestCase):
     def test_request_budget_counts_discovery_and_blocks_all_detail_requests(self) -> None:
         class BudgetProvider:

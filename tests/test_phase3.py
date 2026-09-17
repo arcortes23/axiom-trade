@@ -10,11 +10,14 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
+from typing import Any
 from urllib.request import Request
 from axiom.collector import CollectorConfig, PolymarketCollector
 from axiom.data import InMemoryPredictionProvider, PolymarketAdapter
 from axiom.data._http import HTTPFetchError, fetch_json_strict
 from axiom.canary import CanaryService
+from axiom.canary_settings import CanarySettingsService
 from axiom.experiment_plan import normalize_market_scope
 from axiom.market_scope import resolve_market_scope
 from axiom.director import research_summary, validate_hermes_proposal
@@ -33,6 +36,7 @@ from axiom.domain import (
 from axiom.forward import (
     COMMON_PAPER_ASSUMPTIONS,
     ForwardTestRegistry,
+    _ABSOLUTE_MOVE_PREDICATE,
     _canonical_scope_config,
     _content_hash,
     _normalized_strategy_document,
@@ -44,14 +48,16 @@ from axiom.portfolio import Portfolio
 from axiom.paper import PredictionPaperTrader
 from axiom.paper_engine import (
     ForwardPaperEngine,
+    OperationalPaperPolicy,
     historical_replay_id,
     run_forward_paper,
     run_historical_replay,
 )
+from axiom.shadow import ShadowCompositeModel, ShadowCompositeStrategy
 from axiom.research_bus import DurableResearchBus, ResearchBusPermissionError, ResearchQueueStatus
 from axiom.risk import RiskEngine, RiskLimits
 from axiom.storage import AxiomStore
-from axiom.strategy import validate_strategy
+from axiom.strategy import load_strategy, validate_strategy
 
 
 T0 = datetime(2025, 1, 1, tzinfo=timezone.utc)
@@ -1095,6 +1101,289 @@ class Phase3PaperAndRiskTests(unittest.TestCase):
             self.assertEqual(len(store.load_fills(strategy_id=spec.strategy_hash)), 1)
             state = store.load_paper_state(spec.experiment_id)
             self.assertEqual(state["state"]["fill_count"], 1)
+    def test_legacy_fill_restore_accepts_exact_bounded_count(self) -> None:
+        with AxiomStore(":memory:") as store:
+            spec = ForwardTestRegistry(store).freeze(
+                strategy=_BuyStrategy(),
+                model={"id": "model"},
+                start_timestamp=T0,
+                bankroll=10.0,
+                allowed_markets=("m",),
+            )
+            store.save_paper_state(
+                spec.experiment_id,
+                {"experiment_id": spec.experiment_id, "processed_observations": []},
+                timestamp=T0,
+            )
+            fills = [
+                Fill(
+                    T0,
+                    MarketType.PREDICTION,
+                    "m",
+                    Side.BUY,
+                    1.0,
+                    0.5,
+                    0.0,
+                    0.0,
+                    spec.strategy_hash,
+                    f"legacy-{index}",
+                    market_id="m",
+                    metadata={"paper_experiment_id": spec.experiment_id},
+                )
+                for index in range(2)
+            ]
+            with (
+                patch("axiom.paper_engine._MAX_PAPER_FILL_ROWS", 2),
+                patch.object(store, "count_paper_fills", return_value=2),
+                patch.object(store, "list_paper_fills", return_value=fills),
+            ):
+                engine = ForwardPaperEngine(
+                    spec,
+                    store=store,
+                    strategy=_BuyStrategy(),
+                    model={"id": "model"},
+                )
+            self.assertEqual([fill.order_id for fill in engine.portfolio.fills], ["legacy-0", "legacy-1"])
+
+    def test_legacy_fill_restore_rejects_overflow_or_count_mismatch_before_apply(self) -> None:
+        with AxiomStore(":memory:") as store:
+            spec = ForwardTestRegistry(store).freeze(
+                strategy=_BuyStrategy(),
+                model={"id": "model"},
+                start_timestamp=T0,
+                bankroll=10.0,
+                allowed_markets=("m",),
+            )
+            store.save_paper_state(
+                spec.experiment_id,
+                {"experiment_id": spec.experiment_id, "processed_observations": []},
+                timestamp=T0,
+            )
+            external = Portfolio(spec.bankroll)
+            list_calls: list[int] = []
+
+            def list_fills(*_args: Any, **_kwargs: Any) -> list[Fill]:
+                list_calls.append(1)
+                return []
+
+            with (
+                patch("axiom.paper_engine._MAX_PAPER_FILL_ROWS", 2),
+                patch.object(store, "count_paper_fills", return_value=3),
+                patch.object(store, "list_paper_fills", side_effect=list_fills),
+            ):
+                with self.assertRaisesRegex(ValueError, "PAPER_STATE_FILL_RESTORE_OVERFLOW"):
+                    ForwardPaperEngine(
+                        spec,
+                        store=store,
+                        strategy=_BuyStrategy(),
+                        model={"id": "model"},
+                        portfolio=external,
+                    )
+            self.assertEqual(list_calls, [])
+            self.assertEqual(external.fills, [])
+            self.assertEqual(external.positions, {})
+
+            with (
+                patch("axiom.paper_engine._MAX_PAPER_FILL_ROWS", 2),
+                patch.object(store, "count_paper_fills", return_value=2),
+                patch.object(store, "list_paper_fills", return_value=[]),
+            ):
+                with self.assertRaisesRegex(ValueError, "PAPER_STATE_FILL_RESTORE_COUNT_MISMATCH"):
+                    ForwardPaperEngine(
+                        spec,
+                        store=store,
+                        strategy=_BuyStrategy(),
+                        model={"id": "model"},
+                        portfolio=external,
+                    )
+            self.assertEqual(external.fills, [])
+            self.assertEqual(external.positions, {})
+
+    def test_legacy_shadow_lot_migration_rejects_overflow_before_snapshot_apply(self) -> None:
+        strategy = {"family": "shadow_composite"}
+        with AxiomStore(":memory:") as store:
+            spec = ForwardTestRegistry(store).freeze(
+                strategy=strategy,
+                model={"id": "model"},
+                start_timestamp=T0,
+                bankroll=10.0,
+                allowed_markets=("m",),
+            )
+            store.save_paper_state(
+                spec.experiment_id,
+                {
+                    "experiment_id": spec.experiment_id,
+                    "processed_observations": [],
+                    "portfolio": {
+                        "cash": spec.bankroll - 1.0,
+                        "positions": {},
+                        "fees": 0.0,
+                        "slippage": 0.0,
+                    },
+                },
+                timestamp=T0,
+            )
+            external = Portfolio(spec.bankroll)
+            with (
+                patch("axiom.paper_engine._MAX_PAPER_FILL_ROWS", 2),
+                patch.object(store, "count_paper_fills", return_value=3),
+                patch.object(store, "list_paper_fills", side_effect=AssertionError("must not load")),
+            ):
+                with self.assertRaisesRegex(ValueError, "PAPER_STATE_FILL_RESTORE_OVERFLOW"):
+                    ForwardPaperEngine(
+                        spec,
+                        store=store,
+                        strategy=strategy,
+                        model={"id": "model"},
+                        portfolio=external,
+                    )
+            self.assertEqual(external.cash, spec.bankroll)
+            self.assertEqual(external.fills, [])
+            self.assertEqual(external.positions, {})
+
+    def test_compact_restart_restores_shadow_member_open_lots_for_holding_exit(self) -> None:
+        def member(family: str, candidate_id: str) -> dict[str, Any]:
+            strategy_document = load_strategy(
+                {
+                    "version": 1,
+                    "market_type": "prediction",
+                    "family": family,
+                    "parameters": {"lookback": 1, "threshold": 0.05},
+                    "operations": [],
+                    "probability_model": "constant_baseline",
+                    "resolution_aware": True,
+                    "resolution_inputs": ["settlement"],
+                    "strategy_id": candidate_id,
+                }
+            ).to_dict()
+            return {
+                "shadow_member_id": f"{family}:{candidate_id}",
+                "candidate_id": candidate_id,
+                "family": family,
+                "setup_id": f"setup-{family}",
+                "setup_hash": f"sha256:setup-{family}",
+                "strategy": strategy_document,
+                "strategy_hash": f"sha256:strategy-{family}",
+                "model": {"kind": "constant_baseline", "probability": 0.8},
+                "model_hash": f"sha256:model-{family}",
+                "scope": {},
+                "scope_hash": "sha256:scope",
+                "scope_version": "1",
+                "exit_policy": {"type": "fixed_holding_period", "holding_period": 1},
+                "cost_provenance": {},
+                "rejection_evidence": {},
+            }
+
+        members = [member("momentum", "member-m"), member("mean_reversion", "member-r")]
+        composite = ShadowCompositeStrategy(members)
+        composite_model = ShadowCompositeModel(composite.members)
+        # Freeze the same declarative docs that the composite runtime exposes.
+        composite.definition = dict(composite.definition)
+        composite_model.document = dict(composite_model.document)
+
+        def observation(stamp: datetime, yes_mid: float, member_id: str) -> dict[str, Any]:
+            return {
+                "market_id": "shadow-restart-market",
+                "timestamp": stamp,
+                "yes_mid": yes_mid,
+                "yes_bid": yes_mid - 0.01,
+                "yes_ask": yes_mid + 0.01,
+                "no_mid": 1.0 - yes_mid,
+                "no_bid": 1.0 - yes_mid - 0.01,
+                "no_ask": 1.0 - yes_mid + 0.01,
+                "settlement": "open",
+                "shadow_member_id": member_id,
+                "shadow_group_id": f"group-{stamp.isoformat()}",
+                "shadow_assessment": True,
+                "paper_only": True,
+                "live_execution": False,
+            }
+
+        with AxiomStore(":memory:") as store:
+            spec = ForwardTestRegistry(store).freeze(
+                strategy=composite.definition,
+                model=composite_model.document,
+                start_timestamp=T0,
+                bankroll=1.0,
+                allowed_markets=("shadow-restart-market",),
+            )
+            first = ForwardPaperEngine(
+                spec,
+                store=store,
+                strategy=composite,
+                model=composite_model,
+            )
+            composite.portfolio = first.portfolio
+            first.run(
+                [
+                    observation(T0 + timedelta(hours=1), 0.40, "momentum:member-m"),
+                    observation(T0 + timedelta(hours=1), 0.40, "mean_reversion:member-r"),
+                ],
+                now=T0 + timedelta(hours=1),
+            )
+            entered = first.run(
+                [
+                    observation(T0 + timedelta(hours=2), 0.55, "momentum:member-m"),
+                    observation(T0 + timedelta(hours=2), 0.55, "mean_reversion:member-r"),
+                ],
+                now=T0 + timedelta(hours=2),
+            )
+            self.assertEqual(entered.fills_inserted, 2)
+            persisted = store.load_paper_state(spec.experiment_id)
+            assert persisted is not None
+            open_lots = persisted["state"]["portfolio"]["open_lots"]
+            self.assertEqual(
+                {item["shadow_member_id"] for item in open_lots},
+                {"momentum:member-m", "mean_reversion:member-r"},
+            )
+            self.assertTrue(all(item["side"] == "buy" for item in open_lots))
+            self.assertTrue(all(float(item["remaining_quantity"]) > 0 for item in open_lots))
+
+            restarted_composite = ShadowCompositeStrategy(members)
+            restarted_model = ShadowCompositeModel(restarted_composite.members)
+            restarted = ForwardPaperEngine(
+                spec,
+                store=store,
+                strategy=restarted_composite,
+                model=restarted_model,
+            )
+            restarted_composite.portfolio = restarted.portfolio
+            self.assertEqual(
+                {
+                    fill.metadata.get("shadow_member_id")
+                    for fill in restarted.portfolio.fills
+                },
+                {"momentum:member-m", "mean_reversion:member-r"},
+            )
+            exited = restarted.run(
+                [
+                    observation(T0 + timedelta(hours=3), 0.60, "momentum:member-m"),
+                    observation(T0 + timedelta(hours=3), 0.60, "mean_reversion:member-r"),
+                ],
+                now=T0 + timedelta(hours=3),
+            )
+            self.assertEqual(exited.fills_inserted, 2)
+            fills = store.list_paper_fills(
+                spec.experiment_id,
+                strategy_id=spec.strategy_hash,
+                limit=16,
+            )
+            self.assertEqual(
+                sorted(
+                    [
+                        (fill.side.value, fill.metadata.get("shadow_member_id"))
+                        for fill in fills
+                    ]
+                ),
+                sorted(
+                    [
+                        ("buy", "mean_reversion:member-r"),
+                        ("buy", "momentum:member-m"),
+                        ("sell", "momentum:member-m"),
+                        ("sell", "mean_reversion:member-r"),
+                    ]
+                ),
+            )
     def test_forward_assumptions_are_materialized_into_execution_and_identity(self) -> None:
         strategy = _BuyStrategy()
         model = {"id": "model"}
@@ -1402,9 +1691,77 @@ class Phase3PaperAndRiskTests(unittest.TestCase):
                 model={"id": "model"},
             )
             self.assertIsNone(engine.compatibility_blocker)
+            self.assertEqual(engine._execution_mode, "forward")
+            self.assertEqual(engine._execution_strategy_id, spec.strategy_hash)
+            self.assertEqual(engine._research_mode, "PAPER_FORWARD")
             self.assertEqual(
                 engine.state["execution_binding"],
                 engine.execution_binding,
+            )
+
+    def test_constructor_identity_order_historical_legacy_and_operational(self) -> None:
+        with AxiomStore(":memory:") as store:
+            spec = ForwardTestRegistry(store).freeze(
+                strategy=_BuyStrategy(),
+                model={"id": "model"},
+                start_timestamp=T0,
+                allowed_markets=("m",),
+            )
+
+            legacy = ForwardPaperEngine(
+                spec,
+                store=store,
+                strategy=_BuyStrategy(),
+                model={"id": "model"},
+            )
+            self.assertEqual(legacy._execution_mode, "forward")
+            self.assertEqual(legacy._execution_strategy_id, spec.strategy_hash)
+            self.assertEqual(legacy._research_mode, "PAPER_FORWARD")
+            self.assertIsNone(legacy._operational_policy)
+            self.assertIsNone(legacy._operational_settings)
+
+            historical = ForwardPaperEngine(
+                spec,
+                store=store,
+                strategy=_BuyStrategy(),
+                model={"id": "model"},
+                storage_namespace="historical-constructor-regression",
+                execution_mode="historical_replay",
+            )
+            self.assertEqual(historical._execution_mode, "historical_replay")
+            self.assertEqual(historical._execution_strategy_id, spec.strategy_hash)
+            self.assertEqual(historical._research_mode, "RECORDED_BOOK_REPLAY")
+            self.assertEqual(
+                historical.execution_binding["research_mode"],
+                "RECORDED_BOOK_REPLAY",
+            )
+
+            settings = {
+                "config_id": "canary-constructor-regression",
+                "generation": 7,
+                "config_hash": "sha256:constructor-regression",
+            }
+            operational = ForwardPaperEngine(
+                spec,
+                store=store,
+                strategy=_BuyStrategy(),
+                model={"id": "model"},
+                operational_policy=OperationalPaperPolicy(),
+                operational_settings=settings,
+            )
+            self.assertEqual(operational._execution_mode, "forward")
+            self.assertEqual(operational._execution_strategy_id, spec.strategy_hash)
+            self.assertEqual(operational._research_mode, "PAPER_FORWARD")
+            self.assertIsNotNone(operational._operational_policy)
+            self.assertEqual(
+                operational.execution_binding["operational_settings"],
+                {**settings, "paper_only": True},
+            )
+            self.assertEqual(
+                operational.execution_binding["operational_policy"][
+                    "operational_settings"
+                ],
+                {**settings, "paper_only": True},
             )
 
     def test_unmaterialized_intent_and_terminal_first_cannot_execute_or_close(self) -> None:
@@ -2072,6 +2429,164 @@ class Phase3NodeDashboardTests(unittest.TestCase):
                 worker = next(row for row in store.list_worker_states() if row["worker_name"] == f"paper:{spec.experiment_id}")
                 self.assertEqual(worker["status"], "idle")
                 self.assertNotIn("frozen forward-test hashes", str(worker["payload"]))
+    def test_node_paper_worker_reaches_engine_with_explicit_model_free_document(self) -> None:
+        strategy_document = {
+            "version": 1,
+            "market_type": "prediction",
+            "family": "probability_mispricing",
+            "parameters": {},
+            "probability_model": "market",
+            "resolution_aware": True,
+            "resolution_inputs": ["expiry"],
+        }
+        model_document = {"model_required": False}
+        config = {
+            "execution": "paper_only",
+            "live_execution": False,
+            "strategy_document": strategy_document,
+            "model_document": model_document,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            db = str(Path(directory) / "model-free.sqlite")
+            with AxiomStore(db) as store:
+                spec = ForwardTestRegistry(store).freeze(
+                    strategy=strategy_document,
+                    model=model_document,
+                    config=config,
+                    start_timestamp=T0,
+                    allowed_markets=("m",),
+                    experiment_id="model-free-worker",
+                )
+                node = ResearchNode(
+                    NodeConfig(db, max_markets=1, crypto_enabled=False),
+                    provider=InMemoryPredictionProvider([market("m")]),
+                    store=store,
+                    clock=lambda: T0,
+                )
+                result = node._run_single_paper_worker(spec)
+                self.assertIsNotNone(result)
+                assert result is not None
+                self.assertNotIn("error", result)
+                worker = store.get_worker_state(f"paper:{spec.experiment_id}")
+                self.assertIsNotNone(worker)
+                assert worker is not None
+                self.assertEqual(worker["status"], "idle")
+    def test_node_paper_worker_accepts_legacy_config_hash_without_operational_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = str(Path(directory) / "legacy-config.sqlite")
+            with AxiomStore(db) as store:
+                CanarySettingsService(store, clock=lambda: T0)
+                spec = self._operational_worker_spec(
+                    store,
+                    experiment_id="legacy-config-worker",
+                    config_overrides={"config_hash": "legacy-config-hash"},
+                )
+                node = ResearchNode(
+                    NodeConfig(db, max_markets=1, crypto_enabled=False),
+                    provider=InMemoryPredictionProvider([market("m")]),
+                    store=store,
+                    clock=lambda: T0,
+                )
+                result = node._run_single_paper_worker(spec)
+                self.assertIsNotNone(result)
+                assert result is not None
+                self.assertNotIn("error", result)
+                worker = store.get_worker_state(f"paper:{spec.experiment_id}")
+                self.assertIsNotNone(worker)
+                assert worker is not None
+                self.assertEqual(worker["status"], "idle")
+                self.assertNotIn(
+                    "OPERATIONAL_SETTINGS_IDENTITY_MISMATCH",
+                    worker["payload"].get("errors", ()),
+                )
+
+
+    def _operational_worker_spec(
+        self,
+        store: AxiomStore,
+        *,
+        experiment_id: str,
+        config_overrides: dict[str, object],
+    ) -> Any:
+        strategy_document = {
+            "version": 1,
+            "market_type": "prediction",
+            "family": "momentum",
+            "parameters": {
+                "lookback": 1,
+                "threshold": 0.05,
+                "entry_predicate": dict(_ABSOLUTE_MOVE_PREDICATE),
+            },
+            "probability_model": "plan-model-probability",
+            "resolution_aware": True,
+            "resolution_inputs": ["expiry", "settlement"],
+        }
+        model_document = {"model_required": False}
+        config: dict[str, object] = {
+            "execution": "paper_only",
+            "live_execution": False,
+            "strategy_document": strategy_document,
+            "model_document": model_document,
+            **config_overrides,
+        }
+        return ForwardTestRegistry(store).freeze(
+            strategy=strategy_document,
+            model=model_document,
+            config=config,
+            start_timestamp=T0,
+            allowed_markets=("m",),
+            experiment_id=experiment_id,
+        )
+
+    def test_node_operational_identity_conflict_blocks_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = str(Path(directory) / "identity-conflict.sqlite")
+            with AxiomStore(db) as store:
+                settings = CanarySettingsService(store, clock=lambda: T0)
+                active = settings.snapshot(now=T0)
+                spec = self._operational_worker_spec(
+                    store,
+                    experiment_id="identity-conflict-worker",
+                    config_overrides={
+                        "operational_settings": {
+                            "config_id": active["config_id"],
+                            "generation": active["generation"],
+                            "config_hash": active["config_hash"],
+                            "expected": {
+                                "config_id": "different-operational-config",
+                            },
+                        },
+                    },
+                )
+                node = ResearchNode(
+                    NodeConfig(db, max_markets=1, crypto_enabled=False),
+                    provider=InMemoryPredictionProvider([market("m")]),
+                    store=store,
+                    clock=lambda: T0,
+                )
+                result = node._run_single_paper_worker(spec)
+                self.assertEqual(result["status"], "BLOCKED")
+                self.assertEqual(result["blocker"], "OPERATIONAL_SETTINGS_IDENTITY_MISMATCH")
+
+    def test_node_operational_identity_absence_blocks_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = str(Path(directory) / "identity-absent.sqlite")
+            with AxiomStore(db) as store:
+                CanarySettingsService(store, clock=lambda: T0)
+                spec = self._operational_worker_spec(
+                    store,
+                    experiment_id="identity-absent-worker",
+                    config_overrides={"operational_settings": {}},
+                )
+                node = ResearchNode(
+                    NodeConfig(db, max_markets=1, crypto_enabled=False),
+                    provider=InMemoryPredictionProvider([market("m")]),
+                    store=store,
+                    clock=lambda: T0,
+                )
+                result = node._run_single_paper_worker(spec)
+                self.assertEqual(result["status"], "BLOCKED")
+                self.assertEqual(result["blocker"], "OPERATIONAL_SETTINGS_IDENTITY_MISMATCH")
 
 
 

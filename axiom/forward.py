@@ -545,7 +545,10 @@ class ForwardTestRegistry:
             if existing not in (None, "") and _canonical(existing) != _canonical(value):
                 raise ValueError(f"forward test lineage conflicts for {key}")
             config_record[key] = value
-        config_record = _canonical_forward_config(config_record)
+        config_record = _bind_operational_setup(
+            strategy_value,
+            _canonical_forward_config(config_record),
+        )
         _validate_forward_config(config_record)
         start = ensure_utc(start_timestamp or utc_now())
         normalized_markets = tuple(dict.fromkeys(str(item).strip() for item in allowed_markets if str(item).strip()))
@@ -681,11 +684,16 @@ class ForwardTestRegistry:
                 raise ValueError("scope_resolution must be a mapping or immutable resolution")
             intent_config.setdefault("scope_resolution", dict(proof))
         # Hash the supplied runtime objects after validating them against the
-        # immutable documents carried by the intent config.
+        # immutable documents carried by the intent config.  The strategy
+        # hash must be computed before identity material is assembled; older
+        # callers rely on this exact content hash and may omit setup fields.
         computed_strategy_hash = _content_hash(_normalized_strategy_document(strategy))
         if rolling_strategy_hash is not None and str(rolling_strategy_hash).strip() != computed_strategy_hash:
             raise ValueError("rolling_strategy_hash does not match strategy")
-        normalized_config = _canonical_forward_config(intent_config)
+        normalized_config = _bind_operational_setup(
+            strategy,
+            _canonical_forward_config(intent_config),
+        )
         computed_model_hash = _content_hash(getattr(model, "document", model))
         normalized_risk_limits = dict(risk_limits or {})
         identity_material = {
@@ -973,6 +981,214 @@ def _normalized_strategy_document(value: Any) -> Any:
     return value
 
 
+# These are deliberately data-only.  The operational setup is the contract
+# carried by new directional prediction records; legacy records without it
+# remain readable and are never backfilled by ``ForwardTestSpec``.
+OPERATIONAL_SETUP_SCHEMA = "axiom-operational-setup"
+OPERATIONAL_SETUP_VERSION = "1"
+_DIRECTIONAL_SETUP_FAMILIES = frozenset({"momentum", "mean_reversion"})
+_ABSOLUTE_MOVE_PREDICATE = {
+    "version": "absolute-move-v1",
+    "minimum_move": 0.05,
+    "units": "probability",
+    "boundary": "inclusive",
+}
+
+
+def _operational_setup_for_strategy(
+    strategy: Any,
+    config: Mapping[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Return the canonical setup for one exact directional strategy.
+
+    A setup is intentionally recognized only when all of its immutable
+    contract dimensions are present.  This prevents this compatibility layer
+    from reinterpreting older strategy versions or silently assigning a new
+    contract to an unrelated family.
+    """
+    document = _plain_json(_normalized_strategy_document(strategy))
+    if not isinstance(document, Mapping):
+        return None
+    family = str(document.get("family", "")).strip().lower()
+    if family not in _DIRECTIONAL_SETUP_FAMILIES:
+        return None
+    parameters = document.get("parameters")
+    if not isinstance(parameters, Mapping):
+        return None
+
+    def scalar(value: Any) -> Any:
+        if isinstance(value, (list, tuple)) and len(value) == 1:
+            return value[0]
+        return value
+
+    try:
+        lookback = int(scalar(parameters.get("lookback")))
+        threshold = float(scalar(parameters.get("threshold")))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    predicate = parameters.get("entry_predicate")
+    if (
+        lookback != 1
+        or not math.isfinite(threshold)
+        or abs(threshold - 0.05) > 1e-12
+        or not isinstance(predicate, Mapping)
+        or _canonical(predicate) != _canonical(_ABSOLUTE_MOVE_PREDICATE)
+    ):
+        return None
+
+    source = _plain_json(dict(config or {}))
+    scope_source = source.get("market_scope", source.get("scope"))
+    if isinstance(scope_source, Mapping):
+        try:
+            from .experiment_plan import normalize_market_scope
+
+            scope = normalize_market_scope(scope_source).as_dict()
+        except (TypeError, ValueError):
+            scope = _plain_json(scope_source)
+    else:
+        scope = {
+            "schema_version": "1",
+            "mode": "RULE_BASED_MARKETS",
+            "instrument": "POLYMARKET",
+            "categories": [],
+            "market_ids": [],
+            "filters": {},
+            "regime_restrictions": [],
+            "provenance": "canonical",
+        }
+
+    raw_manifest = source.get("assessment_manifest_ref")
+    boundary = source.get("dataset_boundary")
+    attestation = source.get("dataset_attestation")
+    attestation_hash = (
+        str(attestation.get("attestation_hash", "")).strip()
+        if isinstance(attestation, Mapping)
+        else ""
+    )
+    if isinstance(raw_manifest, Mapping):
+        manifest = _plain_json(raw_manifest)
+        # A boundary alone is not sufficient to identify the assessed
+        # dataset: an attestation can rotate while its ordered rows remain
+        # unchanged.  Bind only the bounded canonical attestation identity,
+        # never the potentially large attestation document.
+        if isinstance(boundary, Mapping) and attestation_hash:
+            manifest = dict(manifest)
+            manifest["attestation_hash"] = attestation_hash
+    else:
+        manifest = {
+            "kind": "dataset_boundary" if isinstance(boundary, Mapping) else "dataset_attestation",
+            "dataset_id": source.get("dataset_id"),
+            "dataset_version": source.get("dataset_version"),
+        }
+        if isinstance(boundary, Mapping):
+            manifest["manifest_digest"] = boundary.get(
+                "ordered_row_manifest_digest",
+                boundary.get("content_hash"),
+            )
+            if attestation_hash:
+                manifest["attestation_hash"] = attestation_hash
+        elif isinstance(attestation, Mapping):
+            manifest["manifest_digest"] = attestation.get("attestation_hash")
+        if source.get("plan_hash") is not None:
+            manifest["plan_hash"] = source.get("plan_hash")
+        manifest = {
+            key: value
+            for key, value in manifest.items()
+            if value is not None and value != ""
+        }
+    setup_id = f"{family}:absolute-move-v1:L1:H1"
+    return {
+        "contract_schema": OPERATIONAL_SETUP_SCHEMA,
+        "contract_version": OPERATIONAL_SETUP_VERSION,
+        "setup_id": setup_id,
+        "family": family,
+        "market_type": "prediction",
+        "market_scope_policy": scope,
+        "assessment_manifest_ref": manifest,
+        "required_observations": {
+            "path_length": 3,
+            "lookback": 1,
+            "holding": 1,
+            "unit": "observations",
+            "same_market": True,
+        },
+        "lookback": 1,
+        "entry_predicate": dict(_ABSOLUTE_MOVE_PREDICATE),
+        "entry_predicate_raw": "abs(delta_probability) >= 0.05",
+        "outcome_mapping": {
+            "positive_delta": "BUY YES",
+            "negative_delta": "BUY NO",
+            "buy_interpretation": "BUY",
+        },
+        "signal_strength": {
+            "formula": "delta_probability / 0.05",
+            "raw_measure": "delta_probability",
+            "scale": "threshold",
+            "threshold": 0.05,
+            "eligibility_separate": True,
+        },
+        "sizing": {
+            "rule": "active_settings",
+            "settings_reference": "active_runtime_settings",
+            "allocation_reference": "paper_assumptions.sizing.allocated_capital",
+            "limit_reference": "active_settings",
+            "hard_coded_cap": False,
+        },
+        "invalidation": {
+            "data_blockers": [
+                "INSUFFICIENT_LOOKBACK",
+                "MISSING_MARKET_PROBABILITY",
+                "MARKET_ID_MISSING",
+                "INCOMPLETE_SAME_MARKET_PATH",
+                "UNRESOLVED_MARKET",
+            ],
+            "invalid_if": "any required observation is absent, non-finite, out of order, or from another market",
+        },
+        "holding_semantics": {
+            "count": 1,
+            "unit": "same_market_observation",
+            "same_market": True,
+            "pending": "retain until the next same-market observation",
+            "unresolved": "do not mark an outcome settled",
+            "terminal": "settle only a terminal outcome; do not extend the path",
+        },
+        "book_assumptions": {
+            "source": "recorded_book",
+            "fee_bps": 10.0,
+            "slippage_bps": 5.0,
+            "quote_policy": "recorded_book_only",
+        },
+        "model_required": False,
+        "paper_only": True,
+        "paper_only_statement": "Paper-only research; no live capability or submission path.",
+    }
+
+
+def _operational_setup_hash(setup: Mapping[str, Any]) -> str:
+    return _content_hash(_plain_json(setup))
+
+
+def _bind_operational_setup(
+    strategy: Any,
+    config: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Canonicalize a new config's setup while preserving supplied identity."""
+    result = _plain_json(dict(config or {}))
+    setup = _operational_setup_for_strategy(strategy, result)
+    if setup is None:
+        return result
+    supplied = result.get("operational_setup")
+    if supplied is not None and _canonical(supplied) != _canonical(setup):
+        raise ValueError("operational_setup does not match the exact strategy contract")
+    supplied_hash = result.get("operational_setup_hash")
+    setup_hash = _operational_setup_hash(setup)
+    if supplied_hash not in (None, "") and str(supplied_hash).strip() != setup_hash:
+        raise ValueError("operational_setup_hash does not match operational_setup")
+    result["operational_setup"] = setup
+    result["operational_setup_hash"] = setup_hash
+    return result
+
+
 
 def _content_hash(value: Any) -> str:
     return "sha256:" + hashlib.sha256(_canonical(value).encode("utf-8")).hexdigest()
@@ -994,14 +1210,44 @@ def _canonical(value: Any) -> str:
     return json.dumps(convert(value), sort_keys=True, separators=(",", ":"), allow_nan=False, default=repr)
 
 
-def _freeze_json(value: Mapping[str, Any]) -> Mapping[str, Any]:
-    from types import MappingProxyType
+class _FrozenList(list):
+    """Immutable list representation that preserves canonical JSON equality."""
 
-    def freeze(item: Any) -> Any:
+    __slots__ = ()
+
+    @staticmethod
+    def _immutable(*_args: Any, **_kwargs: Any) -> None:
+        raise TypeError("frozen forward configuration is immutable")
+
+    __setitem__ = _immutable
+    __delitem__ = _immutable
+    __iadd__ = _immutable
+    __imul__ = _immutable
+    append = _immutable
+    clear = _immutable
+    extend = _immutable
+    insert = _immutable
+    pop = _immutable
+    remove = _immutable
+    reverse = _immutable
+    sort = _immutable
+
+
+def _freeze_json(value: Mapping[str, Any]) -> Mapping[str, Any]:
+    def freeze(item: Any, *, preserve_lists: bool = False) -> Any:
         if isinstance(item, Mapping):
-            return MappingProxyType({str(key): freeze(child) for key, child in item.items()})
+            return MappingProxyType(
+                {
+                    str(key): freeze(
+                        child,
+                        preserve_lists=preserve_lists or str(key) == "operational_setup",
+                    )
+                    for key, child in item.items()
+                }
+            )
         if isinstance(item, list):
-            return tuple(freeze(child) for child in item)
+            frozen = [freeze(child, preserve_lists=preserve_lists) for child in item]
+            return _FrozenList(frozen) if preserve_lists else tuple(frozen)
         return item
 
     return freeze(json.loads(_canonical(value)))
@@ -1010,4 +1256,14 @@ def _plain(value: Any) -> Any:
     return json.loads(_canonical(value))
 
 
-__all__ = ["COMMON_PAPER_ASSUMPTIONS", "ForwardTestRegistry", "ForwardTestSpec"]
+__all__ = [
+    "COMMON_PAPER_ASSUMPTIONS",
+    "ForwardTestRegistry",
+    "ForwardTestSpec",
+    "OPERATIONAL_SETUP_SCHEMA",
+    "OPERATIONAL_SETUP_VERSION",
+    "_ABSOLUTE_MOVE_PREDICATE",
+    "_bind_operational_setup",
+    "_operational_setup_for_strategy",
+    "_operational_setup_hash",
+]

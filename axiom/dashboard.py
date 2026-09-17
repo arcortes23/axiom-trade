@@ -76,7 +76,7 @@ _ENDPOINTS = (
     "evidence-maturity",
     "strategy",
 )
-_V2_ENDPOINTS = ("overview-summary", "canary", "rolling-portfolio", "binance-canary", "datasets", "activity", "candidates", "polymarket", "hermes", "crypto-research", "crypto", "paper")
+_V2_ENDPOINTS = ("overview-summary", "canary", "rolling-portfolio", "binance-canary", "datasets", "activity", "candidates", "polymarket", "hermes", "crypto-research", "crypto", "paper", "shadow")
 
 _DEFAULT_PAGE_SIZE = 25
 _PAGE_SIZE_OPTIONS = (10, 25, 50, 100)
@@ -514,6 +514,314 @@ def _nested_value(*sources: Mapping[str, Any], keys: tuple[str, ...]) -> Any:
             if value is not None and value != "":
                 return value
     return None
+_SHADOW_STATUSES = frozenset(
+    {"REGISTERED", "RUNNING", "WAITING_FOR_DATA", "COMPLETED", "BLOCKED", "STOPPED"}
+)
+_SHADOW_ACTIVE_STATUSES = frozenset({"REGISTERED", "RUNNING", "WAITING_FOR_DATA"})
+_SHADOW_MEMBER_PUBLIC_FIELDS = (
+    "shadow_member_id",
+    "candidate_id",
+    "family",
+    "setup_id",
+    "setup_hash",
+    "strategy_hash",
+    "model_hash",
+    "scope_hash",
+    "scope_version",
+)
+_SHADOW_ACCOUNTING_FIELDS = (
+    "signals",
+    "declines",
+    "risk_rejections",
+    "fills",
+    "exits",
+    "buy_fills",
+    "sell_fills",
+    "filled_quantity",
+    "fees",
+)
+_SHADOW_BUDGET_FIELDS = (
+    "bankroll",
+    "allocated",
+    "allocated_capital",
+    "reserved",
+    "spent",
+    "used",
+    "remaining",
+    "available",
+    "limit",
+    "currency",
+)
+
+
+def _shadow_public_text(value: Any, *, limit: int = 256) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text[:limit] if text else None
+
+
+def _shadow_public_number(value: Any, *, integer: bool = False) -> int | float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if integer:
+        try:
+            number = int(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return number if number >= 0 else None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(number) or number < 0:
+        return None
+    return number
+
+
+def _shadow_public_timestamp(value: Any) -> str | None:
+    if value is None:
+        return None
+    stamp = parse_timestamp(value)
+    return stamp.isoformat() if stamp is not None else None
+
+
+def _shadow_public_accounting(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    result: dict[str, Any] = {}
+    for field in _SHADOW_ACCOUNTING_FIELDS:
+        if field not in value:
+            continue
+        projected = _shadow_public_number(value.get(field), integer=field in {
+            "signals", "declines", "risk_rejections", "fills", "exits", "buy_fills", "sell_fills",
+        })
+        if projected is not None:
+            result[field] = projected
+    return result
+
+
+def _shadow_public_budget(
+    manifest_shared: Mapping[str, Any],
+    state: Mapping[str, Any],
+) -> dict[str, Any]:
+    sources: list[Mapping[str, Any]] = []
+    for source_name in ("shared_budget", "budget", "accounting"):
+        source = state.get(source_name)
+        if isinstance(source, Mapping):
+            sources.append(source)
+    sources.append(manifest_shared)
+    result: dict[str, Any] = {}
+    for field in _SHADOW_BUDGET_FIELDS:
+        for source in sources:
+            if field not in source:
+                continue
+            value = source.get(field)
+            projected = (
+                _shadow_public_text(value)
+                if field == "currency"
+                else _shadow_public_number(value)
+            )
+            if projected is not None:
+                result[field] = projected
+                break
+    bankroll = result.get("bankroll")
+    if bankroll is not None and "allocated_capital" not in result:
+        result["allocated_capital"] = bankroll / 2.0 if isinstance(bankroll, (int, float)) else None
+    return result
+
+
+def _shadow_public_members(
+    manifest: Mapping[str, Any],
+    state: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    raw_members = manifest.get("members")
+    state_members = state.get("members")
+    state_members = state_members if isinstance(state_members, Mapping) else {}
+    if not isinstance(raw_members, (list, tuple)):
+        return []
+    members: list[dict[str, Any]] = []
+    for raw in raw_members[:2]:
+        if not isinstance(raw, Mapping):
+            continue
+        member: dict[str, Any] = {}
+        for field in _SHADOW_MEMBER_PUBLIC_FIELDS:
+            value = raw.get(field)
+            if field in {"shadow_member_id", "candidate_id", "family", "setup_id", "setup_hash", "strategy_hash", "model_hash", "scope_hash", "scope_version"}:
+                member[field] = _shadow_public_text(value)
+        member_id = member.get("shadow_member_id")
+        state_member = state_members.get(member_id) if member_id else None
+        if not isinstance(state_member, Mapping) and member_id:
+            state_member = state_members.get(str(member_id))
+        state_member = state_member if isinstance(state_member, Mapping) else {}
+        accounting = _shadow_public_accounting(state_member.get("accounting"))
+        for field in ("signals", "declines", "risk_rejections", "fills", "exits"):
+            projected = _shadow_public_number(state_member.get(field), integer=True)
+            if projected is not None:
+                accounting[field] = projected
+        member["accounting"] = accounting
+        members.append(member)
+    return members
+
+
+def _shadow_public_blockers(state: Mapping[str, Any]) -> list[str]:
+    values: list[Any] = []
+    raw = state.get("blockers")
+    if isinstance(raw, (list, tuple)):
+        values.extend(raw)
+    values.append(state.get("last_blocker"))
+    result: list[str] = []
+    for value in values:
+        text = _shadow_public_text(value, limit=256)
+        if not text:
+            continue
+        # Persisted blocker details can originate from provider exceptions.
+        # Keep only the stable reason code at the public boundary.
+        text = text.split(":", 1)[0].strip()[:128]
+        if text and text not in result:
+            result.append(text)
+    return result[:32]
+
+
+def _shadow_public_stop_conditions(
+    manifest: Mapping[str, Any],
+    state: Mapping[str, Any],
+) -> dict[str, Any]:
+    declared = manifest.get("stop_conditions")
+    declared = declared if isinstance(declared, Mapping) else {}
+    state_stop = state.get("stop")
+    state_stop = state_stop if isinstance(state_stop, Mapping) else {}
+    result: dict[str, Any] = {}
+    for field in ("max_cycles", "max_observations"):
+        value = declared.get(field, state_stop.get(field))
+        projected = _shadow_public_number(value, integer=True)
+        result[field] = projected
+    result["stop_at"] = _shadow_public_timestamp(
+        declared.get("stop_at", state_stop.get("stop_at"))
+    )
+    result["reached"] = state_stop.get("reached") is True
+    reason = _shadow_public_text(state_stop.get("reason"))
+    result["reason"] = reason
+    return result
+
+
+def _shadow_public_progress(
+    state: Mapping[str, Any],
+    stop_conditions: Mapping[str, Any],
+    status: str,
+) -> dict[str, Any]:
+    cycles = _shadow_public_number(state.get("cycles"), integer=True) or 0
+    observations = _shadow_public_number(state.get("public_observations"), integer=True) or 0
+    member_observations = _shadow_public_number(state.get("member_observations"), integer=True) or 0
+    cycle_limit = stop_conditions.get("max_cycles")
+    observation_limit = stop_conditions.get("max_observations")
+    cycle_fraction = (
+        min(1.0, cycles / cycle_limit)
+        if isinstance(cycle_limit, int) and cycle_limit > 0
+        else None
+    )
+    observation_fraction = (
+        min(1.0, observations / observation_limit)
+        if isinstance(observation_limit, int) and observation_limit > 0
+        else None
+    )
+    fractions = [value for value in (cycle_fraction, observation_fraction) if value is not None]
+    fraction = max(fractions) if fractions else (1.0 if status in {"COMPLETED", "STOPPED"} else None)
+    return {
+        "cycles": cycles,
+        "public_observations": observations,
+        "member_observations": member_observations,
+        "cycle_limit": cycle_limit,
+        "observation_limit": observation_limit,
+        "cycle_fraction": cycle_fraction,
+        "observation_fraction": observation_fraction,
+        "fraction": fraction,
+    }
+
+
+def _shadow_next_action(status: str, blockers: Sequence[str]) -> str:
+    if status == "REGISTERED":
+        return "WAIT_FOR_SHADOW_WORKER"
+    if status == "RUNNING":
+        return "WAIT_FOR_NEXT_EVALUATION"
+    if status == "WAITING_FOR_DATA":
+        return "WAIT_FOR_DATA"
+    if status == "BLOCKED":
+        return "REVIEW_BLOCKER" if blockers else "REVIEW_SHADOW_JOB"
+    if status == "COMPLETED":
+        return "NO_ACTION_COMPLETED"
+    if status == "STOPPED":
+        return "NO_ACTION_STOPPED"
+    return "REVIEW_SHADOW_JOB"
+
+
+def _shadow_public_job(row: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(row, Mapping):
+        return None
+    manifest = row.get("manifest")
+    manifest = manifest if isinstance(manifest, Mapping) else {}
+    state = row.get("state")
+    state = state if isinstance(state, Mapping) else {}
+    status = str(row.get("status") or "UNKNOWN").strip().upper()
+    if status not in _SHADOW_STATUSES:
+        status = "UNKNOWN"
+    stop_conditions = _shadow_public_stop_conditions(manifest, state)
+    blockers = _shadow_public_blockers(state)
+    next_evaluation_at = _shadow_public_timestamp(
+        row.get("next_evaluation_at") or state.get("next_evaluation_at")
+    )
+    members = _shadow_public_members(manifest, state)
+    shared = manifest.get("shared")
+    shared = shared if isinstance(shared, Mapping) else {}
+    progress = _shadow_public_progress(state, stop_conditions, status)
+    last_cycle = state.get("last_cycle")
+    last_cycle = last_cycle if isinstance(last_cycle, Mapping) else {}
+    cycle_summary = {
+        field: _shadow_public_number(last_cycle.get(field), integer=field in {
+            "observations_processed", "events_written", "fills",
+        })
+        for field in ("observations_processed", "events_written", "fills")
+        if _shadow_public_number(last_cycle.get(field), integer=field in {
+            "observations_processed", "events_written", "fills",
+        }) is not None
+    }
+    next_action = _shadow_next_action(status, blockers)
+    return {
+        "job_id": _shadow_public_text(row.get("job_id")),
+        "status": status,
+        "schema": _shadow_public_text(manifest.get("schema") or state.get("schema")),
+        "paper_only": True,
+        "live_execution": False,
+        "created_at": _shadow_public_timestamp(row.get("created_at")),
+        "updated_at": _shadow_public_timestamp(row.get("updated_at")),
+        "next_evaluation_at": next_evaluation_at,
+        "next_evaluation": next_evaluation_at,
+        "version": _shadow_public_number(row.get("version"), integer=True),
+        "members": members,
+        "shared": {
+            "run_id": _shadow_public_text(shared.get("run_id") or state.get("run_id")),
+            "scope_hash": _shadow_public_text(shared.get("scope_hash")),
+            "scope_version": _shadow_public_text(shared.get("scope_version")),
+        },
+        "shared_budget": _shadow_public_budget(shared, state),
+        "accounting": {
+            "members": [
+                {
+                    "shadow_member_id": member.get("shadow_member_id"),
+                    **member.get("accounting", {}),
+                }
+                for member in members
+            ],
+        },
+        "progress": progress,
+        "progress_fraction": progress.get("fraction"),
+        "stop_conditions": stop_conditions,
+        "blockers": blockers,
+        "last_blocker": blockers[-1] if blockers else None,
+        "last_cycle": cycle_summary or None,
+        "next_action": next_action,
+        "read_only": True,
+    }
 def _display_value_missing(value: Any) -> bool:
     """Return whether a persisted display value is absent rather than falsy."""
     return value is None or (isinstance(value, str) and not value.strip())
@@ -4403,6 +4711,27 @@ class DashboardData:
 
     def v2_snapshot(self, endpoint: str, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
         name = endpoint.strip("/")
+        if name.lower() == "shadow":
+            return self.shadow_data(params)
+        if name.lower() == "shadow/latest":
+            latest = self.shadow_data({"page": 1, "page_size": 1})
+            return latest.get("latest") if isinstance(latest.get("latest"), Mapping) else {
+                "available": False,
+                "read_only": True,
+                "paper_only": True,
+                "live_execution": False,
+            }
+        if name.lower().startswith("shadow/"):
+            identifier = unquote(name.split("/", 1)[1])
+            if identifier.lower() == "latest":
+                latest = self.shadow_data({"page": 1, "page_size": 1})
+                return latest.get("latest") if isinstance(latest.get("latest"), Mapping) else {
+                    "available": False,
+                    "read_only": True,
+                    "paper_only": True,
+                    "live_execution": False,
+                }
+            return self.shadow_detail(identifier)
         if name.lower().startswith("datasets/"):
             parts = name.split("/")
             identifier = unquote(parts[1])
@@ -4508,6 +4837,95 @@ class DashboardData:
             else []
         )
         return {"available": bool(states), "states": states, "live_execution": False}
+    def _shadow_storage_rows(
+        self,
+        *,
+        status: str | None = None,
+        limit: int = 1000,
+    ) -> list[Mapping[str, Any]]:
+        if self.store is None:
+            return []
+        loader = getattr(self.store, "list_shadow_jobs", None)
+        if not callable(loader):
+            return []
+        try:
+            rows = loader(status=status, limit=limit)
+        except TypeError:
+            try:
+                rows = loader(status, limit)
+            except (AttributeError, TypeError, ValueError, sqlite3.Error):
+                rows = []
+        except (AttributeError, TypeError, ValueError, sqlite3.Error):
+            rows = []
+        return [row for row in rows if isinstance(row, Mapping)] if isinstance(rows, (list, tuple)) else []
+
+    def shadow_detail(self, job_id: str) -> dict[str, Any]:
+        identifier = unquote(str(job_id).strip())
+        loader = getattr(self.store, "load_shadow_job", None) if self.store is not None else None
+        row: Mapping[str, Any] | None = None
+        if callable(loader) and identifier:
+            try:
+                loaded = loader(identifier)
+                row = loaded if isinstance(loaded, Mapping) else None
+            except (AttributeError, TypeError, ValueError, sqlite3.Error):
+                row = None
+        projected = _shadow_public_job(row)
+        if projected is None:
+            return {
+                "available": False,
+                "job_id": _shadow_public_text(identifier),
+                "read_only": True,
+                "paper_only": True,
+                "live_execution": False,
+            }
+        return {"available": True, **projected}
+
+    def shadow_data(self, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        values = _pagination_params(params)
+        raw_status = values.get("status")
+        status = str(raw_status).strip().upper() if raw_status else None
+        if status and status not in _SHADOW_STATUSES:
+            raise ValueError("invalid shadow status")
+        requested = min(1000, max(values["page"] * values["page_size"], values["page_size"]))
+        rows = [
+            projected
+            for row in self._shadow_storage_rows(status=status, limit=requested)
+            if (projected := _shadow_public_job(row)) is not None
+        ]
+        needle = str(values.get("filter") or "").strip().lower()
+        if needle:
+            rows = [
+                row
+                for row in rows
+                if needle in str(row.get("job_id") or "").lower()
+                or any(needle in str(member.get("shadow_member_id") or "").lower() for member in row.get("members", []))
+            ]
+        total = len(rows)
+        start = (values["page"] - 1) * values["page_size"]
+        items = rows[start : start + values["page_size"]]
+        latest = rows[0] if rows else None
+        active = next(
+            (row for row in rows if str(row.get("status") or "").upper() in _SHADOW_ACTIVE_STATUSES),
+            None,
+        )
+        current = active or latest
+        status_counts = {
+            status_name: sum(1 for row in rows if row.get("status") == status_name)
+            for status_name in sorted(_SHADOW_STATUSES)
+        }
+        return {
+            **_page_result(items, page=values["page"], page_size=values["page_size"], total=total),
+            "available": bool(rows),
+            "latest": latest,
+            "current_job": current,
+            "current_job_id": current.get("job_id") if isinstance(current, Mapping) else None,
+            "next_action": current.get("next_action") if isinstance(current, Mapping) else None,
+            "status_counts": status_counts,
+            "active_count": sum(status_counts[name] for name in _SHADOW_ACTIVE_STATUSES),
+            "read_only": True,
+            "paper_only": True,
+            "live_execution": False,
+        }
 
     def opportunities_data(self) -> Any:
         configured = self._configured("opportunities")
@@ -9909,7 +10327,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         query = parse_qs(parsed.query, keep_blank_values=True)
         if path.startswith("api/v2/"):
             endpoint = path[len("api/v2/") :]
-            allowed = endpoint.lower() in _V2_ENDPOINTS or endpoint.lower().startswith(("datasets/", "candidates/", "hermes/", "crypto-research/"))
+            allowed = endpoint.lower() in _V2_ENDPOINTS or endpoint.lower().startswith(("datasets/", "candidates/", "hermes/", "crypto-research/", "shadow/"))
             if allowed:
                 validation_error = _pagination_error(query)
                 if validation_error:

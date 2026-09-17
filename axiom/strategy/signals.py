@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 
 from collections.abc import Mapping as MappingABC
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 import math
 from statistics import mean, pstdev
 from typing import Any, Iterable, Mapping, Sequence
@@ -21,12 +22,16 @@ MODEL_INPUT_MISSING = "MODEL_INPUT_MISSING"
 WARMING_UP = "WARMING_UP"
 INSUFFICIENT_LOOKBACK = "INSUFFICIENT_LOOKBACK"
 STRATEGY_EVALUATED_DECLINED = "STRATEGY_EVALUATED_DECLINED"
+ENTRY_PREDICATE_NOT_SATISFIED = "ENTRY_PREDICATE_NOT_SATISFIED"
 SIGNAL_PRODUCED = "SIGNAL_PRODUCED"
 MODEL_INPUT_PRESENT = "MODEL_INPUT_PRESENT"
 CONSTANT_BASELINE = "CONSTANT_BASELINE"
 
 DIRECTIONAL_OOS_TRADING = "DIRECTIONAL_OOS_TRADING"
 PROBABILITY_CALIBRATION_UNKNOWN = "PROBABILITY_CALIBRATION_UNKNOWN"
+
+_DECIMAL_ZERO = Decimal("0")
+_DECIMAL_ONE = Decimal("1")
 
 def _number(value: Any, default: float = 0.0) -> float:
     try:
@@ -261,6 +266,48 @@ def _market_probability(item: Any) -> float | None:
     result = _number(value, math.nan)
     return result if math.isfinite(result) and 0.0 <= result <= 1.0 else None
 
+def _decimal_number(value: Any) -> Decimal | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        parsed = value if isinstance(value, Decimal) else Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError, OverflowError):
+        return None
+    return parsed if parsed.is_finite() else None
+
+
+def _canonical_market_probability(item: Any) -> Decimal | None:
+    value = _snapshot_value(item, "yes_mid")
+    if value is None:
+        value = _snapshot_value(item, "yes_ask")
+    result = _decimal_number(value)
+    return result if result is not None and _DECIMAL_ZERO <= result <= _DECIMAL_ONE else None
+
+
+def _prediction_raw_delta_decimal(
+    family: str,
+    snapshots: Sequence[Any],
+    params: Mapping[str, Any],
+) -> Decimal | None:
+    history_market = [
+        market
+        for market in (_canonical_market_probability(snapshot) for snapshot in snapshots)
+        if market is not None
+    ]
+    lookback = _declared_lookback(params)
+    if len(history_market) < lookback + 1:
+        return None
+    if family == "mean_reversion":
+        prior = history_market[:-1]
+        recent = prior[-lookback:]
+        centre = sum(recent, _DECIMAL_ZERO) / len(recent)
+        return centre - history_market[-1]
+    if family == "momentum":
+        return history_market[-1] - history_market[-lookback - 1]
+    return None
+
+
+
 
 def _model_probability(data: Any, item: Any, index: int = -1) -> float | None:
     for key in ("model_probability", "probability", "predicted_probability", "p"):
@@ -491,6 +538,51 @@ def _prediction_requires_model(family: str) -> bool:
         "consistency",
         "correlation_aware",
     }
+def _prediction_raw_delta(
+    family: str,
+    snapshots: Sequence[Any],
+    params: Mapping[str, Any],
+) -> float | None:
+    """Return the unscaled probability movement for directional prediction families."""
+    history_market = [
+        market for market in (_market_probability(snapshot) for snapshot in snapshots)
+        if market is not None
+    ]
+    lookback = _declared_lookback(params)
+    if len(history_market) < lookback + 1:
+        return None
+    if family == "mean_reversion":
+        prior = history_market[:-1]
+        centre = mean(prior[-lookback:])
+        return centre - history_market[-1]
+    if family == "momentum":
+        return history_market[-1] - history_market[-lookback - 1]
+    return None
+
+
+def _entry_predicate(params: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    value = params.get("entry_predicate")
+    return value if isinstance(value, Mapping) else None
+
+
+def _entry_predicate_evidence(predicate: Mapping[str, Any]) -> dict[str, Any]:
+    canonical = {
+        "version": predicate.get("version"),
+        "minimum_move": predicate.get("minimum_move"),
+        "units": predicate.get("units"),
+        "boundary": predicate.get("boundary"),
+    }
+    return {
+        "entry_predicate": canonical,
+        "entry_predicate_version": canonical["version"],
+        "entry_predicate_minimum_move": canonical["minimum_move"],
+        "entry_predicate_units": canonical["units"],
+        "entry_predicate_boundary": canonical["boundary"],
+    }
+
+
+def _entry_predicate_minimum(predicate: Mapping[str, Any]) -> float:
+    return _number(predicate.get("minimum_move"), math.nan)
 
 
 def _prediction_signal(family: str, data: Any, params: Mapping[str, Any]) -> float:
@@ -524,7 +616,9 @@ def _prediction_signal(family: str, data: Any, params: Mapping[str, Any]) -> flo
         ):
             return 0.0
         return _clip((model_p - market_p) / max(threshold, 0.05))
-    history_market = [market for market in (_market_probability(s) for s in snapshots) if market is not None]
+    if family in {"mean_reversion", "momentum"}:
+        raw_delta = _prediction_raw_delta(family, snapshots, params)
+        return _clip(raw_delta / max(threshold, 0.05)) if raw_delta is not None else 0.0
     paired = []
     for index, snapshot in enumerate(snapshots):
         market = _market_probability(snapshot)
@@ -533,17 +627,6 @@ def _prediction_signal(family: str, data: Any, params: Mapping[str, Any]) -> flo
             paired.append((model, market))
     history_model = [model for model, _ in paired]
     history_market_paired = [market for _, market in paired]
-    lookback = _declared_lookback(params)
-    if family == "mean_reversion":
-        if len(history_market) < lookback + 1:
-            return 0.0
-        prior = history_market[:-1]
-        centre = mean(prior[-lookback:])
-        return _clip((centre - history_market[-1]) / max(threshold, 0.05))
-    if family == "momentum":
-        if len(history_market) < lookback + 1:
-            return 0.0
-        return _clip((history_market[-1] - history_market[-lookback - 1]) / max(threshold, 0.05))
     if family == "time_decay":
         seconds = _time_to_expiry(current)
         horizon = max(_number(params.get("horizon", 86400.0), 86400.0), 1.0)
@@ -629,7 +712,10 @@ class Signal(MappingABC[str, Any]):
 
     @property
     def actionable(self) -> bool:
+        if self.evidence.get("entry_eligible") is False:
+            return False
         return abs(self.score) > 1e-12
+
     @property
     def reason(self) -> str:
         return self.reason_code
@@ -778,6 +864,14 @@ def evaluate_signal_evaluation(
                     INSUFFICIENT_LOOKBACK, evidence,
                 )
     else:
+        predicate = (
+            _entry_predicate(definition.parameters)
+            if definition.family in {"momentum", "mean_reversion"}
+            else None
+        )
+        if predicate is not None:
+            evidence.update(_entry_predicate_evidence(predicate))
+            evidence.update({"raw_delta": None, "signal_strength": 0.0, "entry_eligible": False})
         if definition.family == "momentum":
             evidence.update(
                 {
@@ -830,8 +924,43 @@ def evaluate_signal_evaluation(
                     MODEL_INPUT_MISSING, evidence,
                 )
     score = _score_for_definition(definition, data)
-    reason = SIGNAL_PRODUCED if abs(score) > 1e-12 else STRATEGY_EVALUATED_DECLINED
-    side = "buy" if score > 0 else "sell" if score < 0 else "flat"
+    directional_prediction = (
+        definition.market_type is MarketType.PREDICTION
+        and definition.family in {"momentum", "mean_reversion"}
+    )
+    if directional_prediction:
+        raw_delta = _prediction_raw_delta(definition.family, snapshots, definition.parameters)
+        evidence["raw_delta"] = raw_delta
+        evidence["signal_strength"] = score
+        if predicate is not None:
+            minimum_move = _entry_predicate_minimum(predicate)
+            canonical_delta = _prediction_raw_delta_decimal(
+                definition.family,
+                snapshots,
+                definition.parameters,
+            )
+            canonical_minimum = _decimal_number(predicate.get("minimum_move"))
+            entry_eligible = (
+                raw_delta is not None
+                and math.isfinite(raw_delta)
+                and math.isfinite(minimum_move)
+                and canonical_delta is not None
+                and canonical_minimum is not None
+                and abs(canonical_delta) >= canonical_minimum
+            )
+            evidence["entry_eligible"] = entry_eligible
+            if not entry_eligible:
+                reason = ENTRY_PREDICATE_NOT_SATISFIED
+            else:
+                reason = SIGNAL_PRODUCED if abs(score) > 1e-12 else STRATEGY_EVALUATED_DECLINED
+        else:
+            reason = SIGNAL_PRODUCED if abs(score) > 1e-12 else STRATEGY_EVALUATED_DECLINED
+        side = "buy" if abs(score) > 1e-12 else "flat"
+        if side != "flat":
+            evidence["outcome"] = "yes" if score > 0 else "no"
+    else:
+        reason = SIGNAL_PRODUCED if abs(score) > 1e-12 else STRATEGY_EVALUATED_DECLINED
+        side = "buy" if score > 0 else "sell" if score < 0 else "flat"
     return Signal(definition.family, score, side, definition.market_type.value, reason, evidence)
 
 
@@ -872,7 +1001,7 @@ SignalEvaluator = BuiltinSignalEvaluator
 
 __all__ = [
     "BuiltinSignalEvaluator", "CONSTANT_BASELINE", "DIRECTIONAL_OOS_TRADING",
-    "INSUFFICIENT_LOOKBACK", "MODEL_INPUT_MISSING", "MODEL_INPUT_PRESENT",
+    "ENTRY_PREDICATE_NOT_SATISFIED", "INSUFFICIENT_LOOKBACK", "MODEL_INPUT_MISSING", "MODEL_INPUT_PRESENT",
     "ModelProbabilityEvaluation", "PROBABILITY_CALIBRATION_UNKNOWN",
     "SIGNAL_PRODUCED", "STRATEGY_EVALUATED_DECLINED", "Signal", "SignalEvaluator",
     "WARMING_UP", "evaluate_crypto_family", "evaluate_model_document",

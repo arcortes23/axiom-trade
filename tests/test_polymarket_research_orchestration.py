@@ -20,7 +20,11 @@ from axiom.storage import AxiomStore
 from axiom.collector import CollectorConfig, PolymarketCollector
 from axiom.data import InMemoryPredictionProvider
 from axiom.domain import Fill, MarketType, OrderBookLevel, OrderBookSnapshot, PredictionMarketSnapshot, SettlementState, Side
-from axiom.forward import ForwardTestRegistry
+from axiom.forward import (
+    ForwardTestRegistry,
+    _operational_setup_for_strategy,
+    _operational_setup_hash,
+)
 from axiom.node import NodeConfig, ResearchNode
 from axiom.paper_engine import (
     PAPER_STATE_EXECUTION_BINDING_MISMATCH,
@@ -402,6 +406,16 @@ class PolymarketResearchOrchestrationTests(unittest.TestCase):
             self.assertEqual(state["counts"]["running"], 1)
             self.assertEqual(state["counts"]["planned"], len(processor.campaign_configurations()) - 1)
 
+            self.assertEqual(
+                [
+                    item["configuration_id"]
+                    for item in state["protocol"]["configuration_manifest"]
+                ],
+                [
+                    item["configuration_id"]
+                    for item in processor.campaign_configurations()
+                ],
+            )
             durable = store.get_operator_job(processor.campaign_job_name("durable-campaign"))
             self.assertIsNotNone(durable)
             assert durable is not None
@@ -452,6 +466,129 @@ class PolymarketResearchOrchestrationTests(unittest.TestCase):
 
             resumed = AutonomousResearchProcessor(store, clock=lambda: T0).campaign_state("durable-campaign")
             self.assertEqual(resumed, state)
+
+
+    def test_v2_attested_setup_hash_is_stable_through_intent_registration(self) -> None:
+        with AxiomStore(":memory:") as store:
+            attestation = _save_attested_campaign_dataset(
+                store,
+                dataset_id="v2-attested-setup",
+                dataset_version="v1",
+            )
+            processor = AutonomousResearchProcessor(
+                store,
+                config=AutonomousResearchConfig(max_items_per_cycle=1),
+                clock=lambda: T0,
+            )
+            state = processor.start_polymarket_campaign(
+                "polymarket-paper-campaign-v2:attested-setup",
+                dataset_id="v2-attested-setup",
+                dataset_version="v1",
+                now=T0,
+            )
+            queued = processor.bus.list_campaign_trials(
+                "polymarket-paper-campaign-v2:attested-setup",
+                limit=10,
+            )
+            self.assertEqual(len(queued), 1)
+            cycle = processor.process_pending(now=T0)
+            self.assertEqual(cycle.failed, 0, repr(cycle))
+            candidates = store.load_candidate_lifecycle(limit=None)
+            self.assertTrue(candidates)
+            candidate = candidates[0]
+            candidate_payload = candidate["payload"]
+            candidate_id = str(candidate["candidate_id"])
+            intent_id = str(candidate_payload["paper_observation_intent_id"])
+            intent = ForwardTestRegistry(store).get(intent_id)
+            self.assertIsNotNone(intent)
+            assert intent is not None
+            run = store.load_experiment(candidate_id)
+            self.assertEqual(
+                candidate_payload["operational_setup"],
+                intent.config["operational_setup"],
+            )
+            self.assertEqual(
+                candidate_payload["operational_setup_hash"],
+                intent.config["operational_setup_hash"],
+            )
+            self.assertEqual(
+                run["operational_setup_hash"],
+                intent.config["operational_setup_hash"],
+            )
+            self.assertEqual(
+                intent.config["dataset_attestation"]["attestation_hash"],
+                attestation["attestation_hash"],
+            )
+            self.assertEqual(
+                intent.config["operational_setup"]["assessment_manifest_ref"]["attestation_hash"],
+                attestation["attestation_hash"],
+            )
+            self.assertEqual(
+                state["trials"][0]["operational_setup_hash"],
+                queued[0].payload["operational_setup_hash"],
+            )
+
+    def test_attestation_rotation_changes_forward_setup_identity(self) -> None:
+        strategy_document = {
+            "version": 1,
+            "market_type": "prediction",
+            "family": "momentum",
+            "parameters": {
+                "lookback": 1,
+                "threshold": 0.05,
+                "entry_predicate": {
+                    "version": "absolute-move-v1",
+                    "minimum_move": 0.05,
+                    "units": "probability",
+                    "boundary": "inclusive",
+                },
+            },
+            "probability_model": "plan-model-probability",
+            "resolution_aware": True,
+            "resolution_inputs": ["expiry", "settlement"],
+            "metadata": {
+                "operational_setup_id": "momentum:lookback-1:threshold-0.05",
+                "model_required": False,
+            },
+        }
+        # The production helper consumes the validated DSL document mapping,
+        # not the ``StrategyDefinition`` wrapper returned by ``load_strategy``.
+        # Keep this fixture identical to the document passed by campaign setup.
+        strategy = strategy_document
+        base_config = {
+            "dataset_id": "attested-setup",
+            "dataset_version": "v1",
+            "market_scope": {
+                "schema_version": "1",
+                "mode": "EXACT_MARKETS",
+                "instrument": "POLYMARKET",
+                "market_ids": ["market-0"],
+                "provenance": "canonical",
+            },
+            "dataset_boundary": {
+                "schema_version": "1",
+                "dataset_id": "attested-setup",
+                "dataset_version": "v1",
+                "ordered_row_manifest_digest": "sha256:rows",
+            },
+            "dataset_attestation": {"attestation_hash": "sha256:first"},
+        }
+        first = _operational_setup_for_strategy(strategy, base_config)
+        rotated_config = {
+            **base_config,
+            "dataset_attestation": {"attestation_hash": "sha256:second"},
+        }
+        rotated = _operational_setup_for_strategy(strategy, rotated_config)
+        assert first is not None
+        assert rotated is not None
+        self.assertEqual(first["assessment_manifest_ref"]["attestation_hash"], "sha256:first")
+        self.assertEqual(rotated["assessment_manifest_ref"]["attestation_hash"], "sha256:second")
+        self.assertNotEqual(_operational_setup_hash(first), _operational_setup_hash(rotated))
+        self.assertEqual(
+            _operational_setup_for_strategy(strategy, dict(base_config)),
+            first,
+        )
+        json.dumps(first, sort_keys=True, separators=(",", ":"))
 
     def test_legacy_planned_campaign_resumes_once_after_restart(self) -> None:
         legacy_grid = tuple(

@@ -31,10 +31,15 @@ from .bootstrap import (
 )
 from .data import PolymarketAdapter, SyntheticPredictionProvider
 from .domain import OrderBookSnapshot, ensure_utc, parse_timestamp, to_record, utc_now
-from .forward import ForwardTestRegistry, _content_hash
+from .forward import (
+    ForwardTestRegistry,
+    _content_hash,
+    _operational_setup_hash,
+)
 from .opportunity import scan_opportunities
 from .paper import CryptoPaperTrader
 from .paper_engine import (
+    OperationalPaperPolicy,
     PAPER_STATE_EXECUTION_BINDING_MISMATCH,
     paper_execution_binding,
     paper_state_binding_blocker,
@@ -53,6 +58,16 @@ from .lifecycle import PromotionCriteria
 from .strategy import evaluate_signal_record, load_strategy
 from .auto_canary import AutonomousCanaryWorker
 from .canary import CanaryBlocked, CanaryService
+from .canary_settings import CanarySettingsService
+from .shadow import (
+    SHADOW_STATUS_BLOCKED,
+    SHADOW_STATUS_COMPLETED,
+    SHADOW_STATUS_REGISTERED,
+    SHADOW_STATUS_RUNNING,
+    SHADOW_STATUS_STOPPED,
+    SHADOW_STATUS_WAITING_FOR_DATA,
+    ShadowAssessmentService,
+)
 
 POLYMARKET_HISTORICAL_JOB_NAME = "polymarket-historical-refresh"
 POLYMARKET_AUTONOMY_JOB_NAME = "polymarket-autonomy"
@@ -61,6 +76,8 @@ POLYMARKET_AUTONOMY_PROTOCOL_V2_ID = CAMPAIGN_PROTOCOL_V2_ID
 POLYMARKET_AUTONOMY_PROTOCOL_ID = POLYMARKET_AUTONOMY_PROTOCOL_V2_ID
 POLYMARKET_REPLAY_DATASET_ID = "Polymarket-recorded-book-replay"
 POLYMARKET_REPLAY_MAX_ROWS = 10_000
+_MAX_SHADOW_INTERVAL_SECONDS = 86_400.0
+_MAX_SHADOW_JOBS_PER_CYCLE = 100
 
 
 class _HistoricalRequestBudget:
@@ -370,6 +387,9 @@ class NodeConfig:
     historical_refresh_market_budget: int = 4
     paper_candidates_per_cycle: int = 4
     paper_observations_per_candidate: int = 64
+    shadow_enabled: bool = False
+    shadow_interval: float = 60.0
+    shadow_jobs_per_cycle: int = 1
     research_lease_seconds: float = 300.0
     experiment_total_limit: int = 1000
     experiment_family_limit: int = 250
@@ -428,13 +448,34 @@ class NodeConfig:
             raise ValueError("worker_name is required")
         if not str(self.crypto_symbol).strip():
             raise ValueError("crypto_symbol is required")
-        if not isinstance(self.crypto_enabled, bool):
-            raise ValueError("crypto_enabled must be boolean")
         interval = float(self.interval_seconds)
         cooldown = float(self.failure_cooldown_seconds)
         auto_interval = float(self.auto_canary_interval_seconds)
+        shadow_interval = float(self.shadow_interval)
         rolling_evidence_interval = float(self.rolling_evidence_interval_seconds)
         rolling_interval = float(self.rolling_review_interval_seconds)
+        if not isinstance(self.shadow_enabled, bool):
+            raise ValueError("shadow_enabled must be boolean")
+        if not isinstance(self.crypto_enabled, bool):
+            raise ValueError("crypto_enabled must be boolean")
+        if (
+            not math.isfinite(shadow_interval)
+            or shadow_interval <= 0
+            or shadow_interval > _MAX_SHADOW_INTERVAL_SECONDS
+        ):
+            raise ValueError(
+                "shadow_interval must be finite, positive, and no greater than "
+                f"{_MAX_SHADOW_INTERVAL_SECONDS:g} seconds"
+            )
+        if (
+            isinstance(self.shadow_jobs_per_cycle, bool)
+            or not isinstance(self.shadow_jobs_per_cycle, int)
+            or not 1 <= self.shadow_jobs_per_cycle <= _MAX_SHADOW_JOBS_PER_CYCLE
+        ):
+            raise ValueError(
+                "shadow_jobs_per_cycle must be an integer between one and "
+                f"{_MAX_SHADOW_JOBS_PER_CYCLE}"
+            )
         if not math.isfinite(auto_interval) or auto_interval <= 0:
             raise ValueError("auto_canary_interval_seconds must be finite and positive")
         if not math.isfinite(rolling_evidence_interval) or rolling_evidence_interval <= 0:
@@ -560,6 +601,122 @@ class _PersistedProbabilityModel:
         return None
 
 
+_OPERATIONAL_IDENTITY_ALIASES: dict[str, tuple[str, ...]] = {
+    "config_id": (
+        "operational_config_id",
+        "operational_settings_config_id",
+        "settings_config_id",
+        "active_settings_config_id",
+        "risk_config_id",
+        "active_risk_config_id",
+        "active_config_id",
+        "config_id",
+    ),
+    "generation": (
+        "operational_config_generation",
+        "operational_settings_generation",
+        "settings_generation",
+        "active_settings_generation",
+        "risk_config_generation",
+        "active_risk_config_generation",
+        "active_config_generation",
+        "generation",
+    ),
+    "config_hash": (
+        "operational_config_hash",
+        "operational_settings_hash",
+        "settings_config_hash",
+        "active_settings_config_hash",
+        "risk_config_hash",
+        "active_risk_config_hash",
+        "active_config_hash",
+        "config_hash",
+    ),
+}
+_OPERATIONAL_IDENTITY_ALIAS_TO_FIELD = {
+    alias: field_name
+    for field_name, aliases in _OPERATIONAL_IDENTITY_ALIASES.items()
+    for alias in aliases
+}
+
+
+_OPERATIONAL_IDENTITY_NAMESPACE_KEYS = frozenset(
+    {"operational_settings", "operational_identity", "active_settings"}
+)
+_OPERATIONAL_TOP_LEVEL_IDENTITY_ALIASES = frozenset(
+    alias
+    for aliases in _OPERATIONAL_IDENTITY_ALIASES.values()
+    for alias in aliases
+    if alias.startswith("operational_")
+)
+
+
+def _operational_identity_declarations(
+    config: Mapping[str, Any],
+) -> tuple[dict[str, tuple[Any, ...]], bool]:
+    """Collect declarations from explicit operational identity namespaces.
+
+    Generic ``config_id``, ``generation``, and ``config_hash`` fields are
+    common in legacy strategy/config documents and are not operational
+    identity by themselves.  Only explicit operational settings namespaces
+    may promote those generic names; at the config root, only the canonical
+    ``operational_*`` aliases are recognized.
+    """
+    declarations: dict[str, list[Any]] = {
+        field_name: [] for field_name in _OPERATIONAL_IDENTITY_ALIASES
+    }
+    operational_source_declared = False
+    seen: set[int] = set()
+
+    def visit(
+        value: Any,
+        *,
+        depth: int = 0,
+        in_operational_namespace: bool = False,
+    ) -> None:
+        nonlocal operational_source_declared
+        if depth > 8 or not isinstance(value, Mapping) or id(value) in seen:
+            return
+        seen.add(id(value))
+        for raw_key, child in value.items():
+            key = str(raw_key).replace("-", "_").strip().lower()
+            field_name = _OPERATIONAL_IDENTITY_ALIAS_TO_FIELD.get(key)
+            is_namespace = key in _OPERATIONAL_IDENTITY_NAMESPACE_KEYS
+            is_risk_alias = key.startswith(("risk_config_", "active_risk_config_"))
+            allowed_alias = (
+                not is_risk_alias
+                and (
+                    in_operational_namespace
+                    or (depth == 0 and key in _OPERATIONAL_TOP_LEVEL_IDENTITY_ALIASES)
+                )
+            )
+            if field_name is not None and child not in (None, "") and allowed_alias:
+                declarations[field_name].append(child)
+                operational_source_declared = True
+            if is_namespace and child is not None:
+                operational_source_declared = True
+            child_in_operational_namespace = (
+                in_operational_namespace or is_namespace
+            )
+            if isinstance(child, Mapping):
+                visit(
+                    child,
+                    depth=depth + 1,
+                    in_operational_namespace=child_in_operational_namespace,
+                )
+            elif isinstance(child, (list, tuple)):
+                for item in child:
+                    if isinstance(item, Mapping):
+                        visit(
+                            item,
+                            depth=depth + 1,
+                            in_operational_namespace=child_in_operational_namespace,
+                        )
+
+    visit(config)
+    return {name: tuple(values) for name, values in declarations.items()}, operational_source_declared
+
+
 class ResearchNode:
     """Run collection, paper workers, and durable research recovery."""
 
@@ -628,6 +785,12 @@ class ResearchNode:
                 )
             self.historical_provider = selected_historical_provider
         self.provider = selected_provider
+        self.shadow_service = ShadowAssessmentService(
+            self.store,
+            clock=clock,
+            max_markets=min(config.max_markets, 1_000),
+            max_observations=min(config.paper_observations_per_candidate, 10_000),
+        )
         self.opportunity_model = opportunity_model
         self.sleep = sleep
         self.clock = clock
@@ -670,9 +833,11 @@ class ResearchNode:
         self._historical_refresh_thread: threading.Thread | None = None
         self._auto_canary_thread: threading.Thread | None = None
         self._rolling_portfolio_thread: threading.Thread | None = None
+        self._shadow_assessment_thread: threading.Thread | None = None
         self._historical_thread: threading.Thread | None = None
         self._worker_runtime_lock = threading.RLock()
         self._worker_runtime: dict[str, dict[str, Any]] = {}
+        self._shadow_cycle_evidence: dict[str, Any] = self._shadow_evidence_template()
         self._worker_restart_counts: dict[str, int] = {}
         self._worker_fatal: set[str] = set()
         self._health_passes = 0
@@ -744,6 +909,34 @@ class ResearchNode:
             ),
             clock=clock,
         )
+
+    def _shadow_evidence_template(self) -> dict[str, Any]:
+        return {
+            "enabled": bool(self.config.shadow_enabled),
+            "configured_interval_seconds": float(self.config.shadow_interval),
+            "jobs_per_cycle": int(self.config.shadow_jobs_per_cycle),
+            "active_job_count": 0,
+            "due_job_count": 0,
+            "selected_job_count": 0,
+            "processed_jobs": 0,
+            "successful_jobs": 0,
+            "failed_jobs": 0,
+            "completed_jobs": 0,
+            "running_jobs": 0,
+            "waiting_for_data_jobs": 0,
+            "blocked_jobs": 0,
+            "status_counts": {},
+            "processed_job_ids": [],
+            "job_statuses": [],
+            "blockers": [],
+            "errors": [],
+            "next_evaluation_at": None,
+            "last_cycle_started_at": None,
+            "last_cycle_ended_at": None,
+            "next_work": "disabled" if not self.config.shadow_enabled else "evaluate_due_shadow_jobs",
+            "paper_only": True,
+            "live_execution": False,
+        }
 
     @property
     def lock_path(self) -> Path:
@@ -1156,6 +1349,7 @@ class ResearchNode:
         self._historical_error = None
         with self._worker_runtime_lock:
             self._worker_runtime = {}
+        self._shadow_cycle_evidence = self._shadow_evidence_template()
         self._worker_restart_counts = {}
         self._worker_fatal.clear()
         self._health_passes = 0
@@ -1184,6 +1378,7 @@ class ResearchNode:
                     "started_at": self.started_at.isoformat(),
                     "paper_only": True,
                     "live_execution": False,
+                    "shadow_assessment": dict(self._shadow_cycle_evidence),
                     "crypto_paper": dict(self._crypto_status),
                 },
                 started_at=self.started_at,
@@ -1263,6 +1458,15 @@ class ResearchNode:
                     "live_execution": False,
                 },
             }
+            worker_start_states["shadow-assessment"] = {
+                **dict(self._shadow_cycle_evidence),
+                "next_work": (
+                    "evaluate_due_shadow_jobs"
+                    if self.config.shadow_enabled
+                    else "disabled"
+                ),
+                "worker_status": "IDLE" if self.config.shadow_enabled else "DISABLED",
+            }
             if self.config.historical_refresh_enabled:
                 worker_start_states[POLYMARKET_HISTORICAL_JOB_NAME] = {
                     "configured_interval_seconds": float(
@@ -1302,7 +1506,14 @@ class ResearchNode:
                                 worker_name == "autonomous-canary"
                                 and not self.config.mutation_enabled
                             )
-                            else ("idle" if max_cycles == 0 else "running")
+                            else (
+                                "disabled"
+                                if (
+                                    worker_name == "shadow-assessment"
+                                    and not self.config.shadow_enabled
+                                )
+                                else ("idle" if max_cycles == 0 else "running")
+                            )
                         )
                     ),
                 )
@@ -1374,6 +1585,7 @@ class ResearchNode:
                 self._historical_refresh_thread,
                 self._auto_canary_thread,
                 self._rolling_portfolio_thread,
+                self._shadow_assessment_thread,
                 self._historical_thread,
             ):
                 if worker is not None:
@@ -1384,6 +1596,7 @@ class ResearchNode:
             self._health_thread = None
             self._historical_refresh_thread = None
             self._auto_canary_thread = None
+            self._shadow_assessment_thread = None
             self._rolling_portfolio_thread = None
             self._historical_thread = None
             try:
@@ -1394,6 +1607,7 @@ class ResearchNode:
                         "attempts": self._collection_count - self._run_cycle_base,
                         "restart_count": self._restart_count,
                         "crypto_paper": dict(self._crypto_status),
+                        "shadow_assessment": dict(self._shadow_cycle_evidence),
                     },
                 )
             except Exception:
@@ -1450,6 +1664,13 @@ class ResearchNode:
                 name=f"{self.config.worker_name}-historical-refresh",
                 daemon=True,
             )
+        self._shadow_assessment_thread = None
+        if self.config.shadow_enabled:
+            self._shadow_assessment_thread = threading.Thread(
+                target=self._shadow_assessment_worker_loop,
+                name=f"{self.config.worker_name}-shadow-assessment",
+                daemon=True,
+            )
         self._auto_canary_thread = None
         self._rolling_portfolio_thread = threading.Thread(
             target=self._rolling_portfolio_worker_loop,
@@ -1464,6 +1685,8 @@ class ResearchNode:
             )
         self._historical_thread = self._historical_refresh_thread
         self._collector_thread.start()
+        if self._shadow_assessment_thread is not None:
+            self._shadow_assessment_thread.start()
         self._research_thread.start()
         self._health_thread.start()
         if self._historical_refresh_thread is not None:
@@ -1481,6 +1704,11 @@ class ResearchNode:
             "research-engine": ("_research_thread", self._research_worker_loop),
             "health-monitor": ("_health_thread", self._health_worker_loop),
         }
+        if self.config.shadow_enabled:
+            specs["shadow-assessment"] = (
+                "_shadow_assessment_thread",
+                self._shadow_assessment_worker_loop,
+            )
         if self.config.historical_refresh_enabled:
             specs[POLYMARKET_HISTORICAL_JOB_NAME] = (
                 "_historical_refresh_thread",
@@ -1563,6 +1791,284 @@ class ResearchNode:
             setattr(self, attribute, replacement)
             replacement.start()
         return True
+    def _run_shadow_assessment_tick(
+        self,
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Run one bounded tick and publish its coherent progress snapshot."""
+        current = ensure_utc(now or self.clock())
+        worker_name = "shadow-assessment"
+        self._worker_tick_started(
+            worker_name,
+            next_work="evaluate_due_shadow_jobs",
+            timestamp=current,
+        )
+        active_statuses = (
+            SHADOW_STATUS_REGISTERED,
+            SHADOW_STATUS_RUNNING,
+            SHADOW_STATUS_WAITING_FOR_DATA,
+        )
+        rows_by_id: dict[str, Mapping[str, Any]] = {}
+        for status in active_statuses:
+            rows = self.shadow_service.list(status=status, limit=1_000)
+            for row in rows:
+                if not isinstance(row, Mapping):
+                    continue
+                job_id = str(row.get("job_id") or "").strip()
+                if job_id:
+                    rows_by_id[job_id] = row
+
+        def sort_key(row: Mapping[str, Any]) -> tuple[Any, ...]:
+            next_at = parse_timestamp(row.get("next_evaluation_at"))
+            updated_at = parse_timestamp(row.get("updated_at"))
+            status = str(row.get("status") or "").strip().upper()
+            status_order = {
+                SHADOW_STATUS_REGISTERED: 0,
+                SHADOW_STATUS_RUNNING: 1,
+                SHADOW_STATUS_WAITING_FOR_DATA: 2,
+            }.get(status, 99)
+            return (
+                next_at is not None,
+                next_at or datetime.min.replace(tzinfo=current.tzinfo),
+                status_order,
+                updated_at or datetime.min.replace(tzinfo=current.tzinfo),
+                str(row.get("job_id") or ""),
+            )
+
+        active_rows = list(rows_by_id.values())
+        due_rows = [
+            row
+            for row in active_rows
+            if (
+                (next_at := parse_timestamp(row.get("next_evaluation_at"))) is None
+                or next_at <= current
+            )
+        ]
+        due_rows.sort(key=sort_key)
+        selected = due_rows[: self.config.shadow_jobs_per_cycle]
+        states: dict[str, dict[str, Any]] = {}
+        for row in active_rows:
+            job_id = str(row.get("job_id") or "").strip()
+            state = row.get("state")
+            state_mapping = state if isinstance(state, Mapping) else {}
+            states[job_id] = {
+                "job_id": job_id,
+                "status": str(row.get("status") or "").strip().upper(),
+                "blocker": (
+                    str(state_mapping.get("last_blocker") or "").strip()
+                    or None
+                ),
+                "next_evaluation_at": (
+                    row.get("next_evaluation_at")
+                    if row.get("next_evaluation_at") is not None
+                    else state_mapping.get("next_evaluation_at")
+                ),
+            }
+
+        processed_ids: list[str] = []
+        blockers: list[str] = []
+        errors: list[str] = []
+        successful_jobs = 0
+        failed_jobs = 0
+        for row in selected:
+            job_id = str(row.get("job_id") or "").strip()
+            if not job_id:
+                continue
+            processed_ids.append(job_id)
+            try:
+                result = self.shadow_service.tick(
+                    job_id,
+                    self.provider,
+                    now=current,
+                    interval_seconds=float(self.config.shadow_interval),
+                )
+                if not isinstance(result, Mapping):
+                    raise RuntimeError("shadow service returned an invalid tick result")
+                result_status = str(result.get("status") or "").strip().upper()
+                if not result_status:
+                    raise RuntimeError("shadow service returned no job status")
+                result_state = result.get("state")
+                result_state_mapping = (
+                    result_state if isinstance(result_state, Mapping) else {}
+                )
+                blocker = (
+                    str(
+                        result.get("blocker")
+                        or result_state_mapping.get("last_blocker")
+                        or ""
+                    ).strip()
+                    or None
+                )
+                states[job_id] = {
+                    "job_id": job_id,
+                    "status": result_status,
+                    "blocker": blocker,
+                    "next_evaluation_at": result.get("next_evaluation_at")
+                    if result.get("next_evaluation_at") is not None
+                    else result_state_mapping.get("next_evaluation_at"),
+                }
+                successful_jobs += 1
+                if blocker and blocker not in blockers:
+                    blockers.append(blocker)
+            except BaseException as exc:
+                failed_jobs += 1
+                message = f"{job_id}: {exc}"
+                errors.append(message)
+                blocker = type(exc).__name__.upper()
+                if blocker not in blockers:
+                    blockers.append(blocker)
+                states[job_id] = {
+                    **states.get(job_id, {"job_id": job_id}),
+                    "blocker": blocker,
+                }
+
+        status_counts: dict[str, int] = {}
+        for item in states.values():
+            status = str(item.get("status") or "UNKNOWN").upper()
+            status_counts[status] = status_counts.get(status, 0) + 1
+        active_current = {
+            SHADOW_STATUS_REGISTERED,
+            SHADOW_STATUS_RUNNING,
+            SHADOW_STATUS_WAITING_FOR_DATA,
+        }
+        next_values = [
+            parsed
+            for item in states.values()
+            if str(item.get("status") or "").upper() in active_current
+            and (parsed := parse_timestamp(item.get("next_evaluation_at"))) is not None
+            and parsed > current
+        ]
+        next_evaluation = (
+            min(next_values)
+            if next_values
+            else current + timedelta(seconds=float(self.config.shadow_interval))
+        )
+        selected_states = [
+            states[job_id]
+            for job_id in processed_ids
+            if job_id in states
+        ]
+        for item in selected_states:
+            if item.get("blocker") and item["blocker"] not in blockers:
+                blockers.append(str(item["blocker"]))
+        ended_at = ensure_utc(self.clock())
+        evidence = {
+            "enabled": True,
+            "configured_interval_seconds": float(self.config.shadow_interval),
+            "jobs_per_cycle": int(self.config.shadow_jobs_per_cycle),
+            "active_job_count": len(active_rows),
+            "due_job_count": len(due_rows),
+            "selected_job_count": len(selected),
+            "processed_jobs": len(processed_ids),
+            "successful_jobs": successful_jobs,
+            "failed_jobs": failed_jobs,
+            "completed_jobs": sum(
+                1
+                for item in selected_states
+                if item.get("status") == SHADOW_STATUS_COMPLETED
+            ),
+            "running_jobs": sum(
+                1
+                for item in states.values()
+                if item.get("status") == SHADOW_STATUS_RUNNING
+            ),
+            "waiting_for_data_jobs": sum(
+                1
+                for item in states.values()
+                if item.get("status") == SHADOW_STATUS_WAITING_FOR_DATA
+            ),
+            "blocked_jobs": sum(
+                1
+                for item in selected_states
+                if item.get("status") == SHADOW_STATUS_BLOCKED
+            ),
+            "status_counts": status_counts,
+            "processed_job_ids": processed_ids[:_MAX_SHADOW_JOBS_PER_CYCLE],
+            "job_statuses": selected_states[:_MAX_SHADOW_JOBS_PER_CYCLE],
+            "blockers": blockers[:64],
+            "errors": errors[:64],
+            "next_evaluation_at": next_evaluation.isoformat(),
+            "last_cycle_started_at": current.isoformat(),
+            "last_cycle_ended_at": ended_at.isoformat(),
+            "next_work": next_evaluation.isoformat(),
+            "paper_only": True,
+            "live_execution": False,
+        }
+        with self._worker_runtime_lock:
+            runtime = self._worker_runtime.setdefault(worker_name, {"errors": []})
+            for key, value in evidence.items():
+                if key != "errors":
+                    runtime[key] = value
+        self._shadow_cycle_evidence = dict(evidence)
+        self.store.set_scheduler_state(worker_name, dict(evidence))
+        self._worker_tick_completed(
+            worker_name,
+            successful=not failed_jobs,
+            successful_candidates=processed_ids,
+            decision="SHADOW_CYCLE_COMPLETE",
+            next_work=evidence["next_work"],
+            error="; ".join(errors) if errors else None,
+            extra=evidence,
+        )
+        try:
+            self._heartbeat(
+                "running",
+                {"shadow_assessment": dict(evidence)},
+            )
+        except Exception as exc:
+            self._log(
+                logging.WARNING,
+                "shadow root evidence update failed: %s",
+                exc,
+            )
+        return evidence
+
+    def _shadow_assessment_worker_loop(self) -> None:
+        """Schedule bounded, paper-only shadow service ticks."""
+        worker_name = "shadow-assessment"
+        interval = float(self.config.shadow_interval)
+        status = "idle"
+        try:
+            while not self.stop_event.is_set():
+                try:
+                    evidence = self._run_shadow_assessment_tick()
+                    status = "degraded" if evidence["failed_jobs"] else "idle"
+                except BaseException as exc:
+                    status = "degraded"
+                    self._worker_tick_failed(
+                        worker_name,
+                        exc,
+                        fatal=False,
+                        next_work="retry_shadow_assessment",
+                    )
+                    self._log(logging.ERROR, "shadow worker tick failed: %s", exc)
+                if self.stop_event.wait(interval):
+                    break
+        except BaseException as exc:
+            status = "degraded"
+            self._worker_tick_failed(
+                worker_name,
+                exc,
+                fatal=False,
+                next_work="operator_review_required",
+            )
+            self._log(logging.ERROR, "shadow worker loop failed: %s", exc)
+        finally:
+            try:
+                self._persist_worker_runtime(
+                    worker_name,
+                    "stopped" if self.stop_event.is_set() else status,
+                    extra={
+                        "next_work": "stopped",
+                        "shadow_assessment": dict(self._shadow_cycle_evidence),
+                    },
+                )
+            except Exception:
+                pass
+            with self._worker_condition:
+                self._worker_condition.notify_all()
+
     def _auto_canary_worker_loop(self) -> None:
         """Run isolated ticks with bounded recovery and truthful boundaries."""
         if self._auto_canary_fatal:
@@ -3639,6 +4145,16 @@ class ResearchNode:
                 status = "stale" if lock_exists or pid_marker_exists else "stopped"
         elif status not in {"stopped", "closed", "stale"} and health_degraded:
             status = "degraded"
+        persisted_shadow = (
+            worker_payload.get("shadow_assessment")
+            if isinstance(worker_payload, Mapping)
+            else None
+        )
+        shadow_evidence = (
+            dict(persisted_shadow)
+            if isinstance(persisted_shadow, Mapping)
+            else dict(self._shadow_cycle_evidence)
+        )
         payload = {
             "worker_name": self.config.worker_name,
             "status": status,
@@ -3668,6 +4184,7 @@ class ResearchNode:
             "paper_only": True,
             "live_execution": False,
             "crypto_paper": dict(self._crypto_status),
+            "shadow_assessment": shadow_evidence,
             "autonomous_research": {
                 "enabled": self.config.research_enabled,
                 "queue": self.store.research_queue_stats(),
@@ -3889,9 +4406,24 @@ class ResearchNode:
                 "last_error": str(exc),
             }
             self._log(logging.ERROR, "crypto paper cycle failed: %s", exc)
+    def _select_opportunity_estimate(
+        self,
+        market_id: str,
+        record: Mapping[str, Any],
+    ) -> Any:
+        model = self.opportunity_model
+        if isinstance(model, Mapping):
+            return model.get(market_id)
+        if callable(model):
+            return model(record)
+        return None
     def _run_persisted_opportunity_pipeline(self, started: datetime) -> bool:
         """Scan the collector's newest evidence without issuing a second sweep."""
-        if self.opportunity_model is not None and not isinstance(self.opportunity_model, Mapping):
+        if (
+            self.opportunity_model is not None
+            and not isinstance(self.opportunity_model, Mapping)
+            and not callable(self.opportunity_model)
+        ):
             return False
         collector_state = self.store.get_collector_state("polymarket") or {}
         has_completed_collection = bool(collector_state.get("last_cycle_ended_at"))
@@ -3968,17 +4500,20 @@ class ResearchNode:
                 quality = str(record.get("research_quality") or "PRICE_PROXY")
                 uncertainty = 1.0
             else:
-                estimate = self.opportunity_model.get(market_id)
+                estimate = self._select_opportunity_estimate(market_id, record)
                 version = "configured-model"
                 quality = "MODEL_ESTIMATE"
                 uncertainty = 0.0
             if isinstance(estimate, Mapping):
-                probability_value = estimate.get("probability", estimate.get("yes_probability", estimate.get("prediction")))
+                probability_value = estimate.get(
+                    "probability",
+                    estimate.get("yes_probability", estimate.get("prediction")),
+                )
                 version = str(estimate.get("model_version", version))
                 quality = str(estimate.get("research_quality", quality))
                 uncertainty = float(estimate.get("uncertainty", uncertainty) or 0.0)
             else:
-                probability_value = estimate
+                probability_value = getattr(estimate, "probability", estimate)
             try:
                 probability = float(probability_value)
                 uncertainty = float(uncertainty)
@@ -4231,6 +4766,7 @@ class ResearchNode:
                     ),
                 }
                 evidence_by_market[market_id] = evidence
+                features: Mapping[str, Any] = {}
                 if self.opportunity_model is None:
                     estimate = record.get("yes_mid")
                     if estimate is None:
@@ -4238,29 +4774,28 @@ class ResearchNode:
                     version = "market-price-baseline-v1"
                     quality = "PRICE_PROXY"
                     uncertainty = 1.0
-                    features: Mapping[str, Any] = {}
-                elif isinstance(self.opportunity_model, Mapping):
-                    estimate = self.opportunity_model.get(market_id)
+                    probability_value = estimate
+                else:
+                    estimate = self._select_opportunity_estimate(market_id, record)
                     version = "configured-model"
                     quality = "MODEL_ESTIMATE"
                     uncertainty = 0.0
-                    features = {}
-                else:
-                    estimate = self.opportunity_model(market)
-                    version = str(getattr(estimate, "model_version", "configured-model"))
-                    quality = str(getattr(estimate, "research_quality", "MODEL_ESTIMATE"))
-                    uncertainty = float(getattr(estimate, "uncertainty", 0.0) or 0.0)
-                    features_value = getattr(estimate, "features", {})
-                    features = features_value if isinstance(features_value, Mapping) else {}
-                if isinstance(estimate, Mapping):
-                    probability_value = estimate.get("probability", estimate.get("yes_probability", estimate.get("prediction")))
-                    version = str(estimate.get("model_version", version))
-                    quality = str(estimate.get("research_quality", quality))
-                    uncertainty = float(estimate.get("uncertainty", uncertainty) or 0.0)
-                    features_value = estimate.get("features", {})
-                    features = features_value if isinstance(features_value, Mapping) else features
-                else:
-                    probability_value = getattr(estimate, "probability", estimate)
+                    if isinstance(estimate, Mapping):
+                        probability_value = estimate.get(
+                            "probability",
+                            estimate.get("yes_probability", estimate.get("prediction")),
+                        )
+                        version = str(estimate.get("model_version", version))
+                        quality = str(estimate.get("research_quality", quality))
+                        uncertainty = float(estimate.get("uncertainty", uncertainty) or 0.0)
+                        features_value = estimate.get("features", {})
+                        features = (
+                            features_value
+                            if isinstance(features_value, Mapping)
+                            else features
+                        )
+                    else:
+                        probability_value = getattr(estimate, "probability", estimate)
                 try:
                     probability = float(probability_value)
                     uncertainty = float(uncertainty)
@@ -4373,6 +4908,10 @@ class ResearchNode:
                 and not (
                     bool((spec.config if isinstance(spec.config, Mapping) else {}).get("observation_intent"))
                     and not spec.allowed_markets
+                )
+                and not (
+                    bool((spec.config if isinstance(spec.config, Mapping) else {}).get("shadow_assessment"))
+                    or bool((spec.config if isinstance(spec.config, Mapping) else {}).get("shadow_only"))
                 )
             ),
             key=lambda spec: (spec.start_timestamp, spec.experiment_id),
@@ -4514,6 +5053,344 @@ class ResearchNode:
             heartbeat_at=ensure_utc(self.clock()),
         )
         return stats
+    def _operational_paper_runtime(
+        self,
+        spec: Any,
+        *,
+        observed_at: datetime,
+    ) -> dict[str, Any] | None:
+        """Resolve the active paper envelope for an explicit operational setup.
+
+        Operational setup records are the only forward candidates allowed to
+        consume the live settings projection.  The projection is read-only and
+        never consults the legacy canary control row as authorization.
+        """
+        config = spec.config if isinstance(spec.config, Mapping) else {}
+        setup = config.get("operational_setup")
+        setup_hash = str(config.get("operational_setup_hash", "") or "").strip()
+        if setup is None and not setup_hash:
+            return None
+
+        def blocked(blocker: str, **details: Any) -> dict[str, Any]:
+            return {
+                "blocker": blocker,
+                "reason": details.pop("reason", blocker),
+                "retryable": False,
+                "non_retryable": True,
+                **details,
+            }
+
+        if not isinstance(setup, Mapping) or not setup_hash:
+            return blocked("OPERATIONAL_SETUP_INVALID")
+        family = str(setup.get("family", "")).strip().lower()
+        setup_id = str(setup.get("setup_id", "")).strip().lower()
+        if family not in {"momentum", "mean_reversion"} or not setup_id.startswith(
+            f"{family}:absolute-move-v1:"
+        ):
+            return blocked("OPERATIONAL_SETUP_UNSUPPORTED")
+        try:
+            canonical_hash = _operational_setup_hash(setup)
+        except Exception:
+            canonical_hash = ""
+        if setup_hash != canonical_hash:
+            return blocked("OPERATIONAL_SETUP_HASH_MISMATCH")
+
+        settings = CanarySettingsService(
+            self.store,
+            clock=self.clock,
+            initialize=False,
+        )
+        try:
+            snapshot = settings.snapshot(now=observed_at)
+        except Exception as exc:
+            return blocked(
+                "ACTIVE_SETTINGS_UNAVAILABLE",
+                reason="active canary settings are unavailable",
+                error=str(exc),
+            )
+        if (
+            not isinstance(snapshot, Mapping)
+            or str(snapshot.get("status", "")).strip().upper() != "CURRENT"
+            or snapshot.get("settings_available") is not True
+        ):
+            return blocked(
+                "ACTIVE_SETTINGS_NOT_CURRENT",
+                reason="active canary settings are not CURRENT",
+                settings_snapshot=dict(snapshot) if isinstance(snapshot, Mapping) else None,
+            )
+        active = snapshot.get("active")
+        if not isinstance(active, Mapping):
+            return blocked("ACTIVE_SETTINGS_IDENTITY_INVALID")
+        active_state = str(active.get("state", active.get("status", ""))).strip().upper()
+        config_id = str(snapshot.get("config_id") or active.get("config_id") or "").strip()
+        config_hash = str(snapshot.get("config_hash") or active.get("config_hash") or "").strip()
+        try:
+            generation = int(snapshot.get("generation", active.get("generation", 0)))
+            active_generation = int(active.get("generation", 0))
+        except (TypeError, ValueError, OverflowError):
+            generation = 0
+            active_generation = 0
+        if (
+            active_state not in {"ACTIVE", "CURRENT"}
+            or not config_id
+            or not config_hash
+            or generation < 1
+            or active_generation != generation
+            or str(active.get("config_id", "")).strip() != config_id
+            or str(active.get("config_hash", "")).strip() != config_hash
+        ):
+            return blocked("ACTIVE_SETTINGS_IDENTITY_INVALID")
+        identity = {
+            "config_id": config_id,
+            "generation": generation,
+            "config_hash": config_hash,
+            "paper_only": True,
+        }
+
+        declarations, identity_declared = _operational_identity_declarations(config)
+        expected: dict[str, Any] = {}
+        conflicting: dict[str, tuple[Any, ...]] = {}
+        for field_name, values in declarations.items():
+            if not values:
+                continue
+            normalized_values: list[Any] = []
+            for value in values:
+                if field_name == "generation":
+                    if isinstance(value, bool):
+                        normalized_values.append(str(value))
+                        continue
+                    try:
+                        parsed_generation = int(value)
+                    except (TypeError, ValueError, OverflowError):
+                        normalized_values.append(value)
+                        continue
+                    if isinstance(value, float) and not value.is_integer():
+                        normalized_values.append(value)
+                    elif isinstance(value, str) and not re.fullmatch(
+                        r"[+-]?\d+", value.strip()
+                    ):
+                        normalized_values.append(value)
+                    else:
+                        normalized_values.append(parsed_generation)
+                else:
+                    normalized_values.append(str(value).strip())
+            unique_values: list[Any] = []
+            for value in normalized_values:
+                if value not in unique_values:
+                    unique_values.append(value)
+            if len(unique_values) > 1:
+                conflicting[field_name] = tuple(unique_values)
+            expected[field_name] = unique_values[0]
+        if conflicting:
+            return blocked(
+                "OPERATIONAL_SETTINGS_IDENTITY_MISMATCH",
+                reason="operational settings identity declarations conflict",
+                expected_identity=expected,
+                conflicting_identity=conflicting,
+                current_identity=dict(identity),
+            )
+        if identity_declared and set(expected) != {"config_id", "generation", "config_hash"}:
+            return blocked(
+                "OPERATIONAL_SETTINGS_IDENTITY_MISMATCH",
+                reason="operational settings identity is incomplete",
+                expected_identity=expected,
+                current_identity=dict(identity),
+            )
+        if any(expected.get(name) != identity[name] for name in expected):
+            return blocked(
+                "OPERATIONAL_SETTINGS_IDENTITY_MISMATCH",
+                expected_identity=expected,
+                current_identity=dict(identity),
+            )
+
+        limits = snapshot.get("effective_limits")
+        if not isinstance(limits, Mapping):
+            limits = active.get("values", active.get("settings"))
+        if not isinstance(limits, Mapping):
+            return blocked("ACTIVE_SETTINGS_LIMITS_INVALID")
+        required_limits = (
+            "max_all_in_buy_usd",
+            "max_fee_reserve_usd",
+            "max_gross_daily_buy_usd",
+            "max_aggregate_open_cost_usd",
+            "max_aggregate_exposure_usd",
+            "max_positions",
+            "max_submitted_orders_per_day",
+            "realized_loss_entry_stop_usd",
+            "equity_loss_entry_stop_usd",
+        )
+        if any(name not in limits or limits[name] in (None, "") for name in required_limits):
+            return blocked("ACTIVE_SETTINGS_LIMITS_INVALID")
+        try:
+            policy = OperationalPaperPolicy.from_value(limits)
+        except (TypeError, ValueError) as exc:
+            return blocked(
+                "ACTIVE_SETTINGS_LIMITS_INVALID",
+                reason="active canary settings limits are invalid",
+                error=str(exc),
+            )
+        return {
+            "policy": policy,
+            "identity": identity,
+            "settings_snapshot": dict(snapshot),
+        }
+
+    def _operational_paper_blocked_result(
+        self,
+        spec: Any,
+        *,
+        worker_name: str,
+        started: datetime,
+        runtime: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        blocker = str(runtime.get("blocker") or "ACTIVE_SETTINGS_UNAVAILABLE")
+        result = {
+            "status": "BLOCKED",
+            "experiment_id": spec.experiment_id,
+            "observations_seen": 0,
+            "observations_processed": 0,
+            "observations_skipped": 0,
+            "fills_inserted": 0,
+            "settlements": 0,
+            "execution_events": 0,
+            "errors": [blocker],
+            "blocker": blocker,
+            "reason_code": blocker,
+            "reason": str(runtime.get("reason") or blocker),
+            "retryable": False,
+            "non_retryable": True,
+            "execution_skipped": True,
+            "paper_only": True,
+            "live_execution": False,
+        }
+        for key in ("error", "settings_snapshot", "expected_identity", "current_identity"):
+            if key in runtime:
+                result[key] = runtime[key]
+        self.store.save_worker_state(
+            worker_name,
+            "blocked",
+            {
+                "pid": os.getpid(),
+                "experiment_id": spec.experiment_id,
+                **result,
+                "last_error": None,
+                "next_retry_at": None,
+            },
+            started_at=started,
+            heartbeat_at=ensure_utc(self.clock()),
+        )
+        return result
+
+    @staticmethod
+    def _carry_forward_market_rules(
+        observation: dict[str, Any],
+        payload: Mapping[str, Any],
+        *,
+        include_missing: bool,
+    ) -> None:
+        """Project venue rules from collected snapshot/book metadata."""
+        names = {
+            "min_order_size": (
+                "min_order_size",
+                "order_min_size",
+                "minimum_order_size",
+                "min_size",
+                "minimum_size",
+                "quantity_min",
+                "minQuantity",
+                "minOrderSize",
+            ),
+            "size_increment": (
+                "size_increment",
+                "quantity_step",
+                "order_size_increment",
+                "step_size",
+                "quantity_increment",
+                "sizeIncrement",
+            ),
+            "min_notional": (
+                "min_notional",
+                "minimum_notional",
+                "min_cost",
+                "minimum_cost",
+                "min_notional_usd",
+                "minimum_notional_usd",
+                "minimum_cost_usd",
+                "min_order_value",
+                "minimum_order_value",
+                "minNotional",
+                "minimumNotional",
+            ),
+            "tick_size": (
+                "tick_size",
+                "tickSize",
+                "price_increment",
+                "price_tick_size",
+                "order_price_min_tick_size",
+                "orderPriceMinTickSize",
+            ),
+        }
+
+        def sources_for(
+            source: Mapping[str, Any] | None,
+        ) -> list[Mapping[str, Any]]:
+            if not isinstance(source, Mapping):
+                return []
+            result = [source]
+            for key in ("market_rules", "rules", "extra", "metadata", "snapshot", "order_book"):
+                nested = source.get(key)
+                if isinstance(nested, Mapping):
+                    result.append(nested)
+            return result
+
+        def extract(sources: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+            found: dict[str, Any] = {}
+            for source in sources:
+                for canonical, aliases in names.items():
+                    if canonical in found:
+                        continue
+                    for alias in aliases:
+                        value = source.get(alias)
+                        if value not in (None, ""):
+                            found[canonical] = value
+                            break
+            return found
+
+        snapshot = observation.get("snapshot")
+        base_sources: list[Mapping[str, Any]] = []
+        for source in (
+            payload,
+            observation,
+            snapshot if isinstance(snapshot, Mapping) else None,
+            payload.get("metadata"),
+        ):
+            base_sources.extend(sources_for(source))
+        found = extract(base_sources)
+        for canonical, value in found.items():
+            observation.setdefault(canonical, value)
+            if canonical == "min_notional":
+                observation.setdefault("min_cost", value)
+        if include_missing:
+            for canonical in names:
+                observation.setdefault(canonical, None)
+
+        for outcome in ("yes", "no"):
+            outcome_sources: list[Mapping[str, Any]] = []
+            for source in (
+                payload.get(f"{outcome}_market_rules"),
+                payload.get(f"{outcome}_order_book"),
+            ):
+                outcome_sources.extend(sources_for(source))
+            outcome_found = extract(outcome_sources)
+            if outcome_found or include_missing:
+                nested_rules = dict(outcome_found)
+                if "min_notional" in nested_rules:
+                    nested_rules.setdefault("min_cost", nested_rules["min_notional"])
+                if include_missing:
+                    for canonical in names:
+                        nested_rules.setdefault(canonical, None)
+                observation[f"{outcome}_market_rules"] = nested_rules
+
     def _paper_binding_blocked_result(
         self,
         spec: Any,
@@ -4521,6 +5398,8 @@ class ResearchNode:
         worker_name: str,
         started: datetime,
         paper_store: AxiomStore,
+        operational_policy: OperationalPaperPolicy | Mapping[str, Any] | Any | None = None,
+        operational_settings: Mapping[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         state_record = paper_store.load_paper_state(spec.experiment_id)
         if state_record is None:
@@ -4533,7 +5412,11 @@ class ResearchNode:
         )
         blocker = paper_state_binding_blocker(
             persisted_binding,
-            paper_execution_binding(spec),
+            paper_execution_binding(
+                spec,
+                operational_policy=operational_policy,
+                operational_settings=operational_settings,
+            ),
         )
         if blocker is None:
             return None
@@ -4582,11 +5465,27 @@ class ResearchNode:
             heartbeat_at=started,
         )
         try:
+            runtime = self._operational_paper_runtime(spec, observed_at=started)
+            if runtime is not None and "blocker" in runtime:
+                return self._operational_paper_blocked_result(
+                    spec,
+                    worker_name=worker_name,
+                    started=started,
+                    runtime=runtime,
+                )
+            operational_policy = (
+                runtime.get("policy") if isinstance(runtime, Mapping) else None
+            )
+            operational_settings = (
+                runtime.get("identity") if isinstance(runtime, Mapping) else None
+            )
             blocked_result = self._paper_binding_blocked_result(
                 spec,
                 worker_name=worker_name,
                 started=started,
                 paper_store=paper_store,
+                operational_policy=operational_policy,
+                operational_settings=operational_settings,
             )
             if blocked_result is not None:
                 return blocked_result
@@ -4601,9 +5500,34 @@ class ResearchNode:
                 raise ValueError("persisted executable documents do not match frozen forward-test hashes")
             if strategy_definition.market_type.value != "prediction":
                 raise ValueError("node Polymarket workers require a prediction strategy")
-            if "probability" not in model_document and "yes_probability" not in model_document and not (
-                isinstance(model_document.get("field"), str) and model_document["field"].strip()
-            ):
+            model_required = model_document.get("model_required")
+            if model_required is not None and not isinstance(model_required, bool):
+                raise ValueError("persisted model document has invalid model_required")
+            claimed_model = any(
+                key in model_document for key in ("probability", "yes_probability", "field")
+            )
+            if claimed_model:
+                for key in ("probability", "yes_probability"):
+                    if key not in model_document:
+                        continue
+                    value = model_document[key]
+                    if isinstance(value, Mapping):
+                        value = value.get(
+                            "probability",
+                            value.get("yes_probability", value.get("prediction")),
+                        )
+                    try:
+                        probability = float(value)
+                    except (TypeError, ValueError):
+                        raise ValueError("persisted model document is malformed") from None
+                    if not math.isfinite(probability) or not 0.0 <= probability <= 1.0:
+                        raise ValueError("persisted model document is malformed")
+                if "field" in model_document and not (
+                    isinstance(model_document["field"], str)
+                    and model_document["field"].strip()
+                ):
+                    raise ValueError("persisted model document is malformed")
+            elif model_required is not False:
                 raise ValueError("persisted model document is not executable")
             strategy = _PersistedStrategy(strategy_definition)
             model = _PersistedProbabilityModel(model_document)
@@ -4666,6 +5590,11 @@ class ResearchNode:
                     for key in ("yes_order_book", "no_order_book", "available_at"):
                         if key in payload:
                             observation[key] = payload[key]
+                    self._carry_forward_market_rules(
+                        observation,
+                        payload,
+                        include_missing=operational_policy is not None,
+                    )
                     opportunity_records = opportunity_by_market.get(str(market_id), [])
                     if opportunity_records:
                         observation["opportunities"] = opportunity_records
@@ -4696,13 +5625,31 @@ class ResearchNode:
                 strategy=strategy,
                 model=model,
                 observations=observations,
+                operational_policy=operational_policy,
+                operational_settings=operational_settings,
                 now=started,
             )
             cycle_payload = cycle.as_record()
             self.store.save_worker_state(
                 worker_name,
                 "idle",
-                {"pid": os.getpid(), "experiment_id": spec.experiment_id, "cycle": cycle_payload, "paper_only": True, "live_execution": False},
+                {
+                    "pid": os.getpid(),
+                    "experiment_id": spec.experiment_id,
+                    "cycle": cycle_payload,
+                    "operational_settings": (
+                        dict(operational_settings)
+                        if isinstance(operational_settings, Mapping)
+                        else None
+                    ),
+                    "operational_policy": (
+                        operational_policy.as_record()
+                        if isinstance(operational_policy, OperationalPaperPolicy)
+                        else None
+                    ),
+                    "paper_only": True,
+                    "live_execution": False,
+                },
                 started_at=started,
                 heartbeat_at=ensure_utc(self.clock()),
             )
@@ -4984,7 +5931,6 @@ class ResearchNode:
         logger.addHandler(handler)
         self._logger, self._handler = logger, handler
         self._log(logging.INFO, "node started pid=%s db=%s", os.getpid(), self.config.db_path)
-
     def _log(self, level: int, message: str, *args: Any) -> None:
         if self._logger is not None:
             self._logger.log(level, message, *args)
@@ -5006,9 +5952,13 @@ class ResearchNode:
             "pid_path": str(self.pid_path),
             "lock_path": str(self.lock_path),
             "log_path": str(self.log_path),
-            "stale_after_seconds": max(float(self.config.interval_seconds) * 3.0, float(self.config.failure_cooldown_seconds)),
+            "stale_after_seconds": max(
+                float(self.config.interval_seconds) * 3.0,
+                float(self.config.failure_cooldown_seconds),
+            ),
             "paper_only": True,
             "live_execution": False,
+            "shadow_assessment": dict(self._shadow_cycle_evidence),
         }
         self.store.save_worker_state(
             self.config.worker_name,

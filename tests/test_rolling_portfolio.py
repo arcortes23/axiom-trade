@@ -846,6 +846,83 @@ class TestRollingPortfolio(unittest.TestCase):
                 {**base, "failure_reason": "x" * (MAX_REASON_LENGTH + 1)}
             )
 
+    def test_legacy_and_operational_projection_roundtrips_are_idempotent(self) -> None:
+        legacy = RollingEvidence.from_mapping(
+            _evidence("sv-legacy-roundtrip", "window-legacy-roundtrip")
+        )
+        legacy_payload = json.loads(json.dumps(legacy.as_dict()))
+        restored_legacy = RollingEvidence.from_mapping(legacy_payload)
+        self.assertEqual(restored_legacy.evidence_digest, legacy.evidence_digest)
+        self.assertNotIn("operational_evidence", legacy_payload)
+        self.assertIsNone(restored_legacy.valid_observations)
+
+        operational = _canonicalize_evidence(
+            {
+                **_v2_evidence("sv-operational-roundtrip", "window-operational-roundtrip"),
+                "operational_evidence": {
+                    "valid_observations": 3,
+                    "entry_eligible_signals": 2,
+                    "fills": 1,
+                    "net_result": "1.25",
+                    "economic_result_available": True,
+                },
+            }
+        )
+        first = RollingEvidence.from_mapping(operational)
+        payload = json.loads(json.dumps(first.as_dict()))
+        self.assertEqual(
+            payload["operational_evidence"],
+            {
+                "valid_observations": 3,
+                "entry_eligible_signals": 2,
+                "fills": 1,
+                "net_result": "1.25",
+                "economic_result_available": True,
+            },
+        )
+        restored = RollingEvidence.from_mapping(payload)
+        self.assertEqual(restored.evidence_digest, first.evidence_digest)
+        self.assertEqual(restored.valid_observations, 3)
+        self.assertEqual(restored.net_result, Decimal("1.25"))
+
+    def test_operational_projection_conflicts_do_not_override_canonical_counts(self) -> None:
+        base = _v2_evidence("sv-operational-conflict", "window-operational-conflict")
+        with self.assertRaisesRegex(
+            ValueError, "valid_observations conflicts between rolling evidence projections"
+        ):
+            RollingEvidence.from_mapping(
+                _canonicalize_evidence(
+                    {
+                        **base,
+                        "operational_evidence": {"valid_observations": 3},
+                        "metrics": {
+                            "operational_evidence": {"valid_observations": 4},
+                        },
+                    }
+                )
+            )
+
+        canonical = _canonicalize_evidence(
+            {
+                **base,
+                "completed_outcomes": 2,
+                "operational_evidence": {
+                    "completed_outcomes": 99,
+                    "valid_observations": 3,
+                },
+            }
+        )
+        evidence = RollingEvidence.from_mapping(canonical)
+        self.assertEqual(evidence.completed_outcomes, 2)
+        self.assertEqual(
+            evidence.as_dict()["operational_evidence"]["valid_observations"],
+            3,
+        )
+        self.assertNotEqual(
+            evidence.as_dict()["operational_evidence"].get("completed_outcomes"),
+            99,
+        )
+
     def test_v2_missing_accounting_state_or_metrics_cannot_be_admitted(self) -> None:
         policy = _policy(
             min_actual_coverage_seconds=0,

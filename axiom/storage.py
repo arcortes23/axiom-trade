@@ -79,6 +79,10 @@ _QUEUE_RELEASE_BATCH = 256
 _QUEUE_LINEAGE_LIMIT = 256
 _DEFAULT_HERMES_JOB_ID = "f1d27bf8c27a"
 _PAPER_POSITION_PROJECTION_LIMIT = 32
+_PAPER_OBSERVATION_HISTORY_LIMIT = 512
+_PAPER_UNRESOLVED_EVENT_LIMIT = 256
+_PAPER_FILL_QUERY_LIMIT = 100_000
+_PAPER_OPENING_QUERY_LIMIT = 100_000
 _DATASET_METADATA_PROJECTION_LIMIT = 64
 _DATASET_MISSING_RANGE_PROJECTION_LIMIT = 32
 _DASHBOARD_PAYLOAD_MAX_BYTES = 65_536
@@ -107,6 +111,11 @@ SQLITE_BUSY_RETRY_MAX_SECONDS = 0.5
 _MAX_DATASET_ATTESTATION_CONSTITUENTS = 1_000
 _DATASET_ATTESTATION_STATUS_CURRENT = "CURRENT"
 _DATASET_ATTESTATION_STATUS_STALE = "STALE"
+_SHADOW_JOB_STATUSES = frozenset(
+    {"REGISTERED", "RUNNING", "WAITING_FOR_DATA", "COMPLETED", "BLOCKED", "STOPPED"}
+)
+_SHADOW_JOB_LIST_LIMIT_MAX = 1_000
+_SHADOW_JOB_ID_MAX_LENGTH = 256
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -950,8 +959,40 @@ class AxiomStore:
             self._initialize_worker_dashboard_projection()
             self._initialize_canary_risk_schema()
             self._initialize_rolling_portfolio_schema()
+            self._initialize_shadow_jobs_schema()
             self._create_dataset_attestation_triggers()
             self._initialize_dashboard_count_projection()
+    def _initialize_shadow_jobs_schema(self) -> None:
+        """Create the additive shadow-job persistence table."""
+        self._conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS shadow_jobs (
+                job_id TEXT PRIMARY KEY,
+                manifest_json TEXT NOT NULL,
+                state_json TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(
+                    status IN (
+                        'REGISTERED',
+                        'RUNNING',
+                        'WAITING_FOR_DATA',
+                        'COMPLETED',
+                        'BLOCKED',
+                        'STOPPED'
+                    )
+                ),
+                next_evaluation_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                version INTEGER NOT NULL DEFAULT 0 CHECK(version >= 0),
+                CHECK(length(job_id) BETWEEN 1 AND 256)
+            );
+            CREATE INDEX IF NOT EXISTS idx_shadow_jobs_status_updated
+                ON shadow_jobs(status, updated_at DESC, job_id DESC);
+            CREATE INDEX IF NOT EXISTS idx_shadow_jobs_next_evaluation
+                ON shadow_jobs(next_evaluation_at, job_id);
+            """
+        )
+
     def _initialize_worker_dashboard_projection(self) -> None:
         """Ensure bounded worker summary columns exist without reading payloads."""
         columns = {
@@ -11846,7 +11887,12 @@ class AxiomStore:
         order_id: str | None = None,
         start: datetime | None = None,
         end: datetime | None = None,
+        limit: int | None = None,
     ) -> list[Fill]:
+        if limit is not None and (
+            isinstance(limit, bool) or not isinstance(limit, int) or limit < 0
+        ):
+            raise ValueError("limit must be a non-negative integer or None")
         clauses: list[str] = []
         values: list[Any] = []
         for column, value in (("strategy_id", strategy_id), ("symbol", symbol), ("order_id", order_id)):
@@ -11863,10 +11909,155 @@ class AxiomStore:
         if clauses:
             query += " WHERE " + " AND ".join(clauses)
         query += " ORDER BY timestamp"
+        if limit is not None:
+            query += " LIMIT ?"
+            values.append(int(limit))
         with self._lock:
             rows = self._conn.execute(query, values).fetchall()
         return [_fill_from_record(_load(row["payload_json"])) for row in rows]
 
+    def list_paper_fills(
+        self,
+        experiment_id: str,
+        *,
+        strategy_id: str | None = None,
+        market_id: str | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        limit: int = _PAPER_FILL_QUERY_LIMIT,
+    ) -> list[Fill]:
+        """Load a bounded, run-scoped slice of persisted paper fills."""
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            raise ValueError("limit must be a non-negative integer")
+        identifier = str(experiment_id).strip()
+        if not identifier:
+            raise ValueError("experiment_id is required")
+        clauses = [
+            "json_extract(payload_json,'$.metadata.paper_experiment_id')=?"
+        ]
+        values: list[Any] = [identifier]
+        if strategy_id is not None:
+            clauses.append("strategy_id=?")
+            values.append(str(strategy_id))
+        if market_id is not None:
+            clauses.append(
+                "COALESCE(NULLIF(json_extract(payload_json,'$.market_id'),''),symbol)=?"
+            )
+            values.append(str(market_id))
+        if start is not None:
+            clauses.append("timestamp>=?")
+            values.append(_iso(start))
+        if end is not None:
+            clauses.append("timestamp<=?")
+            values.append(_iso(end))
+        query = (
+            "SELECT payload_json FROM fills WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY timestamp,order_id LIMIT ?"
+        )
+        values.append(int(limit))
+        with self._lock:
+            rows = self._conn.execute(query, values).fetchall()
+        return [_fill_from_record(_load(row["payload_json"])) for row in rows]
+
+    def count_paper_fills(
+        self,
+        experiment_id: str,
+        *,
+        strategy_id: str | None = None,
+    ) -> int:
+        """Count durable paper fills without decoding their payloads."""
+        identifier = str(experiment_id).strip()
+        if not identifier:
+            raise ValueError("experiment_id is required")
+        clauses = [
+            "json_extract(payload_json,'$.metadata.paper_experiment_id')=?"
+        ]
+        values: list[Any] = [identifier]
+        if strategy_id is not None:
+            clauses.append("strategy_id=?")
+            values.append(str(strategy_id))
+        query = "SELECT COUNT(*) AS n FROM fills WHERE " + " AND ".join(clauses)
+        with self._lock:
+            row = self._conn.execute(query, values).fetchone()
+        return int(row["n"] if row is not None else 0)
+
+    def aggregate_paper_fill_exposure(
+        self,
+        experiment_id: str,
+        *,
+        strategy_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Aggregate paper fills without hydrating individual fill payloads.
+
+        The signed notional is the exact durable quantity used by
+        :class:`RiskEngine`; one row is retained for each market/outcome,
+        strategy and event identity.  Keeping the aggregation in SQLite makes
+        restart restoration independent of the number of historical fills.
+        """
+        identifier = str(experiment_id).strip()
+        if not identifier:
+            raise ValueError("experiment_id is required")
+        market_expr = (
+            "COALESCE(NULLIF(json_extract(payload_json,'$.market_id'),''),symbol)"
+        )
+        market_type_expr = (
+            "COALESCE(NULLIF(json_extract(payload_json,'$.market_type'),''),'prediction')"
+        )
+        outcome_expr = (
+            "LOWER(COALESCE(NULLIF(json_extract(payload_json,'$.metadata.outcome'),''),'yes'))"
+        )
+        event_expr = (
+            "COALESCE(NULLIF(json_extract(payload_json,'$.metadata.event_id'),''),"
+            "NULLIF(json_extract(payload_json,'$.metadata.event_key'),''),'')"
+        )
+        signed_expr = (
+            "CASE WHEN LOWER(json_extract(payload_json,'$.side'))='buy' "
+            "THEN CAST(json_extract(payload_json,'$.quantity') AS REAL)"
+            " * CAST(json_extract(payload_json,'$.price') AS REAL) "
+            "ELSE -CAST(json_extract(payload_json,'$.quantity') AS REAL)"
+            " * CAST(json_extract(payload_json,'$.price') AS REAL) END"
+        )
+        clauses = [
+            "json_extract(payload_json,'$.metadata.paper_experiment_id')=?"
+        ]
+        values: list[Any] = [identifier]
+        if strategy_id is not None:
+            clauses.append("strategy_id=?")
+            values.append(str(strategy_id))
+        query = (
+            "SELECT "
+            f"{market_expr} AS market_id,"
+            f"{market_type_expr} AS market_type,"
+            f"{outcome_expr} AS outcome,"
+            "strategy_id,"
+            f"{event_expr} AS event_id,"
+            f"SUM({signed_expr}) AS signed_notional,"
+            "MAX(CAST(json_extract(payload_json,'$.price') AS REAL)) AS price,"
+            "MAX(timestamp) AS timestamp,"
+            "COUNT(*) AS fill_count "
+            "FROM fills WHERE "
+            + " AND ".join(clauses)
+            + " GROUP BY "
+            f"{market_expr},{market_type_expr},{outcome_expr},strategy_id,{event_expr} "
+            "ORDER BY market_id,strategy_id,outcome,event_id"
+        )
+        with self._lock:
+            rows = self._conn.execute(query, values).fetchall()
+        return [
+            {
+                "market_id": str(row["market_id"]),
+                "market_type": str(row["market_type"]),
+                "outcome": str(row["outcome"]),
+                "strategy_id": str(row["strategy_id"]),
+                "event_id": str(row["event_id"] or ""),
+                "signed_notional": float(row["signed_notional"] or 0.0),
+                "price": float(row["price"] or 0.0),
+                "timestamp": _parse_datetime(row["timestamp"]),
+                "fill_count": int(row["fill_count"] or 0),
+            }
+            for row in rows
+        ]
     def save_report(self, report_id: str, report: Any, *, experiment_id: str | None = None) -> None:
         try:
             with self._write_context():
@@ -13410,6 +13601,152 @@ class AxiomStore:
                 (int(limit),),
             ).fetchall()
         return {str(row["reason"] or "unknown"): int(row["count"]) for row in rows}
+    def register_shadow_job(
+        self,
+        job_id: str,
+        manifest: Mapping[str, Any],
+        state: Mapping[str, Any],
+        status: str,
+        next_evaluation_at: datetime | None,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Register one immutable shadow job, idempotently by exact identity."""
+        identifier = _shadow_job_identifier(job_id)
+        manifest_json = _shadow_mapping_json(manifest, name="manifest")
+        state_json = _shadow_mapping_json(state, name="state")
+        status_value = _shadow_job_status(status)
+        next_evaluation_iso = _shadow_optional_timestamp(
+            next_evaluation_at,
+            name="next_evaluation_at",
+        )
+        now_iso = _shadow_timestamp(
+            utc_now() if now is None else now,
+            name="now",
+        )
+        with self._write_context():
+            self._conn.execute(
+                "INSERT INTO shadow_jobs("
+                "job_id,manifest_json,state_json,status,next_evaluation_at,"
+                "created_at,updated_at,version"
+                ") VALUES (?,?,?,?,?,?,?,0) "
+                "ON CONFLICT(job_id) DO NOTHING",
+                (
+                    identifier,
+                    manifest_json,
+                    state_json,
+                    status_value,
+                    next_evaluation_iso,
+                    now_iso,
+                    now_iso,
+                ),
+            )
+            existing = self._conn.execute(
+                "SELECT * FROM shadow_jobs WHERE job_id=?",
+                (identifier,),
+            ).fetchone()
+            if existing is None:
+                raise RuntimeError("shadow job registration did not persist")
+            if str(existing["manifest_json"]) != manifest_json:
+                raise ValueError("shadow job manifest mismatch")
+            # Registration is keyed by the immutable manifest identity.  The
+            # state, status, timestamps, and version belong to the running
+            # job and may have advanced since the registration request was
+            # first persisted.  Never replace or reject that terminal state
+            # when an identical manifest is registered again.
+        return _shadow_job_record(existing)
+
+    def load_shadow_job(self, job_id: str) -> dict[str, Any] | None:
+        """Load one shadow job without mutating any persistence state."""
+        identifier = _shadow_job_identifier(job_id)
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM shadow_jobs WHERE job_id=?",
+                (identifier,),
+            ).fetchone()
+        return _shadow_job_record(row)
+
+    def list_shadow_jobs(
+        self,
+        status: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """List bounded shadow jobs using a read-only snapshot."""
+        status_value = None if status is None else _shadow_job_status(status)
+        limit_value = _shadow_job_limit(limit)
+        query = "SELECT * FROM shadow_jobs"
+        values: list[Any] = []
+        if status_value is not None:
+            query += " WHERE status=?"
+            values.append(status_value)
+        query += " ORDER BY updated_at DESC,job_id DESC LIMIT ?"
+        values.append(limit_value)
+        if self.path not in {":memory:", ""} and not self.path.startswith("file:"):
+            snapshot = self._snapshot_read_connection()
+            try:
+                rows = snapshot.execute(query, values).fetchall()
+            finally:
+                snapshot.close()
+        else:
+            with self._lock:
+                rows = self._conn.execute(query, values).fetchall()
+        return [_shadow_job_record(row) for row in rows]
+
+    def update_shadow_job(
+        self,
+        job_id: str,
+        expected_version: int,
+        state: Mapping[str, Any],
+        status: str,
+        next_evaluation_at: datetime | None,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """CAS-update mutable shadow-job state while preserving its manifest."""
+        identifier = _shadow_job_identifier(job_id)
+        if (
+            isinstance(expected_version, bool)
+            or not isinstance(expected_version, int)
+            or expected_version < 0
+        ):
+            raise ValueError("expected_version must be a non-negative integer")
+        state_json = _shadow_mapping_json(state, name="state")
+        status_value = _shadow_job_status(status)
+        next_evaluation_iso = _shadow_optional_timestamp(
+            next_evaluation_at,
+            name="next_evaluation_at",
+        )
+        now_iso = _shadow_timestamp(
+            utc_now() if now is None else now,
+            name="now",
+        )
+        with self._write_context():
+            existing = self._conn.execute(
+                "SELECT version FROM shadow_jobs WHERE job_id=?",
+                (identifier,),
+            ).fetchone()
+            if existing is None:
+                raise KeyError(f"shadow job not found: {identifier}")
+            cursor = self._conn.execute(
+                "UPDATE shadow_jobs SET state_json=?,status=?,"
+                "next_evaluation_at=?,updated_at=?,version=version+1 "
+                "WHERE job_id=? AND version=?",
+                (
+                    state_json,
+                    status_value,
+                    next_evaluation_iso,
+                    now_iso,
+                    identifier,
+                    expected_version,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("shadow job changed concurrently")
+            row = self._conn.execute(
+                "SELECT * FROM shadow_jobs WHERE job_id=?",
+                (identifier,),
+            ).fetchone()
+        return _shadow_job_record(row)
+
+
 
 
     def save_paper_state(
@@ -13785,6 +14122,67 @@ class AxiomStore:
             for row in rows
         ]
 
+    @staticmethod
+    def _paper_event_statuses(statuses: Iterable[str]) -> tuple[str, ...]:
+        if isinstance(statuses, str):
+            statuses = (statuses,)
+        normalized = tuple(sorted({str(value).strip().upper() for value in statuses if str(value).strip()}))
+        if not normalized:
+            raise ValueError("at least one paper event status is required")
+        return normalized
+
+    def count_unresolved_paper_execution_events(
+        self,
+        experiment_id: str,
+        *,
+        statuses: Iterable[str],
+    ) -> int:
+        """Count only unresolved paper events for bounded restart hydration."""
+        normalized = self._paper_event_statuses(statuses)
+        placeholders = ",".join("?" for _ in normalized)
+        query = (
+            "SELECT COUNT(*) AS n FROM paper_execution_events "
+            f"WHERE experiment_id=? AND status IN ({placeholders})"
+        )
+        values: list[Any] = [str(experiment_id), *normalized]
+        with self._lock:
+            row = self._conn.execute(query, values).fetchone()
+        return int(row["n"] if row is not None else 0)
+
+    def list_unresolved_paper_execution_events(
+        self,
+        experiment_id: str,
+        *,
+        statuses: Iterable[str],
+        limit: int = _PAPER_UNRESOLVED_EVENT_LIMIT,
+    ) -> list[dict[str, Any]]:
+        """Hydrate a bounded set of unresolved paper events only."""
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            raise ValueError("limit must be a non-negative integer")
+        normalized = self._paper_event_statuses(statuses)
+        placeholders = ",".join("?" for _ in normalized)
+        query = (
+            "SELECT * FROM paper_execution_events "
+            f"WHERE experiment_id=? AND status IN ({placeholders}) "
+            "ORDER BY timestamp,observation_id LIMIT ?"
+        )
+        values: list[Any] = [str(experiment_id), *normalized, int(limit)]
+        with self._lock:
+            rows = self._conn.execute(query, values).fetchall()
+        return [
+            {
+                "event_id": row["event_id"],
+                "experiment_id": row["experiment_id"],
+                "observation_id": row["observation_id"],
+                "market_id": row["market_id"],
+                "timestamp": _parse_datetime(row["timestamp"]),
+                "status": row["status"],
+                "payload": _load(row["payload_json"]),
+                "created_at": _parse_datetime(row["created_at"]),
+            }
+            for row in rows
+        ]
+
     def save_paper_bet_ledger(
         self,
         bet_id: str,
@@ -13972,16 +14370,46 @@ class AxiomStore:
         experiment_id: str,
         *,
         per_market_limit: int = 512,
+        per_scope_limit: int | None = None,
     ) -> list[dict[str, Any]]:
         if isinstance(per_market_limit, bool) or not isinstance(per_market_limit, int) or per_market_limit < 0:
             raise ValueError("per_market_limit must be a non-negative integer")
+        if per_scope_limit is not None and (
+            isinstance(per_scope_limit, bool)
+            or not isinstance(per_scope_limit, int)
+            or per_scope_limit < 0
+        ):
+            raise ValueError("per_scope_limit must be a non-negative integer or None")
+        row_limit = per_market_limit if per_scope_limit is None else per_scope_limit
+        if per_scope_limit is None:
+            partition_by = "market_id"
+        else:
+            # Shadow members share one physical market row.  Partition on the
+            # durable member identity while ignoring cycle-varying
+            # shadow_group_id and other assessment metadata.
+            path = "$.shadow_member_id"
+            nested_path = "$.metadata.shadow_member_id"
+            path_type = f"json_type(payload_json, '{path}')"
+            nested_type = f"json_type(payload_json, '{nested_path}')"
+            member_identity = (
+                "("
+                f"CASE WHEN {path_type} IS NOT NULL AND {path_type} <> 'null' "
+                f"THEN {path_type} || ':' || json_extract(payload_json, '{path}') "
+                f"WHEN {path_type} IS NULL AND {nested_type} IS NOT NULL "
+                f"AND {nested_type} <> 'null' "
+                f"THEN {nested_type} || ':' || json_extract(payload_json, '{nested_path}') "
+                "END"
+                ")"
+            )
+            partition_by = "market_id, " + member_identity
         with self._lock:
             rows = self._conn.execute(
                 "SELECT observation_id,experiment_id,market_id,timestamp,payload_json,created_at FROM ("
-                "SELECT p.*, ROW_NUMBER() OVER (PARTITION BY market_id ORDER BY timestamp DESC,observation_id DESC) AS row_number "
+                "SELECT p.*, ROW_NUMBER() OVER "
+                f"(PARTITION BY {partition_by} ORDER BY timestamp DESC,observation_id DESC) AS row_number "
                 "FROM paper_observations AS p WHERE experiment_id=?"
                 ") WHERE row_number<=? ORDER BY timestamp,market_id,observation_id",
-                (str(experiment_id), int(per_market_limit)),
+                (str(experiment_id), int(row_limit)),
             ).fetchall()
         return [
             {
@@ -13995,6 +14423,63 @@ class AxiomStore:
             for row in rows
         ]
 
+
+    def list_paper_observation_openings(
+        self,
+        experiment_id: str,
+        *,
+        limit: int = _PAPER_OPENING_QUERY_LIMIT,
+    ) -> list[dict[str, Any]]:
+        """Return earliest observation per stable market/member scope.
+
+        This is an aggregate query over durable timestamps; it deliberately
+        excludes ``shadow_group_id``, which may be regenerated on every
+        shadow cycle.
+        """
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            raise ValueError("limit must be a non-negative integer")
+
+        def identity_expression(key: str) -> str:
+            path = "$." + key
+            nested_path = "$.metadata." + key
+            path_type = f"json_type(payload_json, '{path}')"
+            nested_type = f"json_type(payload_json, '{nested_path}')"
+            return (
+                "("
+                f"CASE WHEN {path_type} IS NOT NULL AND {path_type} <> 'null' "
+                f"THEN json_extract(payload_json, '{path}') "
+                f"WHEN {path_type} IS NULL AND {nested_type} IS NOT NULL "
+                f"AND {nested_type} <> 'null' "
+                f"THEN json_extract(payload_json, '{nested_path}') "
+                "END)"
+            )
+
+        keys = ("shadow_member_id",)
+        expressions = {key: identity_expression(key) for key in keys}
+        query = (
+            "SELECT market_id,MIN(timestamp) AS timestamp,"
+            + ",".join(f"{expressions[key]} AS {key}" for key in keys)
+            + ",COUNT(*) AS observation_count "
+            "FROM paper_observations WHERE experiment_id=? "
+            "GROUP BY market_id,"
+            + ",".join(expressions[key] for key in keys)
+            + " ORDER BY timestamp,market_id LIMIT ?"
+        )
+        with self._lock:
+            rows = self._conn.execute(
+                query,
+                (str(experiment_id), int(limit)),
+            ).fetchall()
+        return [
+            {
+                "experiment_id": str(experiment_id),
+                "market_id": row["market_id"],
+                "timestamp": _parse_datetime(row["timestamp"]),
+                **{key: row[key] for key in keys},
+                "observation_count": int(row["observation_count"] or 0),
+            }
+            for row in rows
+        ]
 
     def save_opportunity_snapshots(self, observed_at: datetime, opportunities: Iterable[Any]) -> int:
         rows = []
@@ -17816,6 +18301,78 @@ def _preflight_dataset_catalog_payload(row: sqlite3.Row) -> None:
             f"{_MAX_DATASET_MISSING_RANGES} entries"
         )
 
+
+
+def _shadow_job_identifier(value: Any) -> str:
+    if value is None:
+        raise ValueError("job_id is required")
+    identifier = str(value).strip()
+    if not identifier:
+        raise ValueError("job_id is required")
+    if len(identifier) > _SHADOW_JOB_ID_MAX_LENGTH:
+        raise ValueError(
+            f"job_id exceeds {_SHADOW_JOB_ID_MAX_LENGTH} characters"
+        )
+    return identifier
+
+
+def _shadow_mapping_json(value: Any, *, name: str) -> str:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{name} must be a mapping")
+    try:
+        return _dump(value)
+    except (TypeError, ValueError, OverflowError, RecursionError) as exc:
+        raise ValueError(f"{name} must be JSON serializable") from exc
+
+
+def _shadow_job_status(value: Any) -> str:
+    status = str(value).strip().upper()
+    if status not in _SHADOW_JOB_STATUSES:
+        allowed = ", ".join(sorted(_SHADOW_JOB_STATUSES))
+        raise ValueError(f"shadow job status must be one of: {allowed}")
+    return status
+
+
+def _shadow_job_limit(value: Any) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 0
+        or value > _SHADOW_JOB_LIST_LIMIT_MAX
+    ):
+        raise ValueError(
+            "limit must be a non-negative integer no greater than "
+            f"{_SHADOW_JOB_LIST_LIMIT_MAX}"
+        )
+    return int(value)
+
+
+def _shadow_timestamp(value: Any, *, name: str) -> str:
+    parsed = parse_timestamp(value)
+    if parsed is None:
+        raise ValueError(f"{name} must be a valid UTC timestamp")
+    return _iso(parsed)
+
+
+def _shadow_optional_timestamp(value: Any, *, name: str) -> str | None:
+    if value is None:
+        return None
+    return _shadow_timestamp(value, name=name)
+
+
+def _shadow_job_record(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    return {
+        "job_id": row["job_id"],
+        "manifest": _load(row["manifest_json"]),
+        "state": _load(row["state_json"]),
+        "status": row["status"],
+        "next_evaluation_at": _parse_datetime(row["next_evaluation_at"]),
+        "created_at": _parse_datetime(row["created_at"]),
+        "updated_at": _parse_datetime(row["updated_at"]),
+        "version": int(row["version"]),
+    }
 
 
 def _dump(value: Any) -> str:

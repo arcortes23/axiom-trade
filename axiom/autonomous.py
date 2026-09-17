@@ -24,9 +24,12 @@ from .backtest.prediction import run_prediction_research_mode
 from .forward import (
     COMMON_PAPER_ASSUMPTIONS,
     ForwardTestRegistry,
+    _ABSOLUTE_MOVE_PREDICATE,
     _canonical_forward_config,
     _content_hash,
     _normalized_strategy_document,
+    _operational_setup_for_strategy,
+    _operational_setup_hash,
 )
 from .director import compact_report, validate_hermes_proposal
 from .domain import Fill, MarketType, ResearchQuality, SettlementState, ensure_utc, parse_timestamp, utc_now
@@ -51,6 +54,7 @@ from .rolling_portfolio import (
     RollingEvidence,
     RollingSelection,
     _latest_windows,
+    _plain as _rolling_plain,
     default_rolling_admission_policy,
     evaluate_rolling_selection,
     REASON_EXTERNAL_OBLIGATIONS_EXCEED_BUDGET,
@@ -344,6 +348,117 @@ POLYMARKET_CAMPAIGN_GRID: tuple[Mapping[str, Any], ...] = tuple(
     for lookback in (1, 3, 5)
     for threshold in (0.02, 0.05)
 )
+_OPERATIONAL_CAMPAIGN_CONFIGURATION_IDS = frozenset(
+    {
+        "momentum:lookback-1:threshold-0.05",
+        "mean_reversion:lookback-1:threshold-0.05",
+    }
+)
+
+
+_OPERATIONAL_BOUNDARY_FIELDS = (
+    "schema_version",
+    "dataset_id",
+    "dataset_version",
+    "source_type",
+    "exact_cutoff",
+    "row_count",
+    "ordered_row_manifest_digest",
+    "ordered_row_manifest_root",
+    "content_hash",
+    "attestation_hash",
+)
+_OPERATIONAL_SPLIT_BOUNDARY_FIELDS = (
+    "start_index",
+    "end_index",
+    "row_count",
+    "first_row_identity",
+    "last_row_identity",
+    "first_content_hash",
+    "last_content_hash",
+)
+
+
+def _canonical_operational_document(value: Any) -> Any:
+    """Return plain JSON for setup identity, independent of container type."""
+    return json.loads(_canonical_binding(value))
+
+
+def _operational_attestation_binding(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep one bounded, plain attestation identity for setup binding."""
+    allowed = (
+        "dataset_id",
+        "dataset_version",
+        "source_type",
+        "market_type",
+        "row_count",
+        "observed_row_count",
+        "completeness",
+        "start_timestamp",
+        "end_timestamp",
+        "contamination_result",
+        "provenance_version",
+        "policy_version",
+        "reason",
+        "attestation_hash",
+        "verified_at",
+        "status",
+    )
+    result = {
+        key: value[key]
+        for key in allowed
+        if key in value and value[key] is not None
+    }
+    bindings = value.get("constituent_bindings", value.get("constituents"))
+    if "constituent_count" in value:
+        result["constituent_count"] = value["constituent_count"]
+    elif isinstance(bindings, (list, tuple)):
+        result["constituent_count"] = len(bindings)
+    digest = next(
+        (
+            value[key]
+            for key in (
+                "canonical_digest",
+                "constituent_bindings_digest",
+                "constituent_digest",
+                "bindings_digest",
+            )
+            if value.get(key) not in (None, "")
+        ),
+        None,
+    )
+    if digest is None and isinstance(bindings, (list, tuple)):
+        digest = _hash_document(bindings)
+    if digest is not None:
+        result["canonical_digest"] = digest
+        result["constituent_bindings_digest"] = digest
+    return _canonical_operational_document(result)
+
+
+def _operational_boundary_binding(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep one bounded, plain dataset-boundary identity for setup binding."""
+    result = {
+        key: value[key]
+        for key in _OPERATIONAL_BOUNDARY_FIELDS
+        if key in value and value[key] is not None
+    }
+    split_boundaries = value.get("split_boundaries")
+    if isinstance(split_boundaries, Mapping):
+        bounded_splits: dict[str, dict[str, Any]] = {}
+        for name in ("development", "validation", "final"):
+            descriptor = split_boundaries.get(name)
+            if not isinstance(descriptor, Mapping):
+                continue
+            bounded_splits[name] = {
+                key: descriptor[key]
+                for key in _OPERATIONAL_SPLIT_BOUNDARY_FIELDS
+                if key in descriptor and descriptor[key] is not None
+            }
+        if bounded_splits:
+            result["split_boundaries"] = bounded_splits
+    return _canonical_operational_document(result)
+
+
 
 
 def _campaign_configuration_key(value: Mapping[str, Any]) -> str:
@@ -619,6 +734,7 @@ def _rolling_payload_without_created_at(value: Mapping[str, Any]) -> dict[str, A
         if str(key) != "created_at"
     }
 
+
 def _scope_binding(plan: ExperimentPlan) -> dict[str, Any]:
     """Return the canonical, recomputed authority carried by every worker artifact."""
     return {
@@ -629,6 +745,96 @@ def _scope_binding(plan: ExperimentPlan) -> dict[str, Any]:
         "scope_version": plan.market_scope_version,
         "dataset_selector": dict(plan.as_dict()["dataset_selector"]),
     }
+def _operational_setup_fields(
+    strategy: Any,
+    plan: ExperimentPlan | None = None,
+    *,
+    dataset_attestation: Mapping[str, Any] | None = None,
+    dataset_boundary: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return setup material only for an explicit V2 operational plan."""
+    if plan is None:
+        return {}
+    protocol = plan.campaign_protocol
+    if not (
+        isinstance(protocol, Mapping)
+        and str(protocol.get("schema_version", "")).strip() == CAMPAIGN_SCHEMA_V2
+    ):
+        return {}
+    config: dict[str, Any] = {}
+    config.update(_scope_binding(plan))
+    config.update(
+        {
+            "dataset_id": plan.dataset_id,
+            "dataset_version": plan.dataset_version,
+            "plan_id": plan.plan_id,
+            "plan_hash": plan.plan_hash,
+        }
+    )
+    attestation_binding = (
+        _operational_attestation_binding(dataset_attestation)
+        if isinstance(dataset_attestation, Mapping)
+        else None
+    )
+    boundary_binding = (
+        _operational_boundary_binding(dataset_boundary)
+        if isinstance(dataset_boundary, Mapping)
+        else None
+    )
+    if attestation_binding is not None:
+        config["dataset_attestation"] = attestation_binding
+    if boundary_binding is not None:
+        config["dataset_boundary"] = boundary_binding
+    setup = _operational_setup_for_strategy(strategy, config)
+    if setup is None:
+        return {}
+    result = {
+        "operational_setup": _canonical_operational_document(setup),
+        "operational_setup_hash": _operational_setup_hash(setup),
+    }
+    # Keep the exact immutable source bindings beside the setup.  Forward
+    # registration recomputes the setup from this material and must see the
+    # same attestation/boundary as the initial candidate registration.
+    if attestation_binding is not None:
+        result["dataset_attestation"] = attestation_binding
+    if boundary_binding is not None:
+        result["dataset_boundary"] = boundary_binding
+    return result
+
+
+def _strategy_with_operational_overlay(
+    plan: ExperimentPlan,
+    strategy: StrategyDefinition,
+) -> StrategyDefinition:
+    """Apply the fixed setup predicate only to an explicit V2 plan."""
+    protocol = plan.campaign_protocol
+    if not (
+        isinstance(protocol, Mapping)
+        and str(protocol.get("schema_version", "")).strip() == CAMPAIGN_SCHEMA_V2
+    ):
+        return strategy
+    source = plan.strategy_document
+    if not isinstance(source, Mapping):
+        return strategy
+    source_parameters = source.get("parameters")
+    if not isinstance(source_parameters, Mapping):
+        return strategy
+    predicate = source_parameters.get("entry_predicate")
+    if not isinstance(predicate, Mapping):
+        return strategy
+    if _canonical_binding(predicate) != _canonical_binding(_ABSOLUTE_MOVE_PREDICATE):
+        return strategy
+    document = strategy.to_dict()
+    parameters = document.get("parameters")
+    if not isinstance(parameters, Mapping) or "entry_predicate" in parameters:
+        return strategy
+    document["parameters"] = {
+        **dict(parameters),
+        "entry_predicate": dict(predicate),
+    }
+    return load_strategy(document)
+
+
 def _strategy_metadata(strategy: StrategyDefinition) -> dict[str, Any]:
     metadata = strategy.metadata if isinstance(strategy.metadata, Mapping) else {}
     role = str(metadata.get("research_role", "")).strip()
@@ -736,6 +942,390 @@ def _rolling_canonical_accounting_complete(value: Any) -> bool:
         if not parsed.is_finite():
             return False
     return True
+def _operational_stage_projection(
+    *,
+    rows: Sequence[Any] = (),
+    events: Sequence[Any] = (),
+    fills: Sequence[Any] = (),
+    ledgers: Sequence[Any] = (),
+    curve: Sequence[Any] = (),
+    valid_observations: int | None = None,
+    remaining_positions: Any = None,
+) -> dict[str, Any]:
+    """Project execution stages without collapsing accounting or input reasons.
+
+    This is deliberately a projection-only helper.  It consumes durable event
+    and fill records when available, while keeping path exclusions, venue
+    blockers, policy rejects, and unavailable accounting in separate buckets.
+    Legacy sources without an operational gate therefore remain readable and
+    report zero approved paper attempts rather than implying admission.
+    """
+    # Source rows alone are historical/canonical input, not operational stage
+    # evidence.  Do not manufacture zero-valued stage metrics when the caller
+    # has no event, fill, ledger, curve, or explicit observation projection.
+    if not any(
+        (
+            events,
+            fills,
+            ledgers,
+            curve,
+            valid_observations is not None,
+            remaining_positions is not None,
+        )
+    ):
+        return {}
+
+    def increment(bucket: dict[str, int], reason: Any, amount: int = 1) -> None:
+        code = str(reason or "UNKNOWN").strip().upper() or "UNKNOWN"
+        bucket[code] = bucket.get(code, 0) + max(1, int(amount))
+
+    def payload_of(value: Any) -> Mapping[str, Any]:
+        if not isinstance(value, Mapping):
+            return {}
+        payload = value.get("payload")
+        return payload if isinstance(payload, Mapping) else value
+
+    def event_view(value: Any) -> dict[str, Any]:
+        if not isinstance(value, Mapping):
+            return {}
+        payload = payload_of(value)
+        result = dict(value)
+        result.update(payload)
+        if value.get("status") is not None:
+            result.setdefault("status", value.get("status"))
+        return result
+
+    def side_of(value: Any) -> str:
+        if not isinstance(value, Mapping):
+            return ""
+        metadata = value.get("metadata")
+        metadata = metadata if isinstance(metadata, Mapping) else {}
+        side = value.get("side", metadata.get("side", ""))
+        return str(getattr(side, "value", side)).strip().lower()
+
+    def is_exit(value: Any) -> bool:
+        if not isinstance(value, Mapping):
+            metadata = getattr(value, "metadata", {})
+            metadata = metadata if isinstance(metadata, Mapping) else {}
+            kind = metadata.get("execution_kind", metadata.get("kind"))
+            side = getattr(getattr(value, "side", None), "value", getattr(value, "side", ""))
+        else:
+            metadata = value.get("metadata")
+            metadata = metadata if isinstance(metadata, Mapping) else {}
+            kind = value.get("execution_kind", metadata.get("execution_kind", metadata.get("kind")))
+            side = value.get("side", metadata.get("side", ""))
+        kind_name = str(kind or "").strip().lower()
+        side_name = str(getattr(side, "value", side)).strip().lower()
+        return kind_name in {"exit", "close", "closing", "managed_exit"} or side_name in {
+            "sell",
+            "sell_yes",
+            "sell_no",
+        }
+
+    def fill_mapping(value: Any) -> Mapping[str, Any]:
+        if isinstance(value, Fill):
+            metadata = value.metadata if isinstance(value.metadata, Mapping) else {}
+            return {
+                "side": getattr(value.side, "value", value.side),
+                "quantity": value.quantity,
+                "price": value.price,
+                "fees": value.fees,
+                "slippage": value.slippage,
+                "metadata": metadata,
+                "execution_kind": metadata.get("execution_kind"),
+                "execution_status": metadata.get("execution_status"),
+                "partial": metadata.get("partial"),
+            }
+        return value if isinstance(value, Mapping) else {}
+
+    path_exclusions: dict[str, int] = {}
+    accounting_limits: dict[str, int] = {}
+    for raw in rows:
+        if not isinstance(raw, Mapping):
+            continue
+        source_reason = raw.get("_rolling_source_rejection") or raw.get(
+            "_rolling_timestamp_rejection"
+        )
+        accounting_reason = raw.get("_rolling_accounting_rejection")
+        if source_reason:
+            increment(path_exclusions, source_reason)
+        if accounting_reason:
+            reason = str(accounting_reason).strip().upper()
+            if reason.startswith(("ACCOUNTING_", "PAPER_RESOLVED_BET_", "PERSISTENCE_")):
+                increment(accounting_limits, reason)
+            elif not source_reason:
+                increment(path_exclusions, reason)
+
+    entry_eligible = 0
+    event_attempts = 0
+    approved_attempts = 0
+    managed_exit_attempts = 0
+    policy_rejects: dict[str, int] = {}
+    venue_blockers: dict[str, int] = {}
+    gate_applied = False
+    saw_event_entry_signal = False
+    for raw in events:
+        event = event_view(raw)
+        if not event:
+            continue
+        operational = event.get("operational_evidence")
+        operational = operational if isinstance(operational, Mapping) else {}
+        gate_applied = gate_applied or bool(
+            operational
+            or event.get("operational_policy")
+            or event.get("operational_policy_hash")
+        )
+        evidence = event.get("evaluation_evidence")
+        evidence = evidence if isinstance(evidence, Mapping) else {}
+        eligible = event.get("entry_eligible", evidence.get("entry_eligible"))
+        is_exit_event = is_exit(event)
+        if eligible is True and not is_exit_event:
+            entry_eligible += 1
+            saw_event_entry_signal = True
+        status = str(event.get("status", "")).strip().upper()
+        outcomes = event.get("outcomes", ())
+        outcomes = tuple(str(item).strip().upper() for item in outcomes) if isinstance(
+            outcomes, (list, tuple, set, frozenset)
+        ) else ()
+        attempted = bool(event.get("order_attempted")) or "ORDER_ATTEMPT" in outcomes
+        if attempted:
+            event_attempts += 1
+            if is_exit_event:
+                managed_exit_attempts += 1
+            approved = (
+                event.get("risk_approved") is True
+                or operational.get("risk_approved") is True
+                or operational.get("allowed") is True
+            )
+            if approved:
+                approved_attempts += 1
+        rejected = status in {
+            "RISK_REJECTED",
+            "POLICY_REJECTED",
+            "BLOCKED",
+            "REJECTED",
+        } or bool(event.get("risk_rejected"))
+        if rejected:
+            reasons = event.get("blockers", operational.get("blockers", ()))
+            reasons = list(reasons) if isinstance(
+                reasons, (list, tuple, set, frozenset)
+            ) else []
+            reason = event.get(
+                "reason_code",
+                event.get("reason", operational.get("reason_code")),
+            )
+            if reason:
+                reasons.append(reason)
+            reasons.extend(
+                outcome
+                for outcome in outcomes
+                if outcome != "ORDER_ATTEMPT"
+                and any(
+                    marker in outcome
+                    for marker in (
+                        "RISK",
+                        "REJECT",
+                        "BLOCK",
+                        "VENUE",
+                        "MIN_",
+                        "ACCOUNTING",
+                        "PERSISTENCE",
+                    )
+                )
+            )
+            if not reasons:
+                reasons.append(status or "UNKNOWN")
+            seen_reasons: set[str] = set()
+            for reason in reasons:
+                reason_name = str(reason).strip().upper()
+                if not reason_name or reason_name in seen_reasons:
+                    continue
+                seen_reasons.add(reason_name)
+                increment(policy_rejects, reason_name)
+                if reason_name.startswith(("VENUE_", "MIN_")):
+                    increment(venue_blockers, reason_name)
+                if reason_name.startswith(
+                    ("ACCOUNTING_", "PERSISTENCE_", "PAPER_RESOLVED_BET_")
+                ):
+                    increment(accounting_limits, reason_name)
+        if status in {"INPUT_EXCLUDED", "PATH_EXCLUDED", "EXCLUDED"}:
+            reason = event.get("reason_code", event.get("reason"))
+            if reason:
+                increment(path_exclusions, reason)
+    if not saw_event_entry_signal:
+        for raw in curve:
+            if not isinstance(raw, Mapping):
+                continue
+            evidence = raw.get("evaluation_evidence")
+            evidence = evidence if isinstance(evidence, Mapping) else {}
+            if evidence.get("entry_eligible") is True and not is_exit(raw):
+                entry_eligible += 1
+        if not entry_eligible:
+            for raw in rows:
+                view = payload_of(raw)
+                if view.get("entry_eligible") is True:
+                    entry_eligible += 1
+
+    fill_count = 0
+    partial_count = 0
+    managed_exit_fills = 0
+    for raw in fills:
+        item = fill_mapping(raw)
+        if not item:
+            continue
+        fill_count += 1
+        metadata = item.get("metadata")
+        metadata = metadata if isinstance(metadata, Mapping) else {}
+        status = str(
+            item.get("execution_status", metadata.get("execution_status", ""))
+        ).strip().upper()
+        if item.get("partial") is True or status in {"PARTIAL", "PARTIAL_FILL", "PARTIALLY_FILLED"}:
+            partial_count += 1
+        if is_exit(item):
+            managed_exit_fills += 1
+
+    position_ids: list[str] = []
+    if isinstance(remaining_positions, Mapping):
+        position_ids = [str(key) for key in remaining_positions if str(key).strip()]
+    elif isinstance(remaining_positions, (list, tuple, set, frozenset)):
+        position_ids = [str(item) for item in remaining_positions if str(item).strip()]
+    elif remaining_positions not in (None, ""):
+        try:
+            position_ids = [str(remaining_positions)] if int(remaining_positions) > 0 else []
+        except (TypeError, ValueError):
+            position_ids = []
+    if not position_ids:
+        for raw in ledgers:
+            if not isinstance(raw, Mapping):
+                continue
+            item = payload_of(raw)
+            open_positions = item.get("open_positions", item.get("remaining_positions", ()))
+            if isinstance(open_positions, (list, tuple, set, frozenset)):
+                position_ids.extend(str(value) for value in open_positions if str(value).strip())
+
+    completed = 0
+    gross: Decimal | None = None
+    realized: Decimal | None = None
+    unrealized: Decimal | None = None
+    net: Decimal | None = None
+    if ledgers:
+        completed = sum(
+            int(_rolling_number(payload_of(item).get("completed_outcomes", 1), Decimal("0")))
+            for item in ledgers
+            if isinstance(item, Mapping)
+        )
+        def total(name: str) -> Decimal:
+            return sum(
+                (_rolling_number(payload_of(item).get(name), Decimal("0")) for item in ledgers if isinstance(item, Mapping)),
+                Decimal("0"),
+            )
+        realized = total("realized_pnl")
+        unrealized = total("unrealized_pnl")
+        net = total("net_pnl")
+        if all(
+            isinstance(item, Mapping) and payload_of(item).get("gross_pnl") is not None
+            for item in ledgers
+        ):
+            gross = total("gross_pnl")
+        else:
+            gross = net + total("fees") + total("slippage")
+
+    valid = valid_observations
+    if valid is None:
+        valid = sum(
+            1
+            for raw in rows
+            if isinstance(raw, Mapping)
+            and not raw.get("_rolling_source_rejection")
+            and not raw.get("_rolling_timestamp_rejection")
+        )
+    stage = {
+        "operational_gate_applied": bool(gate_applied),
+        "valid_observations": int(valid),
+        "entry_eligible_signals": int(entry_eligible),
+        "genuine_entry_signals": int(entry_eligible),
+        "risk_approved_paper_order_attempts": int(approved_attempts),
+        "risk_approved_order_attempts": int(approved_attempts),
+        "paper_order_attempts": int(event_attempts),
+        "policy_risk_rejects_by_reason": dict(sorted(policy_rejects.items())),
+        "risk_rejects_by_reason": dict(sorted(policy_rejects.items())),
+        "venue_minimum_blockers_by_reason": dict(sorted(venue_blockers.items())),
+        "input_path_exclusions_by_reason": dict(sorted(path_exclusions.items())),
+        "persistence_accounting_limits_by_reason": dict(sorted(accounting_limits.items())),
+        "fills": int(fill_count),
+        "partial_fills": int(partial_count),
+        "managed_exit_attempts": int(managed_exit_attempts),
+        "managed_exit_fills": int(managed_exit_fills),
+        "remaining_positions": len(set(position_ids)),
+        "remaining_position_ids": sorted(set(position_ids)),
+        "completed_outcomes": int(completed),
+        "gross_result": gross,
+        "realized_result": realized,
+        "unrealized_result": unrealized,
+        "net_result": net,
+        "negative_economics": bool(net is not None and net < 0),
+
+        "economic_result_available": net is not None,
+    }
+    return stage
+
+def _operational_identity_projection(*sources: Any) -> dict[str, Any]:
+    """Collect immutable setup/settings identity from runtime evidence."""
+    result: dict[str, Any] = {}
+    seen: set[int] = set()
+    pending: list[tuple[Any, int]] = [(source, 0) for source in sources]
+    setup_names = ("operational_setup",)
+    settings_names = (
+        "active_settings",
+        "settings_snapshot",
+        "operational_settings",
+        "settings",
+    )
+    identity_names = {
+        "operational_setup_hash": "operational_setup_hash",
+        "settings_config_id": "settings_config_id",
+        "settings_generation": "settings_generation",
+        "settings_config_hash": "settings_config_hash",
+        "control_generation": "control_generation",
+    }
+    settings_identity_names = {
+        "config_id": "settings_config_id",
+        "generation": "settings_generation",
+        "config_hash": "settings_config_hash",
+        "settings_config_id": "settings_config_id",
+        "settings_generation": "settings_generation",
+        "settings_config_hash": "settings_config_hash",
+    }
+    while pending:
+        item, depth = pending.pop()
+        if not isinstance(item, Mapping) or depth > 4 or id(item) in seen:
+            continue
+        seen.add(id(item))
+        for name in setup_names:
+            value = item.get(name)
+            if isinstance(value, Mapping) and "operational_setup" not in result:
+                result["operational_setup"] = _canonical_operational_document(value)
+        for name, target in identity_names.items():
+            value = item.get(name)
+            if value not in (None, "") and target not in result:
+                result[target] = value
+        for name in settings_names:
+            value = item.get(name)
+            if isinstance(value, Mapping):
+                if "active_settings" not in result:
+                    result["active_settings"] = dict(value)
+                for identity_name, target in settings_identity_names.items():
+                    identity_value = value.get(identity_name)
+                    if identity_value not in (None, "") and target not in result:
+                        result[target] = identity_value
+                pending.append((value, depth + 1))
+        for key, value in item.items():
+            if isinstance(value, Mapping):
+                pending.append((value, depth + 1))
+    setup = result.get("operational_setup")
+    if isinstance(setup, Mapping) and "operational_setup_hash" not in result:
+        result["operational_setup_hash"] = _operational_setup_hash(setup)
+    return result
 
 
 def _rolling_actual_ledger_accounting(
@@ -4918,6 +5508,8 @@ class AutonomousResearchProcessor:
                     "dataset_id",
                     "dataset_version",
                     "dataset_selector",
+                    "dataset_attestation",
+                    "dataset_boundary",
                     "market_scope",
                     "market_scope_hash",
                     "market_scope_version",
@@ -4932,6 +5524,26 @@ class AutonomousResearchProcessor:
                 )
                 if field_name in item and item[field_name] is not None
             }
+            explicit_setup = (
+                isinstance(item.get("operational_setup"), Mapping)
+                or item.get("operational_setup_hash") not in (None, "")
+            )
+            setup = _operational_setup_for_strategy(document, source_fields) if explicit_setup else None
+            setup_fields = (
+                {
+                    "operational_setup": setup,
+                    "operational_setup_hash": _operational_setup_hash(setup),
+                }
+                if setup is not None
+                else {}
+            )
+            model_document = (
+                dict(item["model_document"])
+                if isinstance(item.get("model_document"), Mapping)
+                else None
+            )
+            if setup_fields:
+                model_document = {"model_required": False}
             provenance_values = dict(item.get("provenance") or {})
             for field_name, value in source_fields.items():
                 # Preserve both direct and nested declarations.  A
@@ -4987,11 +5599,7 @@ class AutonomousResearchProcessor:
                 "config_hash": str(item.get("config_hash", strategy_hash)),
                 "created_at": now.isoformat(),
                 "strategy_document": document,
-                "model_document": (
-                    dict(item["model_document"])
-                    if isinstance(item.get("model_document"), Mapping)
-                    else None
-                ),
+                "model_document": model_document,
                 "canonical_strategy": document,
                 "enrollment_mode": enrollment_mode,
                 "provenance": provenance,
@@ -4999,6 +5607,7 @@ class AutonomousResearchProcessor:
                 "execution_scope": "OBSERVATION",
                 "research_only": True,
                 "paper_only": True,
+                **setup_fields,
                 **source_fields,
             }
             trial_id = str(item.get("research_trial_id") or provenance.get("research_trial_id") or "").strip()
@@ -5025,14 +5634,12 @@ class AutonomousResearchProcessor:
                 "execution_scope": "OBSERVATION",
                 "research_only": True,
                 "paper_only": True,
+                **setup_fields,
                 "payload": {
                     "strategy_document": document,
-                    "model_document": (
-                        dict(item["model_document"])
-                        if isinstance(item.get("model_document"), Mapping)
-                        else None
-                    ),
+                    "model_document": model_document,
                     "provenance": provenance,
+                    **setup_fields,
                 },
             }
             def immutable_match(existing: Any, expected: Mapping[str, Any]) -> bool:
@@ -7806,6 +8413,44 @@ class AutonomousResearchProcessor:
             portfolio_accounting["accounting_available"] = False
             for name in _ROLLING_CANONICAL_MONETARY_FIELDS:
                 portfolio_accounting[name] = None
+        fills = tuple(getattr(result, "fills", ()) or ())
+        operational_evidence = _operational_stage_projection(
+            rows=valid_rows,
+            fills=fills,
+            curve=tuple(getattr(result, "equity_curve", ()) or ()),
+            remaining_positions=getattr(result, "unresolved", ()),
+            valid_observations=evaluated_observations,
+        )
+        if isinstance(portfolio_accounting, Mapping):
+            operational_evidence["completed_outcomes"] = int(
+                _rolling_number(
+                    portfolio_accounting.get(
+                        "completed_round_trips",
+                        portfolio_accounting.get("completed_outcomes", 0),
+                    ),
+                    Decimal("0"),
+                )
+            )
+            if portfolio_accounting.get("accounting_available") is True and evaluator_completed:
+                realized = portfolio_accounting.get("realized_pnl")
+                unrealized = portfolio_accounting.get("unrealized_pnl")
+                net = portfolio_accounting.get("net_pnl")
+                fees = portfolio_accounting.get("fees")
+                costs = portfolio_accounting.get("costs")
+                if all(value is not None for value in (realized, unrealized, net, fees, costs)):
+                    net_value = _rolling_number(net)
+                    operational_evidence.update(
+                        {
+                            "realized_result": _rolling_number(realized),
+                            "unrealized_result": _rolling_number(unrealized),
+                            "net_result": net_value,
+                            "gross_result": net_value
+                            + _rolling_number(fees)
+                            + _rolling_number(costs),
+                            "economic_result_available": True,
+                        }
+                    )
+        evaluation["operational_evidence"] = dict(operational_evidence)
         material = {
             "version": "rolling-evaluation:v2",
             "source": requested_source,
@@ -7813,6 +8458,7 @@ class AutonomousResearchProcessor:
             "source_digest": source_digest,
             "portfolio_accounting": portfolio_accounting,
             "evaluation": evaluation,
+            "operational_evidence": operational_evidence,
         }
         evaluation_run_id = run_identity(material)
         return {
@@ -7832,13 +8478,12 @@ class AutonomousResearchProcessor:
             "evaluator_prerequisite": evaluation.get("evaluator_prerequisite"),
             "portfolio_accounting": portfolio_accounting,
             "evaluation": evaluation,
+            "operational_evidence": operational_evidence,
             "metrics": {
                 "portfolio_accounting": portfolio_accounting,
                 "evaluation": evaluation,
+                "operational_evidence": operational_evidence,
             },
-            "accounting_available": portfolio_accounting.get("accounting_available"),
-            "accounting_complete": accounting_complete,
-            "accounting_partial": not accounting_complete,
             "accounting_unavailable_reason": (
                 evaluation.get("evaluator_error")
                 or evaluation.get("evaluator_prerequisite")
@@ -7922,6 +8567,65 @@ class AutonomousResearchProcessor:
             else None
         )
         canonical_evaluation = evaluation_map.get("evaluation")
+        operational_evidence = evaluation_map.get("operational_evidence")
+        operational_evidence = (
+            dict(operational_evidence)
+            if isinstance(operational_evidence, Mapping)
+            else {}
+        )
+        paper_events: list[Mapping[str, Any]] = []
+        paper_fills: list[Any] = []
+        if actual_ledger:
+            experiment_ids = {
+                str(row.get("_paper_experiment_id", "")).strip()
+                for row in rows
+                if isinstance(row, Mapping)
+                and str(row.get("_paper_experiment_id", "")).strip()
+            }
+            event_loader = getattr(self.store, "list_paper_execution_events", None)
+            fill_loader = getattr(self.store, "load_fills", None)
+            if callable(event_loader):
+                for experiment_id in sorted(experiment_ids):
+                    try:
+                        values = event_loader(
+                            experiment_id,
+                            limit=_MAX_ROLLING_SOURCE_ROWS,
+                        )
+                    except (TypeError, ValueError, RuntimeError):
+                        values = ()
+                    if isinstance(values, Sequence) and not isinstance(values, (str, bytes)):
+                        paper_events.extend(
+                            item for item in values if isinstance(item, Mapping)
+                        )
+            if callable(fill_loader):
+                strategy_hash = str(strategy.get("strategy_hash", "")).strip()
+                try:
+                    values = fill_loader(strategy_id=strategy_hash)
+                except (TypeError, ValueError, RuntimeError):
+                    values = ()
+                if isinstance(values, Sequence) and not isinstance(values, (str, bytes)):
+                    for item in values:
+                        metadata = getattr(item, "metadata", {})
+                        metadata = metadata if isinstance(metadata, Mapping) else {}
+                        if (
+                            isinstance(item, Fill)
+                            and str(metadata.get("paper_experiment_id", "")).strip()
+                            in experiment_ids
+                        ):
+                            paper_fills.append(item)
+            operational_evidence = _operational_stage_projection(
+                rows=rows,
+                events=paper_events,
+                fills=paper_fills,
+                ledgers=rows,
+                valid_observations=sum(
+                    1
+                    for row in rows
+                    if isinstance(row, Mapping)
+                    and not row.get("_rolling_source_rejection")
+                    and not row.get("_rolling_timestamp_rejection")
+                ),
+            )
         if canonical_accounting is not None:
             # Evidence schema bounds the immutable open-position projection.
             # Canonical evaluators may report a larger inventory, but the
@@ -8334,6 +9038,7 @@ class AutonomousResearchProcessor:
             )
             completed_values.append(count_value(raw_completed, "completed_outcomes"))
         completed = sum(completed_values) if count_error is None else 0
+
         reliabilities = [dec(item.get("reliability")) for _row, item in selected]
         reliability = (
             sum(reliabilities, Decimal("0")) / Decimal(len(reliabilities))
@@ -8407,6 +9112,43 @@ class AutonomousResearchProcessor:
             dataset_id=dataset_id,
             dataset_version=dataset_version,
         )
+        operational_identity = _operational_identity_projection(
+            strategy,
+            evaluation_map,
+            canonical_evaluation,
+            *paper_events,
+            *rows,
+        )
+        if (
+            (
+                operational_identity.get("operational_setup") is not None
+                or operational_identity.get("operational_setup_hash") not in (None, "")
+            )
+            and operational_identity.get("settings_config_id") in (None, "")
+        ):
+            active_loader = getattr(self.store, "load_canary_setting_config", None)
+            active_settings = None
+            if callable(active_loader):
+                try:
+                    active_settings = active_loader(status="ACTIVE")
+                except (TypeError, ValueError, RuntimeError):
+                    active_settings = None
+            if isinstance(active_settings, Mapping):
+                values = active_settings.get("values", active_settings.get("settings"))
+                if isinstance(values, Mapping):
+                    operational_identity["active_settings"] = dict(values)
+                operational_identity["settings_config_id"] = active_settings.get("config_id")
+                operational_identity["settings_generation"] = active_settings.get("generation")
+                operational_identity["settings_config_hash"] = active_settings.get(
+                    "config_hash"
+                )
+                operational_identity["operational_settings_available"] = True
+                operational_identity["operational_settings_blocker"] = None
+            else:
+                operational_identity["operational_settings_available"] = False
+                operational_identity["operational_settings_blocker"] = (
+                    "ACTIVE_SETTINGS_UNAVAILABLE"
+                )
         resolved_provenance = evaluation_map.get("model_resolution")
         if not isinstance(resolved_provenance, Mapping):
             for nested in (
@@ -8548,6 +9290,8 @@ class AutonomousResearchProcessor:
             "source_digest": source_digest,
             "accounting_digest": accounting_digest,
             "input_manifest": input_manifest,
+            "operational_identity": operational_identity,
+            "operational_evidence": operational_evidence,
         }
         evidence_digest = _rolling_hash(evidence_identity)
         window_id = (
@@ -8706,6 +9450,44 @@ class AutonomousResearchProcessor:
             )
         top_level_realized = realized_pnl if not partial_accounting else None
         top_level_unrealized = unrealized_pnl if not partial_accounting else None
+        # Accounting result fields are deliberately projected only when the
+        # immutable accounting path is complete.  Stage counts remain useful
+        # evidence even when monetary values are unavailable.
+        if operational_evidence:
+            if isinstance(canonical_accounting, Mapping):
+                raw_positions = canonical_accounting.get("open_positions", ())
+                if (
+                    "remaining_positions" not in operational_evidence
+                    and isinstance(raw_positions, (list, tuple, set, frozenset))
+                ):
+                    operational_evidence["remaining_positions"] = len(raw_positions)
+                    operational_evidence["remaining_position_ids"] = sorted(
+                        str(value) for value in raw_positions if str(value).strip()
+                    )
+            if partial_accounting:
+                for name in (
+                    "gross_result",
+                    "realized_result",
+                    "unrealized_result",
+                    "net_result",
+                ):
+                    operational_evidence[name] = None
+                operational_evidence["economic_result_available"] = False
+                operational_evidence["negative_economics"] = None
+            else:
+                gross_result = net_return + fees + costs
+                operational_evidence.update(
+                    {
+                        "gross_result": gross_result,
+                        "realized_result": realized_pnl,
+                        "unrealized_result": unrealized_pnl,
+                        "net_result": net_return,
+                        "economic_result_available": True,
+                        "negative_economics": net_return < Decimal("0"),
+                    }
+                )
+        evaluation_map["operational_evidence"] = dict(operational_evidence)
+        canonical_evaluation["operational_evidence"] = dict(operational_evidence)
         record = {
             "strategy_version_id": strategy["strategy_version_id"],
             "candidate_id": candidate_id,
@@ -8830,6 +9612,7 @@ class AutonomousResearchProcessor:
             "metrics": {
                 "portfolio_accounting": dict(canonical_accounting or {}),
                 "evaluation": dict(canonical_evaluation),
+                "operational_evidence": dict(operational_evidence),
             },
             "portfolio_accounting": dict(canonical_accounting or {}),
             "evaluation": dict(canonical_evaluation),
@@ -8837,6 +9620,32 @@ class AutonomousResearchProcessor:
             "rolling_research": True,
             "measured_at": available_through.isoformat(),
         }
+        if operational_evidence:
+            record["operational_evidence"] = dict(operational_evidence)
+            # Direct aliases are compatibility projections only.  Never let a
+            # stage metric overwrite a canonical legacy/evaluation field such
+            # as ``completed_outcomes``.
+            for name, value in operational_evidence.items():
+                if name not in record:
+                    record[name] = value
+        if operational_identity:
+            record["operational_identity"] = dict(operational_identity)
+            for name, value in operational_identity.items():
+                if name not in record:
+                    record[name] = value
+            # Evidence describes the operational run; only the existing
+            # admission policy may promote or allocate it.
+            record["admitted"] = False
+            record["admission_reasons"] = ["OPERATIONAL_EVIDENCE_NOT_ADMISSION"]
+        if operational_evidence:
+            for source_name, output_name in (
+                ("gross_result", "gross_pnl"),
+                ("realized_result", "realized_result"),
+                ("unrealized_result", "unrealized_result"),
+                ("net_result", "net_pnl"),
+            ):
+                if source_name in operational_evidence and output_name not in record:
+                    record[output_name] = operational_evidence[source_name]
         record["evidence_digest"] = RollingEvidence.from_mapping(record).evidence_digest
         return record
 
@@ -10295,11 +11104,65 @@ class AutonomousResearchProcessor:
         if not value or len(value) > 128:
             raise ValueError("campaign_id must be bounded non-empty text")
         return f"polymarket-research-campaign:{value}"
+    @staticmethod
+    def _campaign_plan_id(campaign_id: str, trial_id: str) -> str:
+        """Return a bounded plan identity while preserving short legacy IDs."""
+        campaign = str(campaign_id).strip()
+        trial = str(trial_id).strip()
+        candidate = f"campaign-plan:{campaign}:{trial}"
+        if re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", candidate):
+            return candidate
+        # Hash the complete source IDs so truncating the readable prefix cannot
+        # make distinct long campaign/trial pairs collide.
+        digest = _hash_document(
+            {"campaign_id": campaign, "trial_id": trial}
+        ).split(":", 1)[-1][:24]
+        canonical = re.sub(r"[^A-Za-z0-9._:-]+", "-", candidate)
+        return f"{canonical[:103]}:{digest}"
+
 
     @staticmethod
     def campaign_configurations() -> tuple[Mapping[str, Any], ...]:
         """Return the fixed, one-variant Polymarket generator grid."""
         return tuple(dict(item) for item in POLYMARKET_CAMPAIGN_GRID)
+
+    @staticmethod
+    def _campaign_configuration_allowlist(
+        configurations: Sequence[Mapping[str, Any]],
+        configuration_allowlist: Any,
+    ) -> frozenset[str]:
+        """Resolve an operator selection to exact members of the fixed grid."""
+        if (
+            isinstance(configuration_allowlist, (str, bytes, bytearray))
+            or isinstance(configuration_allowlist, Mapping)
+            or not isinstance(configuration_allowlist, Sequence)
+        ):
+            raise ValueError("configuration_allowlist must be a non-string sequence")
+        if len(configuration_allowlist) > len(configurations):
+            raise ValueError("configuration_allowlist exceeds the campaign configuration grid")
+        known_ids = {
+            str(item.get("configuration_id", ""))
+            for item in configurations
+            if isinstance(item, Mapping) and str(item.get("configuration_id", "")).strip()
+        }
+        selected: set[str] = set()
+        for raw_id in configuration_allowlist:
+            if not isinstance(raw_id, str):
+                raise ValueError("configuration_allowlist entries must be strings")
+            configuration_id = raw_id.strip()
+            if not configuration_id:
+                raise ValueError("configuration_allowlist entries must not be blank")
+            if configuration_id in selected:
+                raise ValueError(
+                    f"configuration_allowlist contains duplicate configuration id: {configuration_id}"
+                )
+            if configuration_id not in known_ids:
+                raise ValueError(
+                    f"configuration_allowlist contains unknown configuration id: {configuration_id}"
+                )
+            selected.add(configuration_id)
+        return frozenset(selected)
+
 
     @staticmethod
     def _campaign_dataset_rows(store: AxiomStore, dataset_id: str, dataset_version: str) -> list[Mapping[str, Any]]:
@@ -10411,6 +11274,535 @@ class AutonomousResearchProcessor:
                         )
         return keys
     @staticmethod
+    def _campaign_v2_protocol(value: Any) -> bool:
+        """Recognize only an unambiguous, canonical V2 protocol envelope."""
+        if not isinstance(value, Mapping):
+            return False
+        schema_version = str(value.get("schema_version", "")).strip()
+        protocol_id = str(value.get("protocol_id", "")).strip()
+        # Do not let a single forged marker upgrade a V1/legacy document.
+        return (
+            schema_version == CAMPAIGN_SCHEMA_V2
+            and protocol_id == CAMPAIGN_PROTOCOL_V2_ID
+        )
+
+    @staticmethod
+    def _campaign_protocol_digest(value: Mapping[str, Any]) -> str | None:
+        digest = str(value.get("protocol_hash", "")).strip()
+        if len(digest) != 71 or not digest.startswith("sha256:"):
+            return None
+        try:
+            int(digest[7:], 16)
+        except (TypeError, ValueError):
+            return None
+        return digest if digest == digest.lower() else None
+
+    @staticmethod
+    def _campaign_operational_setup_binding(
+        value: Mapping[str, Any],
+    ) -> tuple[str, str] | None:
+        setup = value.get("operational_setup")
+        setup_hash = str(value.get("operational_setup_hash", "")).strip()
+        if not isinstance(setup, Mapping) or not setup_hash:
+            return None
+        setup_id = str(setup.get("setup_id", "")).strip()
+        family = str(setup.get("family", "")).strip().lower()
+        if family not in {"momentum", "mean_reversion"}:
+            return None
+        if setup_id != f"{family}:absolute-move-v1:L1:H1":
+            return None
+        if (
+            str(setup.get("contract_schema", "")).strip() != "axiom-operational-setup"
+            or str(setup.get("contract_version", "")).strip() != "1"
+            or str(setup.get("market_type", "")).strip().lower() != "prediction"
+        ):
+            return None
+        manifest = setup.get("assessment_manifest_ref")
+        if not isinstance(manifest, Mapping):
+            return None
+        # A V2 setup is not durable evidence without an immutable attestation
+        # identity.  Boundary-only setups must remain eligible for reruns.
+        if not str(manifest.get("attestation_hash", "")).strip():
+            return None
+        if not str(manifest.get("dataset_id", "")).strip() or not str(
+            manifest.get("dataset_version", "")
+        ).strip():
+            return None
+        try:
+            canonical_hash = _operational_setup_hash(setup)
+        except (RecursionError, TypeError, ValueError, OverflowError):
+            return None
+        if setup_hash != canonical_hash:
+            return None
+        return setup_id, setup_hash
+
+    @staticmethod
+    def _campaign_exact_configuration_identity(
+        value: Mapping[str, Any],
+        configuration_id: Any,
+    ) -> bool:
+        """Require one canonical scalar member of the V2 operational grid."""
+        configuration = str(configuration_id or "").strip()
+        if configuration not in _OPERATIONAL_CAMPAIGN_CONFIGURATION_IDS:
+            return False
+        family, separator, suffix = configuration.partition(":")
+        if not separator or suffix != "lookback-1:threshold-0.05":
+            return False
+        declared_configuration = value.get("configuration_id")
+        if (
+            declared_configuration is not None
+            and str(declared_configuration).strip() != configuration
+        ):
+            return False
+        template = str(value.get("template", "")).strip().lower()
+        if template != family:
+            return False
+        experiment_family = value.get("experiment_family")
+        if (
+            experiment_family is not None
+            and str(experiment_family).strip().lower() != family
+        ):
+            return False
+        parameters = value.get("parameters")
+        if not isinstance(parameters, Mapping):
+            return False
+        if (
+            len(parameters) != 2
+            or {str(name).strip().lower() for name in parameters}
+            != {"lookback", "threshold"}
+        ):
+            return False
+
+        def scalar(parameter: Any) -> Any:
+            if isinstance(parameter, (list, tuple)):
+                if len(parameter) != 1:
+                    return None
+                return parameter[0]
+            return parameter
+
+        lookback = scalar(parameters.get("lookback"))
+        threshold = scalar(parameters.get("threshold"))
+        if (
+            isinstance(lookback, bool)
+            or not isinstance(lookback, (int, float))
+            or not math.isfinite(float(lookback))
+            or float(lookback) != 1.0
+            or isinstance(threshold, bool)
+            or not isinstance(threshold, (int, float))
+            or not math.isfinite(float(threshold))
+            or abs(float(threshold) - 0.05) > 1e-12
+        ):
+            return False
+        return True
+
+
+    @staticmethod
+    def _campaign_setup_matches_configuration(
+        setup_value: Mapping[str, Any],
+        configuration_id: Any,
+    ) -> bool:
+        configuration = str(configuration_id or "").strip()
+        if configuration not in _OPERATIONAL_CAMPAIGN_CONFIGURATION_IDS:
+            return False
+        setup = setup_value.get("operational_setup")
+        if not isinstance(setup, Mapping):
+            return False
+        family = configuration.split(":", 1)[0]
+        return (
+            str(setup.get("family", "")).strip().lower() == family
+            and str(setup.get("setup_id", "")).strip()
+            == f"{family}:absolute-move-v1:L1:H1"
+        )
+
+    @staticmethod
+    def _campaign_setup_matches_boundary(
+        setup_value: Mapping[str, Any],
+        boundary: Mapping[str, Any] | None,
+    ) -> bool:
+        if not isinstance(boundary, Mapping):
+            return True
+        setup = setup_value.get("operational_setup")
+        manifest = setup.get("assessment_manifest_ref") if isinstance(setup, Mapping) else None
+        if not isinstance(manifest, Mapping):
+            return False
+        for field in ("dataset_id", "dataset_version"):
+            expected = str(boundary.get(field, "")).strip()
+            if expected and str(manifest.get(field, "")).strip() != expected:
+                return False
+        expected_digest = str(
+            boundary.get("ordered_row_manifest_digest", boundary.get("content_hash", ""))
+        ).strip()
+        if expected_digest and str(manifest.get("manifest_digest", "")).strip() != expected_digest:
+            return False
+        expected_attestation = str(boundary.get("attestation_hash", "")).strip()
+        if expected_attestation and str(manifest.get("attestation_hash", "")).strip() != expected_attestation:
+            return False
+        return True
+
+    def _campaign_plan_evidence_binding(
+        self,
+        record: Mapping[str, Any] | None,
+        plan: Mapping[str, Any],
+        setup_value: Mapping[str, Any],
+        *,
+        boundary: Mapping[str, Any] | None = None,
+        expected_protocol_hash: str | None = None,
+    ) -> tuple[str, str] | None:
+        """Validate a setup carried by one immutable experiment-plan source."""
+        protocol = plan.get("campaign_protocol")
+        if not self._campaign_v2_protocol(protocol):
+            return None
+        assert isinstance(protocol, Mapping)
+        protocol_hash = self._campaign_protocol_digest(protocol)
+        if protocol_hash is None or (
+            expected_protocol_hash is not None and protocol_hash != expected_protocol_hash
+        ):
+            return None
+        campaign_id = str(plan.get("campaign_id", "")).strip()
+        trial_id = str(plan.get("campaign_trial_id", "")).strip()
+        configuration_id = str(plan.get("campaign_configuration_id", "")).strip()
+        if not campaign_id or not trial_id or not configuration_id:
+            return None
+        if str(protocol.get("campaign_id", "")).strip() != campaign_id:
+            return None
+        # Setup identity is not enough: a copied setup must remain tied to the
+        # exact scalar configuration declared by this immutable plan.
+        if not self._campaign_exact_configuration_identity(plan, configuration_id):
+            return None
+        selector = plan.get("dataset_selector")
+        setup = setup_value.get("operational_setup")
+        setup_manifest = setup.get("assessment_manifest_ref") if isinstance(setup, Mapping) else None
+        if (
+            not isinstance(selector, Mapping)
+            or not isinstance(setup_manifest, Mapping)
+            or str(selector.get("dataset_id", "")).strip()
+            != str(setup_manifest.get("dataset_id", "")).strip()
+            or str(selector.get("dataset_version", "")).strip()
+            != str(setup_manifest.get("dataset_version", "")).strip()
+        ):
+            return None
+        if not self._campaign_setup_matches_configuration(setup_value, configuration_id):
+            return None
+        binding = self._campaign_operational_setup_binding(setup_value)
+        if binding is None or not self._campaign_setup_matches_boundary(setup_value, boundary):
+            return None
+        template = str(plan.get("template", plan.get("experiment_family", ""))).strip().lower()
+        raw_parameters = plan.get("parameters")
+        parameters = dict(raw_parameters) if isinstance(raw_parameters, Mapping) else {}
+        normalized_parameters = {
+            str(name): (
+                value[0] if isinstance(value, (list, tuple)) and len(value) == 1 else value
+            )
+            for name, value in parameters.items()
+        }
+        expected_template = configuration_id.split(":", 1)[0]
+        if template != expected_template:
+            return None
+        manifest = plan.get("configuration_manifest")
+        if isinstance(manifest, Mapping):
+            expected_manifest = {
+                "configuration_id": configuration_id,
+                "template": template,
+                "parameters": normalized_parameters,
+            }
+            try:
+                manifest_matches = _canonical_binding(manifest) == _canonical_binding(
+                    expected_manifest
+                )
+            except (RecursionError, TypeError, ValueError, OverflowError):
+                return None
+            if not manifest_matches:
+                return None
+        if record is not None:
+            stored_plan_id = str(record.get("plan_id", "")).strip()
+            stored_hash = str(record.get("plan_hash", "")).strip()
+            plan_id = str(plan.get("plan_id", "")).strip()
+            if not stored_plan_id or not stored_hash:
+                return None
+            if plan_id and plan_id != stored_plan_id:
+                return None
+            if stored_hash != _hash_document(plan):
+                return None
+            stored_hypothesis = str(record.get("hypothesis_id", "")).strip()
+            plan_hypothesis = str(plan.get("hypothesis_id", "")).strip()
+            if not stored_hypothesis or (plan_hypothesis and stored_hypothesis != plan_hypothesis):
+                return None
+        return binding
+
+    def _campaign_queue_evidence_binding(
+        self,
+        record: Mapping[str, Any],
+        *,
+        expected_protocol_hash: str | None = None,
+    ) -> tuple[str, str] | None:
+        payload = record.get("payload")
+        if not isinstance(payload, Mapping):
+            return None
+        plan = payload.get("experiment_plan")
+        setup = payload if isinstance(payload, Mapping) else None
+        if not isinstance(plan, Mapping) or not isinstance(setup, Mapping):
+            return None
+        protocol = plan.get("campaign_protocol")
+        if not isinstance(protocol, Mapping):
+            return None
+        protocol_hash = self._campaign_protocol_digest(protocol)
+        if (
+            protocol_hash is None
+            or (
+                expected_protocol_hash is not None
+                and protocol_hash != expected_protocol_hash
+            )
+            or str(payload.get("campaign_protocol_hash", "")).strip() != protocol_hash
+        ):
+            return None
+        campaign_id = str(payload.get("campaign_id", "")).strip()
+        trial_id = str(payload.get("campaign_trial_id", "")).strip()
+        configuration_id = str(payload.get("campaign_configuration_id", "")).strip()
+        if (
+            not campaign_id
+            or not trial_id
+            or not configuration_id
+            or str(plan.get("campaign_id", "")).strip() != campaign_id
+            or str(plan.get("campaign_trial_id", "")).strip() != trial_id
+            or str(plan.get("campaign_configuration_id", "")).strip() != configuration_id
+        ):
+            return None
+        payload_dataset_id = str(payload.get("dataset_id", "")).strip()
+        payload_dataset_version = str(payload.get("dataset_version", "")).strip()
+        if not payload_dataset_id or not payload_dataset_version:
+            return None
+        selector = plan.get("dataset_selector")
+        if isinstance(selector, Mapping) and (
+            str(selector.get("dataset_id", "")).strip() != payload_dataset_id
+            or str(selector.get("dataset_version", "")).strip() != payload_dataset_version
+        ):
+            return None
+        plan_boundary = plan.get("dataset_boundary")
+        boundary = dict(plan_boundary) if isinstance(plan_boundary, Mapping) else {}
+        boundary["dataset_id"] = payload_dataset_id
+        boundary["dataset_version"] = payload_dataset_version
+        plan_id = str(plan.get("plan_id", "")).strip()
+        loader = getattr(self.store, "load_experiment_plan", None)
+        if not plan_id or not callable(loader):
+            return None
+        try:
+            persisted = loader(plan_id)
+        except Exception:
+            return None
+        if not isinstance(persisted, Mapping) or not isinstance(persisted.get("plan"), Mapping):
+            return None
+        persisted_plan = persisted["plan"]
+        if _canonical_binding(persisted_plan) != _canonical_binding(plan):
+            return None
+        if (
+            str(persisted.get("plan_hash", "")).strip() != _hash_document(plan)
+            or (
+                str(payload.get("hypothesis_id", "")).strip()
+                and str(payload.get("hypothesis_id", "")).strip()
+                != str(persisted.get("hypothesis_id", "")).strip()
+            )
+        ):
+            return None
+        return self._campaign_plan_evidence_binding(
+            persisted,
+            plan,
+            setup,
+            boundary=boundary,
+            expected_protocol_hash=protocol_hash,
+        )
+
+    def _campaign_prior_operational_setup_bindings(self) -> set[tuple[str, str]]:
+        """Return setup identities from fully bound V2 durable evidence only."""
+        bindings: set[tuple[str, str]] = set()
+
+        lister = getattr(self.store, "list_experiment_plans", None)
+        if callable(lister):
+            try:
+                records = lister(limit=10_000, newest_first=False)
+            except TypeError:
+                records = lister(limit=10_000)
+            except Exception:
+                records = ()
+            for record in records or ():
+                if not isinstance(record, Mapping):
+                    continue
+                plan = record.get("plan")
+                if not isinstance(plan, Mapping):
+                    continue
+                if self._campaign_v2_protocol(plan.get("campaign_protocol")):
+                    binding = self._campaign_plan_evidence_binding(record, plan, plan)
+                    if binding is not None:
+                        bindings.add(binding)
+
+        try:
+            queued = self.store.list_research_items(limit=10_000)
+        except Exception:
+            queued = ()
+        for record in queued or ():
+            if not isinstance(record, Mapping):
+                continue
+            binding = self._campaign_queue_evidence_binding(record)
+            if binding is not None:
+                bindings.add(binding)
+
+        job_lister = getattr(self.store, "list_operator_jobs", None)
+        if callable(job_lister):
+            try:
+                jobs = job_lister(
+                    job_prefix="polymarket-research-campaign:",
+                    limit=10_000,
+                )
+            except TypeError:
+                try:
+                    jobs = job_lister(limit=10_000)
+                except Exception:
+                    jobs = ()
+            except Exception:
+                jobs = ()
+            for record in jobs or ():
+                if not isinstance(record, Mapping):
+                    continue
+                payload = record.get("payload")
+                if not isinstance(payload, Mapping):
+                    continue
+                job_name = str(record.get("job_name", "")).strip()
+                job_campaign_id = job_name.removeprefix("polymarket-research-campaign:")
+                if job_campaign_id != str(payload.get("campaign_id", "")).strip():
+                    continue
+                protocol = payload.get("protocol")
+                if not self._campaign_v2_protocol(protocol) or not isinstance(protocol, Mapping):
+                    continue
+                protocol_hash = _hash_document(protocol)
+                if (
+                    str(payload.get("protocol_hash", "")).strip() != protocol_hash
+                    or self._campaign_protocol_digest({"protocol_hash": protocol_hash}) is None
+                    or str(payload.get("schema_version", "")).strip() != CAMPAIGN_SCHEMA_V2
+                    or str(payload.get("protocol_id", "")).strip() != CAMPAIGN_PROTOCOL_V2_ID
+                    or str(payload.get("campaign_id", "")).strip()
+                    != str(protocol.get("campaign_id", "")).strip()
+                ):
+                    continue
+                boundary = protocol.get("dataset_boundary")
+                reassessment_boundaries = payload.get("reassessment_boundaries")
+                trials = payload.get("trials")
+                if not isinstance(trials, Sequence) or isinstance(trials, (str, bytes)):
+                    continue
+                operational_setups = protocol.get("operational_setups")
+                if not isinstance(operational_setups, Mapping):
+                    continue
+                for trial in trials:
+                    if not isinstance(trial, Mapping):
+                        continue
+                    configuration_id = str(trial.get("configuration_id", "")).strip()
+                    trial_id = str(trial.get("trial_id", "")).strip()
+                    trial_configuration = trial.get("configuration")
+                    if (
+                        not trial_id
+                        or not isinstance(trial_configuration, Mapping)
+                        or str(trial_configuration.get("configuration_id", "")).strip()
+                        != configuration_id
+                        or str(trial_configuration.get("template", "")).strip().lower()
+                        != configuration_id.split(":", 1)[0]
+                        or not self._campaign_exact_configuration_identity(
+                            trial_configuration,
+                            configuration_id,
+                        )
+                    ):
+                        continue
+                    reassessment_of = str(trial.get("reassessment_of", "")).strip()
+                    trial_boundary = boundary
+                    if reassessment_of:
+                        trial_boundary = (
+                            reassessment_boundaries.get(trial_id)
+                            if isinstance(reassessment_boundaries, Mapping)
+                            else None
+                        )
+                    if not isinstance(trial_boundary, Mapping):
+                        continue
+                    setup = (
+                        {
+                            "operational_setup": trial.get("operational_setup"),
+                            "operational_setup_hash": trial.get("operational_setup_hash"),
+                        }
+                        if isinstance(trial.get("operational_setup"), Mapping)
+                        else None
+                    )
+                    declared = operational_setups.get(configuration_id)
+                    if (
+                        setup is None
+                        or self._campaign_operational_setup_binding(setup) is None
+                        or (
+                            not reassessment_of
+                            and (
+                                not isinstance(declared, Mapping)
+                                or _canonical_binding(setup) != _canonical_binding(declared)
+                            )
+                        )
+                    ):
+                        continue
+                    if not self._campaign_setup_matches_configuration(setup, configuration_id):
+                        continue
+                    if not self._campaign_setup_matches_boundary(setup, trial_boundary):
+                        continue
+                    # A job trial consumes a setup only after its plan and
+                    # queue references resolve to the same immutable source.
+                    plan_id = str(trial.get("plan_id", "")).strip()
+                    plan_hash = str(trial.get("plan_hash", "")).strip()
+                    queue_item_id = str(trial.get("queue_item_id", "")).strip()
+                    loader = getattr(self.store, "load_experiment_plan", None)
+                    queue_loader = getattr(self.store, "get_research_item", None)
+                    if (
+                        not plan_id
+                        or not plan_hash
+                        or not queue_item_id
+                        or not callable(loader)
+                        or not callable(queue_loader)
+                    ):
+                        continue
+                    try:
+                        persisted = loader(plan_id)
+                        queue_record = queue_loader(queue_item_id)
+                    except Exception:
+                        continue
+                    if (
+                        not isinstance(persisted, Mapping)
+                        or not isinstance(persisted.get("plan"), Mapping)
+                        or str(persisted.get("plan_hash", "")).strip() != plan_hash
+                        or not isinstance(queue_record, Mapping)
+                    ):
+                        continue
+                    persisted_plan = persisted["plan"]
+                    trial_binding = self._campaign_plan_evidence_binding(
+                        persisted,
+                        persisted_plan,
+                        setup,
+                        boundary=trial_boundary,
+                        expected_protocol_hash=protocol_hash,
+                    )
+                    if trial_binding is None:
+                        continue
+                    queue_payload = queue_record.get("payload")
+                    if not isinstance(queue_payload, Mapping):
+                        continue
+                    if (
+                        str(queue_payload.get("campaign_id", "")).strip()
+                        != str(payload.get("campaign_id", "")).strip()
+                        or str(queue_payload.get("campaign_trial_id", "")).strip()
+                        != str(trial.get("trial_id", "")).strip()
+                        or str(queue_payload.get("campaign_configuration_id", "")).strip()
+                        != configuration_id
+                    ):
+                        continue
+                    queue_binding = self._campaign_queue_evidence_binding(
+                        queue_record,
+                        expected_protocol_hash=protocol_hash,
+                    )
+                    if queue_binding == trial_binding:
+                        bindings.add(queue_binding)
+        return bindings
+
+
+    @staticmethod
     def _campaign_split_manifests(rows: Sequence[Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
         """Return compact split commitments, not the historical row lists."""
         return dict(_campaign_compact_row_provenance(rows)["split_boundaries"])
@@ -10428,6 +11820,7 @@ class AutonomousResearchProcessor:
         observation_horizon: int,
         protocol_id: str = CAMPAIGN_PROTOCOL_V1_ID,
         attestation_hash: str | None = None,
+        dataset_attestation: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         provenance = _campaign_compact_row_provenance(rows)
         manifests = dict(provenance["split_boundaries"])
@@ -10458,8 +11851,108 @@ class AutonomousResearchProcessor:
             if protocol_identity == CAMPAIGN_PROTOCOL_V2_ID
             else ["timestamp", "market_id", "yes_mid", "yes_bid", "yes_ask", "settlement"]
         )
+        versioned_setup = protocol_identity == CAMPAIGN_PROTOCOL_V2_ID
+        canonical_attestation = (
+            _operational_attestation_binding(dataset_attestation)
+            if isinstance(dataset_attestation, Mapping)
+            else {}
+        )
+        supplied_attestation_hash = str(attestation_hash or "").strip()
+        if supplied_attestation_hash:
+            if (
+                canonical_attestation
+                and str(canonical_attestation.get("attestation_hash", "")).strip()
+                not in {"", supplied_attestation_hash}
+            ):
+                raise ValueError("dataset attestation hash does not match its bounded identity")
+            canonical_attestation.setdefault("attestation_hash", supplied_attestation_hash)
+        if versioned_setup:
+            invalid_ids = {
+                str(configuration.get("configuration_id", "")).strip()
+                for configuration in configurations
+                if not isinstance(configuration, Mapping)
+                or str(configuration.get("configuration_id", "")).strip()
+                not in _OPERATIONAL_CAMPAIGN_CONFIGURATION_IDS
+            }
+            if invalid_ids:
+                raise ValueError(
+                    "V2 campaigns allow only exact operational configuration ids"
+                )
+        setup_scope = {
+            "mode": "RULE_BASED_MARKETS",
+            "instrument": "POLYMARKET",
+            "filters": {},
+            "regime_restrictions": {},
+            "provenance": "canonical",
+        }
+        operational_setups: dict[str, dict[str, Any]] = {}
+        if versioned_setup:
+            for configuration in configurations:
+                family = str(configuration.get("template", "")).strip().lower()
+                raw_parameters = configuration.get("parameters")
+                parameters = dict(raw_parameters) if isinstance(raw_parameters, Mapping) else {}
+                scalar_parameters = {
+                    name: (
+                        value[0]
+                        if isinstance(value, (list, tuple)) and len(value) == 1
+                        else value
+                    )
+                    for name, value in parameters.items()
+                }
+                strategy_parameters = dict(parameters)
+                try:
+                    exact_setup = (
+                        family in {"momentum", "mean_reversion"}
+                        and int(scalar_parameters.get("lookback")) == 1
+                        and math.isfinite(float(scalar_parameters.get("threshold")))
+                        and abs(float(scalar_parameters.get("threshold")) - 0.05) <= 1e-12
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    exact_setup = False
+                if not exact_setup:
+                    continue
+                strategy_parameters["entry_predicate"] = dict(_ABSOLUTE_MOVE_PREDICATE)
+                strategy_document = {
+                    "version": 1,
+                    "market_type": MarketType.PREDICTION.value,
+                    "family": family,
+                    "parameters": strategy_parameters,
+                    "probability_model": "plan-model-probability",
+                    "resolution_aware": True,
+                    "resolution_inputs": ["expiry", "settlement"],
+                    "metadata": {
+                        "operational_setup_id": configuration.get("configuration_id"),
+                        "model_required": False,
+                    },
+                }
+                setup = _operational_setup_for_strategy(
+                    strategy_document,
+                    {
+                        "market_scope": setup_scope,
+                        "dataset_id": dataset_id,
+                        "dataset_version": dataset_version,
+                        # Keep the bounded attestation separate from the
+                        # row boundary; the setup manifest must commit to
+                        # attestation rotation even when rows are unchanged.
+                        "dataset_attestation": canonical_attestation,
+                        "dataset_boundary": boundary,
+                    },
+                )
+                if setup is not None:
+                    operational_setups[str(configuration.get("configuration_id", ""))] = {
+                        "operational_setup": setup,
+                        "operational_setup_hash": _operational_setup_hash(setup),
+                    }
+        fixed_generator = {
+            "families": ["momentum", "mean_reversion"],
+            "lookbacks": [1] if versioned_setup else [1, 3, 5],
+            "thresholds": [0.05] if versioned_setup else [0.02, 0.05],
+            **({"entry_predicate": dict(_ABSOLUTE_MOVE_PREDICATE)} if versioned_setup else {}),
+            "automatic_mutations": False,
+        }
         return {
             "schema_version": schema_version,
+            **({"protocol_id": protocol_identity} if versioned_setup else {}),
             "campaign_id": campaign_id,
             "scientific_rationale": (
                 "Test whether short price-path momentum or mean-reversion "
@@ -10467,17 +11960,37 @@ class AutonomousResearchProcessor:
             ),
             "dataset_boundary": boundary,
             "configuration_manifest": [dict(item) for item in configurations],
-            "fixed_generator": {
-                "families": ["momentum", "mean_reversion"],
-                "lookbacks": [1, 3, 5],
-                "thresholds": [0.02, 0.05],
-                "automatic_mutations": False,
-            },
-            "entry_rules": {
-                "signal": "strategy score exceeds absolute threshold",
-                "price_path": "same-market observed quote only",
-                "selection_partition": "validation",
-            },
+            "fixed_generator": fixed_generator,
+            **(
+                {
+                    "operational_setups": operational_setups,
+                    "contract": {
+                        "schema": "axiom-operational-setup",
+                        "version": "1",
+                        "setups": sorted(operational_setups),
+                    },
+                }
+                if versioned_setup
+                else {}
+            ),
+            "entry_rules": (
+                {
+                    "predicate": dict(_ABSOLUTE_MOVE_PREDICATE),
+                    "predicate_raw": "abs(delta_probability) >= 0.05",
+                    "positive_delta": "BUY YES",
+                    "negative_delta": "BUY NO",
+                    "strength_formula": "delta_probability / 0.05",
+                    "eligibility_separate_from_strength": True,
+                    "price_path": "same-market observed quote only",
+                    "selection_partition": "validation",
+                }
+                if versioned_setup
+                else {
+                    "signal": "strategy score exceeds absolute threshold",
+                    "price_path": "same-market observed quote only",
+                    "selection_partition": "validation",
+                }
+            ),
             "exit_rules": {
                 "type": "fixed_holding_period",
                 "unit": "observations",
@@ -10494,7 +12007,11 @@ class AutonomousResearchProcessor:
                 "count": int(observation_horizon),
                 "semantics": "per_market_observation_count",
             },
-            "costs": {"fee_bps": 10.0, "slippage_bps": 5.0},
+            "costs": {
+                **({"source": "recorded_book"} if versioned_setup else {}),
+                "fee_bps": 10.0,
+                "slippage_bps": 5.0,
+            },
             "qualification_gates": dict(
                 qualification_gates
                 or {"min_expectancy": 0.0, "min_samples": 3, "min_trades": 0}
@@ -10692,6 +12209,8 @@ class AutonomousResearchProcessor:
             "budget_version": protocol.get("budget_version"),
             "reassessment_version": protocol.get("reassessment_version"),
         }
+        if self._campaign_v2_protocol(protocol):
+            expected_reference["protocol_id"] = CAMPAIGN_PROTOCOL_V2_ID
         # ExperimentPlan normalizes the compact reference by copying the
         # separately persisted trial fields into ``campaign_protocol``.  Bind
         # the protocol identity itself exactly, while leaving those bounded
@@ -10730,6 +12249,24 @@ class AutonomousResearchProcessor:
                 "CAMPAIGN_PROTOCOL_INVALID",
                 "campaign plan trial_id does not match the durable campaign trial",
             )
+        trial_setup = trial.get("operational_setup")
+        if isinstance(trial_setup, Mapping):
+            trial_setup_hash = str(trial.get("operational_setup_hash", "")).strip()
+            if trial_setup_hash != _operational_setup_hash(trial_setup):
+                raise AutonomousResearchError(
+                    "CAMPAIGN_PROTOCOL_INVALID",
+                    "campaign trial operational setup hash is not canonical",
+                )
+            if queue_payload is not None and (
+                _canonical_binding(queue_payload.get("operational_setup"))
+                != _canonical_binding(trial_setup)
+                or str(queue_payload.get("operational_setup_hash", "")).strip()
+                != trial_setup_hash
+            ):
+                raise AutonomousResearchError(
+                    "CAMPAIGN_QUEUE_BINDING_MISMATCH",
+                    "campaign queue operational setup is not durably bound",
+                )
         configuration_id = str(trial.get("configuration_id", "")).strip()
         if plan.campaign_configuration_id != configuration_id:
             raise AutonomousResearchError(
@@ -10831,6 +12368,14 @@ class AutonomousResearchProcessor:
         campaign_id = str(state.get("campaign_id", "")).strip()
         trial_id = str(trial.get("trial_id", "")).strip()
         configuration_id = str(trial.get("configuration_id", "")).strip()
+        if (
+            str(protocol.get("schema_version", "")).strip() == CAMPAIGN_SCHEMA_V2
+            and configuration_id not in _OPERATIONAL_CAMPAIGN_CONFIGURATION_IDS
+        ):
+            raise AutonomousResearchError(
+                "CAMPAIGN_PROTOCOL_INVALID",
+                "V2 campaign configuration is not an exact operational setup",
+            )
         base = state.get("base_proposal") if isinstance(state.get("base_proposal"), Mapping) else {}
         raw_base_plan = base.get("experiment_plan") if isinstance(base.get("experiment_plan"), Mapping) else base
         plan_document = dict(raw_base_plan)
@@ -10843,9 +12388,32 @@ class AutonomousResearchProcessor:
             "budget_version": protocol.get("budget_version"),
             "reassessment_version": protocol.get("reassessment_version"),
         }
+        if self._campaign_v2_protocol(protocol):
+            protocol_reference["protocol_id"] = CAMPAIGN_PROTOCOL_V2_ID
+        family = str(config.get("template", "")).strip().lower()
+        raw_parameters = config.get("parameters")
+        parameters = dict(raw_parameters) if isinstance(raw_parameters, Mapping) else {}
+        versioned_setup = str(protocol.get("schema_version", "")).strip() == CAMPAIGN_SCHEMA_V2
+        if versioned_setup:
+            parameters.pop("entry_predicate", None)
+        try:
+            exact_directional_setup = (
+                versioned_setup
+                and family in {"momentum", "mean_reversion"}
+                and int(parameters.get("lookback")) == 1
+                and math.isfinite(float(parameters.get("threshold")))
+                and abs(float(parameters.get("threshold")) - 0.05) <= 1e-12
+            )
+        except (TypeError, ValueError, OverflowError):
+            exact_directional_setup = False
+        strategy_parameters = (
+            {**parameters, "entry_predicate": dict(_ABSOLUTE_MOVE_PREDICATE)}
+            if exact_directional_setup
+            else dict(parameters)
+        )
         plan_document.update(
             {
-                "plan_id": f"campaign-plan:{campaign_id}:{trial_id}",
+                "plan_id": self._campaign_plan_id(campaign_id, trial_id),
                 "hypothesis_id": f"campaign-hypothesis:{campaign_id}:{trial_id}",
                 "campaign_id": campaign_id,
                 "campaign_trial_id": trial_id,
@@ -10859,7 +12427,7 @@ class AutonomousResearchProcessor:
                 "configuration_manifest": {
                     "configuration_id": configuration_id,
                     "template": config.get("template"),
-                    "parameters": dict(config.get("parameters", {})),
+                    "parameters": dict(parameters),
                 },
                 "observation_horizon": protocol.get("observation_horizon", {"unit": "observations", "count": 1}),
                 "qualification_gates": protocol.get("qualification_gates", {}),
@@ -10868,7 +12436,7 @@ class AutonomousResearchProcessor:
                 "template": config.get("template"),
                 "parameters": {
                     str(name): [value]
-                    for name, value in dict(config.get("parameters", {})).items()
+                    for name, value in parameters.items()
                 },
                 "max_variants": 1,
                 "trial_budget": {"limit": 1, "locked": True},
@@ -10884,6 +12452,20 @@ class AutonomousResearchProcessor:
                 },
             }
         )
+        if exact_directional_setup:
+            plan_document["strategy_document"] = {
+                "version": 1,
+                "market_type": MarketType.PREDICTION.value,
+                "family": family,
+                "parameters": strategy_parameters,
+                "probability_model": "plan-model-probability",
+                "resolution_aware": True,
+                "resolution_inputs": ["expiry", "settlement"],
+                "metadata": {
+                    "operational_setup_id": configuration_id,
+                    "model_required": False,
+                },
+            }
         plan_document.pop("scientific_rationale", None)
         plan_document.setdefault("market_type", "prediction")
         plan_document.setdefault("market_scope", {
@@ -10932,6 +12514,15 @@ class AutonomousResearchProcessor:
             if next_trial is None:
                 return None
             protocol, protocol_hash = self._campaign_protocol_state(payload)
+            if (
+                str(protocol.get("schema_version", "")).strip() == CAMPAIGN_SCHEMA_V2
+                and str(next_trial.get("configuration_id", "")).strip()
+                not in _OPERATIONAL_CAMPAIGN_CONFIGURATION_IDS
+            ):
+                raise AutonomousResearchError(
+                    "CAMPAIGN_PROTOCOL_INVALID",
+                    "V2 campaign cannot enqueue a non-operational configuration",
+                )
             plan = self._campaign_queue_plan(payload, next_trial)
             boundary = self._campaign_trial_boundary(payload, protocol, next_trial)
             self._validate_campaign_dataset_provenance(
@@ -10959,6 +12550,11 @@ class AutonomousResearchProcessor:
                 "predeclared_starting_set": False,
                 "automatic_mutations": False,
             }
+            if isinstance(next_trial.get("operational_setup"), Mapping):
+                queue_payload["operational_setup"] = dict(next_trial["operational_setup"])
+                queue_payload["operational_setup_hash"] = str(
+                    next_trial.get("operational_setup_hash", "")
+                ).strip() or _operational_setup_hash(next_trial["operational_setup"])
             dedupe_key = f"campaign:{campaign_id}:{campaign_trial_id}"
             queued = next(
                 (
@@ -11060,6 +12656,7 @@ class AutonomousResearchProcessor:
         observation_horizon: int = 1,
         finalist_count: int = CAMPAIGN_MAX_FINALISTS,
         qualification_gates: Mapping[str, Any] | None = None,
+        configuration_allowlist: Sequence[str] | None = None,
         now: datetime | None = None,
     ) -> Mapping[str, Any]:
         """Persist a finite protocol and queue exactly its next trial."""
@@ -11082,6 +12679,35 @@ class AutonomousResearchProcessor:
         ).strip()
         if resolved_protocol_id not in {CAMPAIGN_PROTOCOL_V1_ID, CAMPAIGN_PROTOCOL_V2_ID}:
             raise ValueError("unsupported campaign protocol")
+        if resolved_protocol_id == CAMPAIGN_PROTOCOL_V2_ID and observation_horizon != 1:
+            raise ValueError("operational setups require holding horizon 1 observation")
+        canonical_configurations: tuple[Mapping[str, Any], ...] | None = None
+        selected_configuration_ids: frozenset[str] | None = None
+        if configuration_allowlist is not None:
+            canonical_configurations = self.campaign_configurations()
+            selected_configuration_ids = self._campaign_configuration_allowlist(
+                canonical_configurations,
+                configuration_allowlist,
+            )
+            if (
+                resolved_protocol_id == CAMPAIGN_PROTOCOL_V2_ID
+                and not selected_configuration_ids.issubset(
+                    _OPERATIONAL_CAMPAIGN_CONFIGURATION_IDS
+                )
+            ):
+                raise ValueError(
+                    "V2 campaigns allow only exact operational configuration ids"
+                )
+        elif resolved_protocol_id == CAMPAIGN_PROTOCOL_V2_ID:
+            canonical_configurations = tuple(
+                item
+                for item in self.campaign_configurations()
+                if str(item.get("configuration_id", "")).strip()
+                in _OPERATIONAL_CAMPAIGN_CONFIGURATION_IDS
+            )
+            selected_configuration_ids = frozenset(
+                str(item["configuration_id"]) for item in canonical_configurations
+            )
         job_name = self.campaign_job_name(campaign)
         existing = self.store.get_operator_job(job_name)
         if isinstance(existing, Mapping):
@@ -11182,30 +12808,80 @@ class AutonomousResearchProcessor:
                 "SOFTWARE_OR_INPUT_ERROR",
                 "campaign dataset rows do not match the attested catalog count",
             )
-        prior = self._campaign_prior_configuration_keys(resolved_protocol_id)
-        configurations = [
-            dict(item)
-            for item in self.campaign_configurations()
-            if _campaign_configuration_key(item) not in prior
-        ]
-        protocol = self._campaign_default_protocol(
-            campaign_id=campaign,
-            dataset_id=resolved_dataset_id,
-            dataset_version=resolved_dataset_version,
-            rows=rows,
-            configurations=configurations,
-            qualification_gates=qualification_gates,
-            finalist_count=int(finalist_count),
-            observation_horizon=int(observation_horizon),
-            protocol_id=resolved_protocol_id,
-            attestation_hash=str(attestation.get("attestation_hash", "")).strip(),
-        )
+        if canonical_configurations is None:
+            candidate_configurations = [
+                dict(item)
+                for item in self.campaign_configurations()
+            ]
+        else:
+            candidate_configurations = [
+                dict(item)
+                for item in canonical_configurations
+                if str(item.get("configuration_id", "")) in selected_configuration_ids
+            ]
+        if resolved_protocol_id == CAMPAIGN_PROTOCOL_V2_ID:
+            candidate_protocol = self._campaign_default_protocol(
+                campaign_id=campaign,
+                dataset_id=resolved_dataset_id,
+                dataset_version=resolved_dataset_version,
+                rows=rows,
+                configurations=candidate_configurations,
+                qualification_gates=qualification_gates,
+                finalist_count=int(finalist_count),
+                observation_horizon=int(observation_horizon),
+                protocol_id=resolved_protocol_id,
+                attestation_hash=str(attestation.get("attestation_hash", "")).strip(),
+                dataset_attestation=attestation,
+            )
+            candidate_setups = candidate_protocol.get("operational_setups")
+            candidate_setups = candidate_setups if isinstance(candidate_setups, Mapping) else {}
+            prior_setups = self._campaign_prior_operational_setup_bindings()
+            configurations = []
+            for item in candidate_configurations:
+                setup = candidate_setups.get(str(item.get("configuration_id", "")).strip())
+                binding = (
+                    self._campaign_operational_setup_binding(setup)
+                    if isinstance(setup, Mapping)
+                    else None
+                )
+                if binding is None or binding not in prior_setups:
+                    configurations.append(item)
+        else:
+            prior = self._campaign_prior_configuration_keys(resolved_protocol_id)
+            configurations = [
+                item
+                for item in candidate_configurations
+                if _campaign_configuration_key(item) not in prior
+            ]
+        if resolved_protocol_id == CAMPAIGN_PROTOCOL_V2_ID and len(configurations) == len(candidate_configurations):
+            protocol = candidate_protocol
+        else:
+            protocol = self._campaign_default_protocol(
+                campaign_id=campaign,
+                dataset_id=resolved_dataset_id,
+                dataset_version=resolved_dataset_version,
+                rows=rows,
+                configurations=configurations,
+                qualification_gates=qualification_gates,
+                finalist_count=int(finalist_count),
+                observation_horizon=int(observation_horizon),
+                protocol_id=resolved_protocol_id,
+                attestation_hash=str(attestation.get("attestation_hash", "")).strip(),
+                dataset_attestation=attestation,
+            )
         protocol_hash = _hash_document(protocol)
+        operational_setups = protocol.get("operational_setups", {})
+        operational_setups = operational_setups if isinstance(operational_setups, Mapping) else {}
         trials: list[dict[str, Any]] = [
             {
                 "trial_id": f"trial:{campaign}:{index:02d}",
                 "configuration_id": item["configuration_id"],
                 "configuration": dict(item),
+                **(
+                    dict(operational_setups[item["configuration_id"]])
+                    if isinstance(operational_setups.get(item["configuration_id"]), Mapping)
+                    else {}
+                ),
                 "status": "PLANNED",
                 "result": None,
             }
@@ -11423,7 +13099,10 @@ class AutonomousResearchProcessor:
                     )
                 final_rows = _campaign_rows_for_split(rows, trial_descriptor)
                 trial_digest = expected_digest
-                strategy = plan.strategy_for(plan.variants()[0], str(trial.get("candidate_id", trial.get("trial_id"))))
+                strategy = _strategy_with_operational_overlay(
+                    plan,
+                    plan.strategy_for(plan.variants()[0], str(trial.get("candidate_id", trial.get("trial_id")))),
+                )
                 metrics = dict(self._run_backtest(plan, strategy, final_rows))
                 gates = protocol.get("qualification_gates", {})
                 sample_check = minimum_sample_check(
@@ -11644,6 +13323,8 @@ class AutonomousResearchProcessor:
         for version in candidates:
             if not version or version in seen or version == current_version:
                 continue
+
+
             seen.add(version)
             if callable(catalog_loader):
                 try:
@@ -11665,6 +13346,89 @@ class AutonomousResearchProcessor:
             ):
                 return resolved_id, version
         return resolved_id, current_version
+    def _campaign_reassessment_operational_setup(
+        self,
+        trial: Mapping[str, Any],
+        *,
+        dataset_id: str,
+        dataset_version: str,
+        dataset_attestation: Mapping[str, Any],
+        dataset_boundary: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], str]:
+        """Rebind a V2 trial's exact setup to reassessed evidence."""
+        configuration_id = str(trial.get("configuration_id", "")).strip()
+        configuration = trial.get("configuration")
+        if (
+            not isinstance(configuration, Mapping)
+            or not self._campaign_exact_configuration_identity(
+                configuration,
+                configuration_id,
+            )
+        ):
+            raise AutonomousResearchError(
+                "CAMPAIGN_PROTOCOL_INVALID",
+                "V2 reassessment trial configuration is not canonical",
+            )
+        family = configuration_id.split(":", 1)[0]
+        raw_parameters = configuration.get("parameters")
+        assert isinstance(raw_parameters, Mapping)
+
+        def scalar(value: Any) -> Any:
+            return value[0] if isinstance(value, (list, tuple)) else value
+
+        strategy_document = {
+            "version": 1,
+            "market_type": MarketType.PREDICTION.value,
+            "family": family,
+            "parameters": {
+                "lookback": 1,
+                "threshold": 0.05,
+                "entry_predicate": dict(_ABSOLUTE_MOVE_PREDICATE),
+            },
+            "probability_model": "plan-model-probability",
+            "resolution_aware": True,
+            "resolution_inputs": ["expiry", "settlement"],
+            "metadata": {
+                "operational_setup_id": configuration_id,
+                "model_required": False,
+            },
+        }
+        # Keep this assertion close to the canonical construction so a future
+        # grid edit cannot accidentally make the setup independent of its
+        # declared scalar configuration.
+        if (
+            scalar(raw_parameters.get("lookback")) != 1
+            or float(scalar(raw_parameters.get("threshold"))) != 0.05
+        ):
+            raise AutonomousResearchError(
+                "CAMPAIGN_PROTOCOL_INVALID",
+                "V2 reassessment trial scalar configuration changed",
+            )
+        setup = _operational_setup_for_strategy(
+            strategy_document,
+            {
+                "market_scope": {
+                    "mode": "RULE_BASED_MARKETS",
+                    "instrument": "POLYMARKET",
+                    "filters": {},
+                    "regime_restrictions": {},
+                    "provenance": "canonical",
+                },
+                "dataset_id": dataset_id,
+                "dataset_version": dataset_version,
+                "dataset_attestation": _operational_attestation_binding(
+                    dataset_attestation
+                ),
+                "dataset_boundary": dataset_boundary,
+            },
+        )
+        if setup is None:
+            raise AutonomousResearchError(
+                "CAMPAIGN_PROTOCOL_INVALID",
+                "V2 reassessment operational setup could not be constructed",
+            )
+        canonical_setup = _canonical_operational_document(setup)
+        return canonical_setup, _operational_setup_hash(canonical_setup)
     @staticmethod
     def _campaign_boundary_for_dataset(
         dataset_id: str,
@@ -11820,22 +13584,36 @@ class AutonomousResearchProcessor:
             for item in trials
         }
         appended = 0
+        v2_reassessment = self._campaign_v2_protocol(protocol)
         for old in waiting:
             reassessment_id = f"{old.get('trial_id')}:reassessment-1"
             if reassessment_id in existing_trial_ids:
                 continue
-            trials.append(
-                {
-                    "trial_id": reassessment_id,
-                    "configuration_id": old.get("configuration_id"),
-                    "configuration": dict(old.get("configuration", {})),
-                    "status": "PLANNED",
-                    "reassessment_of": old.get("trial_id"),
-                    "dataset_id": resolved_dataset_id,
-                    "dataset_version": resolved_dataset_version,
-                    "result": None,
-                }
-            )
+            reassessment_trial = {
+                "trial_id": reassessment_id,
+                "configuration_id": old.get("configuration_id"),
+                "configuration": dict(old.get("configuration", {})),
+                "status": "PLANNED",
+                "reassessment_of": old.get("trial_id"),
+                "dataset_id": resolved_dataset_id,
+                "dataset_version": resolved_dataset_version,
+                "result": None,
+            }
+            if v2_reassessment:
+                setup, setup_hash = self._campaign_reassessment_operational_setup(
+                    reassessment_trial,
+                    dataset_id=resolved_dataset_id,
+                    dataset_version=resolved_dataset_version,
+                    dataset_attestation=reassessment_attestation,
+                    dataset_boundary=reassessment_boundary,
+                )
+                reassessment_trial.update(
+                    {
+                        "operational_setup": setup,
+                        "operational_setup_hash": setup_hash,
+                    }
+                )
+            trials.append(reassessment_trial)
             reassessment_boundaries[reassessment_id] = dict(reassessment_boundary)
             existing_trial_ids.add(reassessment_id)
             appended += 1
@@ -13936,7 +15714,10 @@ class AutonomousResearchProcessor:
         # observation intent before loading or judging historical evidence.
         for parameters in variants:
             candidate_id = _candidate_id(plan, parameters, generation=0)
-            strategy = plan.strategy_for(parameters, candidate_id)
+            strategy = _strategy_with_operational_overlay(
+                plan,
+                plan.strategy_for(parameters, candidate_id),
+            )
             self._initialize_candidate(
                 plan,
                 candidate_id,
@@ -14201,6 +15982,11 @@ class AutonomousResearchProcessor:
         trial_count: int,
         now: datetime,
     ) -> Mapping[str, Any]:
+        dataset_attestation = (
+            self._dataset_attestation(plan, strict=False)
+            if plan.market_type is MarketType.PREDICTION
+            else None
+        )
         payload = self._candidate_payload(
             plan,
             candidate_id,
@@ -14209,6 +15995,7 @@ class AutonomousResearchProcessor:
             variant_id=plan.variant_id(parameters),
             generation=0,
             lineage=(),
+            dataset_attestation=dataset_attestation,
         )
         # Register the worker-generated identity before any lifecycle
         # transition or observation intent is persisted.  The surrounding
@@ -14230,6 +16017,12 @@ class AutonomousResearchProcessor:
                 "dataset_id": plan.dataset_id,
                 "dataset_version": plan.dataset_version,
                 "variant": dict(parameters),
+                **_operational_setup_fields(
+                    strategy.to_dict(),
+                    plan,
+                    dataset_attestation=dataset_attestation,
+                    dataset_boundary=plan.dataset_boundary,
+                ),
                 "trial_index": trial_index,
                 "trial_count": trial_count,
                 "holdout_evaluated": False,
@@ -14239,19 +16032,16 @@ class AutonomousResearchProcessor:
             strategy_id=strategy.id,
         )
         intent = (
-            self._register_schema_observation_intent(plan, candidate_id, strategy, now)
+            self._register_schema_observation_intent(
+                plan,
+                candidate_id,
+                strategy,
+                now,
+                dataset_attestation=dataset_attestation,
+            )
             if plan.market_type is MarketType.PREDICTION
             else None
         )
-        result = {**dict(payload), "paper_observation_intent": intent is not None}
-        if intent is not None:
-            result.update(
-                {
-                    "paper_observation_intent_id": intent.experiment_id,
-                    "paper_observation_intent": True,
-                }
-            )
-        return result
 
     def _register_schema_observation_intent(
         self,
@@ -14259,20 +16049,32 @@ class AutonomousResearchProcessor:
         candidate_id: str,
         strategy: StrategyDefinition,
         now: datetime,
+        *,
+        dataset_attestation: Mapping[str, Any] | None = None,
     ) -> Any:
         model_document = plan.model_for() or {"type": "deterministic"}
+        setup_fields: dict[str, Any] = {}
         if plan.market_type is MarketType.CRYPTO_SPOT:
             config: dict[str, Any] = {"paper_only": True}
             risk_limits: Mapping[str, Any] = {"max_position_fraction": 0.0}
-            dataset_attestation: Mapping[str, Any] | None = None
+            dataset_attestation = None
         else:
-            dataset_attestation = self._dataset_attestation(plan, strict=False)
+            if dataset_attestation is None:
+                dataset_attestation = self._dataset_attestation(plan, strict=False)
             config = {
                 "execution": "paper_only",
                 "market_authority_required": False,
                 "rolling_observation": True,
             }
             risk_limits = {"max_position_fraction": 0.05}
+            setup_fields = _operational_setup_fields(
+                strategy.to_dict(),
+                plan,
+                dataset_attestation=dataset_attestation,
+                dataset_boundary=plan.dataset_boundary,
+            )
+            if setup_fields:
+                model_document = {"model_required": False}
         config.update(
             {
                 "candidate_id": candidate_id,
@@ -14282,6 +16084,7 @@ class AutonomousResearchProcessor:
                 "dataset_version": plan.dataset_version,
                 "strategy_document": strategy.to_dict(),
                 "model_document": dict(model_document),
+                **setup_fields,
                 **_scope_binding(plan),
                 "assumptions": dict(plan.assumptions),
                 "cost_assumptions": {
@@ -14431,7 +16234,10 @@ class AutonomousResearchProcessor:
                     "CANDIDATE_BINDING_MISMATCH",
                     "candidate strategy parameters do not match candidate parameters",
                 )
-            strategy = plan.strategy_for(parameters, candidate_id)
+            strategy = _strategy_with_operational_overlay(
+                plan,
+                plan.strategy_for(parameters, candidate_id),
+            )
             supplied_document = supplied_strategy.to_dict()
             expected_document = strategy.to_dict()
             supplied_document.pop("strategy_id", None)
@@ -16158,6 +17964,14 @@ class AutonomousResearchProcessor:
                 plan,
                 strict=generation > 0 and plan.market_type is MarketType.PREDICTION,
             )
+            setup_fields = _operational_setup_fields(
+                strategy.to_dict(),
+                plan,
+                dataset_attestation=dataset_attestation,
+                dataset_boundary=plan.dataset_boundary,
+            )
+            if setup_fields:
+                model_document = {"model_required": False}
             strategy_hash = _content_hash(strategy.to_dict())
             rolling_strategy_document = dict(strategy.to_dict())
             rolling_strategy_document.pop("strategy_id", None)
@@ -16186,6 +18000,7 @@ class AutonomousResearchProcessor:
                     "strategy_document": strategy.to_dict(),
                     "model_document": dict(model_document),
                 }
+            forward_config.update(setup_fields)
             forward_config["candidate_id"] = candidate_id
             forward_config["observation_intent"] = True
             forward_config.update(_scope_binding(plan))
@@ -16269,7 +18084,6 @@ class AutonomousResearchProcessor:
                     "validation_expectancy": validation_expectancy,
                     "variant_count": variant_count,
                     "forward_test_id": None,
-                    "research_only": True,
                     "execution_capability": "none",
                     "paper_only": True,
                     "crypto_provenance": dict(crypto_binding or {}),
@@ -16562,16 +18376,22 @@ class AutonomousResearchProcessor:
         variant_id: str,
         generation: int,
         lineage: Sequence[str],
+        dataset_attestation: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         return {
             "candidate_id": candidate_id,
             "hypothesis_id": plan.hypothesis_id,
             "plan_id": plan.plan_id,
             "plan_hash": plan.plan_hash,
-            "experiment_plan": plan.as_dict(),
             **_scope_binding(plan),
+            "experiment_plan": plan.as_dict(),
             "strategy": strategy.to_dict(),
-            **_strategy_metadata(strategy),
+            **_operational_setup_fields(
+                strategy.to_dict(),
+                plan,
+                dataset_attestation=dataset_attestation,
+                dataset_boundary=plan.dataset_boundary,
+            ),
             "parameters": dict(parameters),
             "variant_id": variant_id,
             "generation": generation,
@@ -16752,6 +18572,7 @@ class AutonomousResearchProcessor:
         execution_events: Sequence[Mapping[str, Any]],
         ledgers: Sequence[Mapping[str, Any]],
         fills: Sequence[Any] = (),
+        operational_identity: Mapping[str, Any] | None = None,
     ) -> str:
         """Hash immutable paper records so unchanged evidence is idempotent."""
         def rows(items: Sequence[Mapping[str, Any]], identifier: str) -> list[dict[str, Any]]:
@@ -16888,6 +18709,11 @@ class AutonomousResearchProcessor:
                 "execution_events": rows(execution_events, "event_id"),
                 "ledgers": rows(ledgers, "bet_id"),
                 "fills": fill_rows(fills),
+                "operational_identity": dict(
+                    operational_identity
+                    if isinstance(operational_identity, Mapping)
+                    else _operational_identity_projection(scope, config)
+                ),
             }
         )
 
@@ -17326,7 +19152,49 @@ class AutonomousResearchProcessor:
         total_fees = sum(_finite(ledger.get("fees"), 0.0) for ledger in ledgers)
         total_slippage = sum(_finite(ledger.get("slippage"), 0.0) for ledger in ledgers)
         total_net = sum(_finite(ledger.get("net_pnl"), 0.0) for ledger in ledgers)
-        return {
+        operational_identity = _operational_identity_projection(
+            spec_config,
+            *event_payloads,
+            *ledgers,
+        )
+        if (
+            (
+                operational_identity.get("operational_setup") is not None
+                or operational_identity.get("operational_setup_hash") not in (None, "")
+            )
+            and operational_identity.get("settings_config_id") in (None, "")
+        ):
+            active_loader = getattr(self.store, "load_canary_setting_config", None)
+            active_settings = None
+            if callable(active_loader):
+                try:
+                    active_settings = active_loader(status="ACTIVE")
+                except (TypeError, ValueError, RuntimeError):
+                    active_settings = None
+            if isinstance(active_settings, Mapping):
+                values = active_settings.get("values", active_settings.get("settings"))
+                if isinstance(values, Mapping):
+                    operational_identity["active_settings"] = dict(values)
+                operational_identity["settings_config_id"] = active_settings.get("config_id")
+                operational_identity["settings_generation"] = active_settings.get("generation")
+                operational_identity["settings_config_hash"] = active_settings.get(
+                    "config_hash"
+                )
+                operational_identity["operational_settings_available"] = True
+            else:
+                operational_identity["operational_settings_available"] = False
+                operational_identity["operational_settings_blocker"] = (
+                    "ACTIVE_SETTINGS_UNAVAILABLE"
+                )
+        operational_evidence = _operational_stage_projection(
+            rows=observations,
+            events=event_records,
+            fills=fills,
+            ledgers=ledgers,
+            remaining_positions=unresolved_markets,
+            valid_observations=len(observations),
+        )
+        evidence = {
             "forward_test_id": forward_id,
             "evidence_scope": "forward_only",
             "forward_duration_seconds": duration,
@@ -17395,6 +19263,7 @@ class AutonomousResearchProcessor:
                 event_records,
                 ledgers,
                 fills,
+                operational_identity,
             ),
             "paper_only": True,
             "forward_benchmark_comparison": (
@@ -17403,6 +19272,26 @@ class AutonomousResearchProcessor:
                 else None
             ),
         }
+        evidence["operational_evidence"] = dict(operational_evidence)
+        evidence.update(dict(operational_evidence))
+        for source_name, output_name in (
+            ("gross_result", "gross_pnl"),
+            ("realized_result", "realized_result"),
+            ("unrealized_result", "unrealized_result"),
+            ("net_result", "net_pnl"),
+        ):
+            evidence[output_name] = operational_evidence.get(source_name)
+        for name, value in operational_identity.items():
+            evidence[name] = value
+        if operational_identity:
+            evidence["evidence_scope"] = "forward_operational_paper"
+        # Operational projections retain Decimal arithmetic until this
+        # lifecycle boundary.  Use the rolling evidence canonical projection
+        # once, after nested and direct compatibility aliases are assembled,
+        # so every candidate payload is JSON-safe without changing exact
+        # decimal meaning or dropping sparse fields.
+        canonical_evidence = _rolling_plain(evidence)
+        return dict(canonical_evidence)
 
     def _evaluate_forward_candidate(self, candidate_id: str, now: datetime) -> CandidateLifecycle | None:
         record = self.lifecycle.get(candidate_id)
