@@ -2532,6 +2532,24 @@ class OperatorControlTests(unittest.TestCase):
             register.call_args.kwargs["adverse_evidence_ack"],
             {"acknowledged": True, "required": False},
         )
+        conflicting_values = dict(values)
+        conflicting_values.update(
+            {
+                "selection_policy_hash": "policy-hash",
+                "policy_hash": "different-policy",
+            }
+        )
+        with patch.object(
+            self.control, "_authorization_context", return_value=base_context
+        ), patch.object(
+            self.store, "register_execution_authorization_draft"
+        ) as conflicting_register:
+            with self.assertRaisesRegex(
+                OperatorControlError,
+                "^EXECUTION_AUTHORIZATION_BINDING_STALE$",
+            ):
+                self.control.review_execution_authorization(conflicting_values)
+        conflicting_register.assert_not_called()
 
         rejected_context = dict(base_context)
         rejected_context["strategy_versions"] = ["rejected-strategy"]
@@ -2550,7 +2568,41 @@ class OperatorControlTests(unittest.TestCase):
                 self.control.review_execution_authorization(rejected_values)
         rejected_register.assert_not_called()
 
+        rejected_values["adverse_evidence_ack"] = {
+            "acknowledged": True,
+            "required": False,
+        }
+        with patch.object(
+            self.control, "_authorization_context", return_value=rejected_context
+        ), patch.object(
+            self.store, "register_execution_authorization_draft"
+        ) as pseudo_register:
+            with self.assertRaisesRegex(
+                OperatorControlError,
+                "^EXECUTION_AUTHORIZATION_ADVERSE_EVIDENCE_ACK_REQUIRED$",
+            ):
+                self.control.review_execution_authorization(rejected_values)
+        pseudo_register.assert_not_called()
         rejected_values["adverse_evidence_ack"] = True
+        with patch.object(
+            self.control, "_authorization_context", return_value=rejected_context
+        ), patch.object(
+            self.store,
+            "register_execution_authorization_draft",
+            return_value={"authorization_id": "rejected-bool-auth", "generation": 3, "status": "DRAFT"},
+        ) as bool_register:
+            bool_acknowledged = self.control.review_execution_authorization(
+                rejected_values
+            )
+        strict_ack = {"acknowledged": True, "required": True}
+        self.assertEqual(bool_register.call_args.kwargs["adverse_evidence_ack"], strict_ack)
+        self.assertEqual(bool_acknowledged["draft"]["adverse_evidence_ack"], strict_ack)
+        self.assertTrue(bool_acknowledged["draft"]["adverse_evidence_ack_required"])
+
+        rejected_values["adverse_evidence_ack"] = {
+            "acknowledged": True,
+            "required": True,
+        }
         with patch.object(
             self.control, "_authorization_context", return_value=rejected_context
         ), patch.object(

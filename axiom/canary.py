@@ -90,6 +90,96 @@ _ROLLING_EVIDENCE_FIELDS = (
     "evidence_window_id",
     "evidence_digest",
 )
+_ROLLING_AUTHORIZATION_FIELDS = (
+    "selection_hash",
+    "execution_authorization_mode",
+    "execution_authorization_id",
+    "execution_authorization_generation",
+    "execution_authorization_strategy_versions",
+    "execution_authorization_adverse_evidence_ack",
+)
+_ROLLING_NON_ACTIVE_STATUSES = frozenset({"OBSERVE", "PAPER", "REJECTED"})
+_ROLLING_EXPLICIT_ADVERSE_ACK_REQUIRED = frozenset({"REJECTED"})
+
+
+def _canary_adverse_acknowledged(value: Any, *, require_required: bool = False) -> bool:
+    """Accept only a real positive acknowledgment for adverse evidence.
+
+    ``required=false`` is an informational marker for OBSERVE/PAPER members;
+    it is never authority to fund a historically rejected member.
+    """
+    if value is True:
+        return not require_required
+    if not isinstance(value, Mapping):
+        return False
+    acknowledged = value.get("acknowledged") is True
+    if not acknowledged and not require_required:
+        acknowledged = any(
+            value.get(name) is True for name in ("acknowledgment", "accepted")
+        )
+    if not acknowledged:
+        return False
+    return not require_required or value.get("required") is True
+
+
+def _canary_canonical_selection_hash(selection: Mapping[str, Any]) -> str:
+    """Recompute the canonical digest of the current selection contents.
+
+    Storage adds compatibility aliases and volatile timestamps while
+    materializing a selection.  Those fields are not selection authority and
+    are excluded so the digest is stable across the read/write boundary.
+    """
+    if not isinstance(selection, Mapping):
+        raise CanaryBlocked("EXECUTION_AUTHORIZATION_SELECTION_REQUIRED")
+    body = dict(selection)
+    for name in (
+        "selection_hash",
+        "portfolio_selection_hash",
+        "current_selection_hash",
+        "selection_id",
+        "active_risk_config_id",
+        "active_risk_config_generation",
+        "active_risk_config_hash",
+        "created_at",
+        "committed_at",
+        "updated_at",
+    ):
+        body.pop(name, None)
+    raw_members = body.get("members", body.get("selected_members"))
+    if isinstance(raw_members, (list, tuple)):
+        members: list[Any] = []
+        for member in raw_members:
+            if isinstance(member, Mapping):
+                projected = dict(member)
+                for volatile_name in ("created_at", "committed_at", "updated_at"):
+                    projected.pop(volatile_name, None)
+                members.append(projected)
+            else:
+                members.append(member)
+        body["members"] = members
+        body.pop("selected_members", None)
+    try:
+        encoded = json.dumps(
+            body,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+            default=str,
+        )
+    except (TypeError, ValueError) as exc:
+        raise CanaryBlocked("EXECUTION_AUTHORIZATION_SELECTION_INVALID") from exc
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+
+
+def _canary_selection_member_is_positive(member: Mapping[str, Any]) -> bool:
+    try:
+        allocation = Decimal(str(member.get("allocation") or "0"))
+    except (TypeError, ValueError, ArithmeticError):
+        return False
+    return allocation.is_finite() and allocation > 0
 _LEGACY_LINEAGE_TYPE = "LEGACY_FINITE_CAMPAIGN"
 _ROLLING_LINEAGE_TYPE = "ROLLING_PORTFOLIO"
 
@@ -150,6 +240,7 @@ def _normalize_lineage(
             "lineage_type": _LEGACY_LINEAGE_TYPE,
             **{field: None for field in _ROLLING_LINEAGE_FIELDS},
             **{field: None for field in _ROLLING_EVIDENCE_FIELDS},
+            **{field: None for field in _ROLLING_AUTHORIZATION_FIELDS},
         }
     required = ("strategy_version_id", "portfolio_selection_id")
     if any(str(values.get(field) or "").strip() == "" for field in required):
@@ -179,6 +270,39 @@ def _normalize_lineage(
     for field in _ROLLING_EVIDENCE_FIELDS:
         value = values.get(field)
         result[field] = str(value).strip() if value not in (None, "") else None
+    for field in _ROLLING_AUTHORIZATION_FIELDS:
+        value = values.get(field)
+        if field == "execution_authorization_strategy_versions":
+            if isinstance(value, str):
+                value = [value.strip()] if value.strip() else []
+            elif isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
+                value = [str(item).strip() for item in value if str(item).strip()]
+            elif value in (None, ""):
+                value = None
+            else:
+                raise CanaryBlocked("ROLLING_LINEAGE_INVALID")
+        elif field == "execution_authorization_generation":
+            if value in (None, ""):
+                value = None
+            elif isinstance(value, bool):
+                raise CanaryBlocked("ROLLING_LINEAGE_INVALID")
+            else:
+                try:
+                    value = int(value)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise CanaryBlocked("ROLLING_LINEAGE_INVALID") from exc
+                if value < 0:
+                    raise CanaryBlocked("ROLLING_LINEAGE_INVALID")
+        elif field == "execution_authorization_adverse_evidence_ack":
+            if isinstance(value, Mapping):
+                value = dict(value)
+            elif value not in (None, "", True, False):
+                raise CanaryBlocked("ROLLING_LINEAGE_INVALID")
+        elif value not in (None, ""):
+            value = str(value).strip()
+        else:
+            value = None
+        result[field] = value
     return result
 
 
@@ -2263,16 +2387,33 @@ def _canary_authorization_decimal(value: Any, *, field: str) -> Decimal:
 
 def _canary_authorization_current_selection_hash(
     selection: Mapping[str, Any],
-) -> str | None:
+) -> str:
+    """Return the persisted selection digest, with a legacy fallback.
+
+    The operator and rolling worker persist the reviewed digest.  Runtime
+    validation must compare that immutable value rather than silently
+    replacing it with a newly invented projection.  Older in-memory fixtures
+    may omit the digest; retain the canonical fallback for those callers.
+    """
+    if not isinstance(selection, Mapping):
+        raise CanaryBlocked("EXECUTION_AUTHORIZATION_SELECTION_REQUIRED")
+    persisted: set[str] = set()
     for name in (
         "selection_hash",
         "portfolio_selection_hash",
         "current_selection_hash",
     ):
-        value = selection.get(name)
-        if value not in (None, ""):
-            return str(value).strip() or None
-    return None
+        raw = selection.get(name)
+        if raw in (None, ""):
+            continue
+        text = str(raw).strip()
+        if text:
+            persisted.add(text)
+    if len(persisted) > 1:
+        raise CanaryBlocked("EXECUTION_AUTHORIZATION_SELECTION_CHANGED")
+    if persisted:
+        return next(iter(persisted))
+    return _canary_canonical_selection_hash(selection)
 
 
 def _canary_authorization_alias(
@@ -2286,6 +2427,33 @@ def _canary_authorization_alias(
     }
     if len(values) > 1:
         raise CanaryBlocked("EXECUTION_AUTHORIZATION_BINDING_INVALID")
+    return next(iter(values), None)
+def _canary_authorization_selection_policy_hash(
+    selection: Mapping[str, Any],
+) -> str | None:
+    """Return one unambiguous policy hash from a selection envelope."""
+    sources: list[Mapping[str, Any]] = [selection]
+    for name in ("policy_config", "policy", "admission_policy"):
+        nested = selection.get(name)
+        if isinstance(nested, Mapping):
+            sources.append(nested)
+    top_level_aliases = (
+        "reviewed_selection_policy_hash",
+        "selection_policy_hash",
+        "policy_hash",
+        "admission_policy_hash",
+    )
+    nested_aliases = (*top_level_aliases, "config_hash")
+    values: set[str] = set()
+    for index, source in enumerate(sources):
+        for name in (top_level_aliases if index == 0 else nested_aliases):
+            value = source.get(name)
+            if value not in (None, ""):
+                text = str(value).strip()
+                if text:
+                    values.add(text)
+    if len(values) > 1:
+        raise CanaryBlocked("EXECUTION_AUTHORIZATION_POLICY_CHANGED")
     return next(iter(values), None)
 
 
@@ -2301,6 +2469,9 @@ def _canary_authorization_binding_fence(
     requested_cost: Any,
     fee_reserve: Any,
     now: datetime,
+    candidate_id: str | None = None,
+    side: str | None = None,
+    selection_fence: bool = True,
 ) -> None:
     exact_raw = auth.get(
         "exact_strategy_versions",
@@ -2314,33 +2485,41 @@ def _canary_authorization_binding_fence(
         exact_versions = {str(item).strip() for item in exact_raw if str(item).strip()}
     else:
         raise CanaryBlocked("EXECUTION_AUTHORIZATION_STRATEGIES_INVALID")
-    if exact_versions:
-        if not rolling or not strategy:
-            raise CanaryBlocked("EXECUTION_AUTHORIZATION_STRATEGY_REQUIRED")
-        if strategy not in exact_versions:
-            raise CanaryBlocked("EXECUTION_AUTHORIZATION_STRATEGY_MISMATCH")
 
+    authorization_mode = str(auth.get("mode") or "").strip().upper()
     expected_policy = str(
         auth.get("reviewed_selection_policy_hash")
         or auth.get("selection_policy_hash")
+        or auth.get("policy_hash")
         or ""
     ).strip()
-    expected_selection_hash = str(auth.get("selection_hash") or "").strip()
+    expected_selection_hash = str(
+        auth.get("selection_hash")
+        or auth.get("portfolio_selection_hash")
+        or auth.get("current_selection_hash")
+        or ""
+    ).strip()
     expected_selection_id = str(
         auth.get("selection_id") or auth.get("portfolio_selection_id") or ""
     ).strip()
-    if rolling or expected_policy or expected_selection_hash or expected_selection_id:
+    policy_only = not exact_versions and bool(expected_policy)
+    current: Mapping[str, Any] | None = None
+    current_hash: str | None = None
+    if selection_fence and (
+        rolling or expected_policy or expected_selection_hash or expected_selection_id
+    ):
         loader = getattr(service.store, "load_current_portfolio_selection", None)
         if not callable(loader):
             raise CanaryBlocked("EXECUTION_AUTHORIZATION_SELECTION_REQUIRED")
         try:
-            current = loader()
+            loaded = loader()
         except Exception as exc:
             raise CanaryBlocked("EXECUTION_AUTHORIZATION_SELECTION_UNAVAILABLE") from exc
-        if not isinstance(current, Mapping):
+        if not isinstance(loaded, Mapping):
             raise CanaryBlocked("EXECUTION_AUTHORIZATION_SELECTION_REQUIRED")
+        current = loaded
+        current_hash = _canary_authorization_current_selection_hash(current)
         expected_id = expected_selection_id or selection_id
-        current_id = None
         if expected_id or rolling:
             current_id = _canary_authorization_alias(
                 current, ("portfolio_selection_id", "selection_id")
@@ -2348,25 +2527,124 @@ def _canary_authorization_binding_fence(
             if not expected_id or current_id != expected_id:
                 raise CanaryBlocked("EXECUTION_AUTHORIZATION_SELECTION_CHANGED")
         if expected_policy:
-            current_policy = _canary_authorization_alias(
-                current,
-                (
-                    "reviewed_selection_policy_hash",
-                    "selection_policy_hash",
-                    "policy_hash",
-                    "admission_policy_hash",
-                ),
-            )
+            current_policy = _canary_authorization_selection_policy_hash(current)
             if current_policy != expected_policy:
                 raise CanaryBlocked("EXECUTION_AUTHORIZATION_POLICY_CHANGED")
-        if expected_selection_hash:
-            current_hash = _canary_authorization_current_selection_hash(current)
-            if current_hash != expected_selection_hash:
-                raise CanaryBlocked("EXECUTION_AUTHORIZATION_SELECTION_CHANGED")
-        if selection_hash and _canary_authorization_current_selection_hash(current) not in (
-            selection_hash,
-        ):
+        if expected_selection_hash and current_hash != expected_selection_hash:
             raise CanaryBlocked("EXECUTION_AUTHORIZATION_SELECTION_CHANGED")
+        if selection_hash and current_hash != selection_hash:
+            raise CanaryBlocked("EXECUTION_AUTHORIZATION_SELECTION_CHANGED")
+        if policy_only and rolling and (
+            not expected_selection_id
+            or not expected_selection_hash
+            or not selection_hash
+            or expected_selection_hash != selection_hash
+        ):
+            raise CanaryBlocked("EXECUTION_AUTHORIZATION_SELECTION_REQUIRED")
+
+    if exact_versions:
+        if not strategy:
+            raise CanaryBlocked("EXECUTION_AUTHORIZATION_STRATEGY_REQUIRED")
+        # Exact strategy authorization is already a bounded reviewed scope.
+        # It may be used by a direct/non-rolling caller without inventing a
+        # portfolio-selection binding; rolling lineage still entered the
+        # selection fence above.
+        if strategy not in exact_versions:
+            raise CanaryBlocked("EXECUTION_AUTHORIZATION_STRATEGY_MISMATCH")
+    elif policy_only and selection_fence and rolling:
+        # Policy-only authorization is narrowed to the exact, currently
+        # persisted positive allocation set.  It is never an all-strategy
+        # wildcard and cannot mint new allocation.
+        if current is None:
+            raise CanaryBlocked("EXECUTION_AUTHORIZATION_SELECTION_REQUIRED")
+        members = current.get("members", current.get("selected_members", ()))
+        if not isinstance(members, (list, tuple)) or not any(
+            isinstance(member, Mapping)
+            and _canary_selection_member_is_positive(member)
+            and str(member.get("strategy_version_id") or "").strip()
+            == str(strategy or "").strip()
+            for member in members
+        ):
+            raise CanaryBlocked("EXECUTION_AUTHORIZATION_STRATEGY_MISMATCH")
+
+    if current is not None and rolling:
+        members = current.get("members", current.get("selected_members", ()))
+        if not isinstance(members, (list, tuple)):
+            raise CanaryBlocked("EXECUTION_AUTHORIZATION_SELECTION_REQUIRED")
+        for member in members:
+            if not isinstance(member, Mapping) or not _canary_selection_member_is_positive(member):
+                continue
+            member_strategy = str(member.get("strategy_version_id") or "").strip()
+            member_status = str(member.get("status") or "").strip().upper()
+            if member_status not in _ROLLING_EXPLICIT_ADVERSE_ACK_REQUIRED:
+                continue
+            if exact_versions and member_strategy not in exact_versions:
+                continue
+            ack = auth.get(
+                "adverse_evidence_ack",
+                auth.get("adverse_evidence_acknowledgment"),
+            )
+            if not _canary_adverse_acknowledged(ack, require_required=True):
+                raise CanaryBlocked(
+                    "EXECUTION_AUTHORIZATION_ADVERSE_EVIDENCE_ACK_REQUIRED"
+                )
+
+    # A member can be selected as funded and subsequently rejected in the
+    # lifecycle table.  A new BUY must then carry an explicit, required
+    # acknowledgment for this exact authorization scope; exits deliberately
+    # skip this selection fence because they only reduce owned risk.
+    if (
+        selection_fence
+        and str(side or "").strip().upper() == "BUY"
+        and rolling
+        and candidate_id
+    ):
+        if current is not None:
+            members = current.get("members", current.get("selected_members", ()))
+            if isinstance(members, (list, tuple)):
+                candidate_bindings = {
+                    str(member.get("candidate_id") or "").strip()
+                    for member in members
+                    if isinstance(member, Mapping)
+                    and _canary_selection_member_is_positive(member)
+                    and str(member.get("strategy_version_id") or "").strip()
+                    == str(strategy or "").strip()
+                    and str(member.get("candidate_id") or "").strip()
+                }
+                if candidate_bindings and str(candidate_id).strip() not in candidate_bindings:
+                    raise CanaryBlocked("EXECUTION_AUTHORIZATION_STRATEGY_MISMATCH")
+        lifecycle_loader = getattr(service.store, "load_candidate_lifecycle", None)
+        if not callable(lifecycle_loader):
+            raise CanaryBlocked("EXECUTION_AUTHORIZATION_SELECTION_UNAVAILABLE")
+        try:
+            lifecycle = lifecycle_loader(str(candidate_id))
+        except Exception as exc:
+            raise CanaryBlocked("EXECUTION_AUTHORIZATION_SELECTION_UNAVAILABLE") from exc
+        if isinstance(lifecycle, Mapping):
+            lifecycle_payload = lifecycle.get("payload")
+            lifecycle_stage = str(lifecycle.get("stage") or "").strip().upper()
+            payload_stage = (
+                str(lifecycle_payload.get("stage") or "").strip().upper()
+                if isinstance(lifecycle_payload, Mapping)
+                else ""
+            )
+            rejected = (
+                lifecycle_stage == "REJECTED"
+                or payload_stage == "REJECTED"
+                or (
+                    isinstance(lifecycle_payload, Mapping)
+                    and lifecycle_payload.get("rejected") is True
+                )
+            )
+            if rejected:
+                ack = auth.get(
+                    "adverse_evidence_ack",
+                    auth.get("adverse_evidence_acknowledgment"),
+                )
+                if not _canary_adverse_acknowledged(ack, require_required=True):
+                    raise CanaryBlocked(
+                        "EXECUTION_AUTHORIZATION_ADVERSE_EVIDENCE_ACK_REQUIRED"
+                    )
 
     budget = auth.get("lifetime_budget")
     stop_rules = auth.get("stop_rules")
@@ -2517,8 +2795,7 @@ def _require_execution_authorization(
         mode = "EXPLORATORY_MICRO_CANARY"
     elif mode in {"EVIDENCE", "EVIDENCE_SELECTED"}:
         mode = "EVIDENCE_SELECTED"
-    else:
-        raise CanaryBlocked("EXECUTION_AUTHORIZATION_MODE_INVALID")
+    is_exit = signal is None
     rolling = str(binding.get("lineage_type") or "").strip().upper() == _ROLLING_LINEAGE_TYPE
     selection_id = str(
         binding.get("portfolio_selection_id")
@@ -2530,12 +2807,10 @@ def _require_execution_authorization(
         or (signal or {}).get("selection_hash")
         or ""
     ).strip() or None
-    strategy = str(
-        binding.get("strategy_version_id")
-        or (signal or {}).get("strategy_version_id")
-        or ""
-    ).strip() or None
-    if rolling and not selection_id:
+    # Exact strategy scope is trusted only from validated lineage.  A raw
+    # legacy signal field is descriptive evidence, not authorization scope.
+    strategy = str(binding.get("strategy_version_id") or "").strip() or None
+    if rolling and (not selection_id or not selection_hash) and not is_exit:
         raise CanaryBlocked("EVIDENCE_SELECTION_REQUIRED")
     try:
         settings_id, settings_generation, settings_hash = service._settings_identity()
@@ -2579,12 +2854,49 @@ def _require_execution_authorization(
             scope_version=scope_version,
             active_settings_hash=settings_hash,
             active_settings_generation=settings_generation,
-            selection_id=selection_id,
-            selection_hash=selection_hash,
+            # Exits use the originating authorization but intentionally do
+            # not ask the active loader to bind it to today's selection.
+            selection_id=None if is_exit else selection_id,
+            selection_hash=None if is_exit else selection_hash,
         )
     except (TypeError, ValueError, RuntimeError) as exc:
         raise CanaryBlocked("EXECUTION_AUTHORIZATION_REQUIRED") from exc
+    if is_exit and expected_id and (
+        not isinstance(auth, Mapping)
+        or str(auth.get("authorization_id") or "").strip() != expected_id
+    ):
+        # The active loader intentionally selects the newest compatible row.
+        # For an exit, recover the still-active originating row by immutable
+        # id so a replacement authorization cannot strand owned risk.
+        history_loader = getattr(
+            service.store, "list_execution_authorizations", None
+        )
+        if callable(history_loader):
+            try:
+                records = history_loader(
+                    mode=mode,
+                    status=None,
+                    limit=1000,
+                    now=now,
+                )
+            except (TypeError, ValueError, RuntimeError):
+                records = ()
+            for record in records or ():
+                if not isinstance(record, Mapping):
+                    continue
+                if str(record.get("authorization_id") or "").strip() != expected_id:
+                    continue
+                if str(record.get("mode") or mode).strip().upper() != mode:
+                    continue
+                auth = record
+                break
     if not isinstance(auth, Mapping) or str(auth.get("status") or "").upper() != "ACTIVE":
+        if is_exit and isinstance(auth, Mapping):
+            record_expiry = parse_timestamp(auth.get("expires_at"))
+            if str(auth.get("status") or "").upper() == "EXPIRED" or (
+                record_expiry is not None and now >= record_expiry
+            ):
+                raise CanaryBlocked("EXECUTION_AUTHORIZATION_EXPIRED")
         # Active loaders hide expired rows.  A bounded historical projection
         # lets callers distinguish an expired binding from a never-issued one
         # without using a non-active row as authority.
@@ -2644,6 +2956,69 @@ def _require_execution_authorization(
     actual_id = str(auth.get("authorization_id") or "").strip()
     if expected_id and expected_id != actual_id:
         raise CanaryBlocked("EXECUTION_AUTHORIZATION_CHANGED")
+    expected_generation = (
+        binding.get("execution_authorization_generation")
+        or (context or {}).get("execution_authorization_generation")
+    )
+    if expected_generation not in (None, ""):
+        try:
+            observed_generation = int(auth.get("generation"))
+            if observed_generation != int(expected_generation):
+                raise CanaryBlocked("EXECUTION_AUTHORIZATION_CHANGED")
+        except (TypeError, ValueError, OverflowError):
+            raise CanaryBlocked("EXECUTION_AUTHORIZATION_CHANGED") from None
+    expected_versions = (
+        binding.get("execution_authorization_strategy_versions")
+        if "execution_authorization_strategy_versions" in binding
+        else (context or {}).get("execution_authorization_strategy_versions")
+    )
+    if expected_versions is not None:
+        observed_versions = auth.get(
+            "exact_strategy_versions",
+            auth.get("strategy_version_ids", auth.get("strategy_versions", ())),
+        )
+        if isinstance(observed_versions, str):
+            observed_versions = [observed_versions]
+        if isinstance(expected_versions, str):
+            expected_versions = [expected_versions]
+        try:
+            if {
+                str(item).strip()
+                for item in (expected_versions or ())
+                if str(item).strip()
+            } != {
+                str(item).strip()
+                for item in (observed_versions or ())
+                if str(item).strip()
+            }:
+                raise CanaryBlocked("EXECUTION_AUTHORIZATION_CHANGED")
+        except TypeError:
+            raise CanaryBlocked("EXECUTION_AUTHORIZATION_CHANGED") from None
+    expected_ack = (
+        binding.get("execution_authorization_adverse_evidence_ack")
+        if "execution_authorization_adverse_evidence_ack" in binding
+        else (context or {}).get("execution_authorization_adverse_evidence_ack")
+    )
+    if expected_ack not in (None, ""):
+        observed_ack = auth.get(
+            "adverse_evidence_ack",
+            auth.get("adverse_evidence_acknowledgment"),
+        )
+        try:
+            if json.dumps(
+                expected_ack,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ) != json.dumps(
+                observed_ack,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ):
+                raise CanaryBlocked("EXECUTION_AUTHORIZATION_CHANGED")
+        except (TypeError, ValueError):
+            raise CanaryBlocked("EXECUTION_AUTHORIZATION_CHANGED") from None
     _canary_authorization_binding_fence(
         service,
         auth=auth,
@@ -2655,12 +3030,23 @@ def _require_execution_authorization(
         requested_cost=requested_cost,
         fee_reserve=fee_reserve,
         now=now,
+        candidate_id=str(
+            binding.get("candidate_id")
+            or (signal or {}).get("candidate_id")
+            or (context or {}).get("candidate_id")
+            or ""
+        ).strip() or None,
+        side=str(
+            binding.get("side")
+            or (signal or {}).get("side")
+            or (context or {}).get("side")
+            or ""
+        ).strip() or None,
+        selection_fence=not is_exit,
     )
     result = dict(auth)
     result["execution_authorization_mode"] = mode
     return result
-
-
 def _authority_context(
     *,
     lease: Mapping[str, Any],
@@ -6871,6 +7257,7 @@ class CanaryService:
             selection = loader() if callable(loader) else None
         if not isinstance(selection, Mapping):
             raise CanaryBlocked("ROLLING_SELECTION_UNAVAILABLE")
+        canonical_selection_hash = _canary_authorization_current_selection_hash(selection)
         active_loader = getattr(self.store, "get_operator_config", None)
         try:
             active = (
@@ -6971,6 +7358,7 @@ class CanaryService:
             "policy_id": active_policy_id,
             "policy_version": active_policy_version,
             "policy_hash": active_policy_hash,
+            "selection_hash": canonical_selection_hash,
             **expected_risk,
         }
 
@@ -7054,6 +7442,9 @@ class CanaryService:
         risk_config_id: Any = None,
         risk_config_generation: Any = None,
         risk_config_hash: Any = None,
+        execution_authorization_mode: Any = None,
+        execution_authorization_strategy_versions: Any = None,
+        execution_authorization_adverse_evidence_ack: Any = None,
     ) -> dict[str, Any]:
         """Fence rolling identity to the exact current selection and member."""
         values = _lineage_mapping(source)
@@ -7077,7 +7468,8 @@ class CanaryService:
             raise CanaryBlocked("ROLLING_SELECTION_UNAVAILABLE") from exc
         if not isinstance(current, Mapping):
             raise CanaryBlocked("ROLLING_SELECTION_UNAVAILABLE")
-        self.validate_rolling_selection_fence(current)
+        selection_fence = self.validate_rolling_selection_fence(current)
+        explicit["selection_hash"] = selection_fence["selection_hash"]
         checks = (
             ("portfolio_selection_id", current.get("portfolio_selection_id")),
             ("admission_policy_id", current.get("policy_id")),
@@ -7154,13 +7546,100 @@ class CanaryService:
         if require_active and not normalized_side:
             normalized_side = "BUY"
         member_status = str(member.get("status") or "").strip().upper()
+        authorization_mode = (
+            execution_authorization_mode
+            if execution_authorization_mode not in (None, "")
+            else values.get(
+                "execution_authorization_mode",
+                getattr(self, "execution_authorization_mode", None),
+            )
+        )
+        authorization_mode = str(authorization_mode or "").strip().upper()
+        exploratory = authorization_mode in {
+            "EXPLORATORY",
+            "EXPLORATORY_MICRO_CANARY",
+            "MICRO_CANARY",
+        }
+        raw_versions = (
+            execution_authorization_strategy_versions
+            if execution_authorization_strategy_versions not in (None, "")
+            else values.get("execution_authorization_strategy_versions", ())
+        )
+        if isinstance(raw_versions, str):
+            authorized_versions = (
+                {raw_versions.strip()} if raw_versions.strip() else set()
+            )
+        elif isinstance(raw_versions, Sequence) and not isinstance(
+            raw_versions, (bytes, bytearray)
+        ):
+            authorized_versions = {
+                str(value).strip() for value in raw_versions if str(value).strip()
+            }
+        else:
+            authorized_versions = set()
+        if (
+            exploratory
+            and not authorized_versions
+            and (
+                values.get("reviewed_selection_policy_hash")
+                or values.get("selection_policy_hash")
+                or values.get("policy_hash")
+                or values.get("admission_policy_hash")
+            )
+        ):
+            authorized_versions = {
+                str(item.get("strategy_version_id") or "").strip()
+                for item in current.get("members", ())
+                if isinstance(item, Mapping)
+                and _canary_selection_member_is_positive(item)
+                and str(item.get("strategy_version_id") or "").strip()
+            }
+        raw_ack = (
+            execution_authorization_adverse_evidence_ack
+            if execution_authorization_adverse_evidence_ack not in (None, "")
+            else values.get("execution_authorization_adverse_evidence_ack")
+        )
+        acknowledged = _canary_adverse_acknowledged(raw_ack)
+        explicit_acknowledged = _canary_adverse_acknowledged(
+            raw_ack,
+            require_required=True,
+        )
+        if (
+            exploratory
+            and member_status in _ROLLING_NON_ACTIVE_STATUSES
+            and strategy not in authorized_versions
+        ):
+            raise CanaryBlocked("EXECUTION_AUTHORIZATION_STRATEGY_MISMATCH")
+        if (
+            exploratory
+            and member_status in _ROLLING_EXPLICIT_ADVERSE_ACK_REQUIRED
+            and strategy in authorized_versions
+            and not explicit_acknowledged
+        ):
+            raise CanaryBlocked(
+                "EXECUTION_AUTHORIZATION_ADVERSE_EVIDENCE_ACK_REQUIRED"
+            )
+        exploratory_non_active = (
+            exploratory
+            and member_status in _ROLLING_NON_ACTIVE_STATUSES
+            and strategy in authorized_versions
+            and (
+                member_status not in _ROLLING_EXPLICIT_ADVERSE_ACK_REQUIRED
+                and acknowledged
+                or member_status in _ROLLING_EXPLICIT_ADVERSE_ACK_REQUIRED
+                and explicit_acknowledged
+            )
+        )
         if normalized_side == "BUY":
             try:
                 allocation = Decimal(str(member.get("allocation", "0")))
             except (TypeError, ValueError, ArithmeticError) as exc:
                 raise CanaryBlocked("ROLLING_MEMBER_NOT_ACTIVE") from exc
             if (
-                member_status != "ACTIVE"
+                (
+                    member_status != "ACTIVE"
+                    and not exploratory_non_active
+                )
                 or not allocation.is_finite()
                 or allocation <= 0
             ):
@@ -7185,7 +7664,7 @@ class CanaryService:
         signal_values = dict(signal)
         signal_evidence = signal.get("evidence")
         if isinstance(signal_evidence, Mapping):
-            for field in _ROLLING_EVIDENCE_FIELDS:
+            for field in (*_ROLLING_EVIDENCE_FIELDS, *_ROLLING_AUTHORIZATION_FIELDS):
                 if signal_values.get(field) in (None, ""):
                     signal_values[field] = signal_evidence.get(field)
         stored_type = str(signal_values.get("lineage_type") or "").strip().upper()
@@ -7225,6 +7704,41 @@ class CanaryService:
                     raise CanaryBlocked("ROLLING_LINEAGE_CONFLICT")
             elif str(persisted[field]).strip() != str(supplied[field]).strip():
                 raise CanaryBlocked("ROLLING_LINEAGE_CONFLICT")
+        for field in _ROLLING_AUTHORIZATION_FIELDS:
+            persisted_value = persisted.get(field)
+            supplied_value = supplied.get(field)
+            if persisted_value in (None, ""):
+                continue
+            if supplied_value in (None, ""):
+                supplied[field] = persisted_value
+                continue
+            if field == "execution_authorization_generation":
+                try:
+                    matches = int(persisted_value) == int(supplied_value)
+                except (TypeError, ValueError, OverflowError):
+                    matches = False
+            elif field in {
+                "execution_authorization_strategy_versions",
+                "execution_authorization_adverse_evidence_ack",
+            }:
+                try:
+                    matches = json.dumps(
+                        persisted_value,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        default=str,
+                    ) == json.dumps(
+                        supplied_value,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        default=str,
+                    )
+                except (TypeError, ValueError):
+                    matches = False
+            else:
+                matches = str(persisted_value).strip() == str(supplied_value or "").strip()
+            if not matches:
+                raise CanaryBlocked("ROLLING_LINEAGE_CONFLICT")
         candidate_id = str(signal.get("candidate_id") or "").strip()
         validated = self._rolling_lineage(
             {
@@ -7233,6 +7747,15 @@ class CanaryService:
             },
             require_active=str(side).strip().upper() == "BUY",
             side=side,
+            execution_authorization_mode=context_values.get(
+                "execution_authorization_mode"
+            ),
+            execution_authorization_strategy_versions=context_values.get(
+                "execution_authorization_strategy_versions"
+            ),
+            execution_authorization_adverse_evidence_ack=context_values.get(
+                "execution_authorization_adverse_evidence_ack"
+            ),
         )
         current = self.store.load_current_portfolio_selection()
         members = current.get("members", ()) if isinstance(current, Mapping) else ()
@@ -8621,7 +9144,11 @@ class CanaryService:
                         evidence.update(
                             {
                                 field: lineage.get(field)
-                                for field in _ROLLING_EVIDENCE_FIELDS
+                                for field in (
+                                    *_ROLLING_EVIDENCE_FIELDS,
+                                    *_ROLLING_AUTHORIZATION_FIELDS,
+                                )
+                                if lineage.get(field) not in (None, "")
                             }
                         )
                     self.store.connection.execute(
@@ -8889,7 +9416,11 @@ class CanaryService:
             evidence.update(
                 {
                     field: lineage.get(field)
-                    for field in _ROLLING_EVIDENCE_FIELDS
+                    for field in (
+                        *_ROLLING_EVIDENCE_FIELDS,
+                        *_ROLLING_AUTHORIZATION_FIELDS,
+                    )
+                    if lineage.get(field) not in (None, "")
                 }
             )
         evidence.update(
@@ -13303,6 +13834,27 @@ class CanaryService:
         submission_lineage["execution_authorization_mode"] = execution_authorization.get(
             "execution_authorization_mode",
             execution_authorization.get("mode"),
+        )
+        submission_lineage.update(
+            {
+                "execution_authorization_id": execution_authorization.get(
+                    "authorization_id", execution_authorization.get("id")
+                ),
+                "execution_authorization_generation": execution_authorization.get(
+                    "generation"
+                ),
+                "execution_authorization_strategy_versions": execution_authorization.get(
+                    "exact_strategy_versions",
+                    execution_authorization.get(
+                        "strategy_version_ids",
+                        execution_authorization.get("strategy_versions"),
+                    ),
+                ),
+                "execution_authorization_adverse_evidence_ack": execution_authorization.get(
+                    "adverse_evidence_ack",
+                    execution_authorization.get("adverse_evidence_acknowledgment"),
+                ),
+            }
         )
         authority_context = {
             **(dict(rolling_context) if isinstance(rolling_context, Mapping) else {}),

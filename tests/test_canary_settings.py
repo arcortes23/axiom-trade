@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import unittest
 
@@ -224,6 +224,58 @@ class CanarySettingsTests(unittest.TestCase):
         self.assertTrue(result["reset"])
         self.assertEqual(self.store.list_canary_setting_audit(limit=1)[0]["action"], "CUMULATIVE_USAGE_RESET")
 
+
+    def test_exploratory_authorization_binds_exact_strategy_scope_and_generation(self) -> None:
+        active = self.service.snapshot(now=T0)
+        selection_hash = "b" * 64
+        draft = self.service.register_execution_authorization_draft(
+            purpose="review exact exploratory subset",
+            exact_strategy_versions=("strategy-v1", "strategy-v2"),
+            adverse_evidence_ack={"acknowledged": True, "required": True},
+            lifetime_budget={"max_notional_usd": "0.50", "max_orders": 1},
+            stop_rules={"halt_on_unknown_execution": True},
+            expires_at=T0.replace(microsecond=0) + timedelta(hours=1),
+            scope_hash="scope-hash",
+            scope_version="scope-v1",
+            selection_id="selection-v1",
+            selection_hash=selection_hash,
+            actor="operator-a",
+            active_settings_hash=active["config_hash"],
+            active_settings_generation=active["generation"],
+        )
+        activated = self.service.activate_execution_authorization(
+            draft["authorization_id"],
+            "operator-a",
+            expected_generation=1,
+        )
+        self.assertEqual(activated["status"], "ACTIVE")
+        loaded = self.service.load_active_execution_authorization(
+            mode="EXPLORATORY_MICRO_CANARY",
+            now=T0,
+            scope_hash="scope-hash",
+            scope_version="scope-v1",
+            selection_id="selection-v1",
+            selection_hash=selection_hash,
+        )
+        self.assertIsNotNone(loaded)
+        self.assertEqual(
+            loaded["exact_strategy_versions"],
+            ["strategy-v1", "strategy-v2"],
+        )
+        self.assertEqual(
+            loaded["active_settings_generation"],
+            active["generation"],
+        )
+        self.assertIsNone(
+            self.service.load_active_execution_authorization(
+                mode="EXPLORATORY_MICRO_CANARY",
+                now=T0,
+                scope_hash="scope-hash",
+                scope_version="scope-v2",
+                selection_id="selection-v1",
+                selection_hash=selection_hash,
+            )
+        )
 
 class CanaryRiskAccountingTests(unittest.TestCase):
     def test_fill_is_counted_on_pht_fill_day(self) -> None:

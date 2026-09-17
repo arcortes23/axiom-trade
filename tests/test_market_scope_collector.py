@@ -8,7 +8,13 @@ import threading
 import time
 import unittest
 
-from axiom.collector import CollectorConfig, PolymarketCollector
+from axiom.collector import (
+    CollectorConfig,
+    PolymarketCollector,
+    _MAX_SCOPE_INVENTORY,
+    _MAX_SCOPE_SUITABILITY_CACHE,
+    _stable_payload,
+)
 from axiom.data import InMemoryPredictionProvider
 from axiom.storage import AxiomStore, _COLLECTOR_STATE_MAX_BYTES
 from axiom.polymarket_rules import assess_selected_token_depth, parse_polymarket_rules
@@ -1477,6 +1483,340 @@ class MarketScopeCollectorTests(unittest.TestCase):
                 "scope_version": expected.scope_version,
             }],
         )
+    def test_scope_suitability_cache_reuses_identical_probe_with_explicit_ceiling(self) -> None:
+        snapshot = replace(market("cached-scope"), order_book=None)
+        provider = _PagedProvider((snapshot,), ())
+        collector = self._collector(provider, _ScopeStore({}), ())
+        counters = collector._new_counters()
+
+        first = collector._cached_scope_suitability_assessment(
+            snapshot,
+            T0,
+            provider,
+            counters=counters,
+            intended_token="yes",
+        )
+        second = collector._cached_scope_suitability_assessment(
+            snapshot,
+            T0,
+            provider,
+            counters=counters,
+            intended_token="yes",
+        )
+
+        self.assertEqual(first, second)
+        self.assertEqual(provider.book_calls, ["cached-scope"])
+        self.assertEqual(len(collector._scope_suitability_cache), 1)
+        self.assertLessEqual(
+            len(collector._scope_suitability_cache),
+            _MAX_SCOPE_SUITABILITY_CACHE,
+        )
+
+    def test_legacy_scope_continuation_bounds_inventory_and_refresh_queue(self) -> None:
+        visible = market("legacy-visible")
+        provider = _RecordingProvider((visible,))
+        store = _ScopeStore(
+            {
+                "candidate": {
+                    "experiment_plan": {
+                        "market_scope": scope(
+                            "EXACT_MARKETS",
+                            market_ids=("legacy-visible",),
+                        )
+                    }
+                }
+            }
+        )
+        store.states["polymarket"] = {
+            "scope_inventory_continuation": {
+                "after_cursor": 0,
+                "coverage_status": "BUDGET_EXHAUSTED",
+                "inventory_records": [
+                    {"market_id": f"legacy-{index}"}
+                    for index in range(_MAX_SCOPE_INVENTORY + 17)
+                ],
+                "suitability_refresh_queue": [
+                    f"legacy-{index}"
+                    for index in range(_MAX_SCOPE_INVENTORY + 23)
+                ],
+            }
+        }
+
+        collector = self._collector(provider, store, ("candidate",), max_markets=1)
+        collector.collect_once(now=T0)
+
+        continuation = store.states["polymarket"]["scope_inventory_continuation"]
+        self.assertLessEqual(len(continuation["inventory_records"]), _MAX_SCOPE_INVENTORY)
+        self.assertLessEqual(
+            len(continuation["suitability_refresh_queue"]),
+            _MAX_SCOPE_INVENTORY,
+        )
+        self.assertEqual(continuation["inventory_records"][0]["market_id"], "legacy-0")
+        self.assertEqual(continuation["suitability_refresh_queue"][0], "legacy-0")
+
+    def test_scope_cap_keeps_omitted_paper_scopes_out_of_legacy_requirements(self) -> None:
+        scoped_market = market("paper-cap-market")
+        documents = {
+            f"paper-scoped-{index}": {
+                "experiment_plan": {
+                    "market_scope": scope(
+                        "EXACT_MARKETS",
+                        market_ids=("paper-cap-market",),
+                    )
+                }
+            }
+            for index in range(1_001)
+        }
+        store = _ScopeStore(documents)
+        for record in store.documents.values():
+            record["stage"] = "PAPER_FORWARD"
+        provider = _RecordingProvider((scoped_market,))
+        collector = self._collector(provider, store, (), max_markets=1)
+
+        cycle = collector.collect_once(now=T0)
+
+        self.assertEqual(cycle.paper_forward_scheduled, ("paper-cap-market",))
+        self.assertEqual(len(store.resolutions), 1_000)
+        self.assertTrue(
+            all(
+                "paper-scoped-1000" not in candidate_ids
+                for candidate_ids in store.requirement_calls
+            )
+        )
+
+    def test_shared_scope_refresh_snapshot_is_reused_by_later_candidate(self) -> None:
+        shared = market("shared-refresh")
+        document = {
+            "experiment_plan": {
+                "market_scope": scope("EXACT_MARKETS", market_ids=("shared-refresh",)),
+                "suitability": {"required_capital": 1.0},
+            }
+        }
+        store = _ScopeStore({"first": document, "second": document})
+        provider = _RecordingProvider((shared,))
+        collector = self._collector(provider, store, ("first", "second"))
+        record = PolymarketCollector._scope_market_record(shared, T0, provider)
+        collector._scope_inventory_continuation = {
+            "coverage_status": "BUDGET_EXHAUSTED",
+            "after_cursor": "shared-cursor",
+        }
+        collector._discover_scope_inventory = lambda *args, **kwargs: (
+            [record],
+            {},
+            "shared-cursor",
+        )
+        collector._scope_resolutions = {}
+
+        _, candidate_markets, _, _ = collector._resolve_market_scopes(
+            T0,
+            ("first", "second"),
+            {},
+            collector._new_counters(),
+        )
+
+        self.assertEqual(
+            candidate_markets,
+            {
+                "first": ["shared-refresh"],
+                "second": ["shared-refresh"],
+            },
+        )
+        self.assertEqual(provider.market_calls, ["shared-refresh"])
+
+    def test_cached_unsuitable_prefix_does_not_hide_later_unresolved_suitable_market(self) -> None:
+        unsuitable = tuple(market(f"unsuitable-{index}") for index in range(1_000))
+        suitable = market("later-suitable")
+        document = {
+            "experiment_plan": {
+                "market_scope": scope("EXACT_MARKETS", market_ids=("later-suitable",)),
+                "suitability": {"required_capital": 1.0},
+            }
+        }
+        store = _ScopeStore({"candidate": document})
+        provider = _RecordingProvider((*unsuitable, suitable))
+        collector = self._collector(provider, store, ("candidate",))
+        records = [
+            PolymarketCollector._scope_market_record(item, T0, provider)
+            for item in (*unsuitable, suitable)
+        ]
+        snapshots = {item.market_id: item for item in unsuitable}
+        kwargs = collector._suitability_kwargs(document)
+        collector._scope_suitability_cache = {
+            (
+                item.market_id,
+                _stable_payload(kwargs),
+            ): {
+                "market_id": item.market_id,
+                "action": "UNSUITABLE",
+                "category": "CAPITAL_OR_MARKET_CONSTRAINT",
+                "reason": "NO_DEPTH",
+            }
+            for item in unsuitable
+        }
+        collector._scope_inventory_continuation = {
+            "coverage_status": "BUDGET_EXHAUSTED",
+            "after_cursor": "unsuitable-cursor",
+        }
+        collector._discover_scope_inventory = lambda *args, **kwargs: (
+            records,
+            snapshots,
+            "unsuitable-cursor",
+        )
+        collector._scope_resolutions = {}
+
+        _, candidate_markets, _, _ = collector._resolve_market_scopes(
+            T0,
+            ("candidate",),
+            {},
+            collector._new_counters(),
+        )
+
+        self.assertEqual(candidate_markets, {"candidate": ["later-suitable"]})
+        self.assertEqual(provider.market_calls, ["later-suitable"])
+
+    def test_scope_refresh_timeout_rotates_carried_inventory_queue(self) -> None:
+        first = market("first-scope", category="politics")
+        second = market("second-scope", category="politics")
+        provider = _PagedProvider(
+            (first, second),
+            (
+                {"snapshots": (), "next_cursor": "scope-next"},
+                {"snapshots": (), "next_cursor": "scope-next-2"},
+            ),
+        )
+        store = _ScopeStore({})
+        policy = scope("EXACT_MARKETS", market_ids=("second-scope",))
+        document = {
+            "experiment_plan": {
+                "market_scope": policy,
+                "suitability": {"required_capital": 1.0},
+            }
+        }
+
+        class RotatingCollector(_ScopeCollector):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.refresh_calls: list[str] = []
+
+            def _refresh_scope_snapshot(self, snapshot, provider, observed_at, counters):
+                market_id = str(snapshot.market_id)
+                self.refresh_calls.append(market_id)
+                if market_id == "first-scope":
+                    self._scope_refresh_attempted.add(market_id)
+                    self._cycle_deadline_exhausted = True
+                    return None
+                return super()._refresh_scope_snapshot(snapshot, provider, observed_at, counters)
+
+        collector = RotatingCollector(
+            provider,
+            store,
+            CollectorConfig(
+                max_markets=2,
+                discovery_budget_per_cycle=10,
+                max_attempts=1,
+                backoff_initial_seconds=0,
+                jitter_seconds=0,
+            ),
+            candidate_ids=(),
+            clock=lambda: T0,
+            sleep=lambda _seconds: None,
+        )
+        records = [
+            PolymarketCollector._scope_market_record(item, T0, provider)
+            for item in (first, second)
+        ]
+        collector._scope_inventory_continuation = {
+            "after_cursor": "scope-cursor",
+            "coverage_status": "BUDGET_EXHAUSTED",
+            "suitability_enabled": True,
+            "suitability_refresh_queue": ["first-scope", "second-scope"],
+            "inventory_records": records,
+        }
+        collector._scope_refresh_attempted = set()
+        collector._cycle_deadline_exhausted = False
+        collector._discover_scope_inventory(
+            T0,
+            collector._new_counters(),
+            carry_cursor="scope-cursor",
+            documents=(document,),
+        )
+        self.assertEqual(collector.refresh_calls, ["first-scope"])
+        self.assertEqual(
+            collector._scope_inventory_continuation["suitability_refresh_queue"],
+            ["second-scope", "first-scope"],
+        )
+        self.assertLessEqual(
+            len(collector._scope_inventory_continuation["suitability_refresh_queue"]),
+            _MAX_SCOPE_INVENTORY,
+        )
+
+        collector._scope_refresh_attempted = set()
+        collector._cycle_deadline_exhausted = False
+        records_after, snapshots_after, _ = collector._discover_scope_inventory(
+            T0 + timedelta(seconds=1),
+            collector._new_counters(),
+            carry_cursor="scope-next",
+            documents=(document,),
+        )
+        self.assertEqual(
+            collector.refresh_calls,
+            ["first-scope", "second-scope", "first-scope"],
+        )
+        self.assertEqual(
+            collector._scope_inventory_continuation["suitability_refresh_queue"],
+            ["second-scope", "first-scope"],
+        )
+        self.assertLessEqual(
+            len(collector._scope_inventory_continuation["suitability_refresh_queue"]),
+            _MAX_SCOPE_INVENTORY,
+        )
+        self.assertEqual(set(snapshots_after), {"second-scope"})
+        self.assertEqual(
+            collector._scope_inventory_continuation["verified_market_ids"],
+            ["second-scope"],
+        )
+        cached_second = [
+            assessment
+            for (market_id, _), assessment in collector._scope_suitability_cache.items()
+            if market_id == "second-scope"
+        ]
+        self.assertEqual(len(cached_second), 1)
+        self.assertEqual(cached_second[0]["action"], "SUITABLE")
+        self.assertEqual(cached_second[0]["market_id"], "second-scope")
+        suitability_cache_before = {
+            key: dict(value)
+            for key, value in collector._scope_suitability_cache.items()
+        }
+        store.documents["candidate"] = {
+            "candidate_id": "candidate",
+            "stage": "FROZEN",
+            "payload": document,
+        }
+        refresh_calls_before_resolver = list(collector.refresh_calls)
+        books_before_resolver = list(provider.book_calls)
+        collector._discover_scope_inventory = lambda *args, **kwargs: (
+            records_after,
+            snapshots_after,
+            "scope-next-2",
+        )
+        collector._cycle_deadline_monotonic = time.monotonic()
+        collector._scope_resolutions = {}
+        _, candidate_markets, _, _ = collector._resolve_market_scopes(
+            T0 + timedelta(seconds=1),
+            ("candidate",),
+            {},
+            collector._new_counters(),
+        )
+        self.assertEqual(candidate_markets, {"candidate": ["second-scope"]})
+        self.assertEqual(provider.book_calls, books_before_resolver)
+        self.assertEqual(collector.refresh_calls, refresh_calls_before_resolver)
+        proof = collector._scope_resolutions["candidate"]
+        self.assertEqual(proof["status"], MATCHED)
+        self.assertEqual(
+            [item["market_id"] for item in proof["matched_markets"]],
+            ["second-scope"],
+        )
+
     def test_selected_token_book_never_uses_wrong_singleton(self) -> None:
         base = market("exact-book")
         wrong = replace(base.order_book, token_id="no-other-market")

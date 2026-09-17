@@ -25,6 +25,9 @@ from itertools import islice
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 from zoneinfo import ZoneInfo
+
+_LOGGER = logging.getLogger(__name__)
+
 _MAX_LATEST_SCAN_ROWS = 10_000
 _CANARY_EQUITY_MARK_MAX_AGE_SECONDS = 300.0
 _CANARY_CONFIRMED_SETTLEMENT_STATUSES = frozenset(

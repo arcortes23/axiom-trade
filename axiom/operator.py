@@ -11,6 +11,7 @@ from decimal import Decimal
 import hashlib
 import ipaddress
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -30,6 +31,8 @@ from .canary import (
     CanaryService,
     CredentialStore,
     PolymarketClobV2Venue,
+    _canary_adverse_acknowledged,
+    _canary_authorization_current_selection_hash,
     credential_fingerprint,
 )
 from .canary_positions import (
@@ -53,10 +56,12 @@ from .node import (
     _pid_matches_node,
     normalized_execution_profile,
 )
-from .storage import AxiomStore
+
+_LOGGER = logging.getLogger(__name__)
 
 
 DEFAULT_HERMES_JOB_ID = "f1d27bf8c27a"
+
 BOOTSTRAP_JOB_NAME = "crypto-universe-bootstrap"
 HERMES_STATE_NAME = "hermes-control"
 # The configured Hermes job is an external reference only.  The operator has
@@ -1700,7 +1705,10 @@ class OperatorControlPlane:
         selection_id = str(
             selection.get("portfolio_selection_id") or selection.get("selection_id") or ""
         ).strip()
-        selection_hash = self._rolling_canonical_hash(selection) if selection else ""
+        try:
+            selection_hash = _canary_authorization_current_selection_hash(selection)
+        except CanaryBlocked as exc:
+            raise OperatorControlError(str(exc) or "EXECUTION_AUTHORIZATION_SELECTION_INVALID") from exc
         members = selection.get("members", selection.get("selected_members", ()))
         members = members if isinstance(members, (list, tuple)) else ()
         strategy_versions: list[str] = []
@@ -1709,19 +1717,29 @@ class OperatorControlPlane:
         for member in members[:64]:
             if not isinstance(member, Mapping):
                 continue
+            status = str(
+                member.get("status")
+                or member.get("stage")
+                or ""
+            ).strip().upper()
+            rejected = bool(member.get("rejected")) or status == "REJECTED"
+            try:
+                allocation = Decimal(str(member.get("allocation") or "0"))
+            except (ArithmeticError, TypeError, ValueError):
+                allocation = Decimal("0")
+            # Keep rejected identities in the review binding even when their
+            # allocator has already set their opening allocation to zero.
+            if (
+                not allocation.is_finite()
+                or allocation <= 0
+            ) and not rejected:
+                continue
             identifier = str(member.get("strategy_version_id") or "").strip()
             if not identifier:
                 continue
             identifier = identifier[:256]
             if identifier not in strategy_versions:
                 strategy_versions.append(identifier)
-            rejected = bool(member.get("rejected"))
-            status = str(
-                member.get("status")
-                or member.get("stage")
-                or ""
-            ).strip().upper()
-            rejected = rejected or status == "REJECTED"
             candidate_id = str(member.get("candidate_id") or "").strip()
             if not rejected and callable(candidate_loader) and candidate_id:
                 try:
@@ -1936,6 +1954,7 @@ class OperatorControlPlane:
             "strategy_version_ids",
             "reviewed_selection_policy_hash",
             "selection_policy_hash",
+            "policy_hash",
             "adverse_evidence_ack",
             "lifetime_budget",
             "stop_rules",
@@ -1963,6 +1982,29 @@ class OperatorControlPlane:
             expected = context.get(context_key)
             if str(supplied or "") != str(expected or ""):
                 raise OperatorControlError("EXECUTION_AUTHORIZATION_BINDING_STALE")
+        for field, context_key in (
+            ("active_settings_generation", "active_settings_generation"),
+            ("selection_id", "selection_id"),
+            ("selection_hash", "selection_hash"),
+        ):
+            if field not in raw:
+                continue
+            supplied = raw.get(field)
+            expected = context.get(context_key)
+            if field == "active_settings_generation":
+                if isinstance(supplied, bool) or isinstance(expected, bool):
+                    raise OperatorControlError("EXECUTION_AUTHORIZATION_BINDING_STALE")
+                try:
+                    if int(supplied) != int(expected):
+                        raise OperatorControlError(
+                            "EXECUTION_AUTHORIZATION_BINDING_STALE"
+                        )
+                except (TypeError, ValueError, OverflowError):
+                    raise OperatorControlError(
+                        "EXECUTION_AUTHORIZATION_BINDING_STALE"
+                    ) from None
+            elif str(supplied or "") != str(expected or ""):
+                raise OperatorControlError("EXECUTION_AUTHORIZATION_BINDING_STALE")
         purpose = self._authorization_text(
             raw.get("purpose", "exploratory micro-canary review"), "purpose"
         )
@@ -1987,25 +2029,62 @@ class OperatorControlPlane:
             if len(strategy_versions) >= 32:
                 break
         if "exact_strategy_versions" in raw or "strategy_version_ids" in raw:
-            if set(strategy_versions) != set(context["strategy_versions"]):
+            if not set(strategy_versions).issubset(set(context["strategy_versions"])):
                 raise OperatorControlError("EXECUTION_AUTHORIZATION_BINDING_STALE")
         ack = raw.get("adverse_evidence_ack")
-        acknowledged = ack is True
-        if isinstance(ack, Mapping):
-            acknowledged = any(
-                ack.get(name) is True
-                for name in ("acknowledged", "acknowledgment", "accepted")
-            )
         rejected_strategy_versions = {
             str(value).strip()
             for value in context.get("rejected_strategy_versions", ())
             if str(value).strip()
         }
+        policy_values = {
+            str(raw[name]).strip()
+            for name in (
+                "reviewed_selection_policy_hash",
+                "selection_policy_hash",
+                "policy_hash",
+            )
+            if raw.get(name) not in (None, "")
+            and str(raw.get(name)).strip()
+        }
+        if len(policy_values) > 1:
+            raise OperatorControlError("EXECUTION_AUTHORIZATION_BINDING_STALE")
+        supplied_policy_hash = next(iter(policy_values), "")
+        context_policy_hash = str(context.get("selection_policy_hash") or "").strip()
+        if supplied_policy_hash and supplied_policy_hash != context_policy_hash:
+            raise OperatorControlError("EXECUTION_AUTHORIZATION_BINDING_STALE")
+        policy_hash = supplied_policy_hash or context_policy_hash
+        policy_only = not strategy_versions and bool(policy_hash)
         funding_rejected_strategy = bool(
             rejected_strategy_versions.intersection(strategy_versions)
         )
-        if funding_rejected_strategy and not acknowledged:
+        if policy_only:
+            funding_rejected_strategy = bool(rejected_strategy_versions)
+        if ack is True:
+            # Browser checkboxes submit a bare boolean.  Convert that
+            # shorthand before the strict rejected-member fence runs so a
+            # positive operator action carries the required durable marker.
+            ack = {
+                "acknowledged": True,
+                "required": funding_rejected_strategy,
+            }
+        acknowledged = _canary_adverse_acknowledged(ack)
+        rejected_acknowledged = _canary_adverse_acknowledged(
+            ack,
+            require_required=True,
+        )
+        if funding_rejected_strategy and not rejected_acknowledged:
             raise OperatorControlError("EXECUTION_AUTHORIZATION_ADVERSE_EVIDENCE_ACK_REQUIRED")
+        if (
+            policy_only
+            and (
+                not context.get("selection_id")
+                or not context.get("selection_hash")
+            )
+        ):
+            raise OperatorControlError(
+                "EXECUTION_AUTHORIZATION_SELECTION_BINDING_REQUIRED"
+            )
         # The storage contract requires an explicit acknowledgment object for
         # every durable row.  For accepted strategies this is an internal
         # non-required marker; rejected strategies must carry the operator's
@@ -2014,17 +2093,6 @@ class OperatorControlPlane:
             "acknowledged": True,
             "required": False,
         }
-        policy_hash = str(
-            raw.get("reviewed_selection_policy_hash")
-            or raw.get("selection_policy_hash")
-            or context.get("selection_policy_hash")
-            or ""
-        ).strip()
-        if (
-            ("reviewed_selection_policy_hash" in raw or "selection_policy_hash" in raw)
-            and policy_hash != str(context.get("selection_policy_hash") or "")
-        ):
-            raise OperatorControlError("EXECUTION_AUTHORIZATION_BINDING_STALE")
         if not strategy_versions and not policy_hash:
             raise OperatorControlError("EXECUTION_AUTHORIZATION_SELECTION_BINDING_REQUIRED")
         lifetime_budget = self._authorization_decimal(

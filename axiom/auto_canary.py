@@ -5,6 +5,7 @@ from decimal import Decimal, InvalidOperation
 from datetime import datetime, timedelta
 import hashlib
 import json
+import logging
 import math
 import threading
 import uuid
@@ -17,6 +18,9 @@ from .canary import (
     CanaryService,
     PolymarketClobV2Venue,
     _UNSET,
+    _canary_adverse_acknowledged,
+    _canary_authorization_selection_policy_hash,
+    _canary_authorization_current_selection_hash,
 )
 from .domain import ensure_utc, utc_now
 from .ranker import CandidateCanaryRanker
@@ -28,6 +32,10 @@ from .canary_positions import (
     _ensure_schema,
     _sync_entry_lots,
 )
+
+_LOGGER = logging.getLogger(__name__)
+
+
 class AutonomousCanaryWorker:
     """Run one serialized rank/signal/submit decision at a bounded cadence."""
     _SUBMISSION_SUCCESS_STATUSES = frozenset(
@@ -1947,9 +1955,20 @@ class AutonomousCanaryWorker:
         if not strategy_version_id or not research_trial_id or not candidate_id:
             raise CanaryBlocked("ROLLING_LINEAGE_INCOMPLETE")
         position_state = member.get("position_management_state")
-        position_state = position_state if isinstance(position_state, Mapping) else {}
+        position_state = (
+            position_state if isinstance(position_state, Mapping) else {}
+        )
+        member_status = str(
+            member.get("status") or member.get("stage") or ""
+        ).strip().upper()
+        member_rejected = (
+            member.get("rejected") is True or member_status == "REJECTED"
+        )
+        policy_hash = _canary_authorization_selection_policy_hash(selection) or ""
+        selection_hash = _canary_authorization_current_selection_hash(selection)
         context: dict[str, Any] = {
             "lineage_type": "ROLLING_PORTFOLIO",
+            "selection_hash": selection_hash,
             "strategy_version_id": strategy_version_id,
             "research_trial_id": research_trial_id,
             "candidate_id": candidate_id,
@@ -1959,6 +1978,8 @@ class AutonomousCanaryWorker:
                 "observation_horizon",
                 position_state.get("observation_horizon"),
             ),
+            "status": member_status,
+            "rejected": member_rejected,
             "selection_excluded": bool(
                 member.get("selection_excluded", position_state.get("selection_excluded", False))
             ),
@@ -1974,26 +1995,8 @@ class AutonomousCanaryWorker:
             "admission_policy_version": str(
                 selection.get("policy_version") or ""
             ).strip(),
-            "admission_policy_hash": str(
-                selection.get("policy_hash")
-                or selection.get("config_hash")
-                or (
-                    selection.get("policy_config", {}).get("config_hash")
-                    if isinstance(selection.get("policy_config"), Mapping)
-                    else ""
-                )
-                or ""
-            ).strip(),
-            "policy_hash": str(
-                selection.get("policy_hash")
-                or selection.get("config_hash")
-                or (
-                    selection.get("policy_config", {}).get("config_hash")
-                    if isinstance(selection.get("policy_config"), Mapping)
-                    else ""
-                )
-                or ""
-            ).strip(),
+            "admission_policy_hash": policy_hash,
+            "policy_hash": policy_hash,
             "risk_config_id": str(
                 selection.get("active_risk_config_id")
                 or selection.get("risk_config_id")
@@ -2038,11 +2041,119 @@ class AutonomousCanaryWorker:
         return reducing
 
     @staticmethod
-    def _rolling_active_members(selection: Mapping[str, Any]) -> list[Mapping[str, Any]]:
-        """Return only positive-allocation ACTIVE members eligible for entry."""
+    def _rolling_active_members(
+        selection: Mapping[str, Any],
+        *,
+        execution_mode: str = "EVIDENCE_SELECTED",
+        authorization: Mapping[str, Any] | None = None,
+    ) -> list[Mapping[str, Any]]:
+        """Return bounded funded members admitted by the execution mode.
+
+        Evidence-selected execution remains restricted to ACTIVE members.  An
+        exploratory authorization can explicitly fund a currently selected
+        non-ACTIVE member, but never creates allocation: the persisted member
+        must already carry a positive reviewed allocation, and its exact
+        strategy version or exact reviewed policy binding must authorize it.
+        """
         raw_members = selection.get("members", selection.get("selected_members", ()))
         if not isinstance(raw_members, (list, tuple)):
             return []
+        mode = str(execution_mode or "EVIDENCE_SELECTED").strip().upper()
+        exploratory = mode in {
+            "EXPLORATORY",
+            "EXPLORATORY_MICRO_CANARY",
+            "MICRO_CANARY",
+        }
+        exact_versions: set[str] | None = None
+        acknowledged = False
+        explicit_rejected_acknowledged = False
+        policy_only = False
+        if exploratory:
+            if not isinstance(authorization, Mapping):
+                return []
+            if (
+                str(authorization.get("status") or "ACTIVE").strip().upper()
+                != "ACTIVE"
+            ):
+                return []
+            raw_versions = authorization.get(
+                "exact_strategy_versions",
+                authorization.get(
+                    "strategy_version_ids",
+                    authorization.get("strategy_versions", ()),
+                ),
+            )
+            if isinstance(raw_versions, str):
+                exact_versions = {raw_versions.strip()} if raw_versions.strip() else set()
+            elif isinstance(raw_versions, (list, tuple, set, frozenset)):
+                exact_versions = {
+                    str(value).strip()
+                    for value in raw_versions
+                    if str(value).strip()
+                }
+            else:
+                exact_versions = set()
+            policy_hash = str(
+                authorization.get("reviewed_selection_policy_hash")
+                or authorization.get("selection_policy_hash")
+                or authorization.get("policy_hash")
+                or ""
+            ).strip()
+            policy_only = not exact_versions and bool(policy_hash)
+            if policy_only:
+                current_selection_hash = _canary_authorization_current_selection_hash(
+                    selection
+                )
+                authorized_selection_hash = str(
+                    authorization.get("selection_hash")
+                    or authorization.get("portfolio_selection_hash")
+                    or authorization.get("current_selection_hash")
+                    or ""
+                ).strip()
+                current_selection_id = str(
+                    selection.get("portfolio_selection_id")
+                    or selection.get("selection_id")
+                    or ""
+                ).strip()
+                authorized_selection_id = str(
+                    authorization.get("selection_id")
+                    or authorization.get("portfolio_selection_id")
+                    or ""
+                ).strip()
+                try:
+                    current_policy_hash = (
+                        _canary_authorization_selection_policy_hash(selection) or ""
+                    )
+                except CanaryBlocked:
+                    return []
+                if (
+                    not authorized_selection_id
+                    or authorized_selection_id != current_selection_id
+                    or not authorized_selection_hash
+                    or authorized_selection_hash != current_selection_hash
+                    or policy_hash != current_policy_hash
+                ):
+                    return []
+                exact_versions = {
+                    str(member.get("strategy_version_id") or "").strip()
+                    for member in raw_members
+                    if isinstance(member, Mapping)
+                    and str(member.get("strategy_version_id") or "").strip()
+                }
+            raw_ack = authorization.get(
+                "adverse_evidence_ack",
+                authorization.get("adverse_evidence_acknowledgment"),
+            )
+            acknowledged = _canary_adverse_acknowledged(raw_ack)
+            explicit_rejected_acknowledged = _canary_adverse_acknowledged(
+                raw_ack,
+                require_required=True,
+            )
+        allowed_statuses = (
+            {"ACTIVE", "OBSERVE", "PAPER", "REJECTED"}
+            if exploratory
+            else {"ACTIVE"}
+        )
         active: list[Mapping[str, Any]] = []
         policy_config = selection.get("policy_config")
         policy_config = policy_config if isinstance(policy_config, Mapping) else {}
@@ -2066,10 +2177,18 @@ class AutonomousCanaryWorker:
                 continue
             if not allocation.is_finite() or allocation <= Decimal("0"):
                 continue
-            if str(raw.get("status") or "").strip().upper() != "ACTIVE":
+            status = str(raw.get("status") or "").strip().upper()
+            rejected = raw.get("rejected") is True or status == "REJECTED"
+            if status not in allowed_statuses:
                 continue
-            # Keep malformed funded members in the bounded work set so the
-            # durable worker decision is BLOCKED, never silently executable.
+            if exploratory and isinstance(authorization, Mapping):
+                strategy_version_id = str(raw.get("strategy_version_id") or "").strip()
+                if exact_versions is None or strategy_version_id not in exact_versions:
+                    continue
+                if status in {"OBSERVE", "PAPER"} and not acknowledged:
+                    continue
+                if rejected and not explicit_rejected_acknowledged:
+                    continue
             active.append(raw)
         return active
 
@@ -2385,10 +2504,25 @@ class AutonomousCanaryWorker:
                 selection = {}
                 selection_missing = True
                 selection_blocker = "ROLLING_SELECTION_MISSING"
-            active = self._rolling_active_members(selection)
+            if not selection_missing:
+                try:
+                    canonical_selection_hash = _canary_authorization_current_selection_hash(
+                        selection
+                    )
+                    selection = dict(selection)
+                    selection["selection_hash"] = canonical_selection_hash
+                except CanaryBlocked as exc:
+                    selection_blocker = str(exc) or "ROLLING_SELECTION_STALE"
             execution_mode = self._rolling_execution_mode(selection)
             exploratory_authorization_required = (
                 execution_mode == "EXPLORATORY_MICRO_CANARY"
+            )
+            # In exploratory mode the pre-authorization set is only a bounded
+            # candidate list.  It is narrowed to the active authorization's
+            # exact strategy versions below; no member can be funded here.
+            active = self._rolling_active_members(
+                selection,
+                execution_mode=execution_mode,
             )
             setattr(service, "execution_authorization_mode", execution_mode)
             selection_id = str(
@@ -2401,54 +2535,6 @@ class AutonomousCanaryWorker:
                     service.validate_rolling_selection_fence(selection)
                 except CanaryBlocked as exc:
                     selection_blocker = str(exc) or "ROLLING_SELECTION_STALE"
-            if not active and selection_blocker is None:
-                selection_blocker = "ROLLING_SELECTION_EMPTY"
-            reducing = self._rolling_reduction_members(selection)
-            reducing.extend(
-                self._rolling_overlap_loser_members(
-                    service,
-                    active,
-                    reducing,
-                    selection_id=selection_id,
-                )
-            )
-            cursor = self._rolling_cursor.get(selection_id, 0)
-            cursor_store = getattr(self.store, "get_operator_config", None)
-            if callable(cursor_store):
-                try:
-                    stored_cursors = cursor_store("rolling_portfolio_cursor", {})
-                except Exception:
-                    stored_cursors = {}
-                if isinstance(stored_cursors, Mapping):
-                    try:
-                        cursor = int(stored_cursors.get(selection_id, cursor) or cursor)
-                    except (TypeError, ValueError):
-                        cursor = self._rolling_cursor.get(selection_id, 0)
-            if active:
-                cursor %= len(active)
-                ordered = active[cursor:] + active[:cursor]
-                self._remember_rolling_cursor(
-                    selection_id, (cursor + 1) % len(active)
-                )
-            else:
-                ordered = []
-                self._remember_rolling_cursor(selection_id, 0)
-            cursor_setter = getattr(self.store, "set_operator_config", None)
-            if callable(cursor_setter) and selection_id:
-                try:
-                    stored = (
-                        cursor_store("rolling_portfolio_cursor", {})
-                        if callable(cursor_store)
-                        else {}
-                    )
-                    stored = dict(stored) if isinstance(stored, Mapping) else {}
-                    stored.pop(selection_id, None)
-                    stored[selection_id] = self._rolling_cursor.get(selection_id, 0)
-                    while len(stored) > self._ROLLING_CURSOR_MAX:
-                        stored.pop(next(iter(stored)))
-                    cursor_setter("rolling_portfolio_cursor", stored)
-                except Exception:
-                    pass
 
             control = service.authoritative_status()
             control_state = str(control.get("micro_live_canary") or "").upper()
@@ -2466,6 +2552,70 @@ class AutonomousCanaryWorker:
                 "CONTROLLER_LEASE_UNAVAILABLE"
                 if lease_required and controller_lease is None
                 else None
+            )
+            execution_authorization: Mapping[str, Any] | None = None
+            authorization_blocker: str | None = None
+            if enabled and (
+                active
+                or (exploratory_authorization_required and not selection_missing)
+            ):
+                authorization_loader = getattr(
+                    getattr(service, "settings", None),
+                    "load_active_execution_authorization",
+                    None,
+                )
+                authorization_requirement = (
+                    "EXPLORATORY_AUTHORIZATION_REQUIRED"
+                    if exploratory_authorization_required
+                    else "EXECUTION_AUTHORIZATION_REQUIRED"
+                )
+                if not callable(authorization_loader):
+                    authorization_blocker = authorization_requirement
+                else:
+                    try:
+                        execution_authorization = authorization_loader(
+                            mode=execution_mode,
+                            purpose=selection.get("authorization_purpose"),
+                            now=timestamp,
+                            scope_hash=selection.get("scope_hash")
+                            or selection.get("market_scope_hash"),
+                            scope_version=selection.get("scope_version")
+                            or selection.get("market_scope_version"),
+                            selection_id=selection_id or None,
+                            selection_hash=selection.get("selection_hash"),
+                        )
+                    except (TypeError, ValueError, RuntimeError):
+                        execution_authorization = None
+                    if not isinstance(execution_authorization, Mapping):
+                        authorization_blocker = authorization_requirement
+                if isinstance(execution_authorization, Mapping):
+                    auth_id = (
+                        execution_authorization.get("authorization_id")
+                        or execution_authorization.get("id")
+                    )
+                    auth_generation = execution_authorization.get("generation")
+                    setattr(service, "execution_authorization_id", auth_id)
+                    setattr(service, "execution_authorization_generation", auth_generation)
+            if exploratory_authorization_required:
+                active = self._rolling_active_members(
+                    selection,
+                    execution_mode=execution_mode,
+                    authorization=execution_authorization,
+                )
+            if not active and selection_blocker is None and authorization_blocker is None:
+                selection_blocker = "ROLLING_SELECTION_EMPTY"
+            # Diff persisted openings against the authorization-filtered
+            # funded set before position management.  Excluded exploratory
+            # members must exit through their original lineage before any
+            # newly authorized entry is considered.
+            reducing = self._rolling_reduction_members(selection)
+            reducing.extend(
+                self._rolling_overlap_loser_members(
+                    service,
+                    active,
+                    reducing,
+                    selection_id=selection_id,
+                )
             )
             if control_state == "DISARMED":
                 _sync_entry_lots(service, timestamp)
@@ -2518,46 +2668,43 @@ class AutonomousCanaryWorker:
                     "blocked": [],
                     "positions": [],
                 }
-            execution_authorization: Mapping[str, Any] | None = None
-            authorization_blocker: str | None = None
-            if enabled and active:
-                authorization_loader = getattr(
-                    getattr(service, "settings", None),
-                    "load_active_execution_authorization",
-                    None,
-                )
-                authorization_requirement = (
-                    "EXPLORATORY_AUTHORIZATION_REQUIRED"
-                    if exploratory_authorization_required
-                    else "EXECUTION_AUTHORIZATION_REQUIRED"
-                )
-                if not callable(authorization_loader):
-                    authorization_blocker = authorization_requirement
-                else:
+            cursor = self._rolling_cursor.get(selection_id, 0)
+            cursor_store = getattr(self.store, "get_operator_config", None)
+            if callable(cursor_store):
+                try:
+                    stored_cursors = cursor_store("rolling_portfolio_cursor", {})
+                except Exception:
+                    stored_cursors = {}
+                if isinstance(stored_cursors, Mapping):
                     try:
-                        execution_authorization = authorization_loader(
-                            mode=execution_mode,
-                            purpose=selection.get("authorization_purpose"),
-                            now=timestamp,
-                            scope_hash=selection.get("scope_hash")
-                            or selection.get("market_scope_hash"),
-                            scope_version=selection.get("scope_version")
-                            or selection.get("market_scope_version"),
-                            selection_id=selection_id or None,
-                            selection_hash=selection.get("selection_hash"),
-                        )
-                    except (TypeError, ValueError, RuntimeError):
-                        execution_authorization = None
-                    if not isinstance(execution_authorization, Mapping):
-                        authorization_blocker = authorization_requirement
-                if isinstance(execution_authorization, Mapping):
-                    auth_id = (
-                        execution_authorization.get("authorization_id")
-                        or execution_authorization.get("id")
+                        cursor = int(stored_cursors.get(selection_id, cursor) or cursor)
+                    except (TypeError, ValueError):
+                        cursor = self._rolling_cursor.get(selection_id, 0)
+            if active:
+                cursor %= len(active)
+                ordered = active[cursor:] + active[:cursor]
+                self._remember_rolling_cursor(
+                    selection_id, (cursor + 1) % len(active)
+                )
+            else:
+                ordered = []
+                self._remember_rolling_cursor(selection_id, 0)
+            cursor_setter = getattr(self.store, "set_operator_config", None)
+            if callable(cursor_setter) and selection_id:
+                try:
+                    stored = (
+                        cursor_store("rolling_portfolio_cursor", {})
+                        if callable(cursor_store)
+                        else {}
                     )
-                    auth_generation = execution_authorization.get("generation")
-                    setattr(service, "execution_authorization_id", auth_id)
-                    setattr(service, "execution_authorization_generation", auth_generation)
+                    stored = dict(stored) if isinstance(stored, Mapping) else {}
+                    stored.pop(selection_id, None)
+                    stored[selection_id] = self._rolling_cursor.get(selection_id, 0)
+                    while len(stored) > self._ROLLING_CURSOR_MAX:
+                        stored.pop(next(iter(stored)))
+                    cursor_setter("rolling_portfolio_cursor", stored)
+                except Exception:
+                    pass
             cycle_id = f"rolling-{uuid.uuid4().hex[:24]}"
             members_to_evaluate = (
                 ordered
@@ -2595,6 +2742,24 @@ class AutonomousCanaryWorker:
                         if isinstance(execution_authorization, Mapping)
                         else None
                     )
+                    if isinstance(execution_authorization, Mapping):
+                        context["execution_authorization_strategy_versions"] = (
+                            execution_authorization.get(
+                                "exact_strategy_versions",
+                                execution_authorization.get(
+                                    "strategy_version_ids",
+                                    execution_authorization.get("strategy_versions", ()),
+                                ),
+                            )
+                        )
+                        context["execution_authorization_adverse_evidence_ack"] = (
+                            execution_authorization.get(
+                                "adverse_evidence_ack",
+                                execution_authorization.get(
+                                    "adverse_evidence_acknowledgment"
+                                ),
+                            )
+                        )
                     candidate_id = self._rolling_candidate_id(member)
                     row.update(
                         {
@@ -2656,6 +2821,10 @@ class AutonomousCanaryWorker:
             elif selection_blocker is not None:
                 decision = "WAIT_FOR_ROLLING_SELECTION"
                 status = "OBSERVING"
+            elif authorization_blocker is not None:
+                decision = authorization_blocker
+                status = "BLOCKED"
+                global_blocker = authorization_blocker
             elif not active:
                 decision = "WAIT_FOR_ACTIVE_ROLLING_MEMBER"
                 status = "OBSERVING"
@@ -2667,10 +2836,6 @@ class AutonomousCanaryWorker:
                 decision = lease_blocker
                 status = "BLOCKED"
                 global_blocker = lease_blocker
-            elif authorization_blocker is not None:
-                decision = authorization_blocker
-                status = "BLOCKED"
-                global_blocker = authorization_blocker
             elif global_blocker is not None:
                 decision = global_blocker
                 status = "BLOCKED"
@@ -2814,11 +2979,15 @@ class AutonomousCanaryWorker:
             payload["operating_state"] = (
                 "observing"
                 if selection_blocker is not None or not active
+                else "exploratory_micro_canary"
+                if exploratory_authorization_required
                 else "evidence_selected"
             )
             payload["next_work"] = (
                 "refresh_rolling_evidence"
                 if selection_blocker is not None or not active
+                else "evaluate_exploratory_strategies"
+                if exploratory_authorization_required
                 else "evaluate_selected_strategies"
             )
             payload["no_entry_reason"] = (

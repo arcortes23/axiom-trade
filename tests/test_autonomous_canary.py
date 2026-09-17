@@ -16,6 +16,8 @@ from axiom.canary import (
     CanaryBlocked,
     CanaryService,
     CredentialStore,
+    _canary_authorization_binding_fence,
+    _canary_authorization_current_selection_hash,
     credential_fingerprint,
 )
 from axiom.dashboard import DashboardData
@@ -5358,6 +5360,425 @@ class AutonomousWorkflowTests(unittest.TestCase):
                     self.assertEqual(result["signal_scan_coverage_percentage"], 100.0)
                     self.assertEqual(result["orders_attempted"], 0)
 
+    def test_exploratory_admission_requires_exact_ack_and_keeps_reviewed_allocation(self):
+        selection = {
+            "members": [
+                {
+                    "strategy_version_id": "active-reviewed",
+                    "status": "ACTIVE",
+                    "allocation": "0.50",
+                },
+                {
+                    "strategy_version_id": "observe-reviewed",
+                    "status": "OBSERVE",
+                    "allocation": "0.25",
+                },
+                {
+                    "strategy_version_id": "paper-unreviewed",
+                    "status": "PAPER",
+                    "allocation": "0.25",
+                },
+                {
+                    "strategy_version_id": "rejected-reviewed",
+                    "status": "REJECTED",
+                    "allocation": "0.10",
+                },
+            ]
+        }
+        authorization = {
+            "exact_strategy_versions": [
+                "active-reviewed",
+                "observe-reviewed",
+                "rejected-reviewed",
+            ],
+            "adverse_evidence_ack": {"acknowledged": True, "required": True},
+        }
+        admitted = AutonomousCanaryWorker._rolling_active_members(
+            selection,
+            execution_mode="EXPLORATORY_MICRO_CANARY",
+            authorization=authorization,
+        )
+        self.assertEqual(
+            [member["strategy_version_id"] for member in admitted],
+            ["active-reviewed", "observe-reviewed", "rejected-reviewed"],
+        )
+        self.assertEqual(
+            [member["allocation"] for member in admitted],
+            ["0.50", "0.25", "0.10"],
+        )
+        without_ack = dict(authorization)
+        without_ack["adverse_evidence_ack"] = {"acknowledged": False}
+        admitted_without_ack = AutonomousCanaryWorker._rolling_active_members(
+            selection,
+            execution_mode="EXPLORATORY_MICRO_CANARY",
+            authorization=without_ack,
+        )
+        self.assertEqual(
+            [member["strategy_version_id"] for member in admitted_without_ack],
+            ["active-reviewed"],
+        )
+        evidence_selected = AutonomousCanaryWorker._rolling_active_members(
+            selection,
+            execution_mode="EVIDENCE_SELECTED",
+            authorization=authorization,
+        )
+        self.assertEqual(
+            [member["strategy_version_id"] for member in evidence_selected],
+            ["active-reviewed"],
+        )
+    def test_exploratory_overlap_losers_are_managed_before_entries(self):
+        unauthorized = {
+            "strategy_version_id": "excluded-strategy",
+            "research_trial_id": "trial-excluded",
+            "candidate_id": "candidate-excluded",
+            "status": "ACTIVE",
+            "allocation": "0.25",
+        }
+        authorized = {
+            "strategy_version_id": "authorized-strategy",
+            "research_trial_id": "trial-authorized",
+            "candidate_id": "candidate-authorized",
+            "status": "ACTIVE",
+            "allocation": "0.25",
+        }
+        selection = {
+            "portfolio_selection_id": "selection-overlap-order",
+            "execution_authorization_mode": "EXPLORATORY_MICRO_CANARY",
+            "members": [unauthorized, authorized],
+        }
+        loser = {
+            **unauthorized,
+            "action": "REDUCE",
+            "reason": "OVERLAP_LOSER",
+        }
+        service = Mock()
+        service.store = self.store
+        service.authoritative_status.return_value = {
+            "micro_live_canary": AUTONOMOUS_MICRO_LIVE,
+        }
+        service.settings.load_active_execution_authorization.return_value = {
+            "authorization_id": "authorization-overlap-order",
+            "generation": 1,
+            "exact_strategy_versions": ["authorized-strategy"],
+            "adverse_evidence_ack": {
+                "acknowledged": True,
+                "required": False,
+            },
+        }
+        service.evaluate_signal.return_value = {"signal": None}
+        worker = AutonomousCanaryWorker(
+            self.store,
+            clock=lambda: T0,
+            venue_factory=TestVenue,
+        )
+        events: list[str] = []
+
+        def overlap_losers(
+            _service,
+            active_members,
+            reducing_members,
+            *,
+            selection_id,
+        ):
+            events.append("overlap")
+            self.assertEqual(
+                [member["strategy_version_id"] for member in active_members],
+                ["authorized-strategy"],
+            )
+            self.assertEqual(reducing_members, [])
+            self.assertEqual(selection_id, "selection-overlap-order")
+            return [loser]
+
+        def manage(_service, _venue, **kwargs):
+            events.append("manage")
+            self.assertEqual(kwargs["force_exit_members"], [loser])
+            return {
+                "status": "IDLE",
+                "submitted": 0,
+                "blocked": [],
+                "positions": [],
+            }
+
+        with patch(
+            "axiom.auto_canary.CanaryService",
+            return_value=service,
+        ), patch(
+            "axiom.auto_canary._ensure_schema",
+        ), patch.object(
+            worker,
+            "_acquire_controller_lease",
+            return_value={"owner_id": worker.controller_owner_id, "generation": 1},
+        ), patch.object(
+            worker,
+            "_rolling_selection",
+            return_value=selection,
+        ), patch.object(
+            worker,
+            "_rolling_active_members",
+            side_effect=([unauthorized, authorized], [authorized]),
+        ), patch.object(
+            worker,
+            "_rolling_reduction_members",
+            return_value=[],
+        ), patch.object(
+            worker,
+            "_rolling_overlap_loser_members",
+            side_effect=overlap_losers,
+        ), patch.object(
+            AutonomousCanaryWorker,
+            "_position_obligations",
+            return_value=True,
+        ), patch.object(
+            AutonomousCanaryWorker,
+            "_unresolved_position_obligations",
+            return_value=False,
+        ), patch(
+            "axiom.auto_canary.reconcile_pending",
+            return_value={
+                "status": "IDLE",
+                "reconciled": 0,
+                "blocked": 0,
+                "requests": [],
+                "entries": [],
+            },
+        ), patch(
+            "axiom.auto_canary.manage_positions",
+            side_effect=manage,
+        ):
+            result = worker.tick_rolling(now=T0)
+
+        self.assertEqual(events, ["overlap", "manage"])
+        self.assertEqual(result["status"], "NO_SIGNAL")
+        self.assertEqual(result["active_members"], 1)
+        self.assertEqual(result["evaluated_members"], 1)
+        self.assertEqual(result["submissions"], [])
+        service.submit_signal.assert_not_called()
+
+    def test_policy_only_authorization_binds_nested_policy_hash(self):
+        selection = {
+            "portfolio_selection_id": "selection-v1",
+            "policy_config": {"config_hash": "policy-hash"},
+            "members": [
+                {
+                    "strategy_version_id": "selected-v1",
+                    "status": "ACTIVE",
+                    "allocation": "0.25",
+                }
+            ],
+        }
+        selection_hash = _canary_authorization_current_selection_hash(selection)
+        store = Mock()
+        store.load_current_portfolio_selection.return_value = selection
+        service = Mock()
+        service.store = store
+        authorization = {
+            "status": "ACTIVE",
+            "selection_id": "selection-v1",
+            "selection_hash": selection_hash,
+            "reviewed_selection_policy_hash": "policy-hash",
+            "exact_strategy_versions": (),
+        }
+        _canary_authorization_binding_fence(
+            service,
+            auth=authorization,
+            actual_id="authorization-v1",
+            strategy="selected-v1",
+            rolling=True,
+            selection_id="selection-v1",
+            selection_hash=selection_hash,
+            requested_cost=Decimal("0"),
+            fee_reserve=Decimal("0"),
+            now=T0,
+        )
+
+        mismatched = dict(authorization)
+        mismatched["reviewed_selection_policy_hash"] = "different-policy"
+        with self.assertRaisesRegex(
+            CanaryBlocked, "^EXECUTION_AUTHORIZATION_POLICY_CHANGED$"
+        ):
+            _canary_authorization_binding_fence(
+                service,
+                auth=mismatched,
+                actual_id="authorization-v1",
+                strategy="selected-v1",
+                rolling=True,
+                selection_id="selection-v1",
+                selection_hash=selection_hash,
+                requested_cost=Decimal("0"),
+                fee_reserve=Decimal("0"),
+                now=T0,
+            )
+
+        conflicting = dict(selection)
+        conflicting["policy_hash"] = "conflicting-policy"
+        conflicting_hash = _canary_authorization_current_selection_hash(conflicting)
+        store.load_current_portfolio_selection.return_value = conflicting
+        conflicting_authorization = dict(authorization)
+        conflicting_authorization["selection_hash"] = conflicting_hash
+        with self.assertRaisesRegex(
+            CanaryBlocked, "^EXECUTION_AUTHORIZATION_POLICY_CHANGED$"
+        ):
+            _canary_authorization_binding_fence(
+                service,
+                auth=conflicting_authorization,
+                actual_id="authorization-v1",
+                strategy="selected-v1",
+                rolling=True,
+                selection_id="selection-v1",
+                selection_hash=conflicting_hash,
+                requested_cost=Decimal("0"),
+                fee_reserve=Decimal("0"),
+                now=T0,
+            )
+    def test_exploratory_rejected_marker_requires_strict_ack_and_context_truth(self):
+        member = {
+            "strategy_version_id": "marker-rejected",
+            "research_trial_id": "trial-marker-rejected",
+            "candidate_id": "candidate-marker-rejected",
+            "status": "ACTIVE",
+            "rejected": True,
+            "allocation": "0.25",
+        }
+        selection = {
+            "portfolio_selection_id": "selection-marker-rejected",
+            "members": [member],
+        }
+        selection_hash = _canary_authorization_current_selection_hash(selection)
+        authorization = {
+            "status": "ACTIVE",
+            "selection_id": "selection-marker-rejected",
+            "selection_hash": selection_hash,
+            "exact_strategy_versions": ["marker-rejected"],
+            "adverse_evidence_ack": {
+                "acknowledged": True,
+                "required": False,
+            },
+        }
+        self.assertEqual(
+            AutonomousCanaryWorker._rolling_active_members(
+                selection,
+                execution_mode="EXPLORATORY_MICRO_CANARY",
+                authorization=authorization,
+            ),
+            [],
+        )
+
+        authorization["adverse_evidence_ack"] = {
+            "acknowledged": True,
+            "required": True,
+        }
+        admitted = AutonomousCanaryWorker._rolling_active_members(
+            selection,
+            execution_mode="EXPLORATORY_MICRO_CANARY",
+            authorization=authorization,
+        )
+        self.assertEqual(
+            [item["strategy_version_id"] for item in admitted],
+            ["marker-rejected"],
+        )
+        context = AutonomousCanaryWorker._rolling_member_context(selection, admitted[0])
+        self.assertEqual(context["status"], "ACTIVE")
+        self.assertTrue(context["rejected"])
+
+    def test_policy_only_worker_rejects_conflicting_policy_hash_aliases(self):
+        base_selection = {
+            "portfolio_selection_id": "selection-policy-aliases",
+            "members": [
+                {
+                    "strategy_version_id": "policy-selected",
+                    "status": "ACTIVE",
+                    "allocation": "0.25",
+                }
+            ],
+        }
+        for aliases in (
+            {
+                "selection_policy_hash": "policy-hash",
+                "policy_config": {"config_hash": "policy-hash"},
+            },
+            {
+                "admission_policy_hash": "policy-hash",
+                "policy": {"config_hash": "policy-hash"},
+            },
+            {
+                "policy_hash": "policy-hash",
+                "admission_policy": {"config_hash": "policy-hash"},
+            },
+        ):
+            selection = {**base_selection, **aliases}
+            selection_hash = _canary_authorization_current_selection_hash(selection)
+            authorization = {
+                "status": "ACTIVE",
+                "selection_id": "selection-policy-aliases",
+                "selection_hash": selection_hash,
+                "reviewed_selection_policy_hash": "policy-hash",
+                "exact_strategy_versions": (),
+            }
+            admitted = AutonomousCanaryWorker._rolling_active_members(
+                selection,
+                execution_mode="EXPLORATORY_MICRO_CANARY",
+                authorization=authorization,
+            )
+            self.assertEqual(
+                [item["strategy_version_id"] for item in admitted],
+                ["policy-selected"],
+            )
+
+        for aliases in (
+            {
+                "selection_policy_hash": "policy-hash-a",
+                "policy_config": {"config_hash": "policy-hash-b"},
+            },
+            {
+                "admission_policy_hash": "policy-hash-a",
+                "policy": {"config_hash": "policy-hash-b"},
+            },
+            {
+                "selection_policy_hash": "policy-hash-a",
+                "admission_policy": {"config_hash": "policy-hash-b"},
+            },
+        ):
+            selection = {**base_selection, **aliases}
+            selection_hash = _canary_authorization_current_selection_hash(selection)
+            authorization = {
+                "status": "ACTIVE",
+                "selection_id": "selection-policy-aliases",
+                "selection_hash": selection_hash,
+                "reviewed_selection_policy_hash": "policy-hash-a",
+                "exact_strategy_versions": (),
+            }
+            self.assertEqual(
+                AutonomousCanaryWorker._rolling_active_members(
+                    selection,
+                    execution_mode="EXPLORATORY_MICRO_CANARY",
+                    authorization=authorization,
+                ),
+                [],
+            )
+
+    def test_rolling_member_without_position_state_builds_context_and_admits(self):
+        member = {
+            "strategy_version_id": "active-reviewed",
+            "research_trial_id": "trial-active",
+            "candidate_id": "candidate-active",
+            "status": "ACTIVE",
+            "allocation": "0.25",
+        }
+        selection = {
+            "portfolio_selection_id": "selection-v1",
+            "members": [member],
+        }
+        context = AutonomousCanaryWorker._rolling_member_context(selection, member)
+        self.assertEqual(context["lineage_type"], "ROLLING_PORTFOLIO")
+        self.assertEqual(context["strategy_version_id"], "active-reviewed")
+        admitted = AutonomousCanaryWorker._rolling_active_members(
+            selection,
+            execution_mode="EVIDENCE_SELECTED",
+        )
+        self.assertEqual(
+            [item["strategy_version_id"] for item in admitted],
+            ["active-reviewed"],
+        )
 
 
 
