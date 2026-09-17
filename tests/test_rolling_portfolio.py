@@ -3089,6 +3089,94 @@ class TestRollingPortfolio(unittest.TestCase):
         self.assertIn(str(_member_value(member, 'status')), {'OBSERVE', 'PAPER'})
         self.assertEqual(Decimal(str(_member_value(member, 'allocation'))), Decimal('0'))
         self.assertTrue('coverage' in str(_member_value(member, 'reason')).lower() or 'evidence' in str(_member_value(member, 'reason')).lower())
+
+
+    def test_long_low_evidence_reason_is_bounded_and_deterministic(self) -> None:
+        strategy_id = f"sv-{'x' * 54}"
+        failure_overrides = {
+            "available_from": None,
+            "available_through": None,
+            "completed_outcomes": 0,
+            "reliability": "0",
+            "paper_sizing": "0",
+            "allocated_capital_net_return": None,
+            "realized_pnl": None,
+            "unrealized_pnl": None,
+            "fees": None,
+            "costs": None,
+            "evaluation_run_id": "run-long-reason",
+            "evaluation_version": "rolling-v2",
+            "evaluation_kind": "CANONICAL_SIMULATION",
+            "evaluator_invoked": False,
+            "evaluator_completed": False,
+            "accounting_available": False,
+            "accounting_complete": False,
+            "accounting_partial": True,
+            "portfolio_accounting": {},
+        }
+        evidence = [
+            _evidence(
+                strategy_id,
+                "window-long-7",
+                days=7,
+                actual_days=0,
+                **failure_overrides,
+            ),
+            _evidence(
+                strategy_id,
+                "window-long-30",
+                days=30,
+                actual_days=0,
+                **failure_overrides,
+            ),
+        ]
+        policy = _policy(requested_window_days=(7, 30), min_actual_coverage_seconds=0)
+
+        first = evaluate_rolling_selection(policy, evidence, None, NOW)
+        second = evaluate_rolling_selection(policy, list(reversed(evidence)), None, NOW)
+
+        first_member = _decision_members(first)[0]
+        second_member = _decision_members(second)[0]
+        member_reason = str(_member_value(first_member, "reason"))
+        self.assertEqual(member_reason, str(_member_value(second_member, "reason")))
+        self.assertLessEqual(len(member_reason), MAX_REASON_LENGTH)
+        self.assertTrue(member_reason.startswith("LOW_EVIDENCE:"))
+        self.assertIn("OMITTED_COMPONENTS=", member_reason)
+        self.assertIn("TOTAL_COMPONENTS=", member_reason)
+        self.assertIn("COMPONENTS_DIGEST=", member_reason)
+        total_components = int(
+            member_reason.split("TOTAL_COMPONENTS=", 1)[1].split(":", 1)[0]
+        )
+        self.assertGreaterEqual(total_components, 22)
+
+        first_strategy_reasons = [
+            reason for reason in first.reasons if reason.startswith(f"{strategy_id}:")
+        ]
+        second_strategy_reasons = [
+            reason for reason in second.reasons if reason.startswith(f"{strategy_id}:")
+        ]
+        self.assertEqual(first_strategy_reasons, second_strategy_reasons)
+        self.assertEqual(len(first_strategy_reasons), 1)
+        self.assertLessEqual(len(first_strategy_reasons[0]), MAX_REASON_LENGTH)
+        self.assertIn("OMITTED_COMPONENTS=", first_strategy_reasons[0])
+        self.assertEqual(first.as_dict(), second.as_dict())
+
+        short = evaluate_rolling_selection(
+            _policy(min_actual_coverage_seconds=7 * 24 * 60 * 60),
+            [_evidence("sv-short", "window-short", actual_days=2)],
+            None,
+            NOW,
+        )
+        short_member = _decision_members(short)[0]
+        self.assertEqual(
+            _member_value(short_member, "reason"),
+            "LOW_EVIDENCE:7d:coverage_seconds,7d:observation_completeness",
+        )
+        self.assertIn(
+            "sv-short:LOW_EVIDENCE:7d:coverage_seconds,7d:observation_completeness",
+            short.reasons,
+        )
+
     
     
     def test_overlapping_strategies_are_not_separately_funded(self) -> None:

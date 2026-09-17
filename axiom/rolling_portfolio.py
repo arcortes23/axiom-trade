@@ -150,6 +150,59 @@ def _text(value: Any, name: str, *, max_length: int = MAX_ID_LENGTH, required: b
         raise ValueError(f"{name} exceeds {max_length} characters")
     return result
 
+
+def _bounded_reason(
+    primary: str,
+    components: Sequence[str] = (),
+    *,
+    prefix: str = "",
+) -> str:
+    """Compose a deterministic reason while retaining its primary evidence."""
+    primary_text = str(primary)
+    prefix_text = str(prefix)
+    normalized_components = tuple(str(component) for component in components)
+    base = f"{prefix_text}:{primary_text}" if prefix_text else primary_text
+    component_texts: list[str] = []
+    aggregate = ""
+    for component in normalized_components:
+        aggregate = component if not aggregate else f"{aggregate},{component}"
+        component_texts.append(aggregate)
+    complete = f"{base}:{aggregate}" if aggregate else base
+    if len(complete) <= MAX_REASON_LENGTH:
+        return complete
+
+    digest = hashlib.sha256(
+        json.dumps(
+            normalized_components,
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    metadata_template = (
+        ":OMITTED_COMPONENTS={omitted}:"
+        f"TOTAL_COMPONENTS={len(normalized_components)}:"
+        f"COMPONENTS_DIGEST={digest}"
+    )
+    for included_count in range(len(normalized_components), -1, -1):
+        omitted_count = len(normalized_components) - included_count
+        metadata = metadata_template.format(omitted=omitted_count)
+        component_text = component_texts[included_count - 1] if included_count else ""
+        candidate = (
+            f"{base}:{component_text}{metadata}"
+            if component_text
+            else f"{base}{metadata}"
+        )
+        if len(candidate) <= MAX_REASON_LENGTH:
+            return candidate
+
+    # The normal primary prefix is short and always reaches the branch above.
+    # Keep the same deterministic metadata if an unexpected caller supplies an
+    # oversized primary, rather than allowing the persistence invariant to fail.
+    metadata = metadata_template.format(omitted=len(normalized_components))
+    return f"{base[:MAX_REASON_LENGTH - len(metadata)]}{metadata}"
+
+
+
 def _source_class(value: Any, *, required: bool = True) -> str:
     text = _text(value, "source_class", max_length=64, required=required)
     if not text:
@@ -3817,13 +3870,15 @@ def evaluate_rolling_selection(
                 status="OBSERVE",
                 action="OBSERVE",
                 score=score,
-                reason=f"{REASON_LOW_EVIDENCE}:{','.join(failures)}",
+                reason=_bounded_reason(REASON_LOW_EVIDENCE, failures),
                 evidence_window_id=anchor.evidence_window_id,
                 overlap_key=anchor.overlap_key,
                 evidence_digest=anchor.evidence_digest,
                 position_management_state=old.position_management_state,
             )
-            reasons.append(f"{strategy_id}:{REASON_LOW_EVIDENCE}:{','.join(failures)}")
+            reasons.append(
+                _bounded_reason(REASON_LOW_EVIDENCE, failures, prefix=strategy_id)
+            )
         elif score < admission.min_score:
             reduced = old.allocation > ZERO
             retained[strategy_id] = RollingSelectionMember(
@@ -3902,9 +3957,15 @@ def evaluate_rolling_selection(
                 reasons.append(f"{strategy_id}:{REASON_NO_NEW_EVIDENCE}")
                 continue
         if failures:
-            failure_reason = f"{REASON_LOW_EVIDENCE}:{','.join(failures)}"
+            failure_reason = _bounded_reason(REASON_LOW_EVIDENCE, failures)
             observed.append(_member_from_evidence(anchor, score=score, status="OBSERVE", reason=failure_reason))
-            reasons.append(f"{strategy_id}:{failure_reason}")
+            reasons.append(
+                _bounded_reason(
+                    REASON_LOW_EVIDENCE,
+                    failures,
+                    prefix=strategy_id,
+                )
+            )
             continue
         if score < admission.min_score:
             observed.append(_member_from_evidence(anchor, score=score, status="OBSERVE", reason=REASON_LOW_EVIDENCE))
