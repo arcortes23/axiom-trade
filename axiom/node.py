@@ -1595,6 +1595,7 @@ class ResearchNode:
             ):
                 if worker is not None:
                     worker.join()
+            self._close_collector()
             self._stop_heartbeat_watchdog()
             self._collector_thread = None
             self._research_thread = None
@@ -3933,11 +3934,20 @@ class ResearchNode:
             )
         except Exception:
             pass
+    def _close_collector(self) -> None:
+        close = getattr(self.collector, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+
 
     run_forever = run
 
     def stop(self) -> None:
         self.stop_event.set()
+        self._close_collector()
         with self._worker_condition:
             self._worker_condition.notify_all()
 

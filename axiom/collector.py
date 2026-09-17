@@ -114,14 +114,37 @@ class _BoundedProviderExecutor:
                 raise RuntimeError("provider executor queue is full") from exc
         return future
 
-    def shutdown(self) -> None:
+    def shutdown(
+        self,
+        *,
+        wait: bool = True,
+        timeout: float | None = 0.5,
+    ) -> None:
         with self._lock:
+            if self._closed:
+                return
             self._closed = True
-            for _ in self._threads:
+            # Cancel queued work before placing sentinels so every worker can
+            # observe shutdown even when a caller queued its full bounded set.
+            while True:
                 try:
-                    self._queue.put_nowait(None)
-                except queue.Full:
+                    item = self._queue.get_nowait()
+                except queue.Empty:
                     break
+                self._queue.task_done()
+                if item is not None:
+                    item[0].cancel()
+            for _ in self._threads:
+                self._queue.put_nowait(None)
+        if not wait:
+            return
+        deadline = None if timeout is None else time.monotonic() + max(0.0, float(timeout))
+        current = threading.current_thread()
+        for thread in self._threads:
+            if thread is current:
+                continue
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            thread.join(timeout=remaining)
 
     def _run(self) -> None:
         while True:
@@ -270,7 +293,9 @@ class CollectorConfig:
     @property
     def cycle_budget_seconds(self) -> float:
         """Maximum provider-work window for one collection tick."""
-        return 2.0 * float(self.provider_timeout_seconds)
+        # Scope resolution can need one bounded inventory window, one direct
+        # exact-id window, and one downstream collection window.
+        return 3.0 * float(self.provider_timeout_seconds)
 
 
 
@@ -428,6 +453,10 @@ class PolymarketCollector:
         self._scope_authority_market_ids: set[str] = set()
 
         self._scope_direct_lookup_cursor = 0
+        # Provider windows are allocated once per cycle, including when a
+        # bounded test collector supplies its own remaining-time clock.
+        self._scope_inventory_budget_remaining: float | None = None
+        self._scope_direct_budget_remaining: float | None = None
 
         # The nested continuation is assembled during scope discovery and
         # persisted with the root collector state at the end of the cycle.
@@ -444,6 +473,9 @@ class PolymarketCollector:
         self._provider_executor_lock = threading.Lock()
         self._provider_executor: _BoundedProviderExecutor | None = None
         self._scope_provider_executor: _BoundedProviderExecutor | None = None
+        # Exact selected ids are resolver authority, so their direct probes
+        # must not queue behind a broad inventory or suitability request.
+        self._scope_direct_provider_executor: _BoundedProviderExecutor | None = None
         self._collection_provider_executor: _BoundedProviderExecutor | None = None
         self._active_provider_calls: set[tuple[int, str]] = set()
         self._provider_call_pools: dict[tuple[int, str], str] = {}
@@ -452,6 +484,29 @@ class PolymarketCollector:
         self._provider_futures: dict[tuple[int, str], Future[Any]] = {}
         self._current_endpoint: str | None = None
         self._collection_executor: _BoundedProviderExecutor | None = None
+        self._closed = False
+
+    def close(self) -> None:
+        """Stop all provider workers owned by this collector, idempotently."""
+        with self._provider_executor_lock:
+            if self._closed:
+                return
+            self._closed = True
+            executor_values = (
+                self._provider_executor,
+                self._scope_provider_executor,
+                self._scope_direct_provider_executor,
+                self._collection_provider_executor,
+                self._collection_executor,
+            )
+            executors: list[_BoundedProviderExecutor] = []
+            seen: set[int] = set()
+            for executor in executor_values:
+                if executor is not None and id(executor) not in seen:
+                    seen.add(id(executor))
+                    executors.append(executor)
+        for executor in executors:
+            executor.shutdown()
     def _set_current_stage(
         self,
         stage: str,
@@ -537,6 +592,8 @@ class PolymarketCollector:
         monotonic_started = time.monotonic()
         self._cycle_deadline_monotonic = monotonic_started + self.config.cycle_budget_seconds
         self._cycle_deadline_exhausted = False
+        self._scope_inventory_budget_remaining = None
+        self._scope_direct_budget_remaining = None
         self._cycle_last_remaining_market_ids = ()
         root_state = self.store.get_collector_state(self.config.collector_name) or {}
         previous_cycle_continuation = (
@@ -2032,6 +2089,7 @@ class PolymarketCollector:
                         counters,
                         provider=self.provider,
                         market_id=market_id,
+                        pool_name="scope_direct",
                     )
                 except _ProviderDeadlineExceeded:
                     self._mark_cycle_exhaustion("scope_exact_lookup")
@@ -4870,21 +4928,24 @@ class PolymarketCollector:
             raise ValueError("retain_cycles must be positive")
         results: list[CollectionCycle] = []
         completed = 0
-        while cycles is None or completed < cycles:
-            if stop_event is not None and stop_event.is_set():
-                break
-            cycle = self.collect_once()
-            results.append(cycle)
-            if len(results) > retained:
-                del results[:-retained]
-            if on_cycle is not None:
-                on_cycle(cycle)
-            completed += 1
-            if cycles is not None and completed >= cycles:
-                break
-            if stop_event is not None and stop_event.is_set():
-                break
-            self.sleep(self.config.interval_seconds)
+        try:
+            while cycles is None or completed < cycles:
+                if stop_event is not None and stop_event.is_set():
+                    break
+                cycle = self.collect_once()
+                results.append(cycle)
+                if len(results) > retained:
+                    del results[:-retained]
+                if on_cycle is not None:
+                    on_cycle(cycle)
+                completed += 1
+                if cycles is not None and completed >= cycles:
+                    break
+                if stop_event is not None and stop_event.is_set():
+                    break
+                self.sleep(self.config.interval_seconds)
+        finally:
+            self.close()
         return results
 
     def _discover_markets(
@@ -5506,6 +5567,54 @@ class PolymarketCollector:
             provider=provider,
             market_id=market_id,
         ) or ()
+    def _provider_phase_timeout(
+        self,
+        pool_name: str,
+        remaining: float | None,
+    ) -> float:
+        """Allocate bounded provider windows for each scope phase."""
+        timeout = float(self.config.provider_timeout_seconds)
+        if remaining is None or pool_name not in {"scope", "scope_direct"}:
+            return timeout if remaining is None else max(
+                0.000001,
+                min(timeout, remaining),
+            )
+        downstream_reserve = self._downstream_collection_reserve_seconds()
+        if (
+            self._scope_inventory_budget_remaining is None
+            or self._scope_direct_budget_remaining is None
+        ):
+            available = max(0.000002, remaining - downstream_reserve)
+            share = available * 0.5
+            self._scope_inventory_budget_remaining = share
+            self._scope_direct_budget_remaining = share
+        budget = (
+            self._scope_inventory_budget_remaining
+            if pool_name == "scope"
+            else self._scope_direct_budget_remaining
+        )
+        return max(
+            0.000001,
+            min(timeout, budget or 0.0, remaining - downstream_reserve),
+        )
+
+    def _consume_provider_phase_budget(self, pool_name: str, elapsed: float) -> None:
+        if pool_name == "scope":
+            if self._scope_inventory_budget_remaining is not None:
+                self._scope_inventory_budget_remaining = max(
+                    0.0,
+                    self._scope_inventory_budget_remaining - max(0.0, elapsed),
+                )
+        elif pool_name == "scope_direct":
+            if self._scope_direct_budget_remaining is not None:
+                self._scope_direct_budget_remaining = max(
+                    0.0,
+                    self._scope_direct_budget_remaining - max(0.0, elapsed),
+                )
+
+    def _provider_in_flight_wait_timeout(self, pool_name: str) -> float:
+        """Bound retries on prior work without consuming downstream reserve."""
+        return self._provider_phase_timeout(pool_name, self._cycle_remaining_seconds())
 
 
     def _submit_provider_call(
@@ -5513,19 +5622,18 @@ class PolymarketCollector:
         provider: Any,
         endpoint: str,
         operation: Callable[[], Any],
+        *,
+        pool_name: str | None = None,
     ) -> tuple[Future[Any], tuple[int, str]]:
-        pool_name = "scope" if self._scope_phase_active else "collection"
+        pool_name = pool_name or ("scope" if self._scope_phase_active else "collection")
         key = (id(provider), f"{pool_name}:{endpoint}")
         with self._provider_executor_lock:
+            if self._closed:
+                raise RuntimeError("collector is closed")
             if key in self._active_provider_calls:
                 existing = self._provider_futures.get(key)
                 if existing is not None and not existing.done():
-                    remaining = self._cycle_remaining_seconds()
-                    wait_timeout = (
-                        float(self.config.provider_timeout_seconds)
-                        if remaining is None
-                        else max(0.000001, remaining)
-                    )
+                    wait_timeout = self._provider_in_flight_wait_timeout(pool_name)
                     try:
                         existing.result(timeout=wait_timeout)
                     except FutureTimeout:
@@ -5565,12 +5673,7 @@ class PolymarketCollector:
                 active_endpoint = active_for_provider[0]
                 existing = self._provider_futures.get((id(provider), active_endpoint))
                 if existing is not None and not existing.done():
-                    remaining = self._cycle_remaining_seconds()
-                    wait_timeout = (
-                        float(self.config.provider_timeout_seconds)
-                        if remaining is None
-                        else max(0.000001, remaining)
-                    )
+                    wait_timeout = self._provider_in_flight_wait_timeout(pool_name)
                     try:
                         existing.result(timeout=wait_timeout)
                     except FutureTimeout:
@@ -5592,6 +5695,11 @@ class PolymarketCollector:
                 if executor is None:
                     executor = _BoundedProviderExecutor(self.config.max_concurrency)
                     self._scope_provider_executor = executor
+            elif pool_name == "scope_direct":
+                executor = self._scope_direct_provider_executor
+                if executor is None:
+                    executor = _BoundedProviderExecutor(self.config.max_concurrency)
+                    self._scope_direct_provider_executor = executor
             else:
                 executor = self._collection_provider_executor
                 if executor is None:
@@ -5675,9 +5783,11 @@ class PolymarketCollector:
         *,
         provider: Any | None = None,
         market_id: str | None = None,
+        pool_name: str | None = None,
     ) -> Any:
         provider = provider or self.provider
         del market_id
+        provider_pool = pool_name or ("scope" if self._scope_phase_active else "collection")
         # Provider-call stage is volatile telemetry.  Persisting it before
         # every request rewrites the potentially multi-megabyte collector
         # state and can itself delay a bounded tick.  Timeout and terminal
@@ -5695,6 +5805,7 @@ class PolymarketCollector:
                         provider,
                         endpoint,
                         operation,
+                        pool_name=provider_pool,
                     )
                 except _ProviderDeadlineExceeded as exc:
                     deadline_error = self._record_provider_timeout(
@@ -5710,15 +5821,13 @@ class PolymarketCollector:
                     raise deadline_error
                 remaining = self._cycle_remaining_seconds()
                 effective_timeout = timeout
-                if self._scope_phase_active and remaining is not None:
-                    # Scope discovery may use only the time above the
-                    # explicit downstream collection reservation.
-                    effective_timeout = min(
-                        timeout,
-                        max(
-                            0.000001,
-                            remaining - self._scope_phase_reserve_seconds(),
-                        ),
+                if (
+                    remaining is not None
+                    and provider_pool in {"scope", "scope_direct"}
+                ):
+                    effective_timeout = self._provider_phase_timeout(
+                        provider_pool,
+                        remaining,
                     )
                 wait_timeout = (
                     effective_timeout
@@ -5799,9 +5908,9 @@ class PolymarketCollector:
                 counters["provider_failures"] += 1
                 raise
             finally:
-                counters.setdefault("_request_latencies", []).append(
-                    max(0.0, time.monotonic() - request_started)
-                )
+                elapsed = max(0.0, time.monotonic() - request_started)
+                self._consume_provider_phase_budget(provider_pool, elapsed)
+                counters.setdefault("_request_latencies", []).append(elapsed)
         raise RuntimeError(f"{endpoint} failed after retries: {last_error}")
 
     def _consume_transport_errors(self, provider: Any | None = None) -> tuple[Any, ...]:

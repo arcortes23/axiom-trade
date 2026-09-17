@@ -441,6 +441,19 @@ class _BudgetedScopeCollector(_ScopeCollector):
             + 0.20 * len(getattr(provider, "book_calls", ()))
         )
 
+class _TwoWindowScopeCollector(_ScopeCollector):
+    """Exercise a custom cycle budget of two provider windows."""
+
+    def collect_once(self, *args, **kwargs):
+        self._custom_cycle_deadline = time.monotonic() + (
+            2.0 * float(self.config.provider_timeout_seconds)
+        )
+        return super().collect_once(*args, **kwargs)
+
+    def _cycle_remaining_seconds(self):
+        return self._custom_cycle_deadline - time.monotonic()
+
+
 class MarketScopeCollectorTests(unittest.TestCase):
 
     def _collector(
@@ -2564,6 +2577,155 @@ class MarketScopeCollectorTests(unittest.TestCase):
         provider.release.set()
         third = collector.collect_once(now=T0)
         self.assertEqual(provider.keyset_calls, 2)
+
+    def test_hanging_inventory_does_not_starve_direct_exact_scope_across_cycles(self) -> None:
+        closed = replace(
+            market("exact-closed"),
+            active=True,
+            closed=True,
+            settlement=SettlementState.RESOLVED_YES,
+        )
+        eligible = market("exact-eligible", category="politics")
+
+        class DelayedDirectProvider(_HangingScopeProvider):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.exact_market_latencies: list[float] = []
+
+            def market(self, market_id: str):
+                started = time.perf_counter()
+                time.sleep(0.005)
+                result = super().market(market_id)
+                if str(market_id) in {"exact-closed", "exact-eligible"}:
+                    self.exact_market_latencies.append(time.perf_counter() - started)
+                return result
+
+        provider = DelayedDirectProvider(
+            (closed, eligible),
+            ({"markets": (), "next_cursor": None},),
+        )
+        store = _ScopeStore(
+            {
+                "exact": {
+                    "experiment_plan": {
+                        "market_scope": scope(
+                            "EXACT_MARKETS",
+                            market_ids=("exact-closed", "exact-eligible"),
+                        )
+                    }
+                },
+                "inventory": {
+                    "experiment_plan": {
+                        "market_scope": scope(
+                            "RULE_BASED_MARKETS",
+                            category="politics",
+                        )
+                    }
+                },
+            }
+        )
+        collector = _TwoWindowScopeCollector(
+            provider,
+            store,
+            CollectorConfig(
+                max_markets=1,
+                discovery_budget_per_cycle=1,
+                max_attempts=1,
+                provider_timeout_seconds=0.05,
+                backoff_initial_seconds=0,
+                jitter_seconds=0,
+            ),
+            candidate_ids=("exact", "inventory"),
+            clock=lambda: T0,
+            sleep=lambda _seconds: None,
+        )
+
+        cycles = [
+            collector.collect_once(now=T0 + timedelta(seconds=61 * index))
+            for index in range(5)
+        ]
+
+        self.assertEqual(provider.keyset_calls, 1)
+        self.assertGreaterEqual(provider.market_calls.count("exact-closed"), 5)
+        self.assertGreaterEqual(provider.market_calls.count("exact-eligible"), 5)
+        self.assertTrue(
+            all("exact-eligible" in cycle.candidate_bound_scheduled for cycle in cycles)
+        )
+        self.assertTrue(all(cycle.snapshots_inserted >= 1 for cycle in cycles))
+        self.assertTrue(
+            all(latency > 0.001 for latency in provider.exact_market_latencies),
+            provider.exact_market_latencies,
+        )
+        self.assertEqual(len(store.resolutions), 5)
+        exact_resolutions = [
+            result for result in store.resolutions if result.candidate_id == "exact"
+        ]
+        self.assertEqual(len(exact_resolutions), 5)
+        self.assertTrue(
+            all(
+                any(
+                    item.market_id == "exact-closed"
+                    and item.reason == "MARKET_CLOSED"
+                    for item in result.excluded_markets
+                )
+                for result in exact_resolutions
+            )
+        )
+        self.assertIsNotNone(collector._scope_provider_executor)
+        self.assertIsNotNone(collector._scope_direct_provider_executor)
+        self.assertIsNotNone(collector._collection_provider_executor)
+        self.assertEqual(
+            len(collector._scope_provider_executor._threads),  # type: ignore[union-attr]
+            1,
+        )
+        self.assertEqual(
+            len(collector._scope_direct_provider_executor._threads),  # type: ignore[union-attr]
+            1,
+        )
+
+        provider.release.set()
+        collector.close()
+        collector.close()
+        for executor in (
+            collector._scope_provider_executor,
+            collector._scope_direct_provider_executor,
+            collector._collection_provider_executor,
+        ):
+            self.assertTrue(executor._closed)  # type: ignore[union-attr]
+            self.assertFalse(
+                any(thread.is_alive() for thread in executor._threads)  # type: ignore[union-attr]
+            )
+    def test_run_forever_closes_provider_executor(self) -> None:
+        provider = _RecordingProvider((market("standalone"),))
+        collector = _ScopeCollector(
+            provider,
+            _ScopeStore({}),
+            CollectorConfig(
+                market_ids=("standalone",),
+                max_markets=1,
+                discovery_budget_per_cycle=0,
+                max_attempts=1,
+                provider_timeout_seconds=0.05,
+                backoff_initial_seconds=0,
+                jitter_seconds=0,
+            ),
+            candidate_ids=(),
+            clock=lambda: T0,
+            sleep=lambda _seconds: None,
+        )
+
+        results = collector.run_forever(cycles=1)
+
+        self.assertEqual(len(results), 1)
+        self.assertIsNotNone(collector._collection_provider_executor)
+        self.assertTrue(collector._collection_provider_executor._closed)  # type: ignore[union-attr]
+        self.assertFalse(
+            any(
+                thread.is_alive()
+                for thread in collector._collection_provider_executor._threads  # type: ignore[union-attr]
+            )
+        )
+        collector.close()
 
     def test_provider_stage_telemetry_does_not_rewrite_collector_state(self) -> None:
         with AxiomStore(":memory:") as store:

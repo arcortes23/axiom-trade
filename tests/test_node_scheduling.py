@@ -1823,6 +1823,34 @@ class MutationSchedulingTests(unittest.TestCase):
 
 
 class NodeStopPollingTests(unittest.TestCase):
+    def test_stop_closes_collector_resources(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = str(Path(directory) / "stop-closes-collector.sqlite")
+            with AxiomStore(db) as store:
+                node = ResearchNode(
+                    NodeConfig(db, crypto_enabled=False),
+                    provider=InMemoryPredictionProvider([]),
+                    store=store,
+                )
+                close = Mock()
+                with patch.object(node.collector, "close", close):
+                    node.stop()
+                close.assert_called_once_with()
+
+    def test_run_finally_closes_collector_resources(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = str(Path(directory) / "run-closes-collector.sqlite")
+            with AxiomStore(db) as store:
+                node = ResearchNode(
+                    NodeConfig(db, crypto_enabled=False),
+                    provider=InMemoryPredictionProvider([]),
+                    store=store,
+                )
+                close = Mock()
+                with patch.object(node.collector, "close", close):
+                    node.run(max_cycles=0)
+                close.assert_called_once_with()
+
     def test_only_exact_owned_stop_marker_authorizes_shutdown(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             db = str(Path(directory) / "stop-marker.sqlite")
