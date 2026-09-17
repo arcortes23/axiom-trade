@@ -1871,7 +1871,8 @@ class PolymarketCollector:
                     snapshot = candidate_snapshots.get(market_id)
                     # Once the cycle deadline is exhausted, cached successful
                     # snapshots remain safe to assess; only a new provider
-                    # refresh is forbidden.
+                    # refresh is forbidden.  The same reservation applies to
+                    # an uncached selected-token book probe.
                     if (
                         snapshot is None
                         and self._cycle_remaining_seconds() is not None
@@ -1879,7 +1880,13 @@ class PolymarketCollector:
                     ):
                         self._mark_cycle_exhaustion("scope_refresh")
                         break
-                    if snapshot is None and market_id not in self._scope_refresh_attempted:
+                    if (
+                        snapshot is None
+                        and market_id not in self._scope_refresh_attempted
+                        and not self._scope_pipeline_budget_available()
+                    ):
+                        snapshot = None
+                    elif snapshot is None and market_id not in self._scope_refresh_attempted:
                         snapshot = self._scope_snapshot_from_record(raw_record, observed_at)
                         if snapshot is not None:
                             snapshot = self._refresh_scope_snapshot(
@@ -1890,6 +1897,13 @@ class PolymarketCollector:
                             )
                             if snapshot is not None:
                                 self._scope_refreshed_snapshots[market_id] = snapshot
+                    assessment_key = (market_id, _stable_payload(kwargs))
+                    if (
+                        snapshot is not None
+                        and assessment_key not in self._scope_suitability_cache
+                        and not self._scope_pipeline_budget_available()
+                    ):
+                        snapshot = None
                     if snapshot is None:
                         refreshed = dict(raw_record)
                         refreshed["suitability_evidence"] = {
@@ -2357,8 +2371,6 @@ class PolymarketCollector:
         if isinstance(value, str) and value.strip():
             return value.strip()[:_MAX_SCOPE_REQUEST_PATH_LENGTH]
         return fallback[:_MAX_SCOPE_REQUEST_PATH_LENGTH]
-
-
     @staticmethod
     def _scope_page_value(page: Any, name: str, default: Any = _UNSET) -> Any:
         if isinstance(page, Mapping):
@@ -2366,6 +2378,54 @@ class PolymarketCollector:
         else:
             value = getattr(page, name, default)
         return default if value is _UNSET else value
+
+
+
+    def _scope_pipeline_budget_available(self) -> bool:
+        """Keep one provider-call window for a selected-token suitability probe.
+
+        Scope inventory refreshes perform a metadata call followed by a
+        selected-token book/rules probe.  The cycle deadline is twice the
+        provider timeout, so spending the whole remainder on carried
+        metadata can leave no time for the only call that can authorize a
+        market.  Treat half a cycle (one provider timeout) as reserved for
+        that downstream probe.  A direct resolver invocation without a cycle
+        deadline remains unbounded.
+        """
+        remaining = self._cycle_remaining_seconds()
+        if remaining is None:
+            return True
+        cycle_budget = max(0.001, float(self.config.cycle_budget_seconds))
+        provider_window = max(0.001, float(self.config.provider_timeout_seconds))
+        reserve = min(provider_window, cycle_budget * 0.5)
+        return remaining > reserve + 1e-6
+
+    @staticmethod
+    def _scope_exact_market_ids(
+        documents: Sequence[Mapping[str, Any]],
+    ) -> tuple[str, ...]:
+        """Return immutable exact-scope members for refresh prioritization."""
+        result: list[str] = []
+        for document in documents:
+            if not isinstance(document, Mapping):
+                continue
+            try:
+                policy = PolymarketCollector._scope_policy(document)
+            except (TypeError, ValueError):
+                policy = None
+            if policy is None or str(getattr(policy, "mode", "")).upper() != "EXACT_MARKETS":
+                continue
+            values = getattr(policy, "market_ids", ())
+            if isinstance(values, str):
+                values = (values,)
+            if not isinstance(values, (list, tuple, set, frozenset)):
+                continue
+            result.extend(
+                str(item).strip()
+                for item in values
+                if str(item).strip()
+            )
+        return tuple(dict.fromkeys(result))
 
     def _refresh_scope_snapshot(
         self,
@@ -2736,28 +2796,50 @@ class PolymarketCollector:
                     "updated_at": observed_at.isoformat(),
                 }
                 snapshot_by_id: dict[str, PredictionMarketSnapshot] = {}
+                prior_refresh_queue = [
+                    market_id
+                    for market_id in self._scope_market_ids(
+                        base_state.get("suitability_refresh_queue", ())
+                    )
+                    if market_id in inventory_records_by_id
+                ]
+                prior_verified = [
+                    market_id
+                    for market_id in self._scope_market_ids(
+                        base_state.get("verified_market_ids", ())
+                    )
+                    if market_id in inventory_records_by_id
+                ]
+                exact_ids = set(self._scope_exact_market_ids(documents))
                 refresh_order = list(dict.fromkeys([
                     *(
                         market_id
-                        for market_id in self._scope_market_ids(
-                            base_state.get("suitability_refresh_queue", ())
-                        )
-                        if market_id in inventory_records_by_id
+                        for market_id in prior_verified
+                        if market_id in exact_ids
                     ),
+                    *prior_refresh_queue,
+                    *prior_verified,
                     *inventory_records_by_id,
                 ]))[:_MAX_SCOPE_INVENTORY]
                 refresh_index = 0
+                failed_refresh = False
                 for market_id in refresh_order:
                     if self._cycle_deadline_exhausted:
                         refresh_index += 1
+                        failed_refresh = True
                         break
                     if self._cycle_remaining_seconds() is not None and self._cycle_remaining_seconds() <= 0:
                         self._mark_cycle_exhaustion("scope_refresh")
                         refresh_index += 1
+                        failed_refresh = True
+                        break
+                    if suitability_enabled and not self._scope_pipeline_budget_available():
+                        # Leave one provider window for the resolver's
+                        # selected-token book probe on the next tick.
                         break
                     if market_id in self._scope_refresh_attempted:
                         refresh_index += 1
-                        break
+                        continue
                     snapshot = self._scope_snapshot_from_record(
                         inventory_records_by_id[market_id],
                         observed_at,
@@ -2771,13 +2853,19 @@ class PolymarketCollector:
                         )
                     if suitability_enabled and snapshot is None:
                         refresh_index += 1
-                        break
+                        failed_refresh = True
+                        if self._cycle_deadline_exhausted:
+                            break
+                        continue
                     if market_id and snapshot is not None:
                         snapshot_by_id[market_id] = snapshot
                         self._scope_refreshed_snapshots[market_id] = snapshot
                     refresh_index += 1
+                rotation = refresh_index % len(refresh_order) if refresh_order else 0
+                if failed_refresh and refresh_order and rotation == 0:
+                    rotation = 1
                 self._scope_inventory_continuation["suitability_refresh_queue"] = self._scope_market_ids(
-                    refresh_order[refresh_index:] + refresh_order[:refresh_index]
+                    refresh_order[rotation:] + refresh_order[:rotation]
                 )
                 return self._scope_inventory_records(
                     list(inventory_records_by_id.values())
@@ -3029,36 +3117,13 @@ class PolymarketCollector:
                     if isinstance(item, Mapping)
                 ]
             page_records: list[dict[str, Any]] = []
-            freshly_assessed_ids: set[str] = set()
             refreshed_snapshots: dict[str, PredictionMarketSnapshot] = {}
-            for item in new_snapshots:
-                if self._cycle_remaining_seconds() is not None and self._cycle_remaining_seconds() <= 0:
-                    self._mark_cycle_exhaustion("scope_suitability")
-                    break
-                market_id = str(item.market_id).strip()
-                record = dict(self._scope_market_record(item, observed_at, provider))
-                refreshed_snapshots[market_id] = item
-                self._scope_refreshed_snapshots[market_id] = item
-                freshly_assessed_ids.add(market_id)
-                if suitability_enabled:
-                    assessment = self._cached_scope_suitability_assessment(
-                        item,
-                        observed_at,
-                        provider,
-                        counters=counters,
-                        **suitability_kwargs,
-                    )
-                    self._suitable_market_evidence.append(dict(assessment))
-                    suitability_evidence.append(dict(assessment))
-                    record["suitability_evidence"] = dict(assessment)
-                    record["suitable_market"] = assessment.get("action") == "SUITABLE"
-                    if record["suitable_market"]:
-                        verified_market_ids.add(market_id)
-                    else:
-                        suitability_exclusions.append(dict(assessment))
-                page_records.append(record)
             refresh_queue: list[str] = []
             if suitability_enabled:
+                # Carried inventory is a persistent work queue.  Refresh one
+                # market end-to-end before spending the cycle on broad page
+                # suitability, and retain a provider window for its
+                # selected-token book/rules probe before starting metadata.
                 prior_refresh_queue = [
                     market_id
                     for market_id in self._scope_market_ids(
@@ -3073,23 +3138,39 @@ class PolymarketCollector:
                     )
                     if market_id in inventory_records_by_id
                 ]
+                exact_ids = set(self._scope_exact_market_ids(documents))
                 refresh_order = list(dict.fromkeys([
+                    *(
+                        market_id
+                        for market_id in prior_verified
+                        if market_id in exact_ids
+                    ),
                     *prior_refresh_queue,
                     *prior_verified,
                     *inventory_records_by_id,
                 ]))[:_MAX_SCOPE_INVENTORY]
                 refresh_index = 0
+                failed_refresh = False
+                failed_market_id: str | None = None
                 for market_id in refresh_order:
                     if self._cycle_deadline_exhausted:
                         refresh_index += 1
+                        failed_refresh = True
+                        failed_market_id = failed_market_id or market_id
                         break
                     if self._cycle_remaining_seconds() is not None and self._cycle_remaining_seconds() <= 0:
                         self._mark_cycle_exhaustion("scope_suitability")
                         refresh_index += 1
+                        failed_refresh = True
+                        failed_market_id = failed_market_id or market_id
+                        break
+                    if not self._scope_pipeline_budget_available():
+                        # Preserve a full downstream metadata/rules + book
+                        # pipeline for the next queued market.
                         break
                     if market_id in self._scope_refresh_attempted:
                         refresh_index += 1
-                        break
+                        continue
                     record = dict(inventory_records_by_id[market_id])
                     # Evidence from a prior tick is diagnostic history only.
                     record.pop("suitability_evidence", None)
@@ -3098,7 +3179,9 @@ class PolymarketCollector:
                     snapshot = self._scope_snapshot_from_record(record, observed_at)
                     if snapshot is None:
                         refresh_index += 1
-                        break
+                        failed_refresh = True
+                        failed_market_id = failed_market_id or market_id
+                        continue
                     snapshot = self._refresh_scope_snapshot(
                         snapshot,
                         provider,
@@ -3107,6 +3190,17 @@ class PolymarketCollector:
                     )
                     if snapshot is None:
                         refresh_index += 1
+                        failed_refresh = True
+                        failed_market_id = failed_market_id or market_id
+                        if self._cycle_deadline_exhausted:
+                            break
+                        continue
+                    if not self._scope_pipeline_budget_available():
+                        # Metadata succeeded, but starting a book request now
+                        # would consume the reserved suitability window.
+                        refresh_index += 1
+                        failed_refresh = True
+                        failed_market_id = failed_market_id or market_id
                         break
                     assessment = self._cached_scope_suitability_assessment(
                         snapshot,
@@ -3125,12 +3219,56 @@ class PolymarketCollector:
                     if record["suitable_market"]:
                         verified_market_ids.add(market_id)
                     else:
+                        failed_refresh = True
+                        failed_market_id = failed_market_id or market_id
                         suitability_exclusions.append(dict(assessment))
                     inventory_records_by_id[market_id] = record
                     refresh_index += 1
+                    if self._cycle_deadline_exhausted:
+                        break
+                if failed_refresh and failed_market_id and prior_refresh_queue:
+                    queue_rotation = prior_refresh_queue.index(failed_market_id) + 1 if failed_market_id in prior_refresh_queue else None
+                    rotation = (
+                        queue_rotation % len(prior_refresh_queue)
+                        if queue_rotation is not None and prior_refresh_queue
+                        else refresh_index % len(refresh_order) if refresh_order else 0
+                    )
+                else:
+                    rotation = refresh_index % len(refresh_order) if refresh_order else 0
+                if failed_refresh and refresh_order and rotation == 0 and not prior_refresh_queue:
+                    # A complete pass otherwise returns the same head.  Move
+                    # it even when every bounded entry was visited so a
+                    # failed/unsuitable member cannot monopolize position 0.
+                    rotation = 1
+                queue_source = refresh_order
                 refresh_queue = self._scope_market_ids(
-                    refresh_order[refresh_index:] + refresh_order[:refresh_index]
+                    queue_source[rotation:] + queue_source[:rotation]
                 )
+            for item in new_snapshots:
+                if self._cycle_remaining_seconds() is not None and self._cycle_remaining_seconds() <= 0:
+                    self._mark_cycle_exhaustion("scope_suitability")
+                    break
+                market_id = str(item.market_id).strip()
+                record = dict(self._scope_market_record(item, observed_at, provider))
+                refreshed_snapshots[market_id] = item
+                self._scope_refreshed_snapshots[market_id] = item
+                if suitability_enabled:
+                    assessment = self._cached_scope_suitability_assessment(
+                        item,
+                        observed_at,
+                        provider,
+                        counters=counters,
+                        **suitability_kwargs,
+                    )
+                    self._suitable_market_evidence.append(dict(assessment))
+                    suitability_evidence.append(dict(assessment))
+                    record["suitability_evidence"] = dict(assessment)
+                    record["suitable_market"] = assessment.get("action") == "SUITABLE"
+                    if record["suitable_market"]:
+                        verified_market_ids.add(market_id)
+                    else:
+                        suitability_exclusions.append(dict(assessment))
+                page_records.append(record)
             for record in page_records:
                 market_id = str(record.get("market_id", "")).strip()
                 if market_id:

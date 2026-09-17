@@ -364,8 +364,23 @@ class _ScopeCollector(PolymarketCollector):
     def _active_primary_candidate_ids(self) -> list[str]:
         return list(self._candidate_ids)
 
+class _BudgetedScopeCollector(_ScopeCollector):
+    """Expose a deterministic monotonic budget for queue-order regression."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._synthetic_budget = 2.0
+
+    def _cycle_remaining_seconds(self):
+        provider = self.provider
+        return self._synthetic_budget - (
+            0.10 * len(getattr(provider, "page_calls", ()))
+            + 0.20 * len(getattr(provider, "market_calls", ()))
+            + 0.20 * len(getattr(provider, "book_calls", ()))
+        )
 
 class MarketScopeCollectorTests(unittest.TestCase):
+
     def _collector(
         self,
         provider: _RecordingProvider,
@@ -1816,6 +1831,93 @@ class MarketScopeCollectorTests(unittest.TestCase):
             [item["market_id"] for item in proof["matched_markets"]],
             ["second-scope"],
         )
+    def test_reserved_pipeline_verifies_later_queue_head_before_broad_refresh(self) -> None:
+        head = replace(market("queue-head"), order_book=None)
+        suitable_base = market("queue-suitable")
+        suitable_book = suitable_base.order_book
+        self.assertIsNotNone(suitable_book)
+        suitable = replace(suitable_base, order_book=None)
+        broad_base = market("broad-page")
+        broad_book = broad_base.order_book
+        self.assertIsNotNone(broad_book)
+        broad = replace(broad_base, order_book=None)
+
+        class BudgetedProvider(_PagedProvider):
+            def order_books(self, market_id: str, depth: int = 20):
+                self.book_calls.append(str(market_id))
+                if market_id == "queue-head":
+                    return {}
+                if market_id == "queue-suitable":
+                    return {"yes": suitable_book}
+                if market_id == "broad-page":
+                    return {"yes": broad_book}
+                return super().order_books(market_id, depth=depth)
+
+        provider = BudgetedProvider(
+            (head, suitable, broad),
+            ({"snapshots": (broad,), "next_cursor": None},),
+        )
+        document = {
+            "experiment_plan": {
+                "market_scope": scope("EXACT_MARKETS", market_ids=("queue-suitable",)),
+                "suitability": {"required_capital": 1.0},
+            }
+        }
+        store = _ScopeStore({"candidate": document})
+        collector = _BudgetedScopeCollector(
+            provider,
+            store,
+            candidate_ids=("candidate",),
+            config=CollectorConfig(
+                max_markets=1,
+                discovery_budget_per_cycle=1,
+                provider_timeout_seconds=1.0,
+                max_attempts=1,
+                backoff_initial_seconds=0,
+                jitter_seconds=0,
+            ),
+            clock=lambda: T0,
+            sleep=lambda _seconds: None,
+        )
+        records = [
+            PolymarketCollector._scope_market_record(item, T0, provider)
+            for item in (head, suitable)
+        ]
+        collector._scope_inventory_continuation = {
+            "after_cursor": "scope-cursor",
+            "coverage_status": "BUDGET_EXHAUSTED",
+            "suitability_enabled": True,
+            "suitability_refresh_queue": ["queue-head", "queue-suitable"],
+            "inventory_records": records,
+        }
+
+        records_after, snapshots_after, _ = collector._discover_scope_inventory(
+            T0,
+            collector._new_counters(),
+            carry_cursor="scope-cursor",
+            documents=(document,),
+        )
+        continuation = collector._scope_inventory_continuation
+        self.assertIn("queue-suitable", continuation["verified_market_ids"])
+        self.assertEqual(continuation["suitability_refresh_queue"][0], "queue-suitable")
+        self.assertEqual(provider.market_calls, ["queue-head", "queue-suitable"])
+        self.assertEqual(provider.book_calls[:2], ["queue-head", "queue-suitable"])
+        self.assertNotEqual(provider.book_calls[:1], ["broad-page"])
+
+        collector._discover_scope_inventory = lambda *args, **kwargs: (
+            records_after,
+            snapshots_after,
+            "scope-next",
+        )
+        collector._scope_resolutions = {}
+        _, candidate_markets, _, _ = collector._resolve_market_scopes(
+            T0,
+            ("candidate",),
+            {},
+            collector._new_counters(),
+        )
+        self.assertEqual(candidate_markets, {"candidate": ["queue-suitable"]})
+
 
     def test_selected_token_book_never_uses_wrong_singleton(self) -> None:
         base = market("exact-book")
