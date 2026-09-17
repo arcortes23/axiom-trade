@@ -2197,6 +2197,74 @@ class PolymarketCollector:
             for _, document in documents
             for market_id in self._scope_exact_market_ids((document,))
         ))[:_MAX_SCOPE_INVENTORY]
+        protected_priority_exact_ids = list(dict.fromkeys(
+            market_id
+            for candidate_id, document in documents
+            if candidate_id in current_rolling_ids
+            for market_id in self._scope_exact_market_ids((document,))
+        ))
+        protected_priority_exact_id_set = set(protected_priority_exact_ids)
+        pre_direct_attempted_ids: set[str] = set()
+        pre_direct_snapshots: dict[str, PredictionMarketSnapshot] = {}
+        pre_direct_provider: Any | None = None
+        pre_direct_fetcher = None
+        try:
+            protected_cursor = int(self._scope_direct_protected_lookup_cursor)
+        except (TypeError, ValueError, OverflowError):
+            protected_cursor = 0
+        protected_cursor %= len(protected_priority_exact_ids) if protected_priority_exact_ids else 1
+        protected_cursor_start = protected_cursor
+        if protected_priority_exact_ids and self._scope_pipeline_budget_available():
+            pre_direct_provider = self._scope_direct_lookup_provider()
+            pre_direct_fetcher = getattr(pre_direct_provider, "market", None)
+        if protected_priority_exact_ids and callable(pre_direct_fetcher):
+            protected_probe_ids = [
+                protected_priority_exact_ids[
+                    (protected_cursor + offset) % len(protected_priority_exact_ids)
+                ]
+                for offset in range(
+                    min(_MAX_SCOPE_DIRECT_LOOKUPS, len(protected_priority_exact_ids))
+                )
+            ]
+            for market_id in protected_probe_ids:
+                if not self._scope_pipeline_budget_available():
+                    break
+                pre_direct_attempted_ids.add(market_id)
+                try:
+                    direct_snapshot = self._call_provider(
+                        f"scope_exact:/markets/{market_id}",
+                        lambda identifier=market_id: pre_direct_fetcher(identifier),
+                        observed_at,
+                        counters,
+                        provider=pre_direct_provider,
+                        market_id=market_id,
+                        pool_name="scope_direct",
+                    )
+                except _ProviderDeadlineExceeded as exc:
+                    if exc.cycle_expired:
+                        self._mark_cycle_exhaustion("scope_exact_lookup")
+                    break
+                except Exception as exc:
+                    counters["errors"] += 1
+                    try:
+                        self.store.save_collection_error(
+                            market_id,
+                            observed_at,
+                            "scope_exact_lookup",
+                            str(exc),
+                        )
+                    except Exception:
+                        pass
+                    continue
+                if not isinstance(direct_snapshot, PredictionMarketSnapshot):
+                    continue
+                if str(direct_snapshot.market_id).strip() != market_id:
+                    continue
+                pre_direct_snapshots[market_id] = direct_snapshot
+            if pre_direct_attempted_ids:
+                self._scope_direct_protected_lookup_cursor = (
+                    protected_cursor + len(pre_direct_attempted_ids)
+                ) % len(protected_priority_exact_ids)
         carry_cursor = self._scope_cursor(root_state)
         needs_inventory = any(
             self._scope_document_needs_inventory(document)
@@ -2219,6 +2287,7 @@ class PolymarketCollector:
             if (
                 isinstance(self._scope_inventory_continuation, Mapping)
                 and self._scope_inventory_continuation.get("query_reset")
+                and not pre_direct_attempted_ids
             ):
                 # A reset/rebase response is intentionally not a resolver
                 # input.  Keep the candidate scoped so legacy authority cannot
@@ -2226,9 +2295,29 @@ class PolymarketCollector:
                 return scope_candidates, {}, {}, next_cursor
         else:
             current_records, snapshots, next_cursor = [], {}, carry_cursor
-
-        direct_attempted_ids: set[str] = set()
-        direct_snapshots: dict[str, PredictionMarketSnapshot] = {}
+        if pre_direct_attempted_ids:
+            current_records = [
+                record
+                for record in current_records
+                if not (
+                    isinstance(record, Mapping)
+                    and str(record.get("market_id", "")).strip()
+                    in pre_direct_attempted_ids
+                )
+            ]
+            pre_direct_records = [
+                self._scope_market_record(
+                    snapshot,
+                    observed_at,
+                    pre_direct_provider or self.provider,
+                )
+                for snapshot in pre_direct_snapshots.values()
+            ]
+            current_records = [*pre_direct_records, *current_records]
+            snapshots.update(pre_direct_snapshots)
+        direct_loop_attempted_ids: set[str] = set()
+        direct_attempted_ids: set[str] = set(pre_direct_attempted_ids)
+        direct_snapshots: dict[str, PredictionMarketSnapshot] = dict(pre_direct_snapshots)
 
         known_inventory_ids = {
             str(market_id).strip()
@@ -2247,13 +2336,6 @@ class PolymarketCollector:
             for market_id in self._scope_exact_market_ids((document,))
         ))
         priority_exact_id_set = set(priority_exact_ids)
-        protected_priority_exact_ids = list(dict.fromkeys(
-            market_id
-            for candidate_id, document in documents
-            if candidate_id in current_rolling_ids
-            for market_id in self._scope_exact_market_ids((document,))
-        ))
-        protected_priority_exact_id_set = set(protected_priority_exact_ids)
         rotating_priority_exact_ids = [
             market_id
             for market_id in priority_exact_ids
@@ -2281,6 +2363,7 @@ class PolymarketCollector:
             market_id
             for market_id in protected_priority_exact_ids
             if market_id not in known_inventory_ids
+            and market_id not in pre_direct_attempted_ids
         ]
         missing_priority_ids = [
             market_id
@@ -2297,7 +2380,7 @@ class PolymarketCollector:
             *missing_priority_ids,
             *missing_deferred_ids,
         ]
-        direct_provider = self.provider
+        direct_provider = pre_direct_provider or self.provider
         direct_fetcher = getattr(direct_provider, "market", None)
         if missing_exact_ids:
             direct_provider = self._scope_direct_lookup_provider()
@@ -2322,15 +2405,22 @@ class PolymarketCollector:
                 else 1
             )
             direct_cursor %= len(missing_deferred_ids) if missing_deferred_ids else 1
+            direct_capacity_remaining = max(
+                0,
+                _MAX_SCOPE_DIRECT_LOOKUPS - len(pre_direct_attempted_ids),
+            )
             protected_priority_ids = [
                 missing_protected_priority_ids[
                     (protected_cursor + offset) % len(missing_protected_priority_ids)
                 ]
                 for offset in range(
-                    min(_MAX_SCOPE_DIRECT_LOOKUPS, len(missing_protected_priority_ids))
+                    min(direct_capacity_remaining, len(missing_protected_priority_ids))
                 )
             ] if missing_protected_priority_ids else []
-            remaining_direct = max(0, _MAX_SCOPE_DIRECT_LOOKUPS - len(protected_priority_ids))
+            remaining_direct = max(
+                0,
+                direct_capacity_remaining - len(protected_priority_ids),
+            )
             deferred_reserve = 1 if missing_deferred_ids and remaining_direct else 0
             priority_ids = [
                 missing_priority_ids[(priority_cursor + offset) % len(missing_priority_ids)]
@@ -2343,7 +2433,7 @@ class PolymarketCollector:
             ] if missing_priority_ids else []
             remaining_direct = max(
                 0,
-                _MAX_SCOPE_DIRECT_LOOKUPS
+                direct_capacity_remaining
                 - len(protected_priority_ids)
                 - len(priority_ids),
             )
@@ -2354,6 +2444,7 @@ class PolymarketCollector:
                 )
             ] if missing_deferred_ids else []
             direct_ids = [*protected_priority_ids, *priority_ids, *deferred_ids]
+            direct_loop_attempted_ids: set[str] = set()
             attempted_direct = 0
             attempted_protected = 0
             attempted_priority = 0
@@ -2368,6 +2459,7 @@ class PolymarketCollector:
                     self._mark_cycle_exhaustion("scope_exact_lookup")
                     break
                 direct_attempted_ids.add(market_id)
+                direct_loop_attempted_ids.add(market_id)
                 if market_id in protected_priority_id_set:
                     attempted_protected += 1
                 elif market_id in priority_id_set:
@@ -2386,8 +2478,9 @@ class PolymarketCollector:
                         market_id=market_id,
                         pool_name="scope_direct",
                     )
-                except _ProviderDeadlineExceeded:
-                    self._mark_cycle_exhaustion("scope_exact_lookup")
+                except _ProviderDeadlineExceeded as exc:
+                    if exc.cycle_expired:
+                        self._mark_cycle_exhaustion("scope_exact_lookup")
                     break
                 except Exception as exc:
                     counters["errors"] += 1
@@ -2408,14 +2501,14 @@ class PolymarketCollector:
                 direct_snapshots[market_id] = direct_snapshot
                 snapshots[market_id] = direct_snapshot
 
-        if direct_attempted_ids:
+        if direct_loop_attempted_ids:
             carried_records = [
                 record
                 for record in current_records
                 if not (
                     isinstance(record, Mapping)
                     and str(record.get("market_id", "")).strip()
-                    in direct_attempted_ids
+                    in direct_loop_attempted_ids
                 )
             ]
             direct_records = [
@@ -2424,17 +2517,18 @@ class PolymarketCollector:
             ]
             current_records = [*direct_records, *carried_records]
 
-
             self._scope_direct_protected_lookup_cursor = (
-                protected_cursor + attempted_protected
-            ) % len(missing_protected_priority_ids) if missing_protected_priority_ids else 0
+                protected_cursor_start
+                + len(pre_direct_attempted_ids)
+                + attempted_protected
+            ) % len(protected_priority_exact_ids) if protected_priority_exact_ids else 0
             self._scope_direct_priority_lookup_cursor = (
                 priority_cursor + attempted_priority
             ) % len(missing_priority_ids) if missing_priority_ids else 0
             self._scope_direct_lookup_cursor = (
                 direct_cursor + attempted_deferred
             ) % len(missing_deferred_ids) if missing_deferred_ids else 0
-        elif not missing_exact_ids:
+        elif not missing_exact_ids and not pre_direct_attempted_ids:
             self._scope_direct_protected_lookup_cursor = 0
             self._scope_direct_priority_lookup_cursor = 0
             self._scope_direct_lookup_cursor = 0
@@ -2558,6 +2652,42 @@ class PolymarketCollector:
                         continue
                     market_id = str(raw_record.get("market_id", "")).strip()
                     snapshot = candidate_snapshots.get(market_id)
+                    terminal_settlement = snapshot is not None and snapshot.settlement in {
+                        SettlementState.RESOLVED_YES,
+                        SettlementState.RESOLVED_NO,
+                        SettlementState.VOID,
+                    }
+                    if snapshot is not None and (
+                        snapshot.active is False
+                        or snapshot.closed is True
+                        or snapshot.archived is True
+                        or terminal_settlement
+                    ):
+                        lifecycle_reason = (
+                            "MARKET_CLOSED"
+                            if snapshot.closed is True or terminal_settlement
+                            else "INACTIVE_MARKET"
+                        )
+                        refreshed = dict(
+                            self._scope_market_record(
+                                snapshot,
+                                observed_at,
+                                suitability_provider,
+                            )
+                        )
+                        refreshed["suitability_evidence"] = {
+                            "market_id": market_id,
+                            "action": "UNSUITABLE",
+                            "category": "MARKET_LIFECYCLE",
+                            "reason": lifecycle_reason,
+                            "resolver": "scope_lifecycle",
+                            "next_action": "no_refresh_terminal",
+                            "observed_at": observed_at.isoformat(),
+                        }
+                        refreshed_records.append(refreshed)
+                        refreshed_snapshots[market_id] = snapshot
+                        self._scope_refreshed_snapshots[market_id] = snapshot
+                        continue
                     # Once the cycle deadline is exhausted, cached successful
                     # snapshots remain safe to assess; only a new provider
                     # refresh is forbidden.  The same reservation applies to

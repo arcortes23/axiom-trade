@@ -2585,6 +2585,181 @@ class MarketScopeCollectorTests(unittest.TestCase):
         third = collector.collect_once(now=T0)
         self.assertEqual(provider.keyset_calls, 2)
 
+    def test_protected_exact_probe_precedes_hanging_broad_inventory(self) -> None:
+        selected_ids = tuple(f"selected-gamma-{index}" for index in range(5))
+        gamma_ids = tuple(f"gamma-closed-{index}" for index in range(8))
+        closed_markets = tuple(
+            replace(
+                market(market_id),
+                active=True,
+                closed=True,
+                settlement=SettlementState.RESOLVED_YES,
+            )
+            for market_id in gamma_ids
+        )
+        market_by_id = {
+            snapshot.market_id: snapshot for snapshot in closed_markets
+        }
+
+        class DirectClone(_PagedProvider):
+            def market(self, market_id: str):
+                identifier = str(market_id)
+                self.market_calls.append(identifier)
+                return market_by_id.get(identifier)
+
+        class HangingBroadProvider(_HangingScopeProvider):
+            def __init__(self) -> None:
+                super().__init__(
+                    closed_markets,
+                    ({"markets": (), "next_cursor": None},),
+                )
+                self.direct_clone: DirectClone | None = None
+
+            def isolated_worker_factory(self):
+                self.direct_clone = DirectClone(closed_markets, ())
+                return self.direct_clone
+
+        provider = HangingBroadProvider()
+        documents = {
+            candidate_id: {
+                "experiment_plan": {
+                    "market_scope": scope(
+                        "EXACT_MARKETS",
+                        market_ids=gamma_ids,
+                    ),
+                },
+                "assumptions": {"min_activity": 1},
+            }
+            for candidate_id in selected_ids
+        }
+        documents["broad-inventory"] = {
+            "experiment_plan": {
+                "market_scope": scope(
+                    "RULE_BASED_MARKETS",
+                    category="politics",
+                ),
+            },
+        }
+        store = _ScopeStore(documents)
+
+        class SelectedCollector(_TwoWindowScopeCollector):
+            def _rolling_scope_market_ids(self):
+                self._rolling_scope_candidate_ids = selected_ids
+                self._rolling_scope_documents = {}
+                return []
+
+        collector = SelectedCollector(
+            provider,
+            store,
+            CollectorConfig(
+                max_markets=1,
+                discovery_budget_per_cycle=1,
+                max_attempts=1,
+                provider_timeout_seconds=0.05,
+                backoff_initial_seconds=0,
+                jitter_seconds=0,
+            ),
+            candidate_ids=(*selected_ids, "broad-inventory"),
+            clock=lambda: T0,
+            sleep=lambda _seconds: None,
+        )
+
+        cycle = collector.collect_once(now=T0)
+        selected_results = [
+            result for result in store.resolutions
+            if result.candidate_id in selected_ids
+        ]
+        self.assertEqual(len(selected_results), len(selected_ids))
+        self.assertTrue(
+            all(
+                result.status == ZERO_MATCHES
+                and {
+                    item.market_id for item in result.excluded_markets
+                } == set(gamma_ids)
+                and all(item.reason == "MARKET_CLOSED" for item in result.excluded_markets)
+                for result in selected_results
+            )
+        )
+        self.assertGreaterEqual(cycle.provider_timeouts, 1)
+        self.assertEqual(cycle.candidate_bound_scheduled, ())
+        self.assertIsNotNone(provider.direct_clone)
+        self.assertEqual(
+            provider.direct_clone.market_calls,
+            list(gamma_ids),
+        )
+        self.assertEqual(provider.direct_clone.book_calls, [])
+        provider.release.set()
+        collector.close()
+    def test_protected_phase_timeout_preserves_downstream_collection_window(self) -> None:
+        selected_ids = tuple(f"slow-protected-{index}" for index in range(8))
+        legacy_market = market("legacy-leak")
+
+        class SlowDirectClone(_PagedProvider):
+            def market(self, market_id: str):
+                identifier = str(market_id)
+                self.market_calls.append(identifier)
+                time.sleep(0.075)
+                return None
+
+        class SlowProtectedProvider(_PagedProvider):
+            def __init__(self) -> None:
+                super().__init__(
+                    (legacy_market,),
+                    ({"markets": (), "next_cursor": None},),
+                )
+                self.direct_clone: SlowDirectClone | None = None
+
+            def isolated_worker_factory(self):
+                self.direct_clone = SlowDirectClone((), ())
+                return self.direct_clone
+
+        provider = SlowProtectedProvider()
+        documents = {
+            candidate_id: {
+                "experiment_plan": {
+                    "market_scope": scope(
+                        "EXACT_MARKETS",
+                        market_ids=selected_ids,
+                    ),
+                },
+            }
+            for candidate_id in selected_ids
+        }
+        documents["legacy"] = {"target": "legacy-leak"}
+        store = _ScopeStore(documents)
+
+        class SlowProtectedCollector(_TwoWindowScopeCollector):
+            def _rolling_scope_market_ids(self):
+                self._rolling_scope_candidate_ids = selected_ids
+                self._rolling_scope_documents = {}
+                return []
+
+        collector = SlowProtectedCollector(
+            provider,
+            store,
+            CollectorConfig(
+                max_markets=1,
+                discovery_budget_per_cycle=1,
+                max_attempts=1,
+                provider_timeout_seconds=0.05,
+                backoff_initial_seconds=0,
+                jitter_seconds=0,
+            ),
+            candidate_ids=(*selected_ids, "legacy"),
+            clock=lambda: T0,
+            sleep=lambda _seconds: None,
+        )
+
+        cycle = collector.collect_once(now=T0)
+        self.assertIsNotNone(provider.direct_clone)
+        self.assertEqual(provider.direct_clone.market_calls[0], selected_ids[0])
+        self.assertGreaterEqual(cycle.provider_timeouts, 1)
+        self.assertFalse(collector._cycle_deadline_exhausted)
+        self.assertIn("legacy-leak", cycle.candidate_bound_scheduled)
+        self.assertGreaterEqual(cycle.markets_attempted, 1)
+        collector.close()
+
+
     def test_hanging_inventory_does_not_starve_direct_exact_scope_across_cycles(self) -> None:
         closed = replace(
             market("exact-closed"),
