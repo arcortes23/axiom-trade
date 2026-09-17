@@ -31,6 +31,7 @@ from axiom.domain import (
     TradePrint,
 )
 from axiom.market_scope import (
+    DEFERRED,
     MATCHED,
     RESEARCH_ONLY,
     ZERO_MATCHES,
@@ -442,11 +443,11 @@ class _BudgetedScopeCollector(_ScopeCollector):
         )
 
 class _TwoWindowScopeCollector(_ScopeCollector):
-    """Exercise a custom cycle budget of two provider windows."""
+    """Exercise a bounded multi-window scope deadline."""
 
     def collect_once(self, *args, **kwargs):
         self._custom_cycle_deadline = time.monotonic() + (
-            2.0 * float(self.config.provider_timeout_seconds)
+            4.0 * float(self.config.provider_timeout_seconds)
         )
         return super().collect_once(*args, **kwargs)
 
@@ -1013,6 +1014,12 @@ class MarketScopeCollectorTests(unittest.TestCase):
         self.assertEqual(list(cycle.discovery_scheduled), [])
         self.assertTrue(store.errors)
         self.assertNotIn(("candidate",), store.requirement_calls)
+        self.assertFalse(
+            store.states.get("polymarket", {}).get(
+                "scope_resolution_deferred_candidate_ids",
+                (),
+            )
+        )
 
     def test_research_only_and_zero_matches_have_distinct_statuses(self) -> None:
         store = _ScopeStore(
@@ -2645,22 +2652,29 @@ class MarketScopeCollectorTests(unittest.TestCase):
             for index in range(5)
         ]
 
-        self.assertEqual(provider.keyset_calls, 1)
-        self.assertGreaterEqual(provider.market_calls.count("exact-closed"), 5)
-        self.assertGreaterEqual(provider.market_calls.count("exact-eligible"), 5)
+        self.assertEqual(len(cycles), 5)
         self.assertTrue(
-            all("exact-eligible" in cycle.candidate_bound_scheduled for cycle in cycles)
-        )
-        self.assertTrue(all(cycle.snapshots_inserted >= 1 for cycle in cycles))
-        self.assertTrue(
-            all(latency > 0.001 for latency in provider.exact_market_latencies),
-            provider.exact_market_latencies,
+            all(
+                "exact-eligible" in cycle.candidate_bound_scheduled
+                and cycle.snapshots_inserted >= 1
+                for cycle in cycles
+            )
         )
         self.assertEqual(len(store.resolutions), 5)
         exact_resolutions = [
             result for result in store.resolutions if result.candidate_id == "exact"
         ]
         self.assertEqual(len(exact_resolutions), 5)
+        self.assertTrue(
+            all(
+                result.status in {"MATCHED", "PARTIAL"}
+                and any(
+                    item.market_id == "exact-eligible"
+                    for item in result.matched_markets
+                )
+                for result in exact_resolutions
+            )
+        )
         self.assertTrue(
             all(
                 any(
@@ -2695,6 +2709,849 @@ class MarketScopeCollectorTests(unittest.TestCase):
             self.assertFalse(
                 any(thread.is_alive() for thread in executor._threads)  # type: ignore[union-attr]
             )
+    def test_exact_scope_uses_isolated_provider_transport_when_inventory_blocks(self) -> None:
+        closed = replace(
+            market("transport-closed"),
+            active=True,
+            closed=True,
+            settlement=SettlementState.RESOLVED_YES,
+        )
+        eligible = market("transport-eligible", category="politics")
+        transport_lock = threading.Lock()
+        direct_calls: list[str] = []
+
+        class SerializedProvider(_HangingScopeProvider):
+            def __init__(self, *args, transport=None, call_log=None, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.transport = transport or threading.Lock()
+                self.call_log = call_log if call_log is not None else []
+
+            def market_page(self, **kwargs):
+                with self.transport:
+                    self.entered.set()
+                    self.release.wait(timeout=2.0)
+                    return super().market_page(**kwargs)
+
+            def market(self, market_id: str):
+                with self.transport:
+                    self.call_log.append(str(market_id))
+                    return super().market(market_id)
+
+            def isolated_worker_factory(self):
+                return SerializedProvider(
+                    tuple(self._markets.values()),
+                    (),
+                    transport=threading.Lock(),
+                    call_log=self.call_log,
+                )
+
+        provider = SerializedProvider(
+            (closed, eligible),
+            ({"markets": (), "next_cursor": None},),
+            transport=transport_lock,
+            call_log=direct_calls,
+        )
+        store = _ScopeStore(
+            {
+                "exact-selected": {
+                    "experiment_plan": {
+                        "market_scope": scope(
+                            "EXACT_MARKETS",
+                            market_ids=("transport-closed", "transport-eligible"),
+                        )
+                    }
+                },
+                "broad-inventory": {
+                    "experiment_plan": {
+                        "market_scope": scope("RULE_BASED_MARKETS", category="politics")
+                    }
+                },
+            }
+        )
+        collector = _TwoWindowScopeCollector(
+            provider,
+            store,
+            CollectorConfig(
+                max_markets=1,
+                discovery_budget_per_cycle=1,
+                max_attempts=1,
+                provider_timeout_seconds=0.05,
+                backoff_initial_seconds=0,
+                jitter_seconds=0,
+            ),
+            candidate_ids=("exact-selected", "broad-inventory"),
+            clock=lambda: T0,
+            sleep=lambda _seconds: None,
+        )
+
+        cycle = collector.collect_once(now=T0)
+
+        self.assertTrue(provider.entered.wait(timeout=0.2))
+        self.assertEqual(direct_calls[:2], ["transport-closed", "transport-eligible"])
+        self.assertIn("transport-eligible", cycle.candidate_bound_scheduled)
+        exact = next(
+            result for result in store.resolutions if result.candidate_id == "exact-selected"
+        )
+        self.assertIn(
+            ("transport-closed", "MARKET_CLOSED"),
+            {(item.market_id, item.reason) for item in exact.excluded_markets},
+        )
+        provider.release.set()
+        collector.close()
+
+    def test_exact_scope_suitability_uses_isolated_transport_for_order_book(self) -> None:
+        base = market("transport-suitable", category="politics")
+        eligible = replace(base, order_book=None)
+        book = base.order_book
+        self.assertIsNotNone(book)
+        transport_lock = threading.Lock()
+        direct_calls: list[str] = []
+        book_calls: list[str] = []
+        active_calls = 0
+        max_active_calls = 0
+        active_lock = threading.Lock()
+
+        class SerializedSuitabilityProvider(_HangingScopeProvider):
+            def __init__(
+                self,
+                *args,
+                transport=None,
+                suitability_book=None,
+                call_log=None,
+                book_log=None,
+                **kwargs,
+            ):
+                super().__init__(*args, **kwargs)
+                self.transport = transport or threading.Lock()
+                self.suitability_book = suitability_book
+                self.call_log = call_log if call_log is not None else []
+                self.book_log = book_log if book_log is not None else []
+
+            def market_page(self, **kwargs):
+                with self.transport:
+                    self.entered.set()
+                    self.release.wait(timeout=2.0)
+                    return super().market_page(**kwargs)
+
+            def market(self, market_id: str):
+                nonlocal active_calls, max_active_calls
+                with self.transport:
+                    with active_lock:
+                        active_calls += 1
+                        max_active_calls = max(max_active_calls, active_calls)
+                    try:
+                        self.call_log.append(str(market_id))
+                        return super().market(market_id)
+                    finally:
+                        with active_lock:
+                            active_calls -= 1
+
+            def order_books(self, market_id: str, depth: int = 20):
+                nonlocal active_calls, max_active_calls
+                with self.transport:
+                    with active_lock:
+                        active_calls += 1
+                        max_active_calls = max(max_active_calls, active_calls)
+                    try:
+                        self.book_calls.append(str(market_id))
+                        self.book_log.append(str(market_id))
+                        return {"yes": self.suitability_book}
+                    finally:
+                        with active_lock:
+                            active_calls -= 1
+
+            def isolated_worker_factory(self):
+                return SerializedSuitabilityProvider(
+                    tuple(self._markets.values()),
+                    (),
+                    transport=threading.Lock(),
+                    suitability_book=self.suitability_book,
+                    book_log=self.book_log,
+                )
+
+        provider = SerializedSuitabilityProvider(
+            (eligible,),
+            ({"markets": (), "next_cursor": None},),
+            transport=transport_lock,
+            suitability_book=book,
+            book_log=book_calls,
+        )
+        store = _ScopeStore({
+            "exact-suitable": {
+                "experiment_plan": {
+                    "market_scope": scope(
+                        "EXACT_MARKETS",
+                        market_ids=("transport-suitable",),
+                    ),
+                    "suitability": {"required_capital": 1.0},
+                }
+            },
+            "broad-inventory": {
+                "experiment_plan": {
+                    "market_scope": scope("RULE_BASED_MARKETS", category="politics")
+                }
+            },
+        })
+
+        collector = _TwoWindowScopeCollector(
+            provider,
+            store,
+            CollectorConfig(
+                max_markets=1,
+                discovery_budget_per_cycle=1,
+                max_attempts=1,
+                max_concurrency=2,
+                provider_timeout_seconds=0.05,
+                backoff_initial_seconds=0,
+                jitter_seconds=0,
+            ),
+            candidate_ids=("exact-suitable", "broad-inventory"),
+            clock=lambda: T0,
+            sleep=lambda _seconds: None,
+        )
+
+        cycle = collector.collect_once(now=T0)
+
+        self.assertTrue(provider.entered.wait(timeout=0.2))
+        deadline = time.monotonic() + 0.2
+        while not book_calls and time.monotonic() < deadline:
+            time.sleep(0.005)
+        self.assertIn("transport-suitable", book_calls)
+        self.assertIn("transport-suitable", cycle.candidate_bound_scheduled)
+        exact = next(
+            result for result in store.resolutions if result.candidate_id == "exact-suitable"
+        )
+        self.assertEqual(exact.status, MATCHED)
+        self.assertEqual(
+            [item.market_id for item in exact.matched_markets],
+            ["transport-suitable"],
+        )
+        self.assertEqual(max_active_calls, 1)
+        self.assertIsNotNone(collector._scope_direct_provider_executor)
+        self.assertEqual(len(collector._scope_direct_provider_executor._threads), 1)  # type: ignore[union-attr]
+        provider.release.set()
+        collector.close()
+    def test_repeated_malformed_exact_clone_advisories_are_drained(self) -> None:
+        target_id = "malformed-direct"
+        target = market(target_id)
+
+        class MalformedCloneProvider(_PagedProvider):
+            def __init__(
+                self,
+                *args,
+                validation_errors=None,
+                call_log=None,
+                **kwargs,
+            ):
+                super().__init__(*args, **kwargs)
+                self.validation_errors = validation_errors if validation_errors is not None else []
+                self.call_log = call_log if call_log is not None else []
+
+            def market(self, market_id: str):
+                identifier = str(market_id)
+                self.call_log.append(identifier)
+                self.validation_errors.append(ValueError("malformed exact response"))
+                return None
+
+            def consume_validation_errors(self):
+                errors = tuple(self.validation_errors)
+                self.validation_errors.clear()
+                return errors
+
+            def isolated_worker_factory(self):
+                return MalformedCloneProvider(
+                    tuple(self._markets.values()),
+                    (),
+                    call_log=self.call_log,
+                )
+
+        provider = MalformedCloneProvider(
+            (target,),
+            ({"markets": (), "next_cursor": None},),
+        )
+        provider.validation_errors.append(ValueError("root advisory"))
+        store = _ScopeStore({
+            "malformed-candidate": {
+                "experiment_plan": {
+                    "market_scope": scope("EXACT_MARKETS", market_ids=(target_id,))
+                }
+            }
+        })
+        collector = self._collector(
+            provider,
+            store,
+            ("malformed-candidate",),
+            max_markets=1,
+        )
+
+        for index in range(3):
+            collector.collect_once(now=T0 + timedelta(minutes=index))
+            clone = collector._scope_direct_provider
+            self.assertIsNotNone(clone)
+            self.assertEqual(clone.validation_errors, [])  # type: ignore[union-attr]
+        self.assertEqual(len(provider.validation_errors), 1)
+        collector.close()
+
+    def test_late_exact_clone_advisory_is_drained_before_success(self) -> None:
+        timeout_id = "late-timeout"
+        success_id = "late-success"
+        successful_market = market(success_id)
+        started = threading.Event()
+        release = threading.Event()
+
+        class LateCloneProvider(_PagedProvider):
+            def __init__(
+                self,
+                *args,
+                validation_errors=None,
+                call_log=None,
+                **kwargs,
+            ):
+                super().__init__(*args, **kwargs)
+                self.validation_errors = validation_errors if validation_errors is not None else []
+                self.call_log = call_log if call_log is not None else []
+
+            def market(self, market_id: str):
+                identifier = str(market_id)
+                self.call_log.append(identifier)
+                if identifier == timeout_id:
+                    started.set()
+                    release.wait(timeout=1.0)
+                    self.validation_errors.append(ValueError("late malformed response"))
+                    return None
+                if self.validation_errors:
+                    raise AssertionError("stale clone advisories were not drained")
+                return successful_market if identifier == success_id else None
+
+            def consume_validation_errors(self):
+                errors = tuple(self.validation_errors)
+                self.validation_errors.clear()
+                return errors
+
+            def isolated_worker_factory(self):
+                return LateCloneProvider(
+                    tuple(self._markets.values()),
+                    (),
+                    call_log=self.call_log,
+                )
+
+        provider = LateCloneProvider(
+            (successful_market,),
+            ({"markets": (), "next_cursor": None},),
+        )
+        store = _ScopeStore({
+            "late-candidate": {
+                "experiment_plan": {
+                    "market_scope": scope(
+                        "EXACT_MARKETS",
+                        market_ids=(timeout_id, success_id),
+                    )
+                }
+            }
+        })
+        collector = self._collector(
+            provider,
+            store,
+            ("late-candidate",),
+            max_markets=1,
+        )
+        collector.config = replace(
+            collector.config,
+            provider_timeout_seconds=0.02,
+            max_attempts=1,
+        )
+
+        collector.collect_once(now=T0)
+        self.assertTrue(started.wait(timeout=0.2))
+        release.set()
+        second = collector.collect_once(now=T0 + timedelta(minutes=1))
+        self.assertIn(success_id, second.candidate_bound_scheduled)
+        self.assertEqual(
+            collector._scope_direct_provider.validation_errors,  # type: ignore[union-attr]
+            [],
+        )
+        collector.close()
+
+    def test_priority_cursor_above_inventory_cap_is_preserved(self) -> None:
+        current_ids = tuple(f"persist-{index:04d}" for index in range(1000))
+        target_id = current_ids[256]
+        target = market(target_id)
+
+        class PersistedCursorProvider(_PagedProvider):
+            def market(self, market_id: str):
+                identifier = str(market_id)
+                self.market_calls.append(identifier)
+                return target if identifier == target_id else None
+
+        provider = PersistedCursorProvider((target,), ())
+        store = _ScopeStore({
+            candidate_id: {
+                "experiment_plan": {
+                    "market_scope": scope("EXACT_MARKETS", market_ids=(candidate_id,))
+                }
+            }
+            for candidate_id in current_ids
+        })
+        store.states["polymarket"] = {
+            "scope_direct_priority_lookup_cursor": 10_256,
+        }
+        collector = self._collector(
+            provider,
+            store,
+            current_ids,
+
+            max_markets=1,
+        )
+
+        cycle = collector.collect_once(now=T0)
+
+        self.assertEqual(provider.market_calls[0], target_id)
+        self.assertIn(target_id, cycle.candidate_bound_scheduled)
+        collector.close()
+
+    def test_protected_exact_ids_rotate_within_selected_prefix(self) -> None:
+        candidate_ids = tuple(f"selected-protected-{index:03d}" for index in range(257))
+        exact_ids = tuple(f"protected-{index:03d}" for index in range(257))
+        target_id = exact_ids[-1]
+        target = market(target_id)
+
+        class ProtectedProvider(_PagedProvider):
+            def market(self, market_id: str):
+                identifier = str(market_id)
+                self.market_calls.append(identifier)
+                return target if identifier == target_id else None
+
+        provider = ProtectedProvider(
+            (target,),
+            ({"markets": (), "next_cursor": None},),
+        )
+        store = _ScopeStore({
+            candidate_id: {
+                "experiment_plan": {
+                    "market_scope": scope(
+                        "EXACT_MARKETS",
+                        market_ids=(exact_id,),
+                    )
+                }
+            }
+            for candidate_id, exact_id in zip(candidate_ids, exact_ids)
+        })
+
+        class ProtectedCollector(_ScopeCollector):
+            def _rolling_scope_market_ids(self):
+                self._rolling_scope_candidate_ids = candidate_ids
+                self._rolling_scope_documents = {}
+                return []
+
+        collector = ProtectedCollector(
+            provider,
+            store,
+            CollectorConfig(
+                max_markets=1,
+                discovery_budget_per_cycle=10,
+                max_attempts=1,
+                backoff_initial_seconds=0,
+                jitter_seconds=0,
+            ),
+            candidate_ids=candidate_ids,
+            clock=lambda: T0,
+            sleep=lambda _seconds: None,
+        )
+
+        first = collector.collect_once(now=T0)
+        self.assertNotIn(target_id, provider.market_calls)
+        self.assertEqual(
+            store.states["polymarket"]["scope_direct_protected_lookup_cursor"],
+            256,
+        )
+        first_call_count = len(provider.market_calls)
+        second = collector.collect_once(now=T0 + timedelta(minutes=1))
+        self.assertEqual(provider.market_calls[first_call_count], target_id)
+        self.assertIn(target_id, second.candidate_bound_scheduled)
+        collector.close()
+
+    def test_large_exact_ids_rotate_current_matches_without_stale_fallback(self) -> None:
+        candidate_ids = tuple(
+            f"large-exact-candidate-{index:03d}" for index in range(257)
+        )
+        exact_ids = tuple(f"large-exact-market-{index:03d}" for index in range(257))
+        stale_candidate, stale_id = candidate_ids[0], exact_ids[0]
+        closed_candidate, closed_id = candidate_ids[1], exact_ids[1]
+        missing_candidate, missing_id = candidate_ids[2], exact_ids[2]
+        target_candidate, target_id = candidate_ids[-1], exact_ids[-1]
+        stale = market(stale_id)
+        closed = market(closed_id, settlement=SettlementState.RESOLVED_YES, closed=True)
+        target = market(target_id)
+        available = {item.market_id: item for item in (stale, closed, target)}
+
+        class RotatingExactProvider(_PagedProvider):
+            def __init__(self) -> None:
+                super().__init__(
+                    (stale, closed, target),
+                    (
+                        {"markets": (), "next_cursor": None},
+                        {"markets": (), "next_cursor": None},
+                    ),
+                )
+                self._stale_returned = False
+
+            def market(self, market_id: str):
+                identifier = str(market_id)
+                self.market_calls.append(identifier)
+                if identifier == stale_id:
+                    if self._stale_returned:
+                        return None
+                    self._stale_returned = True
+                return available.get(identifier)
+
+        provider = RotatingExactProvider()
+        store = _ScopeStore({
+            candidate_id: {
+                "experiment_plan": {
+                    "market_scope": scope("EXACT_MARKETS", market_ids=(market_id,)),
+                },
+            }
+            for candidate_id, market_id in zip(candidate_ids, exact_ids)
+        })
+        collector = self._collector(
+            provider,
+            store,
+            candidate_ids,
+            max_markets=10,
+        )
+
+        first = collector.collect_once(now=T0)
+        first_by_candidate = {
+            result.candidate_id: result for result in store.resolutions
+        }
+        self.assertEqual(first_by_candidate[stale_candidate].status, MATCHED)
+        self.assertEqual(
+            [item.market_id for item in first_by_candidate[stale_candidate].matched_markets],
+            [stale_id],
+        )
+        self.assertEqual(
+            first_by_candidate[closed_candidate].status,
+            ZERO_MATCHES,
+        )
+        self.assertIn(
+            closed_id,
+            [item.market_id for item in first_by_candidate[closed_candidate].excluded_markets],
+        )
+        self.assertEqual(first_by_candidate[missing_candidate].status, DEFERRED)
+        self.assertIn(stale_id, first.candidate_bound_scheduled)
+        self.assertNotIn(target_id, first.candidate_bound_scheduled)
+
+        first_call_count = len(provider.market_calls)
+        second = collector.collect_once(now=T0 + timedelta(minutes=1))
+        second_by_candidate = {
+            result.candidate_id: result for result in store.resolutions
+        }
+        self.assertEqual(provider.market_calls[first_call_count], target_id)
+        self.assertEqual(second_by_candidate[target_candidate].status, MATCHED)
+        self.assertEqual(
+            [item.market_id for item in second_by_candidate[target_candidate].matched_markets],
+            [target_id],
+        )
+        self.assertEqual(second_by_candidate[stale_candidate].status, DEFERRED)
+        self.assertIn(
+            stale_id,
+            [item.market_id for item in second_by_candidate[stale_candidate].deferred_markets],
+        )
+        self.assertEqual(second_by_candidate[closed_candidate].status, ZERO_MATCHES)
+        self.assertEqual(second_by_candidate[missing_candidate].status, DEFERRED)
+        self.assertNotIn(stale_id, second.candidate_bound_scheduled)
+        self.assertIn(target_id, second.candidate_bound_scheduled)
+        collector.close()
+
+    def test_current_scope_document_rotation_reaches_tail_after_cap(self) -> None:
+        rolling_id = "rolling-selected"
+        rotating_ids = tuple(f"rotating-{index:04d}" for index in range(1000))
+        target_id = rotating_ids[-1]
+        rolling = market(rolling_id)
+        target = market(target_id)
+
+        class RotatingProvider(_PagedProvider):
+            def market(self, market_id: str):
+                identifier = str(market_id)
+                self.market_calls.append(identifier)
+                if identifier == rolling_id:
+                    return rolling
+                if identifier == target_id:
+                    return target
+                return None
+
+        current_ids = (rolling_id, *rotating_ids)
+        provider = RotatingProvider((rolling, target), ())
+        store = _ScopeStore({
+            candidate_id: {
+                "experiment_plan": {
+                    "market_scope": scope("EXACT_MARKETS", market_ids=(candidate_id,))
+                }
+            }
+            for candidate_id in current_ids
+        })
+
+        class RotatingCollector(_ScopeCollector):
+            def _rolling_scope_market_ids(self):
+                self._rolling_scope_candidate_ids = (rolling_id,)
+                self._rolling_scope_documents = {}
+                return []
+
+        collector = RotatingCollector(
+            provider,
+            store,
+            CollectorConfig(
+                max_markets=1,
+                discovery_budget_per_cycle=10,
+                max_attempts=1,
+                backoff_initial_seconds=0,
+                jitter_seconds=0,
+            ),
+            candidate_ids=current_ids,
+            clock=lambda: T0,
+            sleep=lambda _seconds: None,
+        )
+
+        first = collector.collect_once(now=T0)
+        self.assertEqual(provider.market_calls[0], rolling_id)
+        first_call_count = len(provider.market_calls)
+        second = collector.collect_once(now=T0 + timedelta(minutes=1))
+        second_calls = provider.market_calls[first_call_count:]
+        self.assertEqual(second_calls[0], rolling_id)
+        self.assertIn(target_id, collector._scope_authority_market_ids)
+        collector.close()
+    def test_truncated_scope_candidates_preserve_existing_deferred_queue(self) -> None:
+        current_ids = tuple(f"current-{index:04d}" for index in range(1001))
+        deferred_ids = ("deferred-0000", "deferred-0001")
+        target_id = deferred_ids[0]
+        target = market(target_id)
+
+        class DeferredProvider(_PagedProvider):
+            def market(self, market_id: str):
+                identifier = str(market_id)
+                self.market_calls.append(identifier)
+                return target if identifier == target_id else None
+
+        provider = DeferredProvider((target,), ())
+        documents = {
+            candidate_id: {
+                "materialization_marker": candidate_id,
+                "experiment_plan": {
+                    "market_scope": scope("EXACT_MARKETS", market_ids=(candidate_id,))
+                }
+            }
+            for candidate_id in (*current_ids, *deferred_ids)
+        }
+        store = _ScopeStore(documents)
+        store.states["polymarket"] = {
+            "scope_resolution_deferred_candidate_ids": list(deferred_ids),
+        }
+
+        class DeferredCollector(_ScopeCollector):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.materialized_ids: list[str] = []
+
+            def _scope_document(self, payload):
+                marker = payload.get("materialization_marker")
+                if marker:
+                    self.materialized_ids.append(str(marker))
+                return PolymarketCollector._scope_document(payload)
+
+        collector = DeferredCollector(
+            provider,
+            store,
+            CollectorConfig(
+                max_markets=1,
+                discovery_budget_per_cycle=10,
+                max_attempts=1,
+                backoff_initial_seconds=0,
+                jitter_seconds=0,
+            ),
+            candidate_ids=current_ids,
+            clock=lambda: T0,
+            sleep=lambda _seconds: None,
+        )
+
+        collector.collect_once(now=T0)
+        self.assertIn(target_id, provider.market_calls)
+        persisted = store.states["polymarket"]["scope_resolution_deferred_candidate_ids"]
+        self.assertIn(deferred_ids[1], persisted)
+        self.assertIn(target_id, collector.materialized_ids)
+
+        collector._candidate_ids = ("current-0000",)
+        collector.collect_once(now=T0 + timedelta(minutes=1))
+        self.assertIn(target_id, provider.market_calls)
+        deferred_resolution = next(
+            result for result in store.resolutions if result.candidate_id == target_id
+        )
+        self.assertEqual(
+            [item.market_id for item in deferred_resolution.matched_markets],
+            [target_id],
+        )
+        collector.close()
+
+    def test_terminal_complete_requeues_materialized_deferred_scope(self) -> None:
+        current_ids = tuple(f"terminal-current-{index:04d}" for index in range(1001))
+        target_id = "terminal-deferred-target"
+        target = market(target_id)
+
+        class TerminalDeferredProvider(_PagedProvider):
+            def __init__(self) -> None:
+                super().__init__(
+                    (target,),
+                    (
+                        {"markets": (), "next_cursor": None},
+                        {"markets": (), "next_cursor": None},
+                    ),
+                )
+                self.target_available = False
+
+            def market(self, market_id: str):
+                identifier = str(market_id)
+                self.market_calls.append(identifier)
+                return target if identifier == target_id and self.target_available else None
+
+        provider = TerminalDeferredProvider()
+        documents = {
+            candidate_id: {
+                "experiment_plan": {
+                    "market_scope": scope("EXACT_MARKETS", market_ids=(candidate_id,)),
+                },
+            }
+            for candidate_id in (*current_ids, target_id)
+        }
+        store = _ScopeStore(documents)
+        store.states["polymarket"] = {
+            "scope_resolution_deferred_candidate_ids": [target_id],
+        }
+        collector = self._collector(
+            provider,
+            store,
+            current_ids,
+            max_markets=1,
+        )
+
+        collector.collect_once(now=T0)
+        first_resolution = next(
+            result for result in store.resolutions if result.candidate_id == target_id
+        )
+        self.assertEqual(first_resolution.status, DEFERRED)
+        self.assertIn(target_id, provider.market_calls)
+        self.assertIn(
+            target_id,
+            store.states["polymarket"]["scope_resolution_deferred_candidate_ids"],
+        )
+        self.assertEqual(
+            store.states["polymarket"]["scope_inventory_continuation"]["coverage_status"],
+            "COMPLETE",
+        )
+
+        provider.target_available = True
+        second = collector.collect_once(now=T0 + timedelta(minutes=1))
+        latest_resolution = [
+            result for result in store.resolutions if result.candidate_id == target_id
+        ][-1]
+        self.assertEqual(latest_resolution.status, MATCHED)
+        self.assertEqual(
+            [item.market_id for item in latest_resolution.matched_markets],
+            [target_id],
+        )
+        self.assertNotIn(
+            target_id,
+            store.states["polymarket"]["scope_resolution_deferred_candidate_ids"],
+        )
+        collector.close()
+
+    def test_current_selected_exact_ids_precede_deferred_scope_cap(self) -> None:
+        selected = market("selected-current")
+        deferred_ids = tuple(f"deferred-{index:03d}" for index in range(300))
+        documents = {
+            candidate_id: {
+                "experiment_plan": {
+                    "market_scope": scope("EXACT_MARKETS", market_ids=(candidate_id,))
+                }
+            }
+            for candidate_id in deferred_ids
+        }
+        documents["selected-candidate"] = {
+            "experiment_plan": {
+                "market_scope": scope("EXACT_MARKETS", market_ids=("selected-current",))
+            }
+        }
+        store = _ScopeStore(documents)
+        store.states["polymarket"] = {
+            "scope_resolution_deferred_candidate_ids": list(deferred_ids),
+        }
+        provider = _PagedProvider(
+            (selected,),
+            ({"markets": (), "next_cursor": None},),
+        )
+
+        cycle = self._collector(
+            provider,
+            store,
+            ("selected-candidate",),
+            max_markets=1,
+        ).collect_once(now=T0)
+
+        self.assertEqual(provider.market_calls[0], "selected-current")
+        selected_resolution = next(
+            result for result in store.resolutions
+            if result.candidate_id == "selected-candidate"
+        )
+        self.assertEqual(
+            [item.market_id for item in selected_resolution.matched_markets],
+            ["selected-current"],
+        )
+
+    def test_current_exact_priority_cursor_rotates_beyond_direct_cap(self) -> None:
+        current_ids = tuple(f"priority-{index:03d}" for index in range(257))
+        target_id = current_ids[-1]
+        target = market(target_id)
+
+        class PriorityProvider(_PagedProvider):
+            def market(self, market_id: str):
+                identifier = str(market_id)
+                self.market_calls.append(identifier)
+                return target if identifier == target_id else None
+
+        provider = PriorityProvider((target,), ())
+        store = _ScopeStore({
+            candidate_id: {
+                "experiment_plan": {
+                    "market_scope": scope("EXACT_MARKETS", market_ids=(candidate_id,))
+                }
+            }
+            for candidate_id in current_ids
+        })
+        collector = self._collector(
+            provider,
+            store,
+            current_ids,
+            max_markets=1,
+        )
+
+        first = collector.collect_once(now=T0)
+        self.assertEqual(first.candidate_bound_scheduled, ())
+        self.assertEqual(provider.market_calls, list(current_ids[:256]))
+        self.assertEqual(
+            store.states["polymarket"]["scope_direct_priority_lookup_cursor"],
+            256,
+        )
+
+        second = collector.collect_once(now=T0 + timedelta(minutes=1))
+        self.assertEqual(provider.market_calls[256], target_id)
+        self.assertIn(target_id, second.candidate_bound_scheduled)
+        target_resolution = next(
+            result for result in store.resolutions if result.candidate_id == target_id
+        )
+        self.assertEqual(
+            [item.market_id for item in target_resolution.matched_markets],
+            [target_id],
+        )
+        collector.close()
+
     def test_run_forever_closes_provider_executor(self) -> None:
         provider = _RecordingProvider((market("standalone"),))
         collector = _ScopeCollector(

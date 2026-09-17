@@ -95,12 +95,15 @@ class _BoundedProviderExecutor:
         self._lock = threading.Lock()
         self._threads: list[threading.Thread] = []
         for index in range(workers):
+            ready = threading.Event()
             thread = threading.Thread(
                 target=self._run,
+                args=(ready,),
                 name=f"axiom-provider-{index}",
                 daemon=True,
             )
             thread.start()
+            ready.wait(timeout=0.5)
             self._threads.append(thread)
 
     def submit(self, operation: Callable[[], Any]) -> Future[Any]:
@@ -145,8 +148,9 @@ class _BoundedProviderExecutor:
                 continue
             remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
             thread.join(timeout=remaining)
-
-    def _run(self) -> None:
+    def _run(self, ready: threading.Event | None = None) -> None:
+        if ready is not None:
+            ready.set()
         while True:
             item = self._queue.get()
             try:
@@ -453,8 +457,10 @@ class PolymarketCollector:
         self._scope_authority_market_ids: set[str] = set()
 
         self._scope_direct_lookup_cursor = 0
-        # Provider windows are allocated once per cycle, including when a
-        # bounded test collector supplies its own remaining-time clock.
+        self._scope_direct_priority_lookup_cursor = 0
+        self._scope_direct_protected_lookup_cursor = 0
+        self._scope_resolution_candidate_cursor = 0
+        self._scope_resolution_deferred_cursor = 0
         self._scope_inventory_budget_remaining: float | None = None
         self._scope_direct_budget_remaining: float | None = None
 
@@ -473,9 +479,11 @@ class PolymarketCollector:
         self._provider_executor_lock = threading.Lock()
         self._provider_executor: _BoundedProviderExecutor | None = None
         self._scope_provider_executor: _BoundedProviderExecutor | None = None
-        # Exact selected ids are resolver authority, so their direct probes
-        # must not queue behind a broad inventory or suitability request.
+        # Exact selected ids use a provider clone as well as a separate
+        # executor.  A provider may carry a session/throttle lock that a
+        # broad inventory request can hold until its transport deadline.
         self._scope_direct_provider_executor: _BoundedProviderExecutor | None = None
+        self._scope_direct_provider: Any | None = None
         self._collection_provider_executor: _BoundedProviderExecutor | None = None
         self._active_provider_calls: set[tuple[int, str]] = set()
         self._provider_call_pools: dict[tuple[int, str], str] = {}
@@ -507,6 +515,14 @@ class PolymarketCollector:
                     executors.append(executor)
         for executor in executors:
             executor.shutdown()
+        direct_provider = self._scope_direct_provider
+        if direct_provider is not None and direct_provider is not self.provider:
+            close = getattr(direct_provider, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
     def _set_current_stage(
         self,
         stage: str,
@@ -613,6 +629,16 @@ class PolymarketCollector:
             else None
         )
         self._scope_direct_lookup_cursor = self._scope_direct_cursor(root_state)
+        self._scope_direct_priority_lookup_cursor = self._scope_direct_priority_cursor(root_state)
+        self._scope_direct_protected_lookup_cursor = self._scope_direct_protected_cursor(root_state)
+        self._scope_resolution_candidate_cursor = self._scope_resolution_candidate_cursor_value(root_state)
+        try:
+            self._scope_resolution_deferred_cursor = max(
+                0,
+                int(root_state.get("scope_resolution_deferred_cursor", 0)),
+            )
+        except (TypeError, ValueError, OverflowError):
+            self._scope_resolution_deferred_cursor = 0
 
         self._discovery_continuation = (
             root_state.get("discovery_continuation")
@@ -1323,6 +1349,22 @@ class PolymarketCollector:
                     _MAX_SCOPE_INVENTORY,
                     int(self._scope_direct_lookup_cursor),
                 )),
+                "scope_direct_priority_lookup_cursor": max(
+                    0,
+                    int(self._scope_direct_priority_lookup_cursor),
+                ),
+                "scope_direct_protected_lookup_cursor": max(
+                    0,
+                    int(self._scope_direct_protected_lookup_cursor),
+                ),
+                "scope_resolution_candidate_cursor": max(
+                    0,
+                    int(self._scope_resolution_candidate_cursor),
+                ),
+                "scope_resolution_deferred_cursor": max(
+                    0,
+                    int(self._scope_resolution_deferred_cursor),
+                ),
 
                 "scope_resolution_deferred_candidate_ids": list(
                     self._scope_resolution_deferred_candidate_ids
@@ -1921,6 +1963,39 @@ class PolymarketCollector:
         except Exception:
             return []
         return providers if len(providers) >= 2 else []
+    def _scope_direct_lookup_provider(self) -> Any:
+        """Return one bounded provider clone for exact-scope requests.
+
+        The broad scope pool and exact pool intentionally have separate
+        executors, but that is not sufficient for providers whose request
+        session or throttle is serialized internally.  Reuse the established
+        provider factory when available; otherwise preserve the provider's
+        existing single-instance behavior.
+        """
+        if self._scope_direct_provider is not None:
+            return self._scope_direct_provider
+        factory = getattr(self.provider, "isolated_worker_factory", None)
+        if callable(factory):
+            try:
+                worker = factory()
+                if callable(worker) and not isinstance(worker, PredictionMarketDataProvider):
+                    worker = worker()
+                if worker is not None and worker is not self.provider:
+                    self._scope_direct_provider = worker
+                    return worker
+            except Exception:
+                pass
+        return self.provider
+
+    def _scope_provider_pool(self, provider: Any) -> str | None:
+        """Use the isolated exact pool for calls on its provider clone."""
+        if (
+            self._scope_direct_provider is not None
+            and provider is self._scope_direct_provider
+        ):
+            return "scope_direct"
+        return None
+
 
     def _resolve_market_scopes(
         self,
@@ -1955,18 +2030,95 @@ class PolymarketCollector:
 
         documents: list[tuple[str, Mapping[str, Any]]] = []
         scope_candidate_ids: list[str] = []
+        truncated_scope_candidate_ids: list[str] = []
         deferred_candidates = [
             str(item).strip()
             for item in root_state.get("scope_resolution_deferred_candidate_ids", ())
             if str(item).strip()
         ]
-        candidate_order = list(dict.fromkeys([
-            *deferred_candidates,
-            *(
-                str(item).strip()
-                for item in candidate_ids
-                if str(item).strip()
+        current_candidate_ids = list(dict.fromkeys(
+            str(item).strip()
+            for item in candidate_ids
+            if str(item).strip()
+        ))
+        current_rolling_ids = {
+            str(item).strip()
+            for item in getattr(self, "_rolling_scope_candidate_ids", ())
+            if str(item).strip()
+        }
+        protected_current_ids = [
+            candidate_id
+            for candidate_id in current_candidate_ids
+            if candidate_id in current_rolling_ids
+        ]
+        rotating_current_ids = [
+            candidate_id
+            for candidate_id in current_candidate_ids
+            if candidate_id not in current_rolling_ids
+        ]
+        try:
+            candidate_cursor = int(self._scope_resolution_candidate_cursor)
+        except (TypeError, ValueError, OverflowError):
+            candidate_cursor = 0
+        candidate_cursor %= len(rotating_current_ids) if rotating_current_ids else 1
+        rotated_current_ids = (
+            rotating_current_ids[candidate_cursor:]
+            + rotating_current_ids[:candidate_cursor]
+        )
+        try:
+            deferred_cursor = int(self._scope_resolution_deferred_cursor)
+        except (TypeError, ValueError, OverflowError):
+            deferred_cursor = 0
+        deferred_cursor %= len(deferred_candidates) if deferred_candidates else 1
+        rotated_deferred_candidates = (
+            deferred_candidates[deferred_cursor:]
+            + deferred_candidates[:deferred_cursor]
+        )
+        deferred_candidate_set = set(deferred_candidates)
+        current_candidate_set = set(current_candidate_ids)
+        deferred_reserve_id = next(
+            (
+                candidate_id
+                for candidate_id in rotated_deferred_candidates
+                if candidate_id not in current_candidate_set
             ),
+            rotated_deferred_candidates[0] if rotated_deferred_candidates else None,
+        )
+        ordered_deferred_candidates = (
+            [deferred_reserve_id]
+            + [
+                candidate_id
+                for candidate_id in rotated_deferred_candidates
+                if candidate_id != deferred_reserve_id
+            ]
+            if deferred_reserve_id is not None
+            else []
+        )
+        # Reserve one resolver-document slot for persisted deferred work when
+        # noncritical current rotation could otherwise fill the cap forever.
+        reserve_deferred = (
+            1
+            if ordered_deferred_candidates
+            and len(protected_current_ids) < _MAX_SCOPE_RESOLUTION_CANDIDATES
+            else 0
+        )
+        rotating_capacity = max(
+            0,
+            _MAX_SCOPE_RESOLUTION_CANDIDATES
+            - len(protected_current_ids)
+            - reserve_deferred,
+        )
+        rotating_prefix_count = min(len(rotated_current_ids), rotating_capacity)
+        materialized_rotating_ids: set[str] = set()
+        materialized_deferred_ids: set[str] = set()
+        # Protected rolling selections remain first.  One persisted deferred
+        # candidate is admitted before the remainder of current rotation.
+        candidate_order = list(dict.fromkeys([
+            *protected_current_ids,
+            *rotated_current_ids[:rotating_prefix_count],
+            *ordered_deferred_candidates[:reserve_deferred],
+            *rotated_current_ids[rotating_prefix_count:],
+            *ordered_deferred_candidates[reserve_deferred:],
         ]))
         for candidate_id in candidate_order:
             try:
@@ -2002,6 +2154,29 @@ class PolymarketCollector:
                 scope_candidate_ids.append(candidate_id)
                 if len(documents) < _MAX_SCOPE_RESOLUTION_CANDIDATES:
                     documents.append((candidate_id, self._scope_document(payload)))
+                    if candidate_id in rotating_current_ids:
+                        materialized_rotating_ids.add(candidate_id)
+                    if (
+                        candidate_id in deferred_candidate_set
+                        and candidate_id not in current_candidate_set
+                    ):
+                        materialized_deferred_ids.add(candidate_id)
+                else:
+                    truncated_scope_candidate_ids.append(candidate_id)
+        materialized_rotating_count = len(materialized_rotating_ids)
+        self._scope_resolution_candidate_cursor = (
+            candidate_cursor + materialized_rotating_count
+        ) % len(rotating_current_ids) if rotating_current_ids else 0
+        materialized_deferred_count = len(materialized_deferred_ids)
+        self._scope_resolution_deferred_cursor = (
+            deferred_cursor + materialized_deferred_count
+        ) % len(deferred_candidates) if deferred_candidates else 0
+        materialized_candidate_ids = {candidate_id for candidate_id, _ in documents}
+        unmaterialized_deferred_candidates = [
+            candidate_id
+            for candidate_id in deferred_candidates
+            if candidate_id not in materialized_candidate_ids
+        ]
         self._scope_authority_market_ids = set(
             list(dict.fromkeys(
                 market_id
@@ -2017,6 +2192,11 @@ class PolymarketCollector:
             # legacy collection authority or silently schedule its ids.
             return scope_candidate_ids, {}, {}, self._scope_cursor(root_state)
 
+        exact_ids = list(dict.fromkeys(
+            market_id
+            for _, document in documents
+            for market_id in self._scope_exact_market_ids((document,))
+        ))[:_MAX_SCOPE_INVENTORY]
         carry_cursor = self._scope_cursor(root_state)
         needs_inventory = any(
             self._scope_document_needs_inventory(document)
@@ -2030,6 +2210,12 @@ class PolymarketCollector:
                 carry_cursor=carry_cursor,
                 documents=tuple(document for _, document in documents),
             )
+            self._scope_resolution_deferred_candidate_ids = tuple(
+                dict.fromkeys([
+                    *unmaterialized_deferred_candidates,
+                    *truncated_scope_candidate_ids,
+                ])
+            )[:_MAX_SCOPE_RESOLUTION_CANDIDATES]
             if (
                 isinstance(self._scope_inventory_continuation, Mapping)
                 and self._scope_inventory_continuation.get("query_reset")
@@ -2041,36 +2227,139 @@ class PolymarketCollector:
         else:
             current_records, snapshots, next_cursor = [], {}, carry_cursor
 
-        exact_ids = list(dict.fromkeys(
-            market_id
-            for _, document in documents
-            for market_id in self._scope_exact_market_ids((document,))
-        ))[:_MAX_SCOPE_INVENTORY]
         direct_attempted_ids: set[str] = set()
         direct_snapshots: dict[str, PredictionMarketSnapshot] = {}
-
-
 
         known_inventory_ids = {
             str(market_id).strip()
             for market_id in snapshots
             if str(market_id).strip()
         }
-        missing_exact_ids = [
-            market_id for market_id in exact_ids if market_id not in known_inventory_ids
+        priority_candidates = {
+            str(item).strip()
+            for item in candidate_ids
+            if str(item).strip()
+        }
+        priority_exact_ids = list(dict.fromkeys(
+            market_id
+            for candidate_id, document in documents
+            if candidate_id in priority_candidates
+            for market_id in self._scope_exact_market_ids((document,))
+        ))
+        priority_exact_id_set = set(priority_exact_ids)
+        protected_priority_exact_ids = list(dict.fromkeys(
+            market_id
+            for candidate_id, document in documents
+            if candidate_id in current_rolling_ids
+            for market_id in self._scope_exact_market_ids((document,))
+        ))
+        protected_priority_exact_id_set = set(protected_priority_exact_ids)
+        rotating_priority_exact_ids = [
+            market_id
+            for market_id in priority_exact_ids
+            if market_id not in protected_priority_exact_id_set
         ]
-        direct_fetcher = getattr(self.provider, "market", None)
+        documents_by_candidate = {
+            candidate_id: document
+            for candidate_id, document in documents
+        }
+        deferred_exact_ids = list(dict.fromkeys(
+            market_id
+            for candidate_id in ordered_deferred_candidates
+            for document in (documents_by_candidate.get(candidate_id),)
+            if isinstance(document, Mapping)
+            for market_id in self._scope_exact_market_ids((document,))
+            if market_id not in priority_exact_id_set
+        ))
+        deferred_exact_ids.extend(
+            market_id
+            for market_id in exact_ids
+            if market_id not in priority_exact_id_set
+            and market_id not in deferred_exact_ids
+        )
+        missing_protected_priority_ids = [
+            market_id
+            for market_id in protected_priority_exact_ids
+            if market_id not in known_inventory_ids
+        ]
+        missing_priority_ids = [
+            market_id
+            for market_id in rotating_priority_exact_ids
+            if market_id not in known_inventory_ids
+        ]
+        missing_deferred_ids = [
+            market_id
+            for market_id in deferred_exact_ids
+            if market_id not in known_inventory_ids
+        ]
+        missing_exact_ids = [
+            *missing_protected_priority_ids,
+            *missing_priority_ids,
+            *missing_deferred_ids,
+        ]
+        direct_provider = self.provider
+        direct_fetcher = getattr(direct_provider, "market", None)
+        if missing_exact_ids:
+            direct_provider = self._scope_direct_lookup_provider()
+            direct_fetcher = getattr(direct_provider, "market", None)
         if missing_exact_ids and callable(direct_fetcher):
             try:
                 direct_cursor = int(self._scope_direct_lookup_cursor)
             except (TypeError, ValueError):
                 direct_cursor = 0
-            direct_cursor %= len(missing_exact_ids)
-            direct_ids = [
-                missing_exact_ids[(direct_cursor + offset) % len(missing_exact_ids)]
-                for offset in range(min(_MAX_SCOPE_DIRECT_LOOKUPS, len(missing_exact_ids)))
-            ]
+            try:
+                priority_cursor = int(self._scope_direct_priority_lookup_cursor)
+            except (TypeError, ValueError):
+                priority_cursor = 0
+            try:
+                protected_cursor = int(self._scope_direct_protected_lookup_cursor)
+            except (TypeError, ValueError):
+                protected_cursor = 0
+            priority_cursor %= len(missing_priority_ids) if missing_priority_ids else 1
+            protected_cursor %= (
+                len(missing_protected_priority_ids)
+                if missing_protected_priority_ids
+                else 1
+            )
+            direct_cursor %= len(missing_deferred_ids) if missing_deferred_ids else 1
+            protected_priority_ids = [
+                missing_protected_priority_ids[
+                    (protected_cursor + offset) % len(missing_protected_priority_ids)
+                ]
+                for offset in range(
+                    min(_MAX_SCOPE_DIRECT_LOOKUPS, len(missing_protected_priority_ids))
+                )
+            ] if missing_protected_priority_ids else []
+            remaining_direct = max(0, _MAX_SCOPE_DIRECT_LOOKUPS - len(protected_priority_ids))
+            deferred_reserve = 1 if missing_deferred_ids and remaining_direct else 0
+            priority_ids = [
+                missing_priority_ids[(priority_cursor + offset) % len(missing_priority_ids)]
+                for offset in range(
+                    min(
+                        max(0, remaining_direct - deferred_reserve),
+                        len(missing_priority_ids),
+                    )
+                )
+            ] if missing_priority_ids else []
+            remaining_direct = max(
+                0,
+                _MAX_SCOPE_DIRECT_LOOKUPS
+                - len(protected_priority_ids)
+                - len(priority_ids),
+            )
+            deferred_ids = [
+                missing_deferred_ids[(direct_cursor + offset) % len(missing_deferred_ids)]
+                for offset in range(
+                    min(remaining_direct, len(missing_deferred_ids))
+                )
+            ] if missing_deferred_ids else []
+            direct_ids = [*protected_priority_ids, *priority_ids, *deferred_ids]
             attempted_direct = 0
+            attempted_protected = 0
+            attempted_priority = 0
+            attempted_deferred = 0
+            priority_id_set = set(missing_priority_ids)
+            protected_priority_id_set = set(protected_priority_ids)
             for market_id in direct_ids:
                 if (
                     self._cycle_remaining_seconds() is not None
@@ -2079,6 +2368,12 @@ class PolymarketCollector:
                     self._mark_cycle_exhaustion("scope_exact_lookup")
                     break
                 direct_attempted_ids.add(market_id)
+                if market_id in protected_priority_id_set:
+                    attempted_protected += 1
+                elif market_id in priority_id_set:
+                    attempted_priority += 1
+                else:
+                    attempted_deferred += 1
                 attempted_direct += 1
 
                 try:
@@ -2087,7 +2382,7 @@ class PolymarketCollector:
                         lambda identifier=market_id: direct_fetcher(identifier),
                         observed_at,
                         counters,
-                        provider=self.provider,
+                        provider=direct_provider,
                         market_id=market_id,
                         pool_name="scope_direct",
                     )
@@ -2124,16 +2419,24 @@ class PolymarketCollector:
                 )
             ]
             direct_records = [
-                self._scope_market_record(snapshot, observed_at, self.provider)
+                self._scope_market_record(snapshot, observed_at, direct_provider)
                 for snapshot in direct_snapshots.values()
             ]
             current_records = [*direct_records, *carried_records]
 
 
+            self._scope_direct_protected_lookup_cursor = (
+                protected_cursor + attempted_protected
+            ) % len(missing_protected_priority_ids) if missing_protected_priority_ids else 0
+            self._scope_direct_priority_lookup_cursor = (
+                priority_cursor + attempted_priority
+            ) % len(missing_priority_ids) if missing_priority_ids else 0
             self._scope_direct_lookup_cursor = (
-                direct_cursor + attempted_direct
-            ) % len(missing_exact_ids)
+                direct_cursor + attempted_deferred
+            ) % len(missing_deferred_ids) if missing_deferred_ids else 0
         elif not missing_exact_ids:
+            self._scope_direct_protected_lookup_cursor = 0
+            self._scope_direct_priority_lookup_cursor = 0
             self._scope_direct_lookup_cursor = 0
 
         coverage = (
@@ -2175,6 +2478,11 @@ class PolymarketCollector:
                 and str(getattr(policy, "mode", "")).upper() == "EXACT_MARKETS"
             )
             suitability_configured = self._suitability_is_configured(document)
+            suitability_provider = (
+                self._scope_direct_lookup_provider()
+                if exact_scope
+                else self.provider
+            )
             kwargs = self._suitability_kwargs(document) if suitability_configured else {}
 
             direct_exact_scope = exact_scope and bool(
@@ -2190,6 +2498,7 @@ class PolymarketCollector:
                 # A page-local match is not authority without a current
                 # selected-token suitability proof.  Exact ids are resolved
                 # early only after their bounded direct lookup has run.
+                deferred_resolution_ids.append(candidate_id)
                 continue
 
 
@@ -2271,7 +2580,7 @@ class PolymarketCollector:
                         if snapshot is not None:
                             snapshot = self._refresh_scope_snapshot(
                                 snapshot,
-                                self.provider,
+                                suitability_provider,
                                 observed_at,
                                 counters,
                             )
@@ -2300,12 +2609,12 @@ class PolymarketCollector:
                     assessment = self._cached_scope_suitability_assessment(
                         snapshot,
                         observed_at,
-                        self.provider,
+                        suitability_provider,
                         counters=counters,
                         **kwargs,
                     )
                     self._suitable_market_evidence.append(dict(assessment))
-                    refreshed = dict(self._scope_market_record(snapshot, observed_at, self.provider))
+                    refreshed = dict(self._scope_market_record(snapshot, observed_at, suitability_provider))
                     refreshed["suitability_evidence"] = dict(assessment)
                     refreshed["suitable_market"] = assessment.get("action") == "SUITABLE"
                     refreshed_records.append(refreshed)
@@ -2373,12 +2682,35 @@ class PolymarketCollector:
                     candidate_id, observed_at, "market_scope_persistence", str(exc)
                 )
                 continue
+            # A persisted resolution with unresolved current-market
+            # evidence must remain in the bounded deferred queue.  This
+            # applies even when inventory itself is terminal COMPLETE:
+            # direct lookup windows can only verify a subset per cycle.
+            if getattr(result, "deferred_markets", ()):
+                deferred_resolution_ids.append(candidate_id)
             matched = self._scope_result_market_ids(result)
             candidate_markets[candidate_id] = matched
             proof = result.as_dict() if hasattr(result, "as_dict") and callable(result.as_dict) else result
             if isinstance(proof, Mapping):
                 self._scope_resolutions[candidate_id] = proof
-        self._scope_resolution_deferred_candidate_ids = tuple(deferred_resolution_ids)
+        deferred_priority_resolution_ids = [
+            candidate_id
+            for candidate_id in deferred_resolution_ids
+            if candidate_id in deferred_candidate_set
+        ]
+        other_resolution_ids = [
+            candidate_id
+            for candidate_id in deferred_resolution_ids
+            if candidate_id not in deferred_candidate_set
+        ]
+        self._scope_resolution_deferred_candidate_ids = tuple(
+            dict.fromkeys([
+                *unmaterialized_deferred_candidates,
+                *deferred_priority_resolution_ids,
+                *other_resolution_ids,
+                *truncated_scope_candidate_ids,
+            ])
+        )[:_MAX_SCOPE_RESOLUTION_CANDIDATES]
         return scope_candidates, candidate_markets, snapshots, next_cursor
 
     @staticmethod
@@ -2406,7 +2738,33 @@ class PolymarketCollector:
             return 0
         return max(0, min(_MAX_SCOPE_INVENTORY, cursor))
 
+    @staticmethod
+    def _scope_direct_priority_cursor(root_state: Mapping[str, Any]) -> int:
+        value = root_state.get("scope_direct_priority_lookup_cursor", 0)
+        try:
+            cursor = int(value)
+        except (TypeError, ValueError, OverflowError):
+            return 0
+        return max(0, cursor)
 
+    @staticmethod
+    def _scope_resolution_candidate_cursor_value(root_state: Mapping[str, Any]) -> int:
+        value = root_state.get("scope_resolution_candidate_cursor", 0)
+        try:
+            cursor = int(value)
+        except (TypeError, ValueError, OverflowError):
+            return 0
+        return max(0, cursor)
+
+
+    @staticmethod
+    def _scope_direct_protected_cursor(root_state: Mapping[str, Any]) -> int:
+        value = root_state.get("scope_direct_protected_lookup_cursor", 0)
+        try:
+            cursor = int(value)
+        except (TypeError, ValueError, OverflowError):
+            return 0
+        return max(0, cursor)
     @staticmethod
     def _scope_inventory_records(value: Any) -> list[dict[str, Any]]:
         """Normalize persisted inventory records to the durable inventory cap."""
@@ -2414,6 +2772,7 @@ class PolymarketCollector:
             return []
         records: list[dict[str, Any]] = []
         seen_ids: set[str] = set()
+
         for raw_record in value:
             if not isinstance(raw_record, Mapping):
                 continue
@@ -2687,6 +3046,26 @@ class PolymarketCollector:
                 pass
 
     @staticmethod
+    def _drain_provider_advisories_now(provider: Any) -> None:
+        """Discard bounded stale provider advisories outside collector calls.
+
+        Provider adapters retain validation failures separately from transport
+        failures.  Exact-scope calls may run on an isolated adapter clone, so
+        draining only ``self.provider`` leaves late or malformed clone results
+        queued for the next request.  This helper is called only while the
+        clone has no in-flight operation and never attributes clone errors to
+        the root provider.
+        """
+        for name in ("consume_transport_errors", "consume_validation_errors"):
+            consumer = getattr(provider, name, None)
+            if not callable(consumer):
+                continue
+            try:
+                consumer()
+            except Exception:
+                pass
+
+    @staticmethod
     def _scope_query_without_cursor(query: Mapping[str, Any]) -> dict[str, Any]:
         return {
             str(key): value
@@ -2892,6 +3271,7 @@ class PolymarketCollector:
                 counters,
                 provider=provider,
                 market_id=snapshot.market_id,
+                pool_name=self._scope_provider_pool(provider),
             )
         except _ProviderDeadlineExceeded:
             return None
@@ -2993,6 +3373,19 @@ class PolymarketCollector:
             key=lambda item: (item[4], item[0], item[1])
         )
         suitability_enabled = bool(suitability_specs)
+        exact_market_ids = set(self._scope_exact_market_ids(documents))
+        exact_suitability_provider = (
+            self._scope_direct_lookup_provider()
+            if suitability_enabled and exact_market_ids
+            else provider
+        )
+
+        def suitability_provider_for(market_id: str) -> Any:
+            return (
+                exact_suitability_provider
+                if str(market_id).strip() in exact_market_ids
+                else provider
+            )
         suitability_kwargs: dict[str, Any] = (
             dict(suitability_specs[0][3]) if suitability_specs else {}
         )
@@ -3275,7 +3668,7 @@ class PolymarketCollector:
                     )
                     if market_id in inventory_records_by_id
                 ]
-                exact_ids = set(self._scope_exact_market_ids(documents))
+                exact_ids = exact_market_ids
                 refresh_order = list(dict.fromkeys([
                     *(
                         market_id
@@ -3312,7 +3705,7 @@ class PolymarketCollector:
                     if suitability_enabled and snapshot is not None:
                         snapshot = self._refresh_scope_snapshot(
                             snapshot,
-                            provider,
+                            suitability_provider_for(market_id),
                             observed_at,
                             counters,
                         )
@@ -3603,7 +3996,7 @@ class PolymarketCollector:
                     )
                     if market_id in inventory_records_by_id
                 ]
-                exact_ids = set(self._scope_exact_market_ids(documents))
+                exact_ids = exact_market_ids
                 refresh_order = list(dict.fromkeys([
                     *(
                         market_id
@@ -3649,7 +4042,7 @@ class PolymarketCollector:
                         continue
                     snapshot = self._refresh_scope_snapshot(
                         snapshot,
-                        provider,
+                        suitability_provider_for(market_id),
                         observed_at,
                         counters,
                     )
@@ -3674,13 +4067,17 @@ class PolymarketCollector:
                     assessment = self._cached_scope_suitability_assessment(
                         snapshot,
                         observed_at,
-                        provider,
+                        suitability_provider_for(market_id),
                         counters=counters,
                         **probe_kwargs,
                     )
                     self._suitable_market_evidence.append(dict(assessment))
                     suitability_evidence.append(dict(assessment))
-                    record = dict(self._scope_market_record(snapshot, observed_at, provider))
+                    record = dict(self._scope_market_record(
+                        snapshot,
+                        observed_at,
+                        suitability_provider_for(market_id),
+                    ))
                     record["suitability_evidence"] = dict(assessment)
                     record["suitable_market"] = assessment.get("action") == "SUITABLE"
                     refreshed_snapshots[market_id] = snapshot
@@ -3722,7 +4119,11 @@ class PolymarketCollector:
                     # authorization; page rows can continue on the next tick.
                     break
                 market_id = str(item.market_id).strip()
-                record = dict(self._scope_market_record(item, observed_at, provider))
+                record = dict(self._scope_market_record(
+                    item,
+                    observed_at,
+                    suitability_provider_for(market_id),
+                ))
                 refreshed_snapshots[market_id] = item
                 self._scope_refreshed_snapshots[market_id] = item
                 if suitability_enabled:
@@ -3733,7 +4134,7 @@ class PolymarketCollector:
                     assessment = self._cached_scope_suitability_assessment(
                         item,
                         observed_at,
-                        provider,
+                        suitability_provider_for(market_id),
                         counters=counters,
                         **probe_kwargs,
                     )
@@ -3940,7 +4341,9 @@ class PolymarketCollector:
             if isinstance(item, Mapping)
         ]
         for item in page:
-            record = dict(self._scope_market_record(item, observed_at, provider))
+            market_id = str(item.market_id).strip()
+            suitability_provider = suitability_provider_for(market_id)
+            record = dict(self._scope_market_record(item, observed_at, suitability_provider))
             if suitability_enabled:
                 probe_kwargs = suitability_kwargs_by_market.get(
                     str(item.market_id).strip(),
@@ -3949,7 +4352,7 @@ class PolymarketCollector:
                 assessment = self._cached_scope_suitability_assessment(
                     item,
                     observed_at,
-                    provider,
+                    suitability_provider,
                     counters=counters,
                     **probe_kwargs,
                 )
@@ -4276,6 +4679,7 @@ class PolymarketCollector:
                 observed_at,
                 counters,
                 provider=provider,
+                pool_name=self._scope_provider_pool(provider),
             )
 
         if book is None:
@@ -5669,7 +6073,8 @@ class PolymarketCollector:
                     ) == pool_name
                 )
             ]
-            if len(active_for_provider) >= self.config.max_concurrency:
+            active_limit = 1 if pool_name == "scope_direct" else self.config.max_concurrency
+            if len(active_for_provider) >= active_limit:
                 active_endpoint = active_for_provider[0]
                 existing = self._provider_futures.get((id(provider), active_endpoint))
                 if existing is not None and not existing.done():
@@ -5690,6 +6095,14 @@ class PolymarketCollector:
                         float(self.config.provider_timeout_seconds),
                         in_flight=True,
                     )
+            if pool_name == "scope_direct" and not any(
+                active_provider_id == id(provider)
+                for active_provider_id, _active_endpoint in self._active_provider_calls
+            ):
+                # A timed-out daemon call can finish after its caller leaves
+                # _call_provider.  Clear advisories left by that prior clone
+                # operation before this new exact request starts.
+                self._drain_provider_advisories_now(provider)
             if pool_name == "scope":
                 executor = self._scope_provider_executor
                 if executor is None:
@@ -5698,7 +6111,7 @@ class PolymarketCollector:
             elif pool_name == "scope_direct":
                 executor = self._scope_direct_provider_executor
                 if executor is None:
-                    executor = _BoundedProviderExecutor(self.config.max_concurrency)
+                    executor = _BoundedProviderExecutor(1)
                     self._scope_direct_provider_executor = executor
             else:
                 executor = self._collection_provider_executor
@@ -5860,6 +6273,10 @@ class PolymarketCollector:
                     raise
                 self._release_provider_call(_key)
                 transport_errors = self._consume_transport_errors(provider)
+                if provider_pool == "scope_direct":
+                    # Consume validation/advisory failures generated by this
+                    # completed clone operation; the root provider is untouched.
+                    self._drain_provider_advisories_now(provider)
                 retryable_error = next(
                     (error for error in reversed(transport_errors) if getattr(error, "retryable", False)),
                     None,
@@ -5885,6 +6302,8 @@ class PolymarketCollector:
             except Exception as exc:
                 last_error = exc
                 transport_errors = self._consume_transport_errors(provider)
+                if provider_pool == "scope_direct":
+                    self._drain_provider_advisories_now(provider)
                 counters["rate_limits"] += sum(
                     1 for error in transport_errors if getattr(error, "status", None) == 429
                 )
