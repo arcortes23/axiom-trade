@@ -5,7 +5,14 @@ import tempfile
 import unittest
 
 from axiom.collector import CollectionCycle
-from axiom.domain import OrderBookLevel, OrderBookSnapshot, PredictionMarketSnapshot, SettlementState
+from axiom.domain import (
+    InstrumentMetadata,
+    MarketType,
+    OrderBookLevel,
+    OrderBookSnapshot,
+    PredictionMarketSnapshot,
+    SettlementState,
+)
 from axiom.node import NodeConfig, ResearchNode
 from axiom.storage import AxiomStore
 
@@ -38,9 +45,41 @@ class _HealthProvider:
         self.market_calls += 1
         return (self._market(),)
 
+
     def order_books(self, market_id: str, depth: int = 20):
         self.book_calls += 1
-        return {"yes": self._book()}
+        return {"yes": self._book("yes-token")}
+
+    def metadata(self, market_id: str) -> InstrumentMetadata:
+        return InstrumentMetadata(
+            symbol=market_id,
+            market_type=MarketType.PREDICTION,
+            provider=self.provider_name,
+            market_id=market_id,
+            question="Will the fixture resolve YES?",
+            resolution_criteria="fixture",
+            expiry=T0 + timedelta(days=1),
+            condition_id="health-condition",
+            slug="health-market",
+            provider_timestamp=self.market_timestamp,
+            active=True,
+            closed=False,
+            archived=False,
+            accepting_orders=True,
+            enable_order_book=True,
+            order_book_available=True,
+            min_order_size=0.01,
+            tick_size=0.01,
+            neg_risk=False,
+            extra={
+                "token_ids": {"yes": "yes-token", "no": "no-token"},
+                "rules": {
+                    "min_order_size": "0.01",
+                    "tick_size": "0.01",
+                    "neg_risk": False,
+                },
+            },
+        )
 
     def _market(self) -> PredictionMarketSnapshot:
         return PredictionMarketSnapshot(
@@ -58,13 +97,33 @@ class _HealthProvider:
             expiry=T0 + timedelta(days=1),
             settlement=SettlementState.OPEN,
             resolution_criteria="fixture",
+            source=self.provider_name,
+            yes_token_id="yes-token",
+            no_token_id="no-token",
+            condition_id="health-condition",
+            slug="health-market",
+            provider_timestamp=self.market_timestamp,
+            active=True,
+            order_book=self._book("yes-token"),
+            closed=False,
+            archived=False,
+            accepting_orders=True,
+            enable_order_book=True,
         )
 
-    def _book(self) -> OrderBookSnapshot:
+    def _book(self, token_id: str) -> OrderBookSnapshot:
         return OrderBookSnapshot(
             timestamp=self.book_timestamp,
             bids=(OrderBookLevel(0.40, 10.0),),
             asks=(OrderBookLevel(0.42, 10.0),),
+            token_id=token_id,
+            condition_id="health-condition",
+            provider_timestamp=self.book_timestamp,
+            book_hash=f"{token_id}-book-v1",
+            min_order_size=0.01,
+            tick_size=0.01,
+            neg_risk=False,
+            source=self.provider_name,
         )
 
 
@@ -92,6 +151,7 @@ class ScalabilityHealthTests(unittest.TestCase):
         )
         node._run_opportunity_pipeline()
         return store
+
     def test_callable_opportunity_model_is_invoked_for_scalar_estimate(self) -> None:
         provider = _HealthProvider(T0, T0)
         calls: list[dict[str, object]] = []

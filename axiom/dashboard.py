@@ -29,6 +29,7 @@ from .operator import (
     OperatorControlError,
     OperatorControlPlane,
     _rolling_policy_identity,
+    _safe_value,
     _stored_connectivity_projection,
 )
 
@@ -129,6 +130,14 @@ _ROLLING_ACTIVATE_HTTP_FIELDS = frozenset(
         "expected_risk_config_id",
         "expected_risk_config_generation",
         "expected_risk_config_hash",
+    }
+)
+_EXECUTION_AUTHORIZATION_HTTP_FIELDS = frozenset(
+    {
+        "authorization_id",
+        "actor",
+        "expected_generation",
+        "reason",
     }
 )
 _BINANCE_HTTP_FORBIDDEN_ACTIONS = frozenset({"EXECUTION_PROBE", "RECONCILE_PROBE"})
@@ -947,6 +956,38 @@ def _patch_non_missing_values(
         for key, value in section.items():
             if not _display_value_missing(value):
                 merged[key] = value
+    return merged
+_OPERATOR_COVERAGE_COMPAT_KEYS = (
+    "historical_count",
+    "historical_datasets",
+    "historical_rows",
+    "forward_count",
+    "forward_datasets",
+    "forward_rows",
+    "logical_rows",
+)
+
+
+def _merge_operator_coverage(
+    persisted: Mapping[str, Any] | None,
+    controls: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Join qualification and dataset coverage without dropping either."""
+    durable = dict(persisted) if isinstance(persisted, Mapping) else {}
+    live = dict(controls) if isinstance(controls, Mapping) else {}
+    merged = {**durable, **live}
+    for key in _OPERATOR_COVERAGE_COMPAT_KEYS:
+        if key in durable and not _display_value_missing(durable[key]):
+            merged[key] = durable[key]
+    for key, aliases in (
+        ("historical_count", ("historical_datasets",)),
+        ("forward_count", ("forward_datasets",)),
+    ):
+        if _display_value_missing(merged.get(key)):
+            for alias in aliases:
+                if not _display_value_missing(merged.get(alias)):
+                    merged[key] = merged[alias]
+                    break
     return merged
 
 
@@ -8696,6 +8737,7 @@ class DashboardData:
             ),
             "autonomous_canary": autonomous,
             "rolling_portfolio": self.rolling_portfolio_data(),
+            "execution_authorization": self.execution_authorization_data(),
             "canary_signal": signal,
             "connectivity": connectivity,
             "research_cards": {
@@ -8715,6 +8757,206 @@ class DashboardData:
         }
         projection.update({name: canary[name] for name in _CANARY_STATUS_FIELDS})
         return projection
+    def execution_authorization_data(self) -> dict[str, Any]:
+        """Return bounded authorization/identity metadata from shared storage."""
+        active: Mapping[str, Any] | None = None
+        latest: Mapping[str, Any] | None = None
+        loader = getattr(self.store, "load_active_execution_authorization", None)
+        if callable(loader):
+            try:
+                value = loader(mode="EXPLORATORY_MICRO_CANARY", now=self.clock())
+            except TypeError:
+                value = loader()
+            except Exception:
+                value = None
+            if isinstance(value, Mapping):
+                active = value
+        list_authorizations = getattr(
+            self.store, "list_execution_authorizations", None
+        )
+        if callable(list_authorizations):
+            try:
+                records = list_authorizations(
+                    mode="EXPLORATORY_MICRO_CANARY",
+                    limit=1,
+                    now=self.clock(),
+                )
+            except TypeError:
+                records = list_authorizations(
+                    mode="EXPLORATORY_MICRO_CANARY",
+                    limit=1,
+                )
+            except Exception:
+                records = ()
+            if isinstance(records, (list, tuple)) and records:
+                candidate = records[0]
+                if isinstance(candidate, Mapping):
+                    latest = candidate
+                    if active is None and str(
+                        candidate.get("status") or ""
+                    ).upper() == "ACTIVE":
+                        active = candidate
+        get_config = getattr(self.store, "get_operator_config", None)
+        try:
+            draft = (
+                get_config("execution_authorization_review", None)
+                if callable(get_config)
+                else None
+            )
+        except Exception:
+            draft = None
+        draft = dict(draft) if isinstance(draft, Mapping) else None
+        try:
+            workers = (
+                getattr(self.store, "list_worker_states", lambda **_: [])(limit=32)
+            )
+        except Exception:
+            workers = []
+        workers = workers if isinstance(workers, (list, tuple)) else []
+        root = next(
+            (
+                row for row in workers
+                if isinstance(row, Mapping)
+                and str(row.get("worker_name") or "") == "axiom-node"
+            ),
+            {},
+        )
+        worker_payload = root.get("payload") if isinstance(root, Mapping) else {}
+        worker_payload = worker_payload if isinstance(worker_payload, Mapping) else {}
+        db_path = str(
+            getattr(self.store, "path", None)
+            or worker_payload.get("db_path")
+            or ""
+        )
+        process_identity = worker_payload.get("process_identity")
+        pid = worker_payload.get("pid")
+        identity = {
+            "instance_id": str(process_identity or f"axiom-node:{pid or 'unknown'}"),
+            "database": db_path,
+            "db_path": db_path,
+            "revision": worker_payload.get("revision") or "unknown",
+            "service": "axiom.canary.CanaryService",
+            "service_identity": "axiom.canary.CanaryService",
+            "pid": pid,
+            "process_identity": process_identity,
+        }
+        risk = self.risk_settings_data()
+        limits = risk.get("effective_limits", risk.get("active_limits", {}))
+        limits = dict(limits) if isinstance(limits, Mapping) else {}
+        usage = risk.get("usage", {}) if isinstance(risk, Mapping) else {}
+        usage = dict(usage) if isinstance(usage, Mapping) else {}
+        remaining = risk.get("remaining", {}) if isinstance(risk, Mapping) else {}
+        remaining = dict(remaining) if isinstance(remaining, Mapping) else {}
+        latest_status = (
+            str(latest.get("status") or "").strip().upper()
+            if isinstance(latest, Mapping)
+            else ""
+        )
+        if (
+            latest is not None
+            and latest_status in {"DRAFT", "EXPIRED", "REVOKED"}
+            and (
+                draft is None
+                or str(draft.get("status") or "").strip().upper() == "ACTIVE"
+            )
+        ):
+            draft = dict(latest)
+        draft_status = (
+            str(draft.get("status") or "").strip().upper()
+            if isinstance(draft, Mapping)
+            else ""
+        )
+        if isinstance(active, Mapping):
+            status = str(active.get("status") or "ACTIVE").upper()
+        elif latest_status in {"DRAFT", "EXPIRED", "REVOKED", "UNKNOWN"}:
+            status = latest_status
+        elif draft_status in {"DRAFT", "EXPIRED", "REVOKED", "UNKNOWN"}:
+            status = draft_status
+        elif draft is not None and "status" in draft:
+            status = "UNKNOWN"
+        else:
+            status = "DISABLED"
+        authorization = active or latest or draft
+        authorization_id = (
+            authorization.get("authorization_id") or authorization.get("id")
+            if isinstance(authorization, Mapping)
+            else None
+        )
+        mode = (
+            str(authorization.get("mode") or "").strip().upper()
+            if isinstance(authorization, Mapping)
+            else ""
+        ) or "EXPLORATORY_MICRO_CANARY"
+        generation_value = (
+            authorization.get("generation")
+            if isinstance(authorization, Mapping)
+            else None
+        )
+        try:
+            generation = (
+                int(generation_value)
+                if generation_value is not None
+                and not isinstance(generation_value, bool)
+                else None
+            )
+        except (TypeError, ValueError, OverflowError):
+            generation = None
+        if generation is not None and generation <= 0:
+            generation = None
+        lease: Mapping[str, Any] = {}
+        lease_loader = getattr(self.store, "load_canary_controller_lease", None)
+        if callable(lease_loader):
+            try:
+                value = lease_loader(now=self.clock())
+            except TypeError:
+                value = lease_loader()
+            except Exception:
+                value = None
+            if isinstance(value, Mapping):
+                lease = dict(value)
+        return _bounded_value(
+            {
+                "status": status,
+                "mode": mode,
+                "generation": generation,
+                "active": _safe_value(active) if active is not None else None,
+                "authorization": _safe_value(authorization)
+                if isinstance(authorization, Mapping)
+                else None,
+                "authorization_id": str(authorization_id).strip() if authorization_id else None,
+                "controller_lease": _safe_value(lease),
+                "draft": _safe_value(draft) if draft is not None else None,
+                "identity": _safe_value(identity),
+                "instance": _safe_value(identity),
+                "economic_policy": {
+                    "limits": limits,
+                    "usage": usage,
+                    "remaining": remaining,
+                    "daily": {
+                        "submissions": {
+                            "limit": limits.get("max_submitted_orders_per_day"),
+                            "used": usage.get("submitted_orders"),
+                            "remaining": remaining.get("submitted_orders"),
+                        },
+                        "buy_usd": {
+                            "limit": limits.get("max_gross_daily_buy_usd"),
+                            "used": usage.get("gross_daily_buy_usd"),
+                            "remaining": remaining.get("gross_daily_buy_usd"),
+                        },
+                    },
+                    "lifetime": {
+                        "buy_usd": {
+                            "limit": risk.get("cumulative_buy_cap_usd"),
+                            "used": usage.get("cumulative_buy_usd"),
+                            "remaining": risk.get("remaining_cumulative_buy_usd"),
+                        }
+                    },
+                },
+                "paper_only": True,
+                "live_execution": False,
+            }
+        )
+
 
     def _operator_control_data(self) -> dict[str, Any]:
         """Merge responsive controls into the bounded persisted overview."""
@@ -8739,11 +8981,181 @@ class DashboardData:
         # ``overview_summary`` is authoritative for every research surface.
         # Controls are additive and must never replace persisted cards, rows,
         # candidate selections, lifecycle values, or canary evidence.
-        result["operator_controls"] = controls
+        result["operator_controls"] = _safe_value(controls)
+        authorization = controls.get("execution_authorization")
+        if not isinstance(authorization, Mapping):
+            authorization = self.execution_authorization_data()
+        result["execution_authorization"] = _bounded_value(authorization)
+        result["identity"] = _bounded_value(
+            controls.get("identity")
+            or authorization.get("identity")
+            if isinstance(authorization, Mapping)
+            else None
+        )
+        result["instance"] = result["identity"]
+        result["mode"] = str(
+            controls.get("mode")
+            or (
+                "exploratory_reviewed"
+                if str(authorization.get("status") or "").upper() == "ACTIVE"
+                else "observing"
+            )
+        )
+        result["revision"] = (
+            result["identity"].get("revision")
+            if isinstance(result.get("identity"), Mapping)
+            else None
+        )
+        result["armed"] = (
+            controls.get("armed")
+            if isinstance(controls.get("armed"), bool)
+            else str(controls.get("armed_state") or "").upper()
+            in {"ARMED", "AUTONOMOUS_MICRO_LIVE", "LIVE"}
+        )
+        result["armed_state"] = controls.get(
+            "armed_state",
+            controls.get("mode") if str(controls.get("mode") or "").upper() in {
+                "ARMED", "AUTONOMOUS_MICRO_LIVE", "LIVE"
+            } else None,
+        )
+        result["economic_policy"] = _bounded_value(
+            controls.get("economic_policy")
+            or authorization.get("economic_policy", {})
+            if isinstance(authorization, Mapping)
+            else {}
+        )
+        result["policy"] = _bounded_value(
+            controls.get("policy")
+            or (
+                result["economic_policy"].get("policy", {})
+                if isinstance(result.get("economic_policy"), Mapping)
+                else {}
+            )
+        )
+        result["budgets"] = result["economic_policy"]
+        result["daily_budget"] = _bounded_value(
+            result["economic_policy"].get("daily", {})
+            if isinstance(result.get("economic_policy"), Mapping)
+            else {}
+        )
+        result["lifetime_budget"] = _bounded_value(
+            result["economic_policy"].get("lifetime", {})
+            if isinstance(result.get("economic_policy"), Mapping)
+            else {}
+        )
+        result["strategies"] = _bounded_value(
+            controls.get("strategies") or result.get("strategies") or {}
+        )
+        strategy_projection = result["strategies"]
+        result["active_strategies"] = _bounded_value(
+            strategy_projection.get("active", [])
+            if isinstance(strategy_projection, Mapping)
+            else []
+        )
+        result["suspended_strategies"] = _bounded_value(
+            strategy_projection.get("suspended", [])
+            if isinstance(strategy_projection, Mapping)
+            else []
+        )
+        result["signals"] = _bounded_value(
+            controls.get("signals") or result.get("signals") or {}
+        )
+        signal_projection = result["signals"]
+        result["current_signals"] = _bounded_value(
+            signal_projection.get("current", signal_projection.get("latest"))
+            if isinstance(signal_projection, Mapping)
+            else None
+        )
+        result["last_work"] = controls.get(
+            "last_work", controls.get("last_evaluation", result.get("last_work"))
+        )
+        result["next_work"] = controls.get("next_work", result.get("next_work"))
+        result["work"] = {
+            "last": result.get("last_work"),
+            "next": controls.get("next_work", result.get("next_work")),
+        }
+        result["last_review"] = controls.get(
+            "last_review",
+            controls.get("last_review_at", result.get("last_review")),
+        )
+        result["last_review_at"] = result["last_review"]
+        result["next_review"] = controls.get(
+            "next_review",
+            controls.get("next_review_at", result.get("next_review")),
+        )
+        result["next_review_at"] = result["next_review"]
+        result["controller_lease"] = _bounded_value(
+            controls.get("controller_lease")
+            or (
+                authorization.get("controller_lease", {})
+                if isinstance(authorization, Mapping)
+                else {}
+            )
+        )
         result["autonomous_canary_worker"] = controls.get(
             "autonomous_canary_worker", {}
         )
         canary = result.get("canary")
+        persisted_coverage = (
+            result.get("coverage") if isinstance(result.get("coverage"), Mapping) else {}
+        )
+        control_coverage = (
+            controls.get("coverage") if isinstance(controls.get("coverage"), Mapping) else {}
+        )
+        result["coverage"] = _bounded_value(
+            _merge_operator_coverage(persisted_coverage, control_coverage)
+        )
+        result["qualification_coverage"] = _bounded_value(
+            control_coverage or result["coverage"]
+        )
+        coverage_projection = result["coverage"]
+        for coverage_key in (
+            "historical_count",
+            "historical_rows",
+            "forward_count",
+            "forward_rows",
+        ):
+            result[coverage_key] = (
+                coverage_projection.get(coverage_key, 0)
+                if isinstance(coverage_projection, Mapping)
+                else 0
+            )
+        result["exclusions"] = _bounded_value(
+            controls.get("exclusions")
+            or (
+                result["coverage"].get("exclusions", [])
+                if isinstance(result.get("coverage"), Mapping)
+                else []
+            )
+        )
+        result["remaining_budgets"] = _bounded_value(
+            controls.get("remaining_budgets") or controls.get("remaining") or {}
+        )
+        result["execution"] = _bounded_value(
+            controls.get("execution") or controls.get("execution_summary") or {}
+        )
+        result["execution_state"] = _bounded_value(
+            controls.get("execution_state")
+            or (
+                {"state": canary.get("control_state")}
+                if isinstance(canary, Mapping)
+                else {}
+            )
+        )
+        result["blockers"] = _bounded_value(
+            controls.get("blockers")
+            or (
+                [controls.get("blocker")]
+                if controls.get("blocker") not in (None, "", "NONE")
+                else []
+            )
+        )
+        result["execution_authorization_id"] = (
+            authorization.get("authorization_id")
+            or authorization.get("id")
+            if isinstance(authorization, Mapping)
+            else None
+        )
         if isinstance(canary, Mapping):
             result.setdefault(
                 "real_execution_events",
@@ -8807,8 +9219,184 @@ class DashboardData:
                 _canary_autonomous_projection(result),
             )
             result.update(_canary_autonomous_projection(result.get("autonomous_canary")))
+            persisted_coverage = (
+                result.get("coverage")
+                if isinstance(result.get("coverage"), Mapping)
+                else {}
+            )
+            result.setdefault("qualification_coverage", _bounded_value(persisted_coverage))
+            for coverage_key in (
+                "historical_count",
+                "historical_rows",
+                "forward_count",
+                "forward_rows",
+            ):
+                if coverage_key not in result:
+                    result[coverage_key] = persisted_coverage.get(coverage_key, 0)
             if self.control is not None:
                 result["operator_controls"] = self.control.status()
+                controls = result["operator_controls"]
+                authorization = controls.get("execution_authorization")
+                if not isinstance(authorization, Mapping):
+                    authorization = self.execution_authorization_data()
+                result["execution_authorization"] = _bounded_value(authorization)
+                result["execution_authorization_id"] = (
+                    authorization.get("authorization_id")
+                    or authorization.get("id")
+                    if isinstance(authorization, Mapping)
+                    else None
+                )
+                result["identity"] = _bounded_value(
+                    controls.get("identity")
+                    or authorization.get("identity")
+                    if isinstance(authorization, Mapping)
+                    else None
+                )
+                result["instance"] = result["identity"]
+                result["revision"] = (
+                    result["identity"].get("revision")
+                    if isinstance(result.get("identity"), Mapping)
+                    else None
+                )
+                result["mode"] = str(
+                    controls.get("mode")
+                    or (
+                        "exploratory_reviewed"
+                        if str(authorization.get("status") or "").upper() == "ACTIVE"
+                        else "observing"
+                    )
+                )
+                result["armed"] = (
+                    controls.get("armed")
+                    if isinstance(controls.get("armed"), bool)
+                    else str(controls.get("armed_state") or "").upper()
+                    in {"ARMED", "AUTONOMOUS_MICRO_LIVE", "LIVE"}
+                )
+                result["armed_state"] = controls.get("armed_state")
+                result["economic_policy"] = _bounded_value(
+                    controls.get("economic_policy")
+                    or authorization.get("economic_policy", {})
+                    if isinstance(authorization, Mapping)
+                    else {}
+                )
+                result["controller_lease"] = _bounded_value(
+                    controls.get("controller_lease")
+                    or (
+                        authorization.get("controller_lease", {})
+                        if isinstance(authorization, Mapping)
+                        else {}
+                    )
+                )
+                persisted_coverage = (
+                    result.get("coverage")
+                    if isinstance(result.get("coverage"), Mapping)
+                    else {}
+                )
+                control_coverage = (
+                    controls.get("coverage")
+                    if isinstance(controls.get("coverage"), Mapping)
+                    else {}
+                )
+                result["coverage"] = _bounded_value(
+                    _merge_operator_coverage(persisted_coverage, control_coverage)
+                )
+                result["qualification_coverage"] = _bounded_value(
+                    control_coverage or result["coverage"]
+                )
+                for coverage_key in (
+                    "historical_count",
+                    "historical_rows",
+                    "forward_count",
+                    "forward_rows",
+                ):
+                    result[coverage_key] = result["coverage"].get(coverage_key, 0)
+                result["exclusions"] = _bounded_value(
+                    controls.get("exclusions")
+                    or (
+                        result["coverage"].get("exclusions", [])
+                        if isinstance(result.get("coverage"), Mapping)
+                        else []
+                    )
+                )
+                result["remaining_budgets"] = _bounded_value(
+                    controls.get("remaining_budgets") or controls.get("remaining") or {}
+                )
+                result["execution"] = _bounded_value(
+                    controls.get("execution") or controls.get("execution_summary") or {}
+                )
+                result["policy"] = _bounded_value(
+                    controls.get("policy")
+                    or (
+                        result["economic_policy"].get("policy", {})
+                        if isinstance(result.get("economic_policy"), Mapping)
+                        else {}
+                    )
+                )
+                result["budgets"] = result["economic_policy"]
+                result["daily_budget"] = _bounded_value(
+                    result["economic_policy"].get("daily", {})
+                    if isinstance(result.get("economic_policy"), Mapping)
+                    else {}
+                )
+                result["lifetime_budget"] = _bounded_value(
+                    result["economic_policy"].get("lifetime", {})
+                    if isinstance(result.get("economic_policy"), Mapping)
+                    else {}
+                )
+                result["strategies"] = _bounded_value(
+                    controls.get("strategies") or result.get("strategies") or {}
+                )
+                strategy_projection = result["strategies"]
+                result["active_strategies"] = _bounded_value(
+                    strategy_projection.get("active", [])
+                    if isinstance(strategy_projection, Mapping)
+                    else []
+                )
+                result["suspended_strategies"] = _bounded_value(
+                    strategy_projection.get("suspended", [])
+                    if isinstance(strategy_projection, Mapping)
+                    else []
+                )
+                result["signals"] = _bounded_value(
+                    controls.get("signals") or result.get("signals") or {}
+                )
+                signal_projection = result["signals"]
+                result["current_signals"] = _bounded_value(
+                    signal_projection.get("current", signal_projection.get("latest"))
+                    if isinstance(signal_projection, Mapping)
+                    else None
+                )
+                result["last_work"] = controls.get(
+                    "last_work", controls.get("last_evaluation", result.get("last_work"))
+                )
+                result["next_work"] = controls.get("next_work", result.get("next_work"))
+                result["work"] = {
+                    "last": result.get("last_work"),
+                    "next": controls.get("next_work", result.get("next_work")),
+                }
+                result["last_review"] = controls.get(
+                    "last_review",
+                    controls.get("last_review_at", result.get("last_review")),
+                )
+                result["last_review_at"] = result["last_review"]
+                result["next_review"] = controls.get(
+                    "next_review",
+                    controls.get("next_review_at", result.get("next_review")),
+                )
+                result["next_review_at"] = result["next_review"]
+                result["execution_state"] = _bounded_value(
+                    controls.get("execution_state")
+                    or result.get("execution_state")
+                    or {}
+                )
+                result["blockers"] = _bounded_value(
+                    controls.get("blockers")
+                    or (
+                        [controls.get("blocker")]
+                        if controls.get("blocker") not in (None, "", "NONE")
+                        else result.get("blockers", [])
+                    )
+                )
             return result
         if self.store is not None:
             return self._operator_control_data()
@@ -9254,6 +9842,7 @@ def _dashboard_html(
     <section id="view-rolling-portfolio" class="view"><article class="panel"><div class="section-title"><h2>Rolling Portfolio</h2><span id="rolling-status" class="badge warn">paper-only · no live execution</span></div><div id="rolling-action-result" class="page-note"></div><div id="rolling-summary"></div><div id="rolling-policy-controls"></div><div id="rolling-members" class="scroll"></div><div id="rolling-reasons"></div><div id="rolling-jobs"></div><p class="page-note">Rolling membership is append-only and each displayed member is bound to its persisted strategy, research trial, candidate, and exact evidence window. Missing lineage remains non-executable. Policy/allocation review is a non-active draft; activation is separate, deliberate, and remains paper-only.</p></article></section>
     <section id="view-canary" class="view"><article class="panel" style="border-color:var(--red)"><div class="section-title"><h2>REAL CANARY MONEY</h2><span class="badge bad">PRODUCTION LIVE TRADING: DISABLED</span></div><div id="canary-action-result" class="page-note"></div><div id="canary-readiness-snapshot"></div><div id="canary-controls"></div><div id="risk-settings"></div><div id="canary-connectivity"></div><div id="canary-summary"></div><div id="canary-trades" class="scroll"></div><p class="notice">Autonomous canary is independent from paper research. No secrets are stored or displayed. It remains prediction-only, bounded by active settings, and killable from this console.</p></article></section>
     <article id="canary-recovery-form" class="panel"><div class="section-title"><h2>UNKNOWN ENTRY RECOVERY</h2><span class="badge warn">READ-ONLY · PRODUCTION PROFILE</span></div><p class="page-note">Attach only an operator-supplied canonical exchange order ID. This does not post, retry, activate, or release an entry.</p><div class="three-col"><label>Event ID<input id="canary-recovery-event" autocomplete="off"></label><label>Signal ID<input id="canary-recovery-signal" autocomplete="off"></label><label>Canonical exchange order ID<input id="canary-recovery-order" autocomplete="off"></label></div><label>Exact confirmation<input id="canary-recovery-confirm" placeholder="RECOVER UNKNOWN ENTRY" autocomplete="off"></label><p class="page-note"><button id="canary-recovery-submit" class="link">Recover and reconcile</button> <span id="canary-recovery-result"></span></p></article>
+    <article id="execution-authorization-panel" class="panel" style="border-color:var(--amber)"><div class="section-title"><h2>EXPLORATORY MICRO-CANARY AUTHORIZATION</h2><span class="badge warn">REVIEWED · DISARMED BY DEFAULT</span></div><div id="execution-auth-state" class="page-note">Loading authorization state…</div><pre id="execution-auth-details" class="scroll"></pre><div class="three-col"><label>Purpose<input id="execution-auth-purpose" value="Exploratory micro-canary review" maxlength="120" autocomplete="off"></label><label>Lifetime budget (USD)<input id="execution-auth-budget" value="10" inputmode="decimal" maxlength="16"></label><label>Expires at (UTC, optional)<input id="execution-auth-expires" placeholder="2025-01-01T00:00:00Z" maxlength="32" autocomplete="off"></label></div><label class="page-note"><input id="execution-auth-adverse-evidence" type="checkbox"> I acknowledge the adverse evidence; this review remains paper-only and disarmed.</label><p class="page-note">Review binds the current evidence-selected strategy versions, selection policy, risk settings, scope, and stop rules. The browser never accepts or asks for a private authorization ID.</p><p><button id="execution-auth-review" class="link">Review exploratory authorization</button> <button id="execution-auth-activate" class="link">Activate reviewed authorization</button> <button id="execution-auth-revoke" class="link">Revoke active authorization</button> <span id="execution-auth-result"></span></p></article>
     <section id="view-binance-canary" class="view binance-view"><article class="panel" style="border-color:var(--amber)"><div class="section-title"><h2>BINANCE SPOT CANARY</h2><span class="badge warn">DEVELOPMENT / PAPER|TESTNET</span></div><p class="page-note">Separate from the Polymarket canary. <strong>POLYMARKET TRANSPORT: DISABLED</strong> · Binance Spot only · no implicit control-plane construction.</p><div id="binance-action-result" class="page-note"></div><div id="binance-identity"></div><div id="binance-connectivity"></div><div id="binance-qualification"></div><div id="binance-risk"></div><div id="binance-controls"></div><div id="binance-records" class="scroll"></div><details><summary>Full Binance projection and identifiers</summary><pre id="binance-raw"></pre></details><p class="notice">Credentials are never displayed. Connectivity checks are read-only; order validation is an explicit test action. No browser action can place an order.</p></article></section>
     <div id="binance-testnet-static-labels" hidden>BINANCE SPOT TESTNET · TESTNET CONNECTIVITY · ORDER VALIDATION · TESTNET EXECUTION PROBE · AUTONOMOUS TESTNET · localhost</div>
   </main>
@@ -10025,6 +10614,57 @@ def _dashboard_html(
     ensureActivityKind(); if($("crypto-symbol")){const oldSymbol=$("crypto-symbol"),newSymbol=oldSymbol.cloneNode(true);oldSymbol.replaceWith(newSymbol);newSymbol.addEventListener("input",()=>{state.page=1;saveState(true);loadPage("crypto",true);});} document.addEventListener("click",event=>{const button=event.target.closest?.(".copy");if(!button)return;navigator.clipboard?.writeText(button.dataset.copy||"").then(()=>{button.textContent="copied";setTimeout(()=>button.textContent="copy",1200);}).catch(()=>{});}); document.addEventListener("visibilitychange",()=>{if(document.hidden){if(activeController)activeController.abort();}else{nextRefreshAt=0;load();}});
     ensureFacets(); document.querySelectorAll(".tab").forEach(b=>b.addEventListener("click",()=>activate(b.dataset.view))); document.querySelectorAll("[data-link]").forEach(b=>b.addEventListener("click",e=>{e.preventDefault();activate(b.dataset.link)})); document.querySelectorAll(".filters input,.filters select").forEach(el=>el.addEventListener(el.tagName==="INPUT"?"input":"change",()=>{if(el.id.endsWith("-size")){const n=Number(el.value);if([10,25,50,100].includes(n)){state.page_size=n;document.querySelectorAll('select[id$="-size"]').forEach(s=>s.value=String(n));}} else if(el.id.includes("-filter"))state.filter=el.value;state.page=1;saveState(true);loadPage(state.tab)})); window.addEventListener("popstate",()=>{const q=new URLSearchParams(location.search),nextTab=q.get("tab")||"overview",changed=nextTab!==state.tab;params=q;state.tab=nextTab;state.page=Math.max(1,Number(q.get("page")||1));state.page_size=[10,25,50,100].includes(Number(q.get("page_size")))?Number(q.get("page_size")):25;state.filter=changed?"":q.get("filter")||"";state.sort=changed?"":q.get("sort")||"";state.direction=changed?"desc":q.get("direction")==="asc"?"asc":"desc";state.selected=changed?"":q.get("selected")||"";state.expanded=changed?false:q.get("expanded")==="1";restoreFacets();activate(state.tab,false)}); load(); activate(state.tab,false); const refreshHandle=setInterval(load,10000); window.addEventListener("beforeunload",()=>clearInterval(refreshHandle));
     if($("crypto-symbol"))$("crypto-symbol").addEventListener("input",async()=>{const symbol=$("crypto-symbol").value.trim(),q=new URLSearchParams({page:"1",page_size:String(state.page_size),direction:state.direction});if(symbol)q.set("symbol",symbol);const response=await fetch(`/api/v2/crypto-research?${q}`,{cache:"no-store"});if(response.ok)renderCrypto(await response.json());});
+    const executionAuthPanel=$("execution-authorization-panel"),executionCanaryView=$("view-canary"); if(executionAuthPanel&&executionCanaryView)executionCanaryView.appendChild(executionAuthPanel);
+    function renderExecutionAuthorization(value) {
+      const payload=value&&typeof value==="object"?value:{}, auth=payload.execution_authorization&&typeof payload.execution_authorization==="object"?payload.execution_authorization:{}, active=auth.active&&typeof auth.active==="object"?auth.active:null, draft=auth.draft&&typeof auth.draft==="object"?auth.draft:null, row=active||draft||auth.authorization||{}, status=String(auth.status||row.status||"DISABLED").toUpperCase(), id=row.authorization_id||row.id||"", activeId=active?.authorization_id||active?.id||"", draftId=draft?.authorization_id||draft?.id||"", generationValue=row.generation??auth.generation, generation=Number.isInteger(Number(generationValue))&&Number(generationValue)>0?Number(generationValue):null;
+      const adverseEvidenceAcknowledged=row.adverse_evidence_ack===true||row.adverse_evidence_ack?.acknowledged===true||row.adverse_evidence_ack?.accepted===true;
+      const details={status,authorization_id:id,generation,mode:row.mode||auth.mode||"EXPLORATORY_MICRO_CANARY",purpose:row.purpose||"—",strategy_versions:row.exact_strategy_versions||row.strategy_version_ids||"—",selection_policy_hash:row.reviewed_selection_policy_hash||row.selection_policy_hash||"—",selection_id:row.selection_id||"—",selection_hash:row.selection_hash||"—",adverse_evidence_ack:adverseEvidenceAcknowledged?(row.adverse_evidence_ack_required===false?"NOT REQUIRED":"ACKNOWLEDGED"):"NOT ACKNOWLEDGED",adverse_evidence_ack_required:row.adverse_evidence_ack_required!==false,lifetime_budget:row.lifetime_budget||"—",stop_rules:row.stop_rules||"—",expires_at:row.expires_at||"—",scope_hash:row.scope_hash||"—",scope_version:row.scope_version||"—",active_settings_hash:row.active_settings_hash||"—",active_settings_generation:row.active_settings_generation||"—"};
+      details.instance=payload.identity||payload.instance||auth.identity||"—";
+      details.operator_mode=payload.mode||auth.operator_mode||"observing";
+      details.economic_policy=payload.economic_policy||auth.economic_policy||"—";
+      const state=$("execution-auth-state"), out=$("execution-auth-details"), activate=$("execution-auth-activate"), revoke=$("execution-auth-revoke");
+      if(state)state.textContent=`${status} · ${status==="ACTIVE"?"reviewed authorization is present; live route remains separately disarmed":"no active exploratory authorization"}${id?` · record ${id}`:""}`;
+      if(out)out.textContent=JSON.stringify(details,null,2);
+      if(activate)activate.disabled=!(draft&&String(draft.status||"").toUpperCase()==="DRAFT"&&draftId);
+      if(revoke)revoke.disabled=!(active&&String(active.status||"").toUpperCase()==="ACTIVE"&&activeId);
+      return {row,status,id,details,active,draft,activeId,draftId};
+    }
+    async function refreshExecutionAuthorization() {
+      try {
+        const response=await fetch("/api/operator",{cache:"no-store"});
+        if(!response.ok)throw new Error(`HTTP ${response.status}`);
+        const payload=await response.json();
+        lastGood.controls=payload;
+        renderExecutionAuthorization(payload);
+      } catch(error) {
+        const state=$("execution-auth-state"); if(state)state.textContent=`Authorization status unavailable: ${error?.message||"request failed"}`;
+      }
+    }
+    document.addEventListener("click",async event=>{
+      const button=event.target.closest?.("#execution-auth-review,#execution-auth-activate,#execution-auth-revoke"); if(!button)return;
+      const result=$("execution-auth-result"), current=renderExecutionAuthorization(lastGood.controls||lastGood.canary||lastGood.overview||{}), action=button.id;
+      if(action==="execution-auth-review"){
+        const purpose=$("execution-auth-purpose")?.value.trim()||"", budget=$("execution-auth-budget")?.value.trim()||"", expires=$("execution-auth-expires")?.value.trim()||"", adverseEvidence=$("execution-auth-adverse-evidence")?.checked===true;
+        if(!purpose||!budget){if(result)result.textContent="Review blocked: purpose and lifetime budget are required";return;}
+        const values={purpose,lifetime_budget:budget,stop_rules:{max_daily_loss_usd:"5",max_lifetime_loss_usd:"10",on_any_blocker:"STOP"}};
+        if(adverseEvidence)values.adverse_evidence_ack=true;
+        if(expires)values.expires_at=expires;
+        const response=await controlPost("execution_authorization.review","", "REVIEW EXPLORATORY AUTHORIZATION",{values});
+        if(result)result.textContent=response.ok?"Review saved as DRAFT · paper-only":"Review blocked: "+(response.reason||"CONTROL_FAILED");
+        await refreshExecutionAuthorization(); return;
+      }
+      const target=action==="execution-auth-activate"?current.draft:current.active, targetId=target?.authorization_id||target?.id||"", targetGenerationValue=target?.generation, targetGeneration=Number.isInteger(Number(targetGenerationValue))&&Number(targetGenerationValue)>0?Number(targetGenerationValue):null;
+      if(!targetId){if(result)result.textContent="Authorization action blocked: no current server authorization record";return;}
+      const phrase=action==="execution-auth-activate"?"ACTIVATE EXPLORATORY AUTHORIZATION":"REVOKE EXPLORATORY AUTHORIZATION";
+      const confirmation=[phrase,`authorization_id=${targetId}`,`generation=${targetGeneration??"—"}`,`purpose=${target?.purpose||current.details.purpose}`,`strategy_versions=${JSON.stringify(target?.exact_strategy_versions||target?.strategy_version_ids||current.details.strategy_versions)}`,`selection_policy_hash=${target?.reviewed_selection_policy_hash||target?.selection_policy_hash||current.details.selection_policy_hash}`,`adverse_evidence_ack=${target?.adverse_evidence_ack===true||target?.adverse_evidence_ack?.acknowledged===true?"ACKNOWLEDGED":current.details.adverse_evidence_ack}`,`lifetime_budget=${target?.lifetime_budget||current.details.lifetime_budget}`,`stop_rules=${JSON.stringify(target?.stop_rules||current.details.stop_rules)}`,`expires_at=${target?.expires_at||current.details.expires_at}`,`scope_hash=${target?.scope_hash||current.details.scope_hash}`,`active_settings_hash=${target?.active_settings_hash||current.details.active_settings_hash}`].join(" · ");
+      const name=action==="execution-auth-activate"?"execution_authorization.activate":"execution_authorization.revoke";
+      const fencedPayload={authorization_id:targetId}; if(targetGeneration!=null)fencedPayload.expected_generation=targetGeneration;
+      const response=await controlPost(name,"",phrase,fencedPayload);
+      if(result)result.textContent=response.ok?`${phrase} completed · ${response.result?.execution_authorization?.status||"updated"}`:`${phrase} blocked: ${response.reason||"CONTROL_FAILED"}`;
+      await refreshExecutionAuthorization();
+    });
+    refreshExecutionAuthorization();
+    setInterval(refreshExecutionAuthorization,10000);
     // setInterval(load, 10000) is the ten-second refresh contract.
   </script>
 </html>""".replace("__AXIOM_CONTROL_TOKEN__", str(control_token or "")).replace(
@@ -10227,6 +10867,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             "venue",
             *_ROLLING_REVIEW_HTTP_FIELDS,
             *_ROLLING_ACTIVATE_HTTP_FIELDS,
+            *_EXECUTION_AUTHORIZATION_HTTP_FIELDS,
         }
         if set(body) - allowed_fields:
             self._send(400, {"error": "unsupported control fields"})
@@ -10252,6 +10893,17 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             if set(body) & rolling_fields:
                 self._send(400, {"error": "rolling fields require a rolling action"})
                 return
+        execution_authorization_actions = {
+            "execution_authorization.review",
+            "execution_authorization.activate",
+            "execution_authorization.revoke",
+            "exploratory.authorization.review",
+            "exploratory.authorization.activate",
+            "exploratory.authorization.revoke",
+            "authorization.review",
+            "authorization.activate",
+            "authorization.revoke",
+        }
         flat_fields = {
             "values",
             "actor",
@@ -10263,6 +10915,8 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             flat_fields |= _ROLLING_REVIEW_HTTP_FIELDS
         elif action_name in rolling_activate_actions:
             flat_fields |= _ROLLING_ACTIVATE_HTTP_FIELDS
+        elif action_name in execution_authorization_actions:
+            flat_fields |= _EXECUTION_AUTHORIZATION_HTTP_FIELDS
         flat_payload = {
             name: body[name]
             for name in flat_fields
@@ -10281,6 +10935,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             "canary.recover_entry",
             *rolling_review_actions,
             *rolling_activate_actions,
+            *execution_authorization_actions,
         }
         if action_payload and action_name not in payload_actions:
             self._send(400, {"error": "action does not accept a payload"})

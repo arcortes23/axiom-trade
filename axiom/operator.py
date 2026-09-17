@@ -6,7 +6,7 @@ persists every requested action as a bounded audit record.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import hashlib
 import ipaddress
@@ -96,8 +96,28 @@ _ALLOWED_ACTIONS = frozenset(
         "rolling.policy.activate",
         "admission_policy.review",
         "admission_policy.activate",
+        "execution_authorization.review",
+        "execution_authorization.activate",
+        "execution_authorization.revoke",
+        "exploratory.authorization.review",
+        "exploratory.authorization.activate",
+        "exploratory.authorization.revoke",
+        "authorization.review",
+        "authorization.activate",
+        "authorization.revoke",
     }
 )
+_AUTHORIZATION_ACTION_ALIASES = {
+    "execution_authorization.review": "execution_authorization.review",
+    "execution_authorization.activate": "execution_authorization.activate",
+    "execution_authorization.revoke": "execution_authorization.revoke",
+    "exploratory.authorization.review": "execution_authorization.review",
+    "exploratory.authorization.activate": "execution_authorization.activate",
+    "exploratory.authorization.revoke": "execution_authorization.revoke",
+    "authorization.review": "execution_authorization.review",
+    "authorization.activate": "execution_authorization.activate",
+    "authorization.revoke": "execution_authorization.revoke",
+}
 _ROLLING_ACTION_ALIASES = {
     "rolling.admission.review": "rolling.admission.review",
     "rolling.policy.review": "rolling.admission.review",
@@ -112,7 +132,11 @@ _SETTINGS_ACTION_ALIASES = {
     "canary.settings.activate_draft": "risk.settings.activate_draft",
     "risk.settings.activate_draft": "risk.settings.activate_draft",
 }
-_ACTION_ALIASES = {**_ROLLING_ACTION_ALIASES, **_SETTINGS_ACTION_ALIASES}
+_ACTION_ALIASES = {
+    **_ROLLING_ACTION_ALIASES,
+    **_SETTINGS_ACTION_ALIASES,
+    **_AUTHORIZATION_ACTION_ALIASES,
+}
 _CONFIRMATIONS = {
     "canary.eligibility.mark": "MARK CANARY ELIGIBLE",
     "canary.arm": "ARM",
@@ -131,6 +155,13 @@ _CONFIRMATIONS = {
     "admission_policy.review": "REVIEW ROLLING ADMISSION POLICY",
     "admission_policy.activate": "ACTIVATE ROLLING ADMISSION POLICY",
 }
+_CONFIRMATIONS.update(
+    {
+        "execution_authorization.review": "REVIEW EXPLORATORY AUTHORIZATION",
+        "execution_authorization.activate": "ACTIVATE EXPLORATORY AUTHORIZATION",
+        "execution_authorization.revoke": "REVOKE EXPLORATORY AUTHORIZATION",
+    }
+)
 _ISOLATED_OPERATOR_BLOCKED_ACTIONS = frozenset(
     {
         "canary.connectivity_check",
@@ -1325,6 +1356,21 @@ def _safe_identifier(value: Any, field: str) -> str:
     if not identifier or _SAFE_IDENTIFIER.fullmatch(identifier) is None:
         raise OperatorControlError("INVALID_IDENTIFIER", f"invalid {field}")
     return identifier
+def _operator_service_identity(service_type: Any) -> str:
+    """Project a service class name without assuming class metadata exists."""
+    service_class = service_type
+    module = getattr(service_class, "__module__", None)
+    qualname = getattr(service_class, "__qualname__", None)
+    if not isinstance(module, str) or not module.strip():
+        module = getattr(type(service_class), "__module__", "") or ""
+    if not isinstance(qualname, str) or not qualname.strip():
+        qualname = getattr(service_class, "__name__", None)
+    if not isinstance(qualname, str) or not qualname.strip():
+        qualname = getattr(type(service_class), "__qualname__", None) or "service"
+    module_text = str(module).strip()
+    qualname_text = str(qualname).strip()
+    return f"{module_text}.{qualname_text}" if module_text else qualname_text
+
 
 _POSITIVE_GENERATION = re.compile(r"^[1-9][0-9]*$")
 
@@ -1580,6 +1626,644 @@ class OperatorControlPlane:
         if not isinstance(projected, Mapping):
             raise OperatorControlError("RISK_SETTINGS_ACTIVATE_FAILED")
         return dict(projected)
+    @staticmethod
+    def _authorization_text(value: Any, field: str, *, limit: int = 256) -> str:
+        if not isinstance(value, str):
+            raise OperatorControlError(f"EXECUTION_AUTHORIZATION_{field.upper()}_REQUIRED")
+        text = value.strip()
+        if not text or len(text) > limit or _SECRET_KEY.search(text):
+            raise OperatorControlError(f"EXECUTION_AUTHORIZATION_{field.upper()}_INVALID")
+        return text
+
+    @staticmethod
+    def _authorization_decimal(value: Any, field: str) -> str:
+        if isinstance(value, bool) or value is None:
+            raise OperatorControlError(f"EXECUTION_AUTHORIZATION_{field.upper()}_REQUIRED")
+        try:
+            decimal_value = Decimal(str(value).strip())
+        except (ArithmeticError, TypeError, ValueError) as exc:
+            raise OperatorControlError(
+                f"EXECUTION_AUTHORIZATION_{field.upper()}_INVALID"
+            ) from exc
+        if not decimal_value.is_finite() or decimal_value <= 0:
+            raise OperatorControlError(f"EXECUTION_AUTHORIZATION_{field.upper()}_INVALID")
+        return format(decimal_value, "f")
+
+    @staticmethod
+    def _authorization_timestamp(value: Any, field: str) -> str:
+        if isinstance(value, datetime):
+            stamp = value
+        elif isinstance(value, str):
+            try:
+                stamp = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+            except ValueError as exc:
+                raise OperatorControlError(
+                    f"EXECUTION_AUTHORIZATION_{field.upper()}_INVALID"
+                ) from exc
+        else:
+            raise OperatorControlError(f"EXECUTION_AUTHORIZATION_{field.upper()}_REQUIRED")
+        if stamp.tzinfo is None:
+            raise OperatorControlError(f"EXECUTION_AUTHORIZATION_{field.upper()}_INVALID")
+        return stamp.astimezone(timezone.utc).isoformat()
+
+    def _authorization_context(self) -> dict[str, Any]:
+        """Derive immutable authorization bindings from persisted state.
+
+        The browser supplies intent and bounded stop values only.  Strategy,
+        selection, scope, and settings identities are read from the same
+        database that the execution service consumes.
+        """
+        now = utc_now()
+        risk = self.risk_settings_snapshot()
+        active_settings = risk.get("active") if isinstance(risk, Mapping) else {}
+        active_settings = active_settings if isinstance(active_settings, Mapping) else {}
+        settings_hash = str(
+            risk.get("config_hash") or active_settings.get("config_hash") or ""
+        ).strip()
+        settings_generation = risk.get("generation") or active_settings.get("generation")
+        try:
+            settings_generation = int(settings_generation)
+        except (TypeError, ValueError, OverflowError):
+            settings_generation = 0
+        if not settings_hash or settings_generation <= 0:
+            raise OperatorControlError("ACTIVE_RISK_CONFIG_REQUIRED")
+
+        selection_loader = getattr(self.store, "load_current_portfolio_selection", None)
+        try:
+            selection_raw = selection_loader() if callable(selection_loader) else None
+        except Exception as exc:
+            raise OperatorControlError(
+                "EXECUTION_AUTHORIZATION_SELECTION_UNAVAILABLE",
+                type(exc).__name__,
+            ) from exc
+        selection = dict(selection_raw) if isinstance(selection_raw, Mapping) else {}
+        selection_id = str(
+            selection.get("portfolio_selection_id") or selection.get("selection_id") or ""
+        ).strip()
+        selection_hash = self._rolling_canonical_hash(selection) if selection else ""
+        members = selection.get("members", selection.get("selected_members", ()))
+        members = members if isinstance(members, (list, tuple)) else ()
+        strategy_versions: list[str] = []
+        rejected_strategy_versions: list[str] = []
+        candidate_loader = getattr(self.store, "load_candidate_lifecycle", None)
+        for member in members[:64]:
+            if not isinstance(member, Mapping):
+                continue
+            identifier = str(member.get("strategy_version_id") or "").strip()
+            if not identifier:
+                continue
+            identifier = identifier[:256]
+            if identifier not in strategy_versions:
+                strategy_versions.append(identifier)
+            rejected = bool(member.get("rejected"))
+            status = str(
+                member.get("status")
+                or member.get("stage")
+                or ""
+            ).strip().upper()
+            rejected = rejected or status == "REJECTED"
+            candidate_id = str(member.get("candidate_id") or "").strip()
+            if not rejected and callable(candidate_loader) and candidate_id:
+                try:
+                    candidate = candidate_loader(candidate_id)
+                except Exception:
+                    candidate = None
+                if isinstance(candidate, Mapping):
+                    candidate_payload = candidate.get("payload")
+                    candidate_payload = (
+                        candidate_payload
+                        if isinstance(candidate_payload, Mapping)
+                        else {}
+                    )
+                    rejected = (
+                        str(candidate.get("stage") or "").strip().upper()
+                        == "REJECTED"
+                        or str(candidate_payload.get("stage") or "").strip().upper()
+                        == "REJECTED"
+                        or bool(candidate_payload.get("rejected"))
+                    )
+            if rejected and identifier not in rejected_strategy_versions:
+                rejected_strategy_versions.append(identifier)
+        try:
+            rolling = self.rolling_portfolio_state()
+        except Exception as exc:
+            raise OperatorControlError(
+                "EXECUTION_AUTHORIZATION_POLICY_UNAVAILABLE",
+                type(exc).__name__,
+            ) from exc
+        policy_identity = rolling.get("active_policy_identity")
+        if not isinstance(policy_identity, Mapping):
+            policy_identity = rolling.get("policy_identity")
+        policy_hash = (
+            str(
+                policy_identity.get("config_hash")
+                if isinstance(policy_identity, Mapping)
+                else ""
+            ).strip()
+            or str(selection.get("policy_hash") or selection.get("config_hash") or "").strip()
+        )
+        scope_loader = getattr(self.store, "market_scope_resolution_funnel", None)
+        if callable(scope_loader):
+            try:
+                scope = scope_loader(limit=1000)
+            except TypeError:
+                try:
+                    scope = scope_loader()
+                except Exception as exc:
+                    raise OperatorControlError(
+                        "EXECUTION_AUTHORIZATION_SCOPE_UNAVAILABLE",
+                        type(exc).__name__,
+                    ) from exc
+            except Exception as exc:
+                raise OperatorControlError(
+                    "EXECUTION_AUTHORIZATION_SCOPE_UNAVAILABLE",
+                    type(exc).__name__,
+                ) from exc
+        scope = scope if isinstance(scope, Mapping) else {}
+        scope_hash = self._rolling_canonical_hash(scope)
+        scope_version = str(
+            scope.get("scope_version")
+            or scope.get("version")
+            or scope.get("snapshot_version")
+            or "scope-v1"
+        ).strip()[:128]
+        limits = risk.get("effective_limits", risk.get("active_limits", {}))
+        limits = dict(limits) if isinstance(limits, Mapping) else {}
+        return {
+            "now": now,
+            "selection_id": selection_id or None,
+            "selection_hash": selection_hash or None,
+            "strategy_versions": strategy_versions,
+            "rejected_strategy_versions": rejected_strategy_versions,
+            "selection_policy_hash": policy_hash or None,
+            "scope_hash": scope_hash,
+            "scope_version": scope_version,
+            "active_settings_hash": settings_hash,
+            "active_settings_generation": settings_generation,
+            "limits": limits,
+            "selection": selection,
+            "scope": scope,
+        }
+
+    def execution_authorization_snapshot(self) -> dict[str, Any]:
+        """Return active and latest reviewed exploratory authorization state."""
+        loader = getattr(self.store, "load_active_execution_authorization", None)
+        active: Mapping[str, Any] | None = None
+        if callable(loader):
+            try:
+                value = loader(mode="EXPLORATORY_MICRO_CANARY", now=utc_now())
+            except TypeError:
+                value = loader()
+            except Exception:
+                value = None
+            if isinstance(value, Mapping):
+                active = value
+
+        # Keep the latest durable record visible even when the active loader
+        # deliberately hides an expired or stale-binding authorization.  A
+        # dashboard must not turn those states into an indistinguishable
+        # disabled/active projection.
+        latest: Mapping[str, Any] | None = None
+        list_authorizations = getattr(
+            self.store, "list_execution_authorizations", None
+        )
+        if callable(list_authorizations):
+            try:
+                records = list_authorizations(
+                    mode="EXPLORATORY_MICRO_CANARY",
+                    limit=1,
+                    now=utc_now(),
+                )
+            except TypeError:
+                records = list_authorizations(
+                    mode="EXPLORATORY_MICRO_CANARY",
+                    limit=1,
+                )
+            except Exception:
+                records = ()
+            if isinstance(records, (list, tuple)) and records:
+                candidate = records[0]
+                if isinstance(candidate, Mapping):
+                    latest = candidate
+                    if active is None and str(
+                        candidate.get("status") or ""
+                    ).upper() == "ACTIVE":
+                        active = candidate
+
+        get_config = getattr(self.store, "get_operator_config", None)
+        try:
+            draft = (
+                get_config("execution_authorization_review", None)
+                if callable(get_config)
+                else None
+            )
+        except Exception:
+            draft = None
+        draft = dict(draft) if isinstance(draft, Mapping) else None
+
+        latest_status = (
+            str(latest.get("status") or "").strip().upper()
+            if isinstance(latest, Mapping)
+            else ""
+        )
+        if (
+            latest is not None
+            and latest_status in {"DRAFT", "EXPIRED", "REVOKED"}
+            and (
+                draft is None
+                or str(draft.get("status") or "").strip().upper() == "ACTIVE"
+            )
+        ):
+            # The operator config is a compatibility cache and can still
+            # carry ACTIVE after a restart.  Prefer the durable row's
+            # terminal state and generated identifier.
+            draft = dict(latest)
+
+        draft_status = (
+            str(draft.get("status") or "").strip().upper()
+            if isinstance(draft, Mapping)
+            else ""
+        )
+        if isinstance(active, Mapping):
+            status = str(active.get("status") or "ACTIVE").upper()
+        elif latest_status in {"DRAFT", "EXPIRED", "REVOKED", "UNKNOWN"}:
+            status = latest_status
+        elif draft_status in {"DRAFT", "EXPIRED", "REVOKED", "UNKNOWN"}:
+            status = draft_status
+        elif draft is not None and "status" in draft:
+            status = "UNKNOWN"
+        else:
+            status = "DISABLED"
+        authorization = active or latest or draft
+        authorization_id = (
+            authorization.get("authorization_id") or authorization.get("id")
+            if isinstance(authorization, Mapping)
+            else None
+        )
+        authorization_mode = (
+            str(authorization.get("mode") or "").strip().upper()
+            if isinstance(authorization, Mapping)
+            else ""
+        ) or "EXPLORATORY_MICRO_CANARY"
+        return {
+            "active": _safe_value(active) if active is not None else None,
+            "draft": _safe_value(draft) if draft is not None else None,
+            "authorization": _safe_value(authorization)
+            if authorization is not None
+            else None,
+            "authorization_id": str(authorization_id).strip()
+            if authorization_id
+            else None,
+            "status": status,
+            "mode": authorization_mode,
+            "paper_only": True,
+            "live_execution": False,
+        }
+
+    def review_execution_authorization(
+        self,
+        values: Mapping[str, Any] | None = None,
+        *,
+        actor: str = "operator",
+    ) -> dict[str, Any]:
+        """Persist a bounded exploratory authorization draft without activating it."""
+        if values is not None and not isinstance(values, Mapping):
+            raise OperatorControlError("EXECUTION_AUTHORIZATION_VALUES_REQUIRED")
+        raw = dict(values or {})
+        allowed = {
+            "purpose",
+            "exact_strategy_versions",
+            "strategy_version_ids",
+            "reviewed_selection_policy_hash",
+            "selection_policy_hash",
+            "adverse_evidence_ack",
+            "lifetime_budget",
+            "stop_rules",
+            "expires_at",
+            "scope_hash",
+            "scope_version",
+            "active_settings_hash",
+            "active_settings_generation",
+            "selection_id",
+            "selection_hash",
+            "actor_version",
+        }
+        unknown = set(raw) - allowed
+        if unknown:
+            raise OperatorControlError("UNSUPPORTED_EXECUTION_AUTHORIZATION_FIELDS")
+        context = self._authorization_context()
+        for field, context_key in (
+            ("scope_hash", "scope_hash"),
+            ("scope_version", "scope_version"),
+            ("active_settings_hash", "active_settings_hash"),
+        ):
+            if field not in raw:
+                continue
+            supplied = raw.get(field)
+            expected = context.get(context_key)
+            if str(supplied or "") != str(expected or ""):
+                raise OperatorControlError("EXECUTION_AUTHORIZATION_BINDING_STALE")
+        purpose = self._authorization_text(
+            raw.get("purpose", "exploratory micro-canary review"), "purpose"
+        )
+        actor_value = _safe_identifier(actor, "actor")
+        actor_version = self._authorization_text(
+            raw.get("actor_version", os.environ.get("AXIOM_OPERATOR_VERSION", "operator-v1")),
+            "actor_version",
+            limit=64,
+        )
+        strategy_values = raw.get("exact_strategy_versions", raw.get("strategy_version_ids"))
+        if strategy_values is None:
+            strategy_values = context["strategy_versions"]
+        if isinstance(strategy_values, str):
+            strategy_values = (strategy_values,)
+        if not isinstance(strategy_values, (list, tuple, set, frozenset)):
+            raise OperatorControlError("EXECUTION_AUTHORIZATION_STRATEGIES_INVALID")
+        strategy_versions: list[str] = []
+        for item in strategy_values:
+            value = self._authorization_text(item, "strategy_version", limit=256)
+            if value not in strategy_versions:
+                strategy_versions.append(value)
+            if len(strategy_versions) >= 32:
+                break
+        if "exact_strategy_versions" in raw or "strategy_version_ids" in raw:
+            if set(strategy_versions) != set(context["strategy_versions"]):
+                raise OperatorControlError("EXECUTION_AUTHORIZATION_BINDING_STALE")
+        ack = raw.get("adverse_evidence_ack")
+        acknowledged = ack is True
+        if isinstance(ack, Mapping):
+            acknowledged = any(
+                ack.get(name) is True
+                for name in ("acknowledged", "acknowledgment", "accepted")
+            )
+        rejected_strategy_versions = {
+            str(value).strip()
+            for value in context.get("rejected_strategy_versions", ())
+            if str(value).strip()
+        }
+        funding_rejected_strategy = bool(
+            rejected_strategy_versions.intersection(strategy_versions)
+        )
+        if funding_rejected_strategy and not acknowledged:
+            raise OperatorControlError("EXECUTION_AUTHORIZATION_ADVERSE_EVIDENCE_ACK_REQUIRED")
+        # The storage contract requires an explicit acknowledgment object for
+        # every durable row.  For accepted strategies this is an internal
+        # non-required marker; rejected strategies must carry the operator's
+        # explicit acknowledgment above.
+        persisted_ack = ack if acknowledged else {
+            "acknowledged": True,
+            "required": False,
+        }
+        policy_hash = str(
+            raw.get("reviewed_selection_policy_hash")
+            or raw.get("selection_policy_hash")
+            or context.get("selection_policy_hash")
+            or ""
+        ).strip()
+        if (
+            ("reviewed_selection_policy_hash" in raw or "selection_policy_hash" in raw)
+            and policy_hash != str(context.get("selection_policy_hash") or "")
+        ):
+            raise OperatorControlError("EXECUTION_AUTHORIZATION_BINDING_STALE")
+        if not strategy_versions and not policy_hash:
+            raise OperatorControlError("EXECUTION_AUTHORIZATION_SELECTION_BINDING_REQUIRED")
+        lifetime_budget = self._authorization_decimal(
+            raw.get("lifetime_budget", "1.00"), "lifetime_budget"
+        )
+        now = context["now"]
+        expires_value = raw.get("expires_at")
+        if expires_value is None:
+            expires_at = now.replace(microsecond=0) + timedelta(hours=24)
+        else:
+            expires_text = self._authorization_timestamp(expires_value, "expires_at")
+            try:
+                expires_at = datetime.fromisoformat(expires_text)
+            except (TypeError, ValueError):
+                raise OperatorControlError(
+                    "EXECUTION_AUTHORIZATION_EXPIRES_AT_INVALID"
+                ) from None
+        if expires_at <= now:
+            raise OperatorControlError("EXECUTION_AUTHORIZATION_EXPIRED")
+        expires_text = expires_at.isoformat()
+        stop_rules = raw.get(
+            "stop_rules",
+            {
+                "max_submissions": 1,
+                "max_loss_usd": "0.25",
+                "halt_on_unknown_execution": True,
+            },
+        )
+        if not isinstance(stop_rules, Mapping) or not stop_rules:
+            raise OperatorControlError("EXECUTION_AUTHORIZATION_STOP_RULES_REQUIRED")
+        stop_rules = _safe_value(dict(stop_rules))
+        if not isinstance(stop_rules, Mapping):
+            raise OperatorControlError("EXECUTION_AUTHORIZATION_STOP_RULES_INVALID")
+        register = getattr(self.store, "register_execution_authorization_draft", None)
+        if not callable(register):
+            raise OperatorControlError("EXECUTION_AUTHORIZATION_STORAGE_UNAVAILABLE")
+        try:
+            draft = register(
+                authorization_id=None,
+                mode="EXPLORATORY_MICRO_CANARY",
+                purpose=purpose,
+                exact_strategy_versions=tuple(strategy_versions),
+                strategy_version_ids=tuple(strategy_versions),
+                reviewed_selection_policy_hash=policy_hash or None,
+                selection_policy_hash=policy_hash or None,
+                adverse_evidence_ack=persisted_ack,
+                lifetime_budget=lifetime_budget,
+                stop_rules=dict(stop_rules),
+                expires_at=expires_at,
+                scope_hash=str(raw.get("scope_hash") or context["scope_hash"]),
+                scope_version=str(raw.get("scope_version") or context["scope_version"]),
+                active_settings_hash=str(
+                    raw.get("active_settings_hash") or context["active_settings_hash"]
+                ),
+                active_settings_generation=int(
+                    raw.get("active_settings_generation")
+                    or context["active_settings_generation"]
+                ),
+                selection_id=str(raw.get("selection_id") or context["selection_id"] or "") or None,
+                selection_hash=str(raw.get("selection_hash") or context["selection_hash"] or "") or None,
+                actor=actor_value,
+                actor_version=actor_version,
+                timestamp=now,
+            )
+        except OperatorControlError:
+            raise
+        except Exception as exc:
+            raise OperatorControlError(
+                "EXECUTION_AUTHORIZATION_DRAFT_FAILED", type(exc).__name__
+            ) from exc
+        projected = _safe_value(draft)
+        if not isinstance(projected, Mapping):
+            raise OperatorControlError("EXECUTION_AUTHORIZATION_DRAFT_INVALID")
+        document = dict(projected)
+        document.update(
+            {
+                "mode": "EXPLORATORY_MICRO_CANARY",
+                "purpose": purpose,
+                "exact_strategy_versions": strategy_versions,
+                "reviewed_selection_policy_hash": policy_hash or None,
+                "adverse_evidence_ack": persisted_ack,
+                "adverse_evidence_ack_required": funding_rejected_strategy,
+                "lifetime_budget": lifetime_budget,
+                "stop_rules": dict(stop_rules),
+                "expires_at": expires_text,
+                "scope_hash": context["scope_hash"],
+                "scope_version": context["scope_version"],
+                "active_settings_hash": context["active_settings_hash"],
+                "active_settings_generation": context["active_settings_generation"],
+                "selection_id": context["selection_id"],
+                "selection_hash": context["selection_hash"],
+                "actor": actor_value,
+                "actor_version": actor_version,
+                "status": "DRAFT",
+                "paper_only": True,
+                "live_execution": False,
+            }
+        )
+        self.store.set_operator_config("execution_authorization_review", document)
+        return {
+            "status": "DRAFT",
+            "draft": document,
+            "authorization": document,
+            "paper_only": True,
+            "live_execution": False,
+        }
+
+    def activate_execution_authorization(
+        self,
+        authorization_id: Any | None = None,
+        *,
+        actor: str = "operator",
+        expected_generation: Any | None = None,
+    ) -> dict[str, Any]:
+        """Activate only the reviewed immutable exploratory record."""
+        get_config = getattr(self.store, "get_operator_config", None)
+        draft = get_config("execution_authorization_review", None) if callable(get_config) else None
+        draft = dict(draft) if isinstance(draft, Mapping) else {}
+        if str(draft.get("status") or "").upper() != "DRAFT":
+            raise OperatorControlError("EXECUTION_AUTHORIZATION_DRAFT_REQUIRED")
+        draft_id = str(draft.get("authorization_id") or draft.get("id") or "").strip()
+        if not draft_id:
+            raise OperatorControlError("EXECUTION_AUTHORIZATION_DRAFT_REQUIRED")
+        if authorization_id is not None and str(authorization_id).strip() != draft_id:
+            raise OperatorControlError("EXECUTION_AUTHORIZATION_BINDING_STALE")
+        identifier = draft_id
+        actor_value = _safe_identifier(actor, "actor")
+        generation = expected_generation
+        if generation is None:
+            generation = draft.get("generation")
+        if generation is not None:
+            try:
+                generation = _positive_generation(generation, "EXECUTION_AUTHORIZATION_GENERATION_REQUIRED")
+            except OperatorControlError:
+                raise
+        activate = getattr(self.store, "activate_execution_authorization", None)
+        if not callable(activate):
+            raise OperatorControlError("EXECUTION_AUTHORIZATION_STORAGE_UNAVAILABLE")
+        try:
+            result = activate(
+                identifier,
+                actor_value,
+                expected_generation=generation,
+                timestamp=utc_now(),
+            )
+        except OperatorControlError:
+            raise
+        except Exception as exc:
+            raise OperatorControlError(
+                "EXECUTION_AUTHORIZATION_ACTIVATE_FAILED", type(exc).__name__
+            ) from exc
+        projected = _safe_value(result)
+        if not isinstance(projected, Mapping):
+            raise OperatorControlError("EXECUTION_AUTHORIZATION_ACTIVE_INVALID")
+        document = dict(projected)
+        document.setdefault("mode", "EXPLORATORY_MICRO_CANARY")
+        document["paper_only"] = True
+        document["live_execution"] = False
+        self.store.set_operator_config("execution_authorization_review", document)
+        return {
+            "status": str(document.get("status") or "ACTIVE").upper(),
+            "authorization": document,
+            "paper_only": True,
+            "live_execution": False,
+        }
+
+    def revoke_execution_authorization(
+        self,
+        authorization_id: Any | None = None,
+        *,
+        actor: str = "operator",
+        expected_generation: Any | None = None,
+        reason: str = "operator_revoke",
+    ) -> dict[str, Any]:
+        """Revoke the active exploratory record; never changes paper state."""
+        active = self.execution_authorization_snapshot().get("active")
+        active = active if isinstance(active, Mapping) else {}
+        active_id = str(
+            active.get("authorization_id") or active.get("id") or ""
+        ).strip()
+        if not active_id:
+            raise OperatorControlError("EXECUTION_AUTHORIZATION_ACTIVE_REQUIRED")
+        if authorization_id is not None and str(authorization_id).strip() != active_id:
+            raise OperatorControlError("EXECUTION_AUTHORIZATION_BINDING_STALE")
+        identifier = active_id
+        generation = expected_generation
+        if generation is None:
+            generation = active.get("generation")
+        if generation is not None:
+            generation = _positive_generation(
+                generation, "EXECUTION_AUTHORIZATION_GENERATION_REQUIRED"
+            )
+        revoke = getattr(self.store, "revoke_execution_authorization", None)
+        if not callable(revoke):
+            raise OperatorControlError("EXECUTION_AUTHORIZATION_STORAGE_UNAVAILABLE")
+        try:
+            result = revoke(
+                identifier,
+                _safe_identifier(actor, "actor"),
+                expected_generation=generation,
+                reason=self._authorization_text(reason, "revoke_reason", limit=128),
+                timestamp=utc_now(),
+            )
+        except OperatorControlError:
+            raise
+        except Exception as exc:
+            raise OperatorControlError(
+                "EXECUTION_AUTHORIZATION_REVOKE_FAILED", type(exc).__name__
+            ) from exc
+        projected = _safe_value(result)
+        if not isinstance(projected, Mapping):
+            raise OperatorControlError("EXECUTION_AUTHORIZATION_REVOKED_INVALID")
+        document = dict(projected)
+        document["paper_only"] = True
+        document["live_execution"] = False
+        self.store.set_operator_config("execution_authorization_review", document)
+        return {
+            "status": str(document.get("status") or "REVOKED").upper(),
+            "authorization": document,
+            "paper_only": True,
+            "live_execution": False,
+        }
+
+    def controller_lease_status(self) -> dict[str, Any]:
+        loader = getattr(self.store, "load_canary_controller_lease", None)
+        if not callable(loader):
+            return {"status": "UNAVAILABLE", "owner_id": None, "paper_only": True}
+        try:
+            value = loader(now=utc_now())
+        except TypeError:
+            value = loader()
+        except Exception:
+            value = None
+        projected = _safe_value(value) if isinstance(value, Mapping) else {}
+        result = dict(projected) if isinstance(projected, Mapping) else {}
+        result.setdefault("status", "NONE")
+        result["paper_only"] = True
+        result["live_execution"] = False
+        return result
 
 
     def rolling_portfolio_state(self) -> dict[str, Any]:
@@ -3431,17 +4115,329 @@ class OperatorControlPlane:
         )
         if self.execution_profile != PRODUCTION_EXECUTION_PROFILE:
             canary_submit = "DISABLED_ISOLATED_EXECUTION_PROFILE"
+        authorization = self.execution_authorization_snapshot()
+        lease = self.controller_lease_status()
+        node_status = self._node_status(verify_identity=False)
+        control_state = str(
+            canary_status.get("control_state")
+            or canary_status.get("micro_live_canary")
+            or "DISARMED"
+        ).upper()
+        auth_active = authorization.get("active")
+        auth_status = (
+            str(auth_active.get("status") or "").upper()
+            if isinstance(auth_active, Mapping)
+            else ""
+        )
+        rolling_status = str(
+            rolling_state.get("selection_status")
+            or rolling_state.get("status")
+            or ""
+        ).upper()
+        current_selection = rolling_state.get("selection")
+        current_selection = (
+            current_selection if isinstance(current_selection, Mapping) else {}
+        )
+        current_members = current_selection.get(
+            "members",
+            current_selection.get("selected_members", ()),
+        )
+        current_member_count = (
+            len(current_members)
+            if isinstance(current_members, (list, tuple))
+            else 0
+        )
+        selection_state = str(
+            current_selection.get("selection_status")
+            or current_selection.get("status")
+            or rolling_state.get("selection_status")
+            or ""
+        ).strip().upper()
+        current_selection_available = bool(
+            current_member_count
+            and selection_state not in {"NONE", "STALE", "UNKNOWN", "OBSERVE"}
+            and current_selection.get("selection_valid") is not False
+        )
+        if not current_selection_available:
+            operator_mode = "observing"
+        elif (
+            control_state in {"AUTONOMOUS_MICRO_LIVE", "LIVE", "ARMED"}
+            and auth_status == "ACTIVE"
+        ):
+            operator_mode = "live_authorized"
+        elif auth_status == "ACTIVE":
+            operator_mode = "exploratory_reviewed"
+        elif rolling_status in {"CURRENT", "READY"} or rolling_state.get("actionable", 0):
+            operator_mode = "evidence_selected"
+        else:
+            operator_mode = "observing"
+        service_identity = _operator_service_identity(CanaryService)
+        identity = {
+            "instance_id": str(
+                node_status.get("process_identity")
+                or f"axiom-node:{node_status.get('pid') or 'unknown'}"
+            ),
+            "database": self.db_path,
+            "db_path": self.db_path,
+            "service": service_identity,
+            "service_identity": service_identity,
+            "revision": node_status.get("revision") or os.environ.get("AXIOM_REVISION") or "unknown",
+            "process_identity": node_status.get("process_identity"),
+        }
+        limits = dict(
+            settings_snapshot.get("effective_limits", {})
+            if isinstance(settings_snapshot, Mapping)
+            else {}
+        )
+        usage = dict(
+            settings_snapshot.get("usage", {})
+            if isinstance(settings_snapshot, Mapping)
+            and isinstance(settings_snapshot.get("usage"), Mapping)
+            else {}
+        )
+        remaining = dict(
+            settings_snapshot.get("remaining", {})
+            if isinstance(settings_snapshot, Mapping)
+            and isinstance(settings_snapshot.get("remaining"), Mapping)
+            else {}
+        )
+        skip_reasons = autonomous_state.get("signal_scan_reason_counts")
+        if not isinstance(skip_reasons, Mapping):
+            skip_reasons = {}
+        economic_policy = {
+            "mode": operator_mode,
+            "policy": rolling_state.get("policy_identity")
+            or rolling_state.get("active_policy_identity")
+            or {},
+            "limits": limits,
+            "usage": usage,
+            "remaining": remaining,
+            "daily": {
+                "submissions": {
+                    "limit": limits.get("max_submitted_orders_per_day"),
+                    "used": usage.get("submitted_orders"),
+                    "remaining": remaining.get("submitted_orders"),
+                },
+                "buy_usd": {
+                    "limit": limits.get("max_gross_daily_buy_usd"),
+                    "used": usage.get("gross_daily_buy_usd"),
+                    "remaining": remaining.get("gross_daily_buy_usd"),
+                },
+            },
+            "lifetime": {
+                "buy_usd": {
+                    "limit": settings_snapshot.get("cumulative_buy_cap_usd")
+                    if isinstance(settings_snapshot, Mapping)
+                    else None,
+                    "used": usage.get("cumulative_buy_usd"),
+                    "remaining": settings_snapshot.get("remaining_cumulative_buy_usd")
+                    if isinstance(settings_snapshot, Mapping)
+                    else None,
+                }
+            },
+        }
+        next_work = (
+            rolling_worker.get("next_work")
+            or autonomous_state.get("next_work")
+            or rolling_worker.get("next_retry_at")
+        )
+        last_evaluation = (
+            rolling_worker.get("last_tick_completed_at")
+            or rolling_worker.get("last_successful_tick")
+            or autonomous_state.get("last_tick_completed_at")
+        )
+        if node_status.get("status") != "RUNNING":
+            next_action = "LAUNCH_OBSERVATION"
+        elif isinstance(authorization.get("draft"), Mapping) and str(
+            authorization["draft"].get("status") or ""
+        ).upper() == "DRAFT":
+            next_action = "ACTIVATE_REVIEWED_AUTHORIZATION"
+        elif operator_mode == "evidence_selected":
+            next_action = "REVIEW_OR_ENABLE_EVIDENCE_SELECTED_POLICY"
+        else:
+            next_action = "CONTINUE_OBSERVATION"
+        raw_blocker = canary_status.get("blocker")
+        if isinstance(raw_blocker, Mapping):
+            blocker_code = str(
+                raw_blocker.get("code")
+                or raw_blocker.get("reason")
+                or raw_blocker.get("category")
+                or "UNKNOWN"
+            ).strip().upper()
+            blocker_resolver = str(
+                raw_blocker.get("resolver")
+                or raw_blocker.get("action")
+                or "REVIEW_OPERATOR_STATUS"
+            ).strip()
+        else:
+            blocker_code = str(raw_blocker or "").strip().upper() or "NONE"
+            blocker_resolver = (
+                "LAUNCH_OBSERVATION"
+                if blocker_code == "AUTONOMOUS_CANARY_DISABLED"
+                else "REVIEW_PERSISTED_EVIDENCE"
+                if blocker_code in {"NO_SIGNAL", "NO_DATA", "DATA_UNAVAILABLE"}
+                else "REVIEW_OPERATOR_STATUS"
+            )
+        if blocker_code in {"NONE", "OK", "READY"}:
+            blocker_category = "NONE"
+        elif "AUTH" in blocker_code or "REVIEW" in blocker_code:
+            blocker_category = "AUTHORIZATION"
+        elif any(token in blocker_code for token in ("CONFIG", "SETTING", "PROFILE")):
+            blocker_category = "CONFIG"
+        elif any(token in blocker_code for token in ("CAPITAL", "BALANCE", "BUDGET", "LIMIT", "RISK")):
+            blocker_category = "CAPITAL"
+        elif any(token in blocker_code for token in ("DATA", "MARKET", "DEPTH", "SIGNAL")):
+            blocker_category = "DATA"
+        elif any(token in blocker_code for token in ("ERROR", "EXCEPTION", "DEFECT", "INVARIANT")):
+            blocker_category = "DEFECT"
+        else:
+            blocker_category = "EXECUTION"
+        blocker_detail = {
+            "code": blocker_code,
+            "category": blocker_category,
+            "resolver": blocker_resolver,
+            "action": next_action,
+            "next_scheduled_action": str(
+                next_work or rolling_worker.get("next_review_at") or next_action
+            ),
+        }
+        coverage = dict(market_scope_funnel)
+        coverage.setdefault("exclusions", market_scope_funnel.get("exclusions", []))
+        coverage_summary_loader = getattr(self.store, "dashboard_coverage_summary", None)
+        if callable(coverage_summary_loader):
+            try:
+                coverage_summary = coverage_summary_loader()
+            except Exception:
+                coverage_summary = {}
+            if isinstance(coverage_summary, Mapping):
+                # Qualification funnel fields and dataset-count compatibility
+                # fields are distinct durable projections; keep both.
+                for key in (
+                    "historical_count",
+                    "historical_datasets",
+                    "historical_rows",
+                    "forward_count",
+                    "forward_datasets",
+                    "forward_rows",
+                ):
+                    if key not in coverage and coverage_summary.get(key) is not None:
+                        coverage[key] = coverage_summary[key]
+        canary_status["blocker_detail"] = blocker_detail
+        autonomous_state["blocker_detail"] = dict(blocker_detail)
+        selection = rolling_state.get("selection")
+        selection = selection if isinstance(selection, Mapping) else {}
+        active_strategies = (
+            rolling_state.get("active_rows")
+            if isinstance(rolling_state.get("active_rows"), (list, tuple))
+            else selection.get("members", selection.get("selected_members", []))
+        )
+        active_strategies = (
+            list(active_strategies)
+            if isinstance(active_strategies, (list, tuple))
+            else []
+        )
+        suspended_strategies = rolling_state.get(
+            "suspended_strategies",
+            rolling_state.get("suspended_rows", []),
+        )
+        if not isinstance(suspended_strategies, (list, tuple)):
+            suspended_strategies = [
+                item
+                for item in active_strategies
+                if isinstance(item, Mapping)
+                and str(item.get("status") or "").strip().upper()
+                in {"SUSPENDED", "PAUSED", "BLOCKED"}
+            ]
+        suspended_strategies = list(suspended_strategies)
+        execution_summary = {
+            "orders": execution_report.get("orders", execution_report.get("trades", [])),
+            "partial_fills": execution_report.get("partial_fills", []),
+            "positions": execution_report.get("positions", []),
+            "exits": execution_report.get("exits", []),
+            "net_pnl": execution_report.get(
+                "net_pnl", execution_report.get("net_pnl_usd")
+            ),
+        }
+        strategies_projection = {
+            "active": active_strategies,
+            "suspended": suspended_strategies,
+            "selection": rolling_state.get("selection"),
+        }
+        signals_projection = {
+            "latest": latest_signal,
+            "current": latest_signal,
+            "skip_reasons": dict(skip_reasons),
+            "category_skip_reasons": dict(skip_reasons),
+        }
+        execution_state = {
+            "state": control_state,
+            "mode": operator_mode,
+            "submit": canary_submit,
+            "summary": execution_summary,
+            "live_execution": False,
+        }
+        last_review = (
+            rolling_state.get("last_review_at")
+            or rolling_state.get("reviewed_at")
+            or rolling_state.get("active_at")
+        )
         return {
             "execution_profile": self.execution_profile,
+            "identity": identity,
+            "revision": identity.get("revision"),
+            "blocker": blocker_detail,
+            "blockers": [blocker_detail] if blocker_code != "NONE" else [],
+            "instance": identity,
+            "mode": operator_mode,
+            "armed": control_state in {"ARMED", "AUTONOMOUS_MICRO_LIVE", "LIVE"},
+            "armed_state": control_state,
+            "economic_policy": economic_policy,
+            "policy": economic_policy.get("policy", {}),
+            "budgets": economic_policy,
+            "limits": limits,
+            "daily_budget": economic_policy.get("daily", {}),
+            "lifetime_budget": economic_policy.get("lifetime", {}),
+            "usage": usage,
+            "remaining": remaining,
+            "remaining_budgets": remaining,
+            "authorization": authorization,
+            "execution_authorization": authorization,
+            "execution_authorization_id": authorization.get("authorization_id")
+            if isinstance(authorization, Mapping)
+            else None,
+            "controller_lease": lease,
+            "coverage": coverage,
+            "qualification_coverage": coverage,
+            "historical_count": coverage.get("historical_count", 0),
+            "historical_rows": coverage.get("historical_rows", 0),
+            "forward_count": coverage.get("forward_count", 0),
+            "forward_rows": coverage.get("forward_rows", 0),
+            "strategies": strategies_projection,
+            "active_strategies": strategies_projection["active"],
+            "suspended_strategies": strategies_projection["suspended"],
+            "signals": signals_projection,
+            "current_signals": signals_projection["current"],
+            "execution_summary": execution_summary,
+            "execution": execution_summary,
+            "execution_state": execution_state,
+            "last_review": last_review,
+            "last_review_at": last_review,
+            "last_evaluation": last_evaluation,
+            "last_work": last_evaluation,
+            "work": {"last": last_evaluation, "next": next_work},
+            "next_work": next_work,
+            "next_review": rolling_worker.get("next_review_at")
+            or rolling_state.get("review_due_at"),
+            "next_review_at": rolling_worker.get("next_review_at")
+            or rolling_state.get("review_due_at"),
             "actions": self._action_snapshot(),
             "risk_settings": settings_snapshot,
             "canary_status_report": dict(report),
             "connectivity": latest_connectivity,
-            "node": self._node_status(verify_identity=False),
             "hermes": hermes.state(),
             "collector": worker("polymarket-collector"),
             "paper": {**worker("paper-engine"), "read_only": True, "live_execution": False},
-            "research": worker("research-engine"),
+            "node": node_status,
             "autonomous_canary_worker": worker_status,
             "shadow_worker": shadow_worker,
             "shadow_jobs": shadow_jobs,
@@ -3459,6 +4455,7 @@ class OperatorControlPlane:
             "market_scope_funnel": market_scope_funnel,
             "credentials": credentials,
             "canary": {
+                "blocker_detail": blocker_detail,
                 "status": canary_status,
                 "status_report": dict(report),
                 "control": dict(control_report),
@@ -3626,6 +4623,58 @@ class OperatorControlPlane:
                         action_payload["expected_risk_config_generation"],
                         "ROLLING_RISK_GENERATION_REQUIRED",
                     )
+            elif action_value == "execution_authorization.review":
+                allowed = {"values", "actor"}
+                if set(action_payload) - allowed:
+                    raise OperatorControlError("UNSUPPORTED_EXECUTION_AUTHORIZATION_FIELDS")
+                values = action_payload.get("values")
+                if values is not None and not isinstance(values, Mapping):
+                    raise OperatorControlError("EXECUTION_AUTHORIZATION_VALUES_REQUIRED")
+                target_value = "exploratory:" + self._rolling_canonical_hash(
+                    values if isinstance(values, Mapping) else {}
+                )[:32]
+            elif action_value in {
+                "execution_authorization.activate",
+                "execution_authorization.revoke",
+            }:
+                allowed = {"authorization_id", "actor", "expected_generation", "reason"}
+                if set(action_payload) - allowed:
+                    raise OperatorControlError("UNSUPPORTED_EXECUTION_AUTHORIZATION_FIELDS")
+                is_revoke = action_value.endswith("revoke")
+                if is_revoke:
+                    current = self.execution_authorization_snapshot().get("active")
+                    required_reason = "EXECUTION_AUTHORIZATION_ACTIVE_REQUIRED"
+                else:
+                    get_config = getattr(self.store, "get_operator_config", None)
+                    current = (
+                        get_config("execution_authorization_review", None)
+                        if callable(get_config)
+                        else None
+                    )
+                    required_reason = "EXECUTION_AUTHORIZATION_DRAFT_REQUIRED"
+                current = current if isinstance(current, Mapping) else {}
+                current_status = str(current.get("status") or "").upper()
+                expected_status = "ACTIVE" if is_revoke else "DRAFT"
+                if current_status != expected_status:
+                    raise OperatorControlError(required_reason)
+                current_id = str(
+                    current.get("authorization_id") or current.get("id") or ""
+                ).strip()
+                if not current_id:
+                    raise OperatorControlError(required_reason)
+                supplied_id = action_payload.get("authorization_id")
+                if supplied_id is not None and str(supplied_id).strip() != current_id:
+                    raise OperatorControlError("EXECUTION_AUTHORIZATION_BINDING_STALE")
+                target_value = f"exploratory:{current_id}"
+                if action_payload.get("expected_generation") is not None:
+                    generation = _positive_generation(
+                        action_payload["expected_generation"],
+                        "EXECUTION_AUTHORIZATION_GENERATION_REQUIRED",
+                    )
+                    if current.get("generation") is not None and int(current["generation"]) != generation:
+                        raise OperatorControlError(
+                            "EXECUTION_AUTHORIZATION_GENERATION_CHANGED"
+                        )
             if action_value == RECOVERY_ACTION:
                 allowed = {"event_id", "signal_id", "exchange_order_id"}
                 if set(action_payload) - allowed:
@@ -3734,6 +4783,30 @@ class OperatorControlPlane:
                         action_payload["config_id"],
                         actor=action_payload.get("actor", "operator"),
                         expected_generation=action_payload.get("expected_generation"),
+                    )
+                }
+            elif action_value == "execution_authorization.review":
+                result = {
+                    "execution_authorization": self.review_execution_authorization(
+                        action_payload.get("values"),
+                        actor=action_payload.get("actor", "operator"),
+                    )
+                }
+            elif action_value == "execution_authorization.activate":
+                result = {
+                    "execution_authorization": self.activate_execution_authorization(
+                        action_payload.get("authorization_id"),
+                        actor=action_payload.get("actor", "operator"),
+                        expected_generation=action_payload.get("expected_generation"),
+                    )
+                }
+            elif action_value == "execution_authorization.revoke":
+                result = {
+                    "execution_authorization": self.revoke_execution_authorization(
+                        action_payload.get("authorization_id"),
+                        actor=action_payload.get("actor", "operator"),
+                        expected_generation=action_payload.get("expected_generation"),
+                        reason=action_payload.get("reason", "operator_revoke"),
                     )
                 }
             elif action_value == "rolling.admission.review":

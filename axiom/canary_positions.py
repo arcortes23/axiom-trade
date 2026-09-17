@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 import inspect
 import json
 import re
@@ -223,6 +223,11 @@ def trade_timestamp(trade: Any) -> datetime | None:
         return None
     return timestamp_value(value, "trade timestamp")
 
+from .polymarket_rules import (
+    PolymarketRuleError,
+    assess_selected_token_depth,
+    parse_polymarket_rules,
+)
 from .canary import (
     CANARY_SUBMISSION_TIMEOUT_SECONDS,
     CanaryBlocked,
@@ -231,6 +236,9 @@ from .canary import (
     _account_trade_binding,
     _call_with_timeout,
     _canonical_exchange_order_id,
+    _final_venue_identity_fence,
+    _require_controller_lease,
+    _require_execution_authorization,
     _validate_trade_history_coverage,
 )
 from .domain import ensure_utc, parse_timestamp, utc_now
@@ -251,6 +259,12 @@ _POSITION_LINEAGE_FIELDS = (
     "risk_config_generation",
     "risk_config_hash",
 )
+_POSITION_AUTHORITY_FIELDS = (
+    "execution_authorization_id",
+    "execution_authorization_mode",
+    "controller_owner_id",
+    "controller_generation",
+)
 _LEGACY_LINEAGE_TYPE = "LEGACY_FINITE_CAMPAIGN"
 _ROLLING_LINEAGE_TYPE = "ROLLING_PORTFOLIO"
 
@@ -262,24 +276,89 @@ def _lineage_from_row(row: Mapping[str, Any]) -> dict[str, Any]:
         else _LEGACY_LINEAGE_TYPE
     )
     lineage_type = str(raw_type or _LEGACY_LINEAGE_TYPE).strip().upper()
+    authority = {
+        name: row[name] if name in row.keys() else None
+        for name in _POSITION_AUTHORITY_FIELDS
+    }
     if lineage_type != _ROLLING_LINEAGE_TYPE:
         return {
             "lineage_type": _LEGACY_LINEAGE_TYPE,
             **{name: None for name in _POSITION_LINEAGE_FIELDS},
+            **authority,
         }
     result = {
         name: row[name] if name in row.keys() else None
         for name in _POSITION_LINEAGE_FIELDS
     }
+    result.update(authority)
     result["lineage_type"] = _ROLLING_LINEAGE_TYPE
     if result["risk_config_generation"] is not None:
         result["risk_config_generation"] = int(result["risk_config_generation"])
     return result
 
 
+def _opening_authority(
+    service: CanaryService,
+    lot: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Recover immutable opening authority from the lot and canonical BUY evidence."""
+    authority = {
+        name: lot.get(name)
+        for name in _POSITION_AUTHORITY_FIELDS
+        if lot.get(name) not in (None, "")
+    }
+    reservation_id = str(lot.get("reservation_id") or "").strip()
+    if reservation_id:
+        with service.store._lock:
+            sources: list[Mapping[str, Any]] = []
+            try:
+                reservation = _connection(service).execute(
+                    "SELECT execution_authorization_id,controller_owner_id,"
+                    "controller_generation,detail_json "
+                    "FROM canary_risk_reservations WHERE reservation_id=?",
+                    (reservation_id,),
+                ).fetchone()
+            except sqlite3.OperationalError:
+                reservation = None
+            if reservation is not None:
+                sources.append(dict(reservation))
+            try:
+                fill = _connection(service).execute(
+                    "SELECT execution_authorization_id,controller_owner_id,"
+                    "controller_generation,detail_json "
+                    "FROM canary_risk_fills WHERE reservation_id=? "
+                    "ORDER BY filled_at DESC LIMIT 1",
+                    (reservation_id,),
+                ).fetchone()
+            except sqlite3.OperationalError:
+                fill = None
+            if fill is not None:
+                sources.append(dict(fill))
+        for source in sources:
+            detail = _decode(source.get("detail_json"))
+            for name in (
+                "execution_authorization_id",
+                "controller_owner_id",
+                "controller_generation",
+            ):
+                if authority.get(name) in (None, "") and source.get(name) not in (
+                    None,
+                    "",
+                ):
+                    authority[name] = source.get(name)
+            if authority.get("execution_authorization_mode") in (None, ""):
+                mode = detail.get("execution_authorization_mode")
+                if mode not in (None, ""):
+                    authority["execution_authorization_mode"] = mode
+    if authority.get("controller_generation") not in (None, ""):
+        authority["controller_lease_generation"] = authority["controller_generation"]
+    return authority
+
+
 def _opening_lot_lineage(service: CanaryService, lot: Mapping[str, Any]) -> dict[str, Any]:
     """Return immutable lot lineage, including its opening allocation."""
     lineage = _lineage_from_row(lot)
+    lineage.update(_opening_authority(service, lot))
     rolling = lineage["lineage_type"] == _ROLLING_LINEAGE_TYPE
     candidate_id = str(lot.get("candidate_id") or "").strip()
     lineage["candidate_id"] = (candidate_id or None) if rolling else None
@@ -860,6 +939,10 @@ def _ensure_schema(service: CanaryService) -> None:
               risk_config_generation INTEGER,
               risk_config_hash TEXT,
               lineage_type TEXT NOT NULL DEFAULT 'LEGACY_FINITE_CAMPAIGN',
+              execution_authorization_id TEXT,
+              execution_authorization_mode TEXT,
+              controller_owner_id TEXT,
+              controller_generation INTEGER,
               exit_policy_json TEXT NOT NULL DEFAULT '{}',
               quantity TEXT NOT NULL DEFAULT '0',
               sold_quantity TEXT NOT NULL DEFAULT '0',
@@ -894,6 +977,9 @@ def _ensure_schema(service: CanaryService) -> None:
               risk_config_id TEXT,
               risk_config_generation INTEGER,
               risk_config_hash TEXT,
+              execution_authorization_id TEXT,
+              controller_owner_id TEXT,
+              controller_generation INTEGER,
               lineage_type TEXT NOT NULL DEFAULT 'LEGACY_FINITE_CAMPAIGN',
               order_id TEXT,
               requested_quantity TEXT NOT NULL,
@@ -972,6 +1058,24 @@ def _ensure_schema(service: CanaryService) -> None:
             "risk_config_generation",
             "risk_config_hash",
         )
+        lot_authority_fields = (
+            "execution_authorization_id",
+            "execution_authorization_mode",
+            "controller_owner_id",
+            "controller_generation",
+        )
+        lot_columns = {
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(canary_position_lots)"
+            )
+        }
+        for name in lot_authority_fields:
+            if name not in lot_columns:
+                declaration = "INTEGER" if name == "controller_generation" else "TEXT"
+                connection.execute(
+                    f"ALTER TABLE canary_position_lots ADD COLUMN {name} {declaration}"
+                )
         for table in (
             "canary_position_lots",
             "canary_position_requests",
@@ -1006,6 +1110,15 @@ def _ensure_schema(service: CanaryService) -> None:
             if name not in request_columns:
                 connection.execute(
                     f"ALTER TABLE canary_position_requests ADD COLUMN {name} TEXT"
+                )
+        for name, declaration in (
+            ("execution_authorization_id", "TEXT"),
+            ("controller_owner_id", "TEXT"),
+            ("controller_generation", "INTEGER"),
+        ):
+            if name not in request_columns:
+                connection.execute(
+                    f"ALTER TABLE canary_position_requests ADD COLUMN {name} {declaration}"
                 )
         reconciliation_columns = {
             str(row["name"])
@@ -1121,9 +1234,11 @@ def _extract_book_price(context: Mapping[str, Any], *, side: str) -> Decimal:
     # that would let malformed data select a mark or exit price.
     direct_prices: dict[str, Decimal] = {}
     for name in names:
-        raw = context.get(name)
-        if raw in (None, ""):
+        if name not in context:
             continue
+        raw = context[name]
+        if raw in (None, ""):
+            raise CanaryBlocked("CANARY_EXIT_PRICE_UNAVAILABLE")
         direct_prices[name] = _canonical_clob_price(
             raw,
             "CANARY_EXIT_PRICE_UNAVAILABLE",
@@ -2139,7 +2254,9 @@ def _sync_entry_lots(service: CanaryService, now: datetime) -> int:
         with service.store._lock:
             try:
                 reservation_row = connection.execute(
-                    "SELECT reservation_id,config_id,config_generation "
+                    "SELECT reservation_id,config_id,config_generation,"
+                    "execution_authorization_id,controller_owner_id,"
+                    "controller_generation,detail_json "
                     "FROM canary_risk_reservations "
                     "WHERE event_id=? AND UPPER(side)='BUY' "
                     "ORDER BY created_at DESC,reservation_id DESC LIMIT 1",
@@ -2152,7 +2269,22 @@ def _sync_entry_lots(service: CanaryService, now: datetime) -> int:
                         (reservation_row["reservation_id"],),
                     ).fetchone()
             except sqlite3.OperationalError:
-                reservation_row = None
+                try:
+                    reservation_row = connection.execute(
+                        "SELECT reservation_id,config_id,config_generation "
+                        "FROM canary_risk_reservations "
+                        "WHERE event_id=? AND UPPER(side)='BUY' "
+                        "ORDER BY created_at DESC,reservation_id DESC LIMIT 1",
+                        (event_id,),
+                    ).fetchone()
+                    if reservation_row is not None:
+                        canonical_fill = connection.execute(
+                            "SELECT 1 FROM canary_risk_fills "
+                            "WHERE reservation_id=? AND CAST(quantity AS NUMERIC)>0 LIMIT 1",
+                            (reservation_row["reservation_id"],),
+                        ).fetchone()
+                except sqlite3.OperationalError:
+                    reservation_row = None
         if reservation_row is None or canonical_fill is None:
             # A legacy ledger acknowledgement without a canonical BUY
             # reservation/fill cannot establish owned inventory.
@@ -2193,6 +2325,17 @@ def _sync_entry_lots(service: CanaryService, now: datetime) -> int:
                 (signal_id,),
             ).fetchone() if signal_id else None
         lineage = _lineage_from_row(row)
+        opening_authority = _opening_authority(
+            service,
+            {
+                "reservation_id": reservation_id,
+                **lineage,
+            },
+        )
+        lineage.update(opening_authority)
+        for name in _POSITION_AUTHORITY_FIELDS:
+            if evidence.get(name) not in (None, ""):
+                lineage[name] = evidence[name]
         if signal_row is not None:
             signal_lineage = _lineage_from_row(signal_row)
             # A legacy BUY may point at a signal that later acquired rolling
@@ -2225,7 +2368,9 @@ def _sync_entry_lots(service: CanaryService, now: datetime) -> int:
                 "SELECT token_id,quantity,cost_basis,fees,status,"
                 "strategy_version_id,research_trial_id,portfolio_selection_id,"
                 "admission_policy_id,admission_policy_version,risk_config_id,"
-                "risk_config_generation,risk_config_hash,lineage_type "
+                "risk_config_generation,risk_config_hash,lineage_type,"
+                "execution_authorization_id,execution_authorization_mode,"
+                "controller_owner_id,controller_generation "
                 "FROM canary_position_lots WHERE position_id=?",
                 (position_id,),
             ).fetchone()
@@ -2282,9 +2427,11 @@ def _sync_entry_lots(service: CanaryService, now: datetime) -> int:
                 "strategy_hash,model_hash,config_id,config_generation,"
                 "strategy_version_id,research_trial_id,portfolio_selection_id,"
                 "admission_policy_id,admission_policy_version,risk_config_id,"
-                "risk_config_generation,risk_config_hash,lineage_type,exit_policy_json,"
+                "risk_config_generation,risk_config_hash,lineage_type,"
+                "execution_authorization_id,execution_authorization_mode,"
+                "controller_owner_id,controller_generation,exit_policy_json,"
                 "quantity,sold_quantity,cost_basis,fees,pending_exit_quantity,status,"
-                "opened_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "opened_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     position_id,
                     reservation_id,
@@ -2303,6 +2450,7 @@ def _sync_entry_lots(service: CanaryService, now: datetime) -> int:
                     reservation_config_generation,
                     *(lineage.get(name) for name in _POSITION_LINEAGE_FIELDS),
                     lineage.get("lineage_type") or _LEGACY_LINEAGE_TYPE,
+                    *(lineage.get(name) for name in _POSITION_AUTHORITY_FIELDS),
                     _json(policy),
                     str(quantity),
                     "0",
@@ -3142,7 +3290,9 @@ def _reserve_exit(
         quantity=str(quantity),
         market_id=str(lot.get("market_id") or ""),
         event_id=request_id,
-        config_id=identifier,
+        execution_authorization_id=config.get("execution_authorization_id"),
+        controller_owner_id=config.get("controller_owner_id"),
+        controller_generation=config.get("controller_generation"),
         config_generation=generation,
         config_hash=config_hash,
         control_generation=control_generation,
@@ -3167,12 +3317,16 @@ def _reserve_exit(
             "candidate_id": str(lot.get("candidate_id") or ""),
             "event_id": request_id,
             "settlement_status": "PENDING",
+            "execution_authorization_id": config.get("execution_authorization_id"),
+            "execution_authorization_mode": config.get("execution_authorization_mode"),
+            "controller_owner_id": config.get("controller_owner_id"),
+            "controller_generation": config.get("controller_generation"),
             **{
                 name: opening_lineage[name]
                 for name in _POSITION_LINEAGE_FIELDS
             },
-            "lineage_type": opening_lineage["lineage_type"],
         },
+        timestamp=now,
     )
 
 
@@ -3217,6 +3371,48 @@ def submit_exit(
         raise CanaryBlocked("CANARY_POSITION_NOT_FOUND")
     position_key = str(lot.get("position_id") or position_id)
     lot_lineage = _opening_lot_lineage(service, lot)
+    controller_lease = _require_controller_lease(
+        service,
+        context=rolling_context,
+        now=now,
+    )
+    execution_authorization = _require_execution_authorization(
+        service,
+        signal=None,
+        lineage=lot_lineage,
+        context=rolling_context,
+        now=now,
+    )
+    authorization_mode = execution_authorization.get("execution_authorization_mode")
+    config = {
+        **dict(config),
+        "execution_authorization_id": execution_authorization.get(
+            "authorization_id"
+        ),
+        "execution_authorization_mode": authorization_mode,
+        "controller_owner_id": controller_lease.get("owner_id"),
+        "controller_generation": controller_lease.get("generation"),
+    }
+    lot_lineage = {
+        **lot_lineage,
+        "execution_authorization_id": execution_authorization.get(
+            "authorization_id"
+        ),
+        "execution_authorization_mode": authorization_mode,
+        "controller_owner_id": controller_lease.get("owner_id"),
+        "controller_generation": controller_lease.get("generation"),
+        "controller_lease_generation": controller_lease.get("generation"),
+    }
+    authority_context = {
+        **(dict(rolling_context) if isinstance(rolling_context, Mapping) else {}),
+        "controller_owner_id": controller_lease.get("owner_id"),
+        "controller_generation": controller_lease.get("generation"),
+        "controller_lease_generation": controller_lease.get("generation"),
+        "execution_authorization_id": execution_authorization.get(
+            "authorization_id"
+        ),
+        "execution_authorization_mode": authorization_mode,
+    }
     requested_lineage = dict(rolling_context or {})
     requested_lineage.update(
         {
@@ -3254,6 +3450,10 @@ def submit_exit(
     sold_quantity = _decimal(lot.get("sold_quantity"), ZERO)
     pending_quantity = _decimal(lot.get("pending_exit_quantity"), ZERO)
     quantity = max(ZERO, total_quantity - sold_quantity - pending_quantity)
+    # Polymarket CLOB orders carry quantities at two decimal places.  Floor
+    quantity = quantity.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+    if quantity:
+        quantity = quantity.normalize()
     lot_status = str(lot.get("status") or "").upper()
     if lot_status == "MANAGEMENT_BLOCKED" and not force_exit:
         raise CanaryBlocked("CANARY_POSITION_MANAGEMENT_BLOCKED")
@@ -3301,34 +3501,32 @@ def submit_exit(
     accepting_orders = context.get("accepting_orders")
     if type(accepting_orders) is not bool or not accepting_orders:
         raise CanaryBlocked("CANARY_MARKET_NOT_ACCEPTING_ORDERS")
-    min_size = _required_market_decimal(
-        context,
-        ("min_order_size", "order_min_size", "minimum_order_size"),
-        reason="CANARY_EXIT_MARKET_RULES_UNAVAILABLE",
-    )
-    size_increment = _required_market_decimal(
-        context,
-        ("size_increment", "quantity_step", "step_size", "quantity_increment"),
-        reason="CANARY_EXIT_MARKET_RULES_UNAVAILABLE",
-    )
-    min_notional = _required_market_decimal(
-        context,
-        (
-            "min_notional",
-            "minimum_notional",
-            "venue_minimum_notional",
-            "venue_minimum_cost",
-            "minimum_cost",
-        ),
-        reason="CANARY_EXIT_MARKET_RULES_UNAVAILABLE",
-    )
-    if quantity + DUST < min_size:
+    neg_risk_key = "neg_risk" if "neg_risk" in context else "negRisk"
+    if neg_risk_key not in context or type(context.get(neg_risk_key)) is not bool:
+        raise CanaryBlocked("CANARY_EXIT_MARKET_RULES_UNAVAILABLE")
+    try:
+        rules = parse_polymarket_rules(context)
+    except PolymarketRuleError as exc:
+        raise CanaryBlocked("CANARY_EXIT_MARKET_RULES_UNAVAILABLE") from exc
+    if quantity + DUST < rules.min_order_size:
         raise CanaryBlocked("CANARY_EXIT_BELOW_MINIMUM")
-    remainder = quantity % size_increment
-    if remainder > DUST and size_increment - remainder > DUST:
-        raise CanaryBlocked("CANARY_EXIT_SIZE_INCREMENT_INVALID")
-    if quantity * price + DUST < min_notional:
-        raise CanaryBlocked("CANARY_EXIT_BELOW_MIN_NOTIONAL")
+    # A managed SELL must use a canonical tick-aligned quote.
+    remainder = price % rules.tick_size
+    if remainder > DUST and rules.tick_size - remainder > DUST:
+        raise CanaryBlocked("CANARY_EXIT_PRICE_TICK_INVALID")
+    try:
+        depth = assess_selected_token_depth(
+            context,
+            rules,
+            side="SELL",
+            quantity=quantity,
+        )
+    except PolymarketRuleError as exc:
+        raise CanaryBlocked("CANARY_EXIT_DEPTH_UNAVAILABLE") from exc
+    if not depth.suitable:
+        if depth.reason in {"NO_DEPTH", "INSUFFICIENT_DEPTH"}:
+            raise CanaryBlocked("CANARY_EXIT_INSUFFICIENT_DEPTH")
+        raise CanaryBlocked("CANARY_EXIT_DEPTH_UNAVAILABLE")
     # Validate a test transport before reserving capacity so a missing method
     # is a deterministic preflight blocker, not an UNKNOWN post-boundary state.
     test_submit = _method(venue, "submit_limit_order") if allow_test_venue else None
@@ -3384,9 +3582,10 @@ def submit_exit(
                 "request_id,position_id,reservation_id,event_id,venue,market_id,"
                 "token_id,asset_id,market_version,strategy_version_id,research_trial_id,"
                 "portfolio_selection_id,admission_policy_id,admission_policy_version,"
-                "risk_config_id,risk_config_generation,risk_config_hash,lineage_type,"
-                "side,requested_quantity,requested_price,status,expected_generation,"
-                "config_id,submitted_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "risk_config_id,risk_config_generation,risk_config_hash,"
+                "execution_authorization_id,controller_owner_id,controller_generation,"
+                "lineage_type,side,requested_quantity,requested_price,status,expected_generation,"
+                "config_id,submitted_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     request_id,
                     position_key,
@@ -3398,6 +3597,9 @@ def submit_exit(
                     asset_id,
                     market_version,
                     *(lot_lineage.get(name) for name in _POSITION_LINEAGE_FIELDS),
+                    config.get("execution_authorization_id"),
+                    config.get("controller_owner_id"),
+                    config.get("controller_generation"),
                     lot_lineage["lineage_type"],
                     "SELL",
                     str(quantity),
@@ -3433,6 +3635,9 @@ def submit_exit(
             config_generation=int(expected_generation),
             config_hash=str(config.get("config_hash") or ""),
             control_generation=control_generation,
+            execution_authorization_id=config.get("execution_authorization_id"),
+            controller_owner_id=config.get("controller_owner_id"),
+            controller_generation=config.get("controller_generation"),
             strategy_version_id=lot_lineage["strategy_version_id"],
             research_trial_id=lot_lineage["research_trial_id"],
             portfolio_selection_id=lot_lineage["portfolio_selection_id"],
@@ -3452,6 +3657,9 @@ def submit_exit(
                     for name in _POSITION_LINEAGE_FIELDS
                     if lot_lineage.get(name) is not None
                 },
+                "execution_authorization_id": config.get("execution_authorization_id"),
+                "controller_owner_id": config.get("controller_owner_id"),
+                "controller_generation": config.get("controller_generation"),
                 "lineage_type": lot_lineage["lineage_type"],
             },
         )
@@ -3474,7 +3682,9 @@ def submit_exit(
         )
         with service.store._lock:
             row = _connection(service).execute(
-                "SELECT status,requested_quantity FROM canary_position_requests WHERE request_id=?",
+                "SELECT status,requested_quantity,execution_authorization_id,"
+                "controller_owner_id,controller_generation "
+                "FROM canary_position_requests WHERE request_id=?",
                 (request_id,),
             ).fetchone()
             lot_check = _connection(service).execute(
@@ -3487,6 +3697,18 @@ def submit_exit(
             ).fetchone()
         if row is None or str(row["status"] or "").upper() != "SUBMITTING":
             raise CanaryBlocked("CANARY_SUBMISSION_PHASE_CHANGED")
+        expected_authority = (
+            str(config.get("execution_authorization_id") or "").strip(),
+            str(config.get("controller_owner_id") or "").strip(),
+            str(config.get("controller_generation") or "").strip(),
+        )
+        observed_authority = (
+            str(row["execution_authorization_id"] or "").strip(),
+            str(row["controller_owner_id"] or "").strip(),
+            str(row["controller_generation"] or "").strip(),
+        )
+        if not all(expected_authority) or observed_authority != expected_authority:
+            raise CanaryBlocked("CANARY_RESERVATION_INVALID")
         allowed_lot_statuses = {"OPEN", "EXIT_PENDING"}
         if force_exit:
             allowed_lot_statuses.add("MANAGEMENT_BLOCKED")
@@ -3513,6 +3735,28 @@ def submit_exit(
         ):
             raise CanaryBlocked("ROLLING_OPENING_LINEAGE_MISMATCH")
 
+        _require_controller_lease(
+            service,
+            context=authority_context,
+            now=ensure_utc(service.clock()),
+        )
+        _require_execution_authorization(
+            service,
+            signal=None,
+            lineage=lot_lineage,
+            context=authority_context,
+            now=ensure_utc(service.clock()),
+        )
+        _final_venue_identity_fence(
+            service,
+            venue,
+            side="SELL",
+            market_id=market_id,
+            token_id=token_id,
+            asset_id=asset_id,
+            context={**context, **authority_context},
+            close_only_allowed=True,
+        )
     transport_state_lock = threading.Lock()
     submission_cancelled = threading.Event()
     network_send_started = False
@@ -3615,10 +3859,37 @@ def submit_exit(
             "CANARY_SETTINGS_GENERATION_CHANGED",
             "CANARY_MARKET_NOT_ACCEPTING_ORDERS",
             "CANARY_EXIT_BELOW_MINIMUM",
-            "CANARY_EXIT_BELOW_MIN_NOTIONAL",
-            "CANARY_EXIT_SIZE_INCREMENT_INVALID",
             "CANARY_EXIT_MARKET_RULES_UNAVAILABLE",
+            "CANARY_EXIT_PRICE_TICK_INVALID",
+            "CANARY_EXIT_INSUFFICIENT_DEPTH",
+            "CANARY_EXIT_DEPTH_UNAVAILABLE",
             "CANARY_SUBMISSION_CONTEXT_INVALID",
+            "CANARY_CONTROLLER_LEASE_REQUIRED",
+            "CANARY_CONTROLLER_LEASE_UNAVAILABLE",
+            "CANARY_CONTROLLER_LEASE_INVALID",
+            "CANARY_CONTROLLER_LEASE_CHANGED",
+            "CANARY_CONTROLLER_LEASE_OWNER_MISMATCH",
+            "CANARY_CONTROLLER_LEASE_EXPIRED",
+            "EXECUTION_AUTHORIZATION_REQUIRED",
+            "EXECUTION_AUTHORIZATION_EXPIRED",
+            "EXECUTION_AUTHORIZATION_SETTINGS_MISMATCH",
+            "EXECUTION_AUTHORIZATION_CHANGED",
+            "GEOGRAPHICALLY_BLOCKED",
+            "GEOBLOCK_CLOSE_ONLY",
+            "GEOBLOCK_CHECK_FAILED",
+            "GEOBLOCK_RESPONSE_INVALID",
+            "ACCOUNT_CHECK_UNAVAILABLE",
+            "ACCOUNT_CHECK_FAILED",
+            "ACCOUNT_NOT_AUTHENTICATED",
+            "SIGNER_MISMATCH",
+            "FUNDER_MISMATCH",
+            "OWNER_MISMATCH",
+            "ACCOUNT_OWNER_MISMATCH",
+            "SELECTED_TOKEN_MISMATCH",
+            "MARKET_OUTCOME_ID_UNAVAILABLE",
+            "MARKET_CONTEXT_FAILED",
+            "EXCHANGE_SPENDER_MISMATCH",
+            "EXCHANGE_SPENDER_UNAVAILABLE",
             "CANARY_RESERVATION_INVALID",
             "ROLLING_LINEAGE_INCOMPLETE",
             "ROLLING_LINEAGE_CONFLICT",
@@ -4754,7 +5025,7 @@ def manage_positions(
                 expected_generation=int(config.get("generation", 0)),
                 config_id=str(config.get("config_id") or ""),
                 allow_test_venue=allow_test_venue,
-                rolling_context=_opening_lot_lineage(service, lot) if forced else None,
+                rolling_context=_opening_lot_lineage(service, lot),
                 force_exit=forced,
             )
             submitted.append(result)

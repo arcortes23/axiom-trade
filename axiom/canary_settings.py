@@ -873,6 +873,131 @@ class CanarySettingsService:
         """
         active = self._active_record()
         return _canonical(dict(active.get("values") or {}))
+    def register_execution_authorization_draft(
+        self,
+        *,
+        purpose: str,
+        mode: str = "EXPLORATORY_MICRO_CANARY",
+        exact_strategy_versions: list[str] | tuple[str, ...] | None = None,
+        strategy_version_ids: list[str] | tuple[str, ...] | None = None,
+        strategy_versions: list[str] | tuple[str, ...] | None = None,
+        reviewed_selection_policy_hash: str | None = None,
+        selection_policy_hash: str | None = None,
+        adverse_evidence_ack: Any | None = None,
+        adverse_evidence_acknowledgment: Any | None = None,
+        lifetime_budget: Mapping[str, Any] | Any,
+        stop_rules: Mapping[str, Any],
+        expires_at: datetime,
+        scope_hash: str,
+        scope_version: str | int,
+        selection_id: str | None = None,
+        selection_hash: str | None = None,
+        actor: Any,
+        actor_version: str = "1",
+        authorization_id: str | None = None,
+        active_settings_hash: str | None = None,
+        active_settings_generation: int | None = None,
+    ) -> dict[str, Any]:
+        """Create a separately controlled execution authorization draft."""
+        active = self._active_record()
+        current_hash = str(active.get("config_hash") or "")
+        current_generation = int(active.get("generation") or 0)
+        if active_settings_hash is not None and str(active_settings_hash) != current_hash:
+            raise CanarySettingsConflict("active settings hash changed")
+        if (
+            active_settings_generation is not None
+            and int(active_settings_generation) != current_generation
+        ):
+            raise CanarySettingsConflict("settings generation changed")
+        return self.store.register_execution_authorization_draft(
+            authorization_id=authorization_id,
+            mode=mode,
+            purpose=purpose,
+            exact_strategy_versions=(
+                exact_strategy_versions
+                if exact_strategy_versions is not None
+                else strategy_version_ids
+                if strategy_version_ids is not None
+                else strategy_versions
+            ),
+            reviewed_selection_policy_hash=(
+                reviewed_selection_policy_hash
+                if reviewed_selection_policy_hash is not None
+                else selection_policy_hash
+            ),
+            adverse_evidence_ack=(
+                adverse_evidence_ack
+                if adverse_evidence_ack is not None
+                else adverse_evidence_acknowledgment
+            ),
+            lifetime_budget=lifetime_budget,
+            stop_rules=stop_rules,
+            expires_at=expires_at,
+            scope_hash=scope_hash,
+            scope_version=scope_version,
+            active_settings_hash=current_hash,
+            active_settings_generation=current_generation,
+            selection_id=selection_id,
+            selection_hash=selection_hash,
+            actor=_actor(actor),
+            actor_version=actor_version,
+            timestamp=_timestamp(self.clock()),
+        )
+
+    def activate_execution_authorization(
+        self,
+        authorization_id: str,
+        actor: Any,
+        *,
+        expected_generation: int | None = None,
+    ) -> dict[str, Any]:
+        return self.store.activate_execution_authorization(
+            authorization_id,
+            _actor(actor),
+            expected_generation=expected_generation,
+            timestamp=_timestamp(self.clock()),
+        )
+
+    def load_active_execution_authorization(
+        self,
+        *,
+        mode: str = "EXPLORATORY_MICRO_CANARY",
+        purpose: str | None = None,
+        now: datetime | None = None,
+        scope_hash: str | None = None,
+        scope_version: str | int | None = None,
+        selection_id: str | None = None,
+        selection_hash: str | None = None,
+    ) -> dict[str, Any] | None:
+        active = self._active_record()
+        return self.store.load_active_execution_authorization(
+            mode=mode,
+            purpose=purpose,
+            now=now or _timestamp(self.clock()),
+            scope_hash=scope_hash,
+            scope_version=scope_version,
+            active_settings_hash=str(active.get("config_hash") or ""),
+            active_settings_generation=int(active.get("generation") or 0),
+            selection_id=selection_id,
+            selection_hash=selection_hash,
+        )
+
+    def revoke_execution_authorization(
+        self,
+        authorization_id: str,
+        actor: Any,
+        *,
+        expected_generation: int | None = None,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        return self.store.revoke_execution_authorization(
+            authorization_id,
+            _actor(actor),
+            expected_generation=expected_generation,
+            reason=reason,
+            timestamp=_timestamp(self.clock()),
+        )
+
     @staticmethod
     def _candidate_values(candidate: Mapping[str, Any] | None) -> dict[str, Any]:
         if candidate is None:
@@ -904,6 +1029,8 @@ class CanarySettingsService:
             "per_event_buy_usd": {},
             "cumulative_buy_usd": "0.00",
             "external_flow_usd": "0.00",
+            "exploratory_lifetime_used_usd": "0.00",
+            "exploratory_lifetime_orders": 0,
         }
     def _unavailable_snapshot(self, observed: datetime) -> dict[str, Any]:
         """Return an explicit read-only unknown projection without seeding."""
@@ -935,6 +1062,12 @@ class CanarySettingsService:
             "draft": self._public_record(draft),
             "effective_limits": None,
             "candidate_constraints": None,
+            "execution_authorization": None,
+            "exploratory_lifetime_budget": None,
+            "exploratory_lifetime_used_usd": "0.00",
+            "exploratory_lifetime_orders": 0,
+            "remaining_exploratory_lifetime_usd": None,
+            "remaining_exploratory_lifetime_orders": None,
             "usage": _canonical(self._usage_defaults()),
             "cumulative_buy_cap_usd": None,
             "remaining_cumulative_buy_usd": None,
@@ -944,6 +1077,12 @@ class CanarySettingsService:
             "remaining": {},
             "entry_over_limit_dimensions": [],
             "entry_block_reasons": ["active canary settings are unavailable"],
+            "entry_blockers": [{
+                "category": "CONFIG",
+                "reason": "active canary settings are unavailable",
+                "resolver": "restore a reviewed ACTIVE settings configuration",
+                "next_action": "schedule settings migration/review before the next entry",
+            }],
             "pht_next_reset": _next_pht_reset(observed).isoformat(),
             "next_reset_at_pht": _next_pht_reset(observed).isoformat(),
             "engineering_bounds": self.engineering_bounds,
@@ -994,9 +1133,30 @@ class CanarySettingsService:
             raw_usage.update(dict(usage))
         used = self._usage_defaults()
         used.update(raw_usage)
-        for name in ("buy_filled_usd", "buy_pending_usd", "buy_unknown_usd", "gross_daily_buy_usd", "all_in_buy_reserved_usd", "aggregate_open_cost_usd", "aggregate_exposure_usd", "realized_loss_usd", "today_realized_pnl_usd", "equity_loss_usd", "cumulative_buy_usd", "external_flow_usd"):
+        execution_authorization = self.store.load_active_execution_authorization(
+            mode="EXPLORATORY_MICRO_CANARY",
+            now=observed,
+            active_settings_hash=str(active.get("config_hash") or ""),
+            active_settings_generation=int(active.get("generation") or 0),
+        )
+        exploratory_usage: dict[str, Any] = {}
+        if execution_authorization is not None:
+            exploratory_usage = self.store.canary_risk_accounting(
+                observed,
+                execution_authorization_id=execution_authorization["authorization_id"],
+            )
+            used["exploratory_lifetime_used_usd"] = exploratory_usage.get(
+                "exploratory_lifetime_used_usd",
+                "0.00",
+            )
+            used["exploratory_lifetime_orders"] = exploratory_usage.get(
+                "exploratory_lifetime_orders",
+                0,
+            )
+        for name in ("buy_filled_usd", "buy_pending_usd", "buy_unknown_usd", "gross_daily_buy_usd", "all_in_buy_reserved_usd", "aggregate_open_cost_usd", "aggregate_exposure_usd", "realized_loss_usd", "today_realized_pnl_usd", "equity_loss_usd", "cumulative_buy_usd", "external_flow_usd", "exploratory_lifetime_used_usd"):
             value = used.get(name, "0")
             used[name] = format(Decimal(str(value)), "f")
+        used["exploratory_lifetime_orders"] = int(used.get("exploratory_lifetime_orders", 0) or 0)
         equity_status = str(used.get("equity_status") or "UNKNOWN").strip().upper()
         if equity_status not in {"KNOWN", "CURRENT", "OBSERVED", "UNKNOWN", "MISSING", "STALE"}:
             equity_status = "UNKNOWN"
@@ -1030,6 +1190,33 @@ class CanarySettingsService:
                 if cumulative_buy_over_limit
                 else None
             )
+        lifetime_budget = (
+            dict(execution_authorization.get("lifetime_budget") or {})
+            if execution_authorization is not None
+            else {}
+        )
+        lifetime_used = Decimal(str(used["exploratory_lifetime_used_usd"]))
+        lifetime_orders_used = int(used["exploratory_lifetime_orders"])
+        lifetime_limit = (
+            Decimal(str(lifetime_budget["max_notional_usd"]))
+            if lifetime_budget.get("max_notional_usd") not in (None, "")
+            else None
+        )
+        lifetime_order_limit = (
+            int(lifetime_budget["max_orders"])
+            if lifetime_budget.get("max_orders") not in (None, "")
+            else None
+        )
+        remaining_lifetime = (
+            format(max(Decimal("0"), lifetime_limit - lifetime_used), "f")
+            if lifetime_limit is not None
+            else None
+        )
+        remaining_lifetime_orders = (
+            max(0, lifetime_order_limit - lifetime_orders_used)
+            if lifetime_order_limit is not None
+            else None
+        )
         # ``max_all_in_buy_usd`` is the fee-inclusive maximum for one BUY,
         # not a shared aggregate budget.  Aggregate usage is reported through
         # the independent gross/open/exposure dimensions below.
@@ -1044,6 +1231,8 @@ class CanarySettingsService:
             "realized_loss_usd": format(max(Decimal("0"), Decimal(effective["realized_loss_entry_stop_usd"]) - Decimal(used["realized_loss_usd"])), "f"),
             "equity_loss_usd": format(max(Decimal("0"), Decimal(effective["equity_loss_entry_stop_usd"]) - Decimal(used["equity_loss_usd"])), "f"),
             "slippage_bps": effective["max_slippage_bps"],
+            "exploratory_lifetime_usd": remaining_lifetime,
+            "exploratory_lifetime_orders": remaining_lifetime_orders,
         }
         # Values smaller than a held commitment affect entries only.  The
         # projection says this explicitly so a UI cannot imply liquidation is
@@ -1099,6 +1288,35 @@ class CanarySettingsService:
             entry_block_reasons.append(f"durable risk breaker active: {risk_breaker}")
         if equity_status in {"UNKNOWN", "MISSING", "STALE"}:
             entry_block_reasons.append("authoritative equity evidence is unavailable or stale")
+        entry_blockers: list[dict[str, Any]] = []
+        if over_limit_dimensions:
+            entry_blockers.append({
+                "category": "RISK_LIMIT",
+                "reason": "existing commitments exceed current entry limits",
+                "resolver": "reduce/reconcile open commitments or activate a compatible reviewed limit",
+                "next_action": "reconcile commitments before the next entry attempt",
+            })
+        if cumulative_buy_over_limit_reason:
+            entry_blockers.append({
+                "category": "RISK_LIMIT",
+                "reason": cumulative_buy_over_limit_reason,
+                "resolver": "wait for a reviewed cumulative budget change; never reset while armed",
+                "next_action": "schedule disarmed operator review of cumulative usage",
+            })
+        if risk_breaker:
+            entry_blockers.append({
+                "category": "RISK_BREAKER",
+                "reason": f"durable risk breaker active: {risk_breaker}",
+                "resolver": "reconcile the durable execution/evidence breaker",
+                "next_action": "schedule breaker investigation before any new entry",
+            })
+        if equity_status in {"UNKNOWN", "MISSING", "STALE"}:
+            entry_blockers.append({
+                "category": "DATA",
+                "reason": "authoritative equity evidence is unavailable or stale",
+                "resolver": "refresh authoritative equity evidence and liquidation marks",
+                "next_action": "schedule an evidence refresh before the next entry",
+            })
         return {
             "status": "CURRENT",
             "settings_available": True,
@@ -1115,6 +1333,12 @@ class CanarySettingsService:
             "risk_breaker": risk_breaker,
             "candidate_constraints": _canonical(candidate) if candidate else None,
             "usage": _canonical(used),
+            "execution_authorization": _canonical(execution_authorization),
+            "exploratory_lifetime_budget": _canonical(lifetime_budget),
+            "exploratory_lifetime_used_usd": used["exploratory_lifetime_used_usd"],
+            "exploratory_lifetime_orders": int(used["exploratory_lifetime_orders"]),
+            "remaining_exploratory_lifetime_usd": remaining_lifetime,
+            "remaining_exploratory_lifetime_orders": remaining_lifetime_orders,
             "cumulative_buy_cap_usd": (
                 format(cumulative_cap, "f") if cumulative_cap is not None else None
             ),
@@ -1124,6 +1348,7 @@ class CanarySettingsService:
             "cumulative_buy_over_limit_reason": cumulative_buy_over_limit_reason,
             "remaining": _canonical(remaining),
             "entry_over_limit_dimensions": _canonical(over_limit_dimensions),
+            "entry_blockers": _canonical(entry_blockers),
             "entry_block_reasons": _canonical(entry_block_reasons),
             "pht_next_reset": _next_pht_reset(observed).isoformat(),
             "next_reset_at_pht": _next_pht_reset(observed).isoformat(),

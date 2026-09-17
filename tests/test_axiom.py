@@ -916,9 +916,19 @@ class PhaseTwoQualityTests(unittest.TestCase):
                     no_ask=0.60,
                     no_mid=0.55,
                     expiry=T0 + timedelta(days=2),
+                    settlement=SettlementState.OPEN,
                     resolution_criteria="official result",
+                    source="fake-polymarket",
                     yes_token_id="yes-token",
                     no_token_id="no-token",
+                    condition_id="condition-m",
+                    slug="will-event-happen",
+                    provider_timestamp=T0,
+                    active=True,
+                    closed=False,
+                    archived=False,
+                    accepting_orders=True,
+                    enable_order_book=True,
                 )
 
             def price_history(self, market_id: str, start=None, end=None):
@@ -929,8 +939,32 @@ class PhaseTwoQualityTests(unittest.TestCase):
 
             def order_books(self, market_id: str, depth: int = 20):
                 return {
-                    "yes": OrderBookSnapshot(T0, (OrderBookLevel(0.40, 10.0),), (OrderBookLevel(0.50, 10.0),), "yes-token"),
-                    "no": OrderBookSnapshot(T0, (OrderBookLevel(0.50, 10.0),), (OrderBookLevel(0.60, 10.0),), "no-token"),
+                    "yes": OrderBookSnapshot(
+                        T0,
+                        (OrderBookLevel(0.40, 10.0),),
+                        (OrderBookLevel(0.50, 10.0),),
+                        "yes-token",
+                        "condition-m",
+                        T0,
+                        "yes-book-v1",
+                        min_order_size=0.01,
+                        tick_size=0.01,
+                        neg_risk=False,
+                        source="fake-polymarket",
+                    ),
+                    "no": OrderBookSnapshot(
+                        T0,
+                        (OrderBookLevel(0.50, 10.0),),
+                        (OrderBookLevel(0.60, 10.0),),
+                        "no-token",
+                        "condition-m",
+                        T0,
+                        "no-book-v1",
+                        min_order_size=0.01,
+                        tick_size=0.01,
+                        neg_risk=False,
+                        source="fake-polymarket",
+                    ),
                 }
 
             def metadata(self, market_id: str):
@@ -942,6 +976,26 @@ class PhaseTwoQualityTests(unittest.TestCase):
                     question="Will event happen?",
                     resolution_criteria="official result",
                     expiry=T0 + timedelta(days=2),
+                    condition_id="condition-m",
+                    slug="will-event-happen",
+                    provider_timestamp=T0,
+                    active=True,
+                    closed=False,
+                    archived=False,
+                    accepting_orders=True,
+                    enable_order_book=True,
+                    order_book_available=True,
+                    min_order_size=0.01,
+                    tick_size=0.01,
+                    neg_risk=False,
+                    extra={
+                        "token_ids": {"yes": "yes-token", "no": "no-token"},
+                        "rules": {
+                            "min_order_size": "0.01",
+                            "tick_size": "0.01",
+                            "neg_risk": False,
+                        },
+                    },
                 )
 
             def trades(self, market_id: str, start=None, end=None):

@@ -51,6 +51,65 @@ YES_TOKEN_ID = "SYNTHETIC_OFFLINE-future-politics-YES"
 NO_TOKEN_ID = "SYNTHETIC_OFFLINE-future-politics-NO"
 CANDIDATE_ID = "SYNTHETIC_OFFLINE-scope-candidate"
 PROPOSAL_ID = "SYNTHETIC_OFFLINE-scope-proposal"
+SYNTHETIC_TICK_SIZE = 0.01
+SYNTHETIC_MIN_ORDER_SIZE = 0.01
+SYNTHETIC_NEG_RISK = False
+SYNTHETIC_DEPTH_PER_LEVEL = 100.0
+SYNTHETIC_ASSUMPTIONS = {
+    "version": "price-proxy-v1",
+    "mode": "PRICE_PROXY_RESEARCH",
+    "fee_bps": 0.0,
+    "slippage_bps": 0.0,
+    "roundtrip_fee_bps": 0.0,
+    "roundtrip_slippage_bps": 0.0,
+}
+
+
+def _book_record(book: OrderBookSnapshot) -> dict[str, object]:
+    return {
+        "timestamp": book.timestamp.isoformat(),
+        "provider_timestamp": (
+            book.provider_timestamp.isoformat()
+            if book.provider_timestamp is not None
+            else None
+        ),
+        "token_id": book.token_id,
+        "condition_id": book.condition_id,
+        "min_order_size": book.min_order_size,
+        "tick_size": book.tick_size,
+        "neg_risk": book.neg_risk,
+        "available": book.available,
+        "source": book.source,
+        "bids": [
+            {"price": level.price, "size": level.size}
+            for level in book.bids
+        ],
+        "asks": [
+            {"price": level.price, "size": level.size}
+            for level in book.asks
+        ],
+    }
+
+
+def _market_book(
+    book: OrderBookSnapshot,
+    *,
+    bids: tuple[OrderBookLevel, ...] | None = None,
+    asks: tuple[OrderBookLevel, ...] | None = None,
+) -> dict[str, object]:
+    record = _book_record(book)
+    if bids is not None:
+        record["bids"] = [
+            {"price": level.price, "size": level.size}
+            for level in bids
+        ]
+    if asks is not None:
+        record["asks"] = [
+            {"price": level.price, "size": level.size}
+            for level in asks
+        ]
+    return record
+
 
 
 def _offline_market(
@@ -67,22 +126,55 @@ def _offline_market(
     no_mid = 1.0 - yes_mid
     no_bid = no_mid - 0.01
     no_ask = no_mid + 0.01
+    # Keep both sides of both selected-token books populated across multiple
+    # levels so the collector proves cumulative executable depth, not a
+    # singleton quote or a guessed opposite-token book.
     yes_book = OrderBookSnapshot(
         timestamp=stamp,
-        bids=(OrderBookLevel(yes_bid, 100.0),),
-        asks=(OrderBookLevel(yes_ask, 100.0),),
+        bids=(
+            OrderBookLevel(yes_bid, SYNTHETIC_DEPTH_PER_LEVEL),
+            OrderBookLevel(
+                round(yes_bid - SYNTHETIC_TICK_SIZE, 2),
+                SYNTHETIC_DEPTH_PER_LEVEL,
+            ),
+        ),
+        asks=(
+            OrderBookLevel(yes_ask, SYNTHETIC_DEPTH_PER_LEVEL),
+            OrderBookLevel(
+                round(yes_ask + SYNTHETIC_TICK_SIZE, 2),
+                SYNTHETIC_DEPTH_PER_LEVEL,
+            ),
+        ),
         token_id=yes_token_id,
         condition_id=condition_id,
         provider_timestamp=stamp,
+        min_order_size=SYNTHETIC_MIN_ORDER_SIZE,
+        tick_size=SYNTHETIC_TICK_SIZE,
+        neg_risk=SYNTHETIC_NEG_RISK,
         source="SYNTHETIC_OFFLINE",
     )
     no_book = OrderBookSnapshot(
         timestamp=stamp,
-        bids=(OrderBookLevel(no_bid, 100.0),),
-        asks=(OrderBookLevel(no_ask, 100.0),),
+        bids=(
+            OrderBookLevel(no_bid, SYNTHETIC_DEPTH_PER_LEVEL),
+            OrderBookLevel(
+                round(no_bid - SYNTHETIC_TICK_SIZE, 2),
+                SYNTHETIC_DEPTH_PER_LEVEL,
+            ),
+        ),
+        asks=(
+            OrderBookLevel(no_ask, SYNTHETIC_DEPTH_PER_LEVEL),
+            OrderBookLevel(
+                round(no_ask + SYNTHETIC_TICK_SIZE, 2),
+                SYNTHETIC_DEPTH_PER_LEVEL,
+            ),
+        ),
         token_id=no_token_id,
         condition_id=condition_id,
         provider_timestamp=stamp,
+        min_order_size=SYNTHETIC_MIN_ORDER_SIZE,
+        tick_size=SYNTHETIC_TICK_SIZE,
+        neg_risk=SYNTHETIC_NEG_RISK,
         source="SYNTHETIC_OFFLINE",
     )
     default_fixture = market_id == MARKET_ID
@@ -181,11 +273,16 @@ class _SyntheticOfflinePublicProvider(InMemoryPredictionProvider):
             provider=self.provider_name,
             market_id=snapshot.market_id,
             condition_id=snapshot.condition_id,
+            slug=snapshot.slug,
             question=snapshot.question,
             resolution_criteria=snapshot.resolution_criteria,
             category="politics",
             tags=("politics", "SYNTHETIC_OFFLINE"),
             expiry=snapshot.expiry,
+            tick_size=SYNTHETIC_TICK_SIZE,
+            lot_size=SYNTHETIC_MIN_ORDER_SIZE,
+            min_order_size=SYNTHETIC_MIN_ORDER_SIZE,
+            neg_risk=SYNTHETIC_NEG_RISK,
             provider_timestamp=snapshot.provider_timestamp,
             active=True,
             closed=False,
@@ -194,7 +291,23 @@ class _SyntheticOfflinePublicProvider(InMemoryPredictionProvider):
             order_book_available=True,
             extra={
                 "fixture_label": "SYNTHETIC_OFFLINE",
+                "source": self.provider_name,
+                "source_type": "CURRENT",
+                "observed_at": snapshot.timestamp.isoformat(),
+                "provider_timestamp": (
+                    snapshot.provider_timestamp.isoformat()
+                    if snapshot.provider_timestamp is not None
+                    else None
+                ),
+                "condition_id": snapshot.condition_id,
                 "token_ids": {"yes": snapshot.yes_token_id, "no": snapshot.no_token_id},
+                "tick_size": SYNTHETIC_TICK_SIZE,
+                "min_order_size": SYNTHETIC_MIN_ORDER_SIZE,
+                "neg_risk": SYNTHETIC_NEG_RISK,
+                "active": True,
+                "closed": False,
+                "accepting_orders": True,
+                "enable_order_book": True,
             },
         )
 
@@ -206,24 +319,31 @@ class _SyntheticOfflinePublicProvider(InMemoryPredictionProvider):
             return {}
         return {
             "yes": OrderBookSnapshot(
-                snapshot.order_book.timestamp,
-                snapshot.order_book.bids[:depth],
-                snapshot.order_book.asks[:depth],
+                timestamp=snapshot.order_book.timestamp,
+                bids=snapshot.order_book.bids[:depth],
+                asks=snapshot.order_book.asks[:depth],
                 token_id=snapshot.yes_token_id,
                 condition_id=snapshot.condition_id,
                 provider_timestamp=snapshot.order_book.provider_timestamp,
+                min_order_size=SYNTHETIC_MIN_ORDER_SIZE,
+                tick_size=SYNTHETIC_TICK_SIZE,
+                neg_risk=SYNTHETIC_NEG_RISK,
                 source=self.provider_name,
             ),
             "no": OrderBookSnapshot(
-                no_book.timestamp,
-                no_book.bids[:depth],
-                no_book.asks[:depth],
+                timestamp=no_book.timestamp,
+                bids=no_book.bids[:depth],
+                asks=no_book.asks[:depth],
                 token_id=snapshot.no_token_id,
                 condition_id=snapshot.condition_id,
                 provider_timestamp=no_book.provider_timestamp,
+                min_order_size=SYNTHETIC_MIN_ORDER_SIZE,
+                tick_size=SYNTHETIC_TICK_SIZE,
+                neg_risk=SYNTHETIC_NEG_RISK,
                 source=self.provider_name,
             ),
         }
+
 
 
 
@@ -249,6 +369,7 @@ class MarketScopeEndToEndTests(unittest.TestCase):
                     "provenance": "canonical",
                 },
                 "model_document": {"probability": 0.80},
+                "assumptions": dict(SYNTHETIC_ASSUMPTIONS),
             }
         )
         return plan
@@ -934,6 +1055,7 @@ def _runtime_plan(proposal_id: str) -> dict[str, object]:
         "max_variants": 1,
         "exit_policy": {"type": "fixed_holding_period", "holding_period": 4},
         "model_document": {"probability": SYNTHETIC_MODEL_PROBABILITY},
+        "assumptions": dict(SYNTHETIC_ASSUMPTIONS),
         "paper_only": True,
     }
     return {
@@ -950,11 +1072,71 @@ def _runtime_plan(proposal_id: str) -> dict[str, object]:
 
 def _forward_metadata(market_id: str) -> dict[str, object]:
     expiry = (T0 + timedelta(days=30)).isoformat()
+    market, no_book = _offline_market(
+        T0,
+        0.50,
+        market_id=market_id,
+        condition_id=f"{market_id}-condition",
+        yes_token_id=f"{market_id}-yes",
+        no_token_id=f"{market_id}-no",
+    )
+    yes_book = market.order_book
+    assert yes_book is not None
+    yes_record = _book_record(yes_book)
+    no_record = _book_record(no_book)
+    official = {
+        "tick_size": SYNTHETIC_TICK_SIZE,
+        "min_order_size": SYNTHETIC_MIN_ORDER_SIZE,
+        "neg_risk": SYNTHETIC_NEG_RISK,
+        "active": True,
+        "closed": False,
+        "accepting_orders": True,
+        "enable_order_book": True,
+        "provider": "SYNTHETIC_OFFLINE",
+        "source": "SYNTHETIC_OFFLINE",
+        "source_type": "FORWARD_COLLECTED",
+        "observed_at": T0.isoformat(),
+        "provider_timestamp": T0.isoformat(),
+        "condition_id": market.condition_id,
+        "yes_token_id": market.yes_token_id,
+        "no_token_id": market.no_token_id,
+        "token_ids": {"yes": market.yes_token_id, "no": market.no_token_id},
+    }
+    metadata = {
+        "instrument": "POLYMARKET",
+        "market_type": "prediction",
+        "category": "politics",
+        "expiry": expiry,
+        "question": market.question,
+        "resolution_criteria": market.resolution_criteria,
+        "provenance_label": SYNTHETIC_MODEL_LABEL,
+        **official,
+    }
+    snapshot = {
+        "market_id": market_id,
+        "instrument": "POLYMARKET",
+        "market_type": "prediction",
+        "category": "politics",
+        "condition_id": market.condition_id,
+        "yes_token_id": market.yes_token_id,
+        "no_token_id": market.no_token_id,
+        "token_ids": {"yes": market.yes_token_id, "no": market.no_token_id},
+        "yes_mid": 0.50,
+        "liquidity": 1_500.0,
+        "spread": 0.02,
+        "expiry": expiry,
+        "settlement": "open",
+        "yes_order_book": yes_record,
+        "no_order_book": no_record,
+        "provenance_label": SYNTHETIC_MODEL_LABEL,
+        **official,
+    }
     return {
         "market_id": market_id,
-        "condition_id": f"{market_id}-condition",
-        "yes_token_id": f"{market_id}-yes",
-        "no_token_id": f"{market_id}-no",
+        "condition_id": market.condition_id,
+        "yes_token_id": market.yes_token_id,
+        "no_token_id": market.no_token_id,
+        "token_ids": {"yes": market.yes_token_id, "no": market.no_token_id},
         "instrument": "POLYMARKET",
         "market_type": "prediction",
         "category": "politics",
@@ -964,29 +1146,12 @@ def _forward_metadata(market_id: str) -> dict[str, object]:
         "liquidity": 1_500.0,
         "spread": 0.02,
         "expiry": expiry,
-        "active": True,
-        "closed": False,
-        "metadata": {
-            "instrument": "POLYMARKET",
-            "market_type": "prediction",
-            "category": "politics",
-            "active": True,
-            "closed": False,
-            "expiry": expiry,
-            "provenance_label": SYNTHETIC_MODEL_LABEL,
-        },
-        "snapshot": {
-            "market_id": market_id,
-            "instrument": "POLYMARKET",
-            "market_type": "prediction",
-            "category": "politics",
-            "yes_mid": 0.50,
-            "liquidity": 1_500.0,
-            "spread": 0.02,
-            "expiry": expiry,
-            "settlement": "open",
-        },
         "provenance_label": SYNTHETIC_MODEL_LABEL,
+        **official,
+        "metadata": metadata,
+        "snapshot": snapshot,
+        "yes_order_book": yes_record,
+        "no_order_book": no_record,
     }
 
 
@@ -998,11 +1163,35 @@ def _forward_observation(
     regime: str = "calm",
     no_fill: bool = False,
 ) -> dict[str, object]:
+    market, no_book = _offline_market(
+        stamp,
+        0.50,
+        market_id=market_id,
+        condition_id=f"{market_id}-condition",
+        yes_token_id=f"{market_id}-yes",
+        no_token_id=f"{market_id}-no",
+    )
+    yes_book = market.order_book
+    assert yes_book is not None
+    yes_record = (
+        _market_book(yes_book, bids=(yes_book.bids[0],), asks=())
+        if no_fill
+        else _book_record(yes_book)
+    )
     observation: dict[str, object] = {
         "market_id": market_id,
         "instrument": "POLYMARKET",
         "market_type": "prediction",
+        "condition_id": market.condition_id,
+        "yes_token_id": market.yes_token_id,
+        "no_token_id": market.no_token_id,
+        "token_ids": {"yes": market.yes_token_id, "no": market.no_token_id},
         "timestamp": stamp.isoformat(),
+        "provider_timestamp": stamp.isoformat(),
+        "observed_at": stamp.isoformat(),
+        "source_timestamp": stamp.isoformat(),
+        "source": "SYNTHETIC_OFFLINE",
+        "provider": "SYNTHETIC_OFFLINE",
         "yes_bid": 0.49,
         "yes_ask": 0.51,
         "yes_mid": 0.50,
@@ -1015,19 +1204,19 @@ def _forward_observation(
         "expiry": (T0 + timedelta(days=30)).isoformat(),
         "resolution_criteria": "synthetic offline fixture outcome",
         "settlement": settlement,
+        "active": True,
+        "closed": False,
+        "accepting_orders": True,
+        "enable_order_book": True,
+        "tick_size": SYNTHETIC_TICK_SIZE,
+        "min_order_size": SYNTHETIC_MIN_ORDER_SIZE,
+        "neg_risk": SYNTHETIC_NEG_RISK,
+        "yes_order_book": yes_record,
+        "no_order_book": _book_record(no_book),
         "regime": regime,
         "source_type": "FORWARD_COLLECTED",
         "model_label": SYNTHETIC_MODEL_LABEL,
     }
-    if no_fill:
-        # A bid-only book is a real paper-execution no-fill, not a fabricated
-        # result: the strategy signals, the book has no executable ask, and
-        # the paper engine records ORDER_ATTEMPT followed by NO_FILL.
-        observation["yes_order_book"] = {
-            "timestamp": stamp.isoformat(),
-            "bids": [{"price": 0.49, "size": 10.0}],
-            "asks": [],
-        }
     return observation
 
 

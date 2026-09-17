@@ -112,9 +112,10 @@ class TestVenue:
             "accepting_orders": True,
             "min_order_size": "1",
             "tick_size": "0.01",
+            "neg_risk": False,
             "bids": [{"price": "0.49", "size": "100"}],
             "asks": [{"price": "0.50", "size": "100"}],
-            "fee_bps": "10",
+            "fee_bps": "0",
         }
 
     def balance(self):
@@ -181,7 +182,7 @@ def candidate_payload(
             "regime_restrictions": {},
             "provenance": "canonical",
         },
-        "market_scope_hash": "sha256:fixture-market-scope",
+        "market_scope_hash": hashlib.sha256(b"fixture-market-scope").hexdigest(),
         "market_scope_version": "market-scope-v1",
         "plan_hash": "sha256:fixture-plan",
         "dataset_provenance": {
@@ -1255,6 +1256,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
             venue_factory=lambda: venue,
             allow_test_venue=True,
         )
+        self._install_worker_authority(worker)
         with patch.object(
             CanaryService,
             "evaluate_signal",
@@ -1318,6 +1320,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
             venue_factory=venue_factory,
             allow_test_venue=True,
         )
+        self._install_worker_authority(worker)
         with patch.object(CredentialStore, "configured", return_value=True):
             first = worker.tick(now=T0)
             signal = self.service.latest_signal("venue-retry")
@@ -2678,6 +2681,53 @@ class AutonomousWorkflowTests(unittest.TestCase):
             config_id=str(settings["config_id"]),
             expected_generation=int(settings["generation"]),
         )
+    def _install_test_authority(self, *, owner_id: str) -> dict[str, object]:
+        """Install persisted authority bound to this fixture's active settings."""
+        self.service.controller_owner_id = owner_id
+        # Legacy worker tests intentionally exercise ranking/venue mechanics
+        # without a rolling portfolio-selection record. Keep the persisted
+        # lease and authorization real, while isolating only that unavailable
+        # selection-binding fence to this fixture.
+        binding_fence = patch(
+            "axiom.canary._canary_authorization_binding_fence",
+            autospec=True,
+            return_value=None,
+        )
+        binding_fence.start()
+        self.addCleanup(binding_fence.stop)
+        lease = self.store.acquire_canary_controller_lease(
+            owner_id=owner_id,
+            lease_seconds=86_400,
+            now=T0,
+        )
+        settings = self.service.settings.snapshot(now=T0)
+        draft = self.store.register_execution_authorization_draft(
+            authorization_id=f"test-autonomous-auth:{owner_id}",
+            purpose="autonomous-worker-tests",
+            exact_strategy_versions=("test-strategy",),
+            adverse_evidence_ack=True,
+            lifetime_budget={"max_notional_usd": "1000", "max_orders": 100},
+            stop_rules={"max_loss_usd": "1000"},
+            expires_at=T0 + timedelta(days=1),
+            scope_hash=hashlib.sha256(b"fixture-market-scope").hexdigest(),
+            scope_version="market-scope-v1",
+            active_settings_hash=str(settings["config_hash"]),
+            active_settings_generation=int(settings["generation"]),
+            actor="test-fixture",
+            timestamp=T0,
+        )
+        self.store.activate_execution_authorization(
+            str(draft["authorization_id"]),
+            "test-fixture",
+            expected_generation=int(draft["generation"]),
+            timestamp=T0,
+        )
+        return dict(lease)
+
+    def _install_worker_authority(self, worker: AutonomousCanaryWorker) -> None:
+        owner_id = "test-autonomous-worker"
+        worker.controller_owner_id = owner_id
+        worker._controller_lease = self._install_test_authority(owner_id=owner_id)
 
     @staticmethod
     def _ready_signal(candidate_id: str, *, feasible: bool = True) -> dict[str, object]:
@@ -4069,6 +4119,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
             venue_factory=lambda: venue,
             allow_test_venue=True,
         )
+        self._install_worker_authority(worker)
         with patch.object(CredentialStore, "configured", return_value=True):
             result = worker.tick(now=T0)
 
@@ -4109,6 +4160,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
             venue_factory=lambda: venue,
             allow_test_venue=True,
         )
+        self._install_worker_authority(worker)
 
         with patch.object(CredentialStore, "configured", return_value=True):
             result = worker.tick(now=T0)
@@ -4233,6 +4285,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
             venue_factory=lambda: venue,
             allow_test_venue=True,
         )
+        self._install_worker_authority(worker)
         original_evaluate_signal = CanaryService.evaluate_signal
 
         def evaluate_signal(service, candidate_id, **kwargs):
@@ -5016,6 +5069,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
         )
         CandidateCanaryRanker(self.store, clock=lambda: T0).evaluate_and_select(T0)
         self._enable_worker()
+        self._install_test_authority(owner_id="test-execution-quality")
         signal = self.service.generate_signal("executable")
         self.assertIsNotNone(signal)
         result = self.service.submit_signal(

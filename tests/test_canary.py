@@ -42,6 +42,58 @@ from axiom.dashboard import DashboardData, _dashboard_html
 from axiom.storage import AxiomStore, SQLiteBusyTimeout
 
 T0=datetime(2026,1,2,12,tzinfo=timezone.utc)
+TEST_CONTROLLER_OWNER = "test-canary-controller"
+
+
+def _install_test_authority(
+    store: AxiomStore,
+    service: CanaryService,
+    *,
+    scope_hash: str,
+    scope_version: str | int,
+    owner_id: str = TEST_CONTROLLER_OWNER,
+    now: datetime = T0,
+    lease_seconds: float = 86_400,
+    authorization_seconds: int = 86_400,
+    exact_strategy_versions: tuple[str, ...] = (),
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Install explicit persisted authority for deterministic fake-venue tests."""
+    service.controller_owner_id = owner_id
+    lease = store.acquire_canary_controller_lease(
+        owner_id=owner_id,
+        lease_seconds=lease_seconds,
+        now=now,
+    )
+    settings_id, settings_generation, settings_hash = service._settings_identity()
+    policy_hash = None if exact_strategy_versions else ("0" * 64)
+    if policy_hash:
+        store.load_current_portfolio_selection = lambda: {
+            "selection_policy_hash": policy_hash,
+        }
+    assert settings_id and settings_generation and settings_hash
+    draft = store.register_execution_authorization_draft(
+        authorization_id=f"test-auth:{owner_id}",
+        purpose="test-canary-mechanics",
+        reviewed_selection_policy_hash=policy_hash,
+        exact_strategy_versions=exact_strategy_versions,
+        adverse_evidence_ack=True,
+        lifetime_budget={"max_notional_usd": "1000", "max_orders": 100},
+        stop_rules={"max_loss_usd": "1000"},
+        expires_at=now + timedelta(seconds=authorization_seconds),
+        scope_hash=scope_hash,
+        scope_version=scope_version,
+        active_settings_hash=settings_hash,
+        active_settings_generation=int(settings_generation),
+        actor="test-fixture",
+        timestamp=now,
+    )
+    authorization = store.activate_execution_authorization(
+        str(draft["authorization_id"]),
+        "test-fixture",
+        expected_generation=int(draft["generation"]),
+        timestamp=now,
+    )
+    return lease, authorization
 
 def _persist_test_scope(
     store,
@@ -200,6 +252,10 @@ class FakeVenue:
 
     def market_context(self, market_id, token_id):
         return {
+            "market_id": market_id,
+            "token_id": token_id,
+            "asset_id": token_id,
+            "neg_risk": False,
             "accepting_orders": self.accepting,
             "min_order_size": self.minimum,
             "tick_size": "0.01",
@@ -246,11 +302,15 @@ class ProcessBlockingVenue(FakeVenue):
 
 def _blocked_submit_worker(database_path, entered, release, results):
     store = HealthyStore(database_path)
+    store.load_current_portfolio_selection = lambda: {
+        "selection_policy_hash": "0" * 64,
+    }
     try:
         service = CanaryService(
             store,
             credentials=FakeCredentials(),
             clock=lambda: T0,
+            controller_owner_id=TEST_CONTROLLER_OWNER,
         )
         result = service.submit(
             signal_id="cross-process",
@@ -371,6 +431,12 @@ class CanaryTests(unittest.TestCase):
             },
         }
         _persist_test_scope(self.store, "C123", payload, ("m",))
+        _install_test_authority(
+            self.store,
+            self.service,
+            scope_hash=payload["market_scope_hash"],
+            scope_version=payload["market_scope_version"],
+        )
         self.store.save_candidate_lifecycle("C123","IDEA",payload,timestamp=T0)
         for stage in ("SCHEMA_VALIDATED","BACKTESTED","VALIDATED","ROBUSTNESS_CHECKED","FROZEN","PAPER_FORWARD","PAPER_PROMOTABLE"):
             self.store.save_candidate_lifecycle("C123",stage,payload,timestamp=T0)
@@ -794,6 +860,301 @@ class CanaryTests(unittest.TestCase):
             ).fetchone()[0],
             0,
         )
+    def test_submission_requires_controller_lease_before_reservation(self):
+        self.arm()
+        self._ensure_direct_signal("authority-missing-lease")
+        lease = self.store.load_canary_controller_lease(
+            owner_id=TEST_CONTROLLER_OWNER,
+            now=T0,
+        )
+        self.assertIsNotNone(lease)
+        assert lease is not None
+        self.store.release_canary_controller_lease(
+            owner_id=TEST_CONTROLLER_OWNER,
+            generation=int(lease["generation"]),
+            now=T0,
+            reason="test",
+        )
+        service = CanaryService(
+            self.store,
+            credentials=FakeCredentials(),
+            clock=lambda: T0,
+            controller_owner_id=TEST_CONTROLLER_OWNER,
+        )
+        with self.assertRaisesRegex(CanaryBlocked, "CANARY_CONTROLLER_LEASE_REQUIRED"):
+            service.submit(
+                signal_id="authority-missing-lease",
+                candidate_id="C123",
+                market_id="m",
+                token_id="yes",
+                side="BUY",
+                paper_expected_price=Decimal("0.50"),
+                venue=self.venue,
+                allow_test_venue=True,
+            )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM canary_risk_reservations"
+            ).fetchone()[0],
+            0,
+        )
+    def test_file_backed_production_submission_requires_active_authority(self):
+        self.arm()
+        self._ensure_direct_signal("authority-file-backed")
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = f"{directory}\\canary.sqlite3"
+            target = sqlite3.connect(database_path)
+            try:
+                self.store.connection.backup(target)
+            finally:
+                target.close()
+            missing_store = HealthyStore(database_path)
+            try:
+                missing_service = CanaryService(
+                    missing_store,
+                    credentials=FakeCredentials(),
+                    clock=lambda: T0,
+                )
+                with self.assertRaisesRegex(
+                    CanaryBlocked, "CANARY_CONTROLLER_LEASE_REQUIRED"
+                ):
+                    missing_service.submit(
+                        signal_id="authority-file-backed",
+                        candidate_id="C123",
+                        market_id="m",
+                        token_id="yes",
+                        side="BUY",
+                        paper_expected_price=Decimal("0.50"),
+                        venue=FakeVenue(),
+                        allow_test_venue=True,
+                    )
+            finally:
+                missing_store.close()
+            valid_store = HealthyStore(database_path)
+            valid_store.load_current_portfolio_selection = lambda: {
+                "selection_policy_hash": "0" * 64,
+            }
+            try:
+                valid_service = CanaryService(
+                    valid_store,
+                    credentials=FakeCredentials(),
+                    clock=lambda: T0,
+                    controller_owner_id=TEST_CONTROLLER_OWNER,
+                )
+                result = valid_service.submit(
+                    signal_id="authority-file-backed",
+                    candidate_id="C123",
+                    market_id="m",
+                    token_id="yes",
+                    side="BUY",
+                    paper_expected_price=Decimal("0.50"),
+                    venue=FakeVenue(),
+                    allow_test_venue=True,
+                )
+                self.assertEqual(result["execution_status"], "MATCHED")
+            finally:
+                valid_store.close()
+
+
+    def test_execution_authorization_uses_service_fallback_when_context_missing(self):
+        self._ensure_direct_signal("authority-service-fallback")
+        signal = self.service.get_signal("authority-service-fallback")
+        self.assertIsNotNone(signal)
+        assert signal is not None
+        _, settings_generation, settings_hash = self.service._settings_identity()
+        service_auth_id = "service-evidence-auth"
+        self.service.execution_authorization_mode = "EVIDENCE_SELECTED"
+        self.service.execution_authorization_id = service_auth_id
+        loaded: list[dict[str, object]] = []
+        authorization = {
+            "authorization_id": service_auth_id,
+            "status": "ACTIVE",
+            "mode": "EVIDENCE_SELECTED",
+            "expires_at": (T0 + timedelta(hours=1)).isoformat(),
+            "active_settings_hash": settings_hash,
+            "active_settings_generation": settings_generation,
+        }
+
+        def load_authorization(**kwargs):
+            loaded.append(dict(kwargs))
+            if kwargs["mode"] == "EXPLORATORY_MICRO_CANARY":
+                return {
+                    **authorization,
+                    "authorization_id": "context-exploratory-auth",
+                    "mode": "EXPLORATORY_MICRO_CANARY",
+                }
+            return authorization
+
+        with patch.object(
+            self.store,
+            "load_active_execution_authorization",
+            side_effect=load_authorization,
+        ):
+            resolved = canary_module._require_execution_authorization(
+                self.service,
+                signal=signal,
+                lineage={},
+                context=None,
+                now=T0,
+            )
+            context_resolved = canary_module._require_execution_authorization(
+                self.service,
+                signal=signal,
+                lineage={},
+                context={
+                    "execution_authorization_mode": "EXPLORATORY_MICRO_CANARY",
+                    "execution_authorization_id": "context-exploratory-auth",
+                },
+                now=T0,
+            )
+        self.assertEqual(resolved["authorization_id"], service_auth_id)
+        self.assertEqual(
+            context_resolved["authorization_id"], "context-exploratory-auth"
+        )
+        auth_calls = [item for item in loaded if "purpose" in item]
+        self.assertEqual(len(auth_calls), 2)
+        self.assertEqual(auth_calls[0]["mode"], "EVIDENCE_SELECTED")
+        self.assertEqual(auth_calls[-1]["mode"], "EXPLORATORY_MICRO_CANARY")
+
+    def test_exact_strategy_authorization_rejects_legacy_signal(self):
+        signal = {"strategy_version_id": "test-strategy"}
+        _, settings_generation, settings_hash = self.service._settings_identity()
+        authorization = {
+            "authorization_id": "exact-auth",
+            "status": "ACTIVE",
+            "mode": "EXPLORATORY_MICRO_CANARY",
+            "expires_at": (T0 + timedelta(hours=1)).isoformat(),
+            "active_settings_hash": settings_hash,
+            "active_settings_generation": settings_generation,
+            "exact_strategy_versions": ["test-strategy"],
+        }
+        with patch.object(
+            self.store,
+            "load_active_execution_authorization",
+            return_value=authorization,
+        ):
+            with self.assertRaisesRegex(
+                CanaryBlocked, "EXECUTION_AUTHORIZATION_STRATEGY_REQUIRED"
+            ):
+                canary_module._require_execution_authorization(
+                    self.service,
+                    signal=signal,
+                    lineage={"lineage_type": "LEGACY"},
+                    now=T0,
+                )
+
+
+    def test_submission_rejects_expired_execution_authorization(self):
+        self.arm()
+        self._ensure_direct_signal("authority-expired-auth")
+        active = self.store.load_active_execution_authorization(
+            mode="EXPLORATORY_MICRO_CANARY",
+            now=T0,
+            scope_hash=self.service.get_signal("authority-expired-auth")["evidence"][
+                "scope_hash"
+            ],
+            scope_version=self.service.get_signal("authority-expired-auth")["evidence"][
+                "scope_version"
+            ],
+            active_settings_hash=self.service._settings_identity()[2],
+            active_settings_generation=self.service._settings_identity()[1],
+        )
+        self.assertIsNotNone(active)
+        assert active is not None
+        expired = dict(active)
+        expired["expires_at"] = T0 - timedelta(seconds=1)
+        with patch.object(
+            self.store,
+            "load_active_execution_authorization",
+            return_value=expired,
+        ):
+            with self.assertRaisesRegex(
+                CanaryBlocked, "EXECUTION_AUTHORIZATION_EXPIRED"
+            ):
+                self.submit("authority-expired-auth")
+        self.assertFalse(self.venue.submissions)
+
+    def test_valid_authority_is_persisted_through_reservation_attempt_and_fill(self):
+        self.arm()
+        result = self.submit("authority-valid")
+        self.assertEqual(result["execution_status"], "MATCHED")
+        reservation = self.store.connection.execute(
+            "SELECT execution_authorization_id,controller_owner_id,"
+            "controller_generation FROM canary_risk_reservations "
+            "WHERE event_id=?",
+            (result["event_id"],),
+        ).fetchone()
+        self.assertIsNotNone(reservation)
+        assert reservation is not None
+        self.assertEqual(
+            reservation["execution_authorization_id"],
+            "test-auth:" + TEST_CONTROLLER_OWNER,
+        )
+        self.assertEqual(reservation["controller_owner_id"], TEST_CONTROLLER_OWNER)
+        self.assertGreater(int(reservation["controller_generation"]), 0)
+        reservation_detail = self.store.connection.execute(
+            "SELECT detail_json FROM canary_risk_reservations WHERE event_id=?",
+            (result["event_id"],),
+        ).fetchone()
+        self.assertIsNotNone(reservation_detail)
+        assert reservation_detail is not None
+        self.assertEqual(
+            json.loads(reservation_detail["detail_json"])[
+                "execution_authorization_mode"
+            ],
+            "EXPLORATORY_MICRO_CANARY",
+        )
+        attempt = self.store.connection.execute(
+            "SELECT execution_authorization_id,controller_owner_id,"
+            "controller_generation FROM canary_submission_attempts WHERE intent_id=?",
+            (result["event_id"],),
+        ).fetchone()
+        self.assertIsNotNone(attempt)
+        assert attempt is not None
+        self.assertEqual(
+            tuple(attempt[name] for name in (
+                "execution_authorization_id",
+                "controller_owner_id",
+            )),
+            ("test-auth:" + TEST_CONTROLLER_OWNER, TEST_CONTROLLER_OWNER),
+        )
+        self.assertGreater(int(attempt["controller_generation"]), 0)
+        attempt_detail = self.store.connection.execute(
+            "SELECT detail_json FROM canary_submission_attempts WHERE intent_id=?",
+            (result["event_id"],),
+        ).fetchone()
+        self.assertIsNotNone(attempt_detail)
+        assert attempt_detail is not None
+        self.assertEqual(
+            json.loads(attempt_detail["detail_json"])[
+                "execution_authorization_mode"
+            ],
+            "EXPLORATORY_MICRO_CANARY",
+        )
+        ledger = self.store.connection.execute(
+            "SELECT evidence_json FROM canary_ledger WHERE event_id=?",
+            (result["event_id"],),
+        ).fetchone()
+        event = self.store.connection.execute(
+            "SELECT evidence_json FROM canary_execution_events "
+            "WHERE canary_event_id=?",
+            (result["event_id"],),
+        ).fetchone()
+        self.assertIsNotNone(ledger)
+        self.assertIsNotNone(event)
+        assert ledger is not None and event is not None
+        for row in (ledger, event):
+            evidence = json.loads(row["evidence_json"])
+            self.assertEqual(
+                evidence["execution_authorization_id"],
+                "test-auth:" + TEST_CONTROLLER_OWNER,
+            )
+            self.assertEqual(evidence["controller_owner_id"], TEST_CONTROLLER_OWNER)
+            self.assertGreater(int(evidence["controller_generation"]), 0)
+            self.assertEqual(
+                evidence["execution_authorization_mode"],
+                "EXPLORATORY_MICRO_CANARY",
+            )
     def test_check_and_submit_enforce_one_dollar_minimum_with_side_quotes(self):
         class SideQuoteVenue(FakeVenue):
             def market_context(self, market_id, token_id):
@@ -2232,25 +2593,47 @@ class CanaryTests(unittest.TestCase):
     def test_target_is_never_silently_increased(self): self.arm(); result=self.submit(); self.assertLessEqual(Decimal(result["requested_notional"]),Decimal("1.00"))
     def test_market_minimum_exceeding_target_skips(self): self.arm(); venue=FakeVenue(minimum="5",ask="0.50"); self.assertBlocked("VENUE_MINIMUM_EXCEEDS",lambda:self.submit(venue=venue)); self.assertFalse(venue.submissions)
 
-    def test_documented_notional_minimum_rounds_up_to_quantity_step(self):
-        class MinimumNotionalVenue(FakeVenue):
+    def test_canonical_rules_ignore_legacy_minimum_fields_and_use_cents(self):
+        class LegacyFieldsVenue(FakeVenue):
             def market_context(self, market_id, token_id):
                 return {
                     **super().market_context(market_id, token_id),
-                    "min_notional": "0.26",
-                    "size_increment": "0.01",
+                    "min_notional": "99",
+                    "size_increment": "0.001",
                 }
 
-        venue = MinimumNotionalVenue(minimum="0.01")
+        venue = LegacyFieldsVenue(minimum="0.01")
         self.arm(venue=venue)
         self.submit(venue=venue)
         order = venue.submissions[0]
         quantity = Decimal(str(order["size"]))
         price = Decimal(str(order["price"]))
-        step = Decimal("0.01")
-        self.assertGreaterEqual(quantity * price, Decimal("0.26"))
-        self.assertLess((quantity - step) * price, Decimal("0.26"))
-        self.assertEqual(quantity % step, Decimal("0"))
+        self.assertEqual(quantity, Decimal("0.01"))
+        self.assertEqual(quantity % Decimal("0.01"), Decimal("0"))
+        self.assertLessEqual(quantity * price, Decimal("1.00"))
+
+    def test_buy_depth_is_cumulative_only_within_max_price(self):
+        self.arm()
+        venue = FakeVenue(
+            minimum="2",
+            asks=[
+                {"price": "0.50", "size": "1.00"},
+                {"price": "0.51", "size": "100.00"},
+            ]
+        )
+        readiness = self.service.check(
+            candidate_id="C123",
+            venue=venue,
+            market_id="m",
+            token_id="yes",
+        )
+        self.assertFalse(readiness["ready"])
+        self.assertIn("CANARY_INSUFFICIENT_DEPTH", readiness["failures"])
+        self.assertBlocked(
+            "CANARY_INSUFFICIENT_DEPTH",
+            lambda: self.submit(signal="depth-bounded", venue=venue),
+        )
+        self.assertFalse(venue.submissions)
 
     def test_non_polymarket_venue_requires_explicit_test_opt_in(self):
         self.arm()
@@ -2405,9 +2788,31 @@ class CanaryTests(unittest.TestCase):
         self.assertTrue(client.closed)
 
     def test_official_market_context_tick_reaches_buy_preflight(self):
-        self.arm()
+        values = {
+            "private_key": "key",
+            "wallet_address": "wallet",
+            "api_key": "clob-key",
+            "api_secret": "clob-secret",
+            "api_passphrase": "clob-passphrase",
+        }
         posted = []
         book_assets = []
+        submitted_order_kwargs = []
+        credentials_patch = patch.object(
+            self.service.credentials,
+            "load",
+            return_value=values,
+        )
+        credentials_patch.start()
+        self.addCleanup(credentials_patch.stop)
+        official_store_patch = patch.object(
+            CredentialStore,
+            "load",
+            return_value=values,
+        )
+        official_store_patch.start()
+        self.addCleanup(official_store_patch.stop)
+        self.arm()
 
         class OrderMetadata:
             @staticmethod
@@ -2463,6 +2868,7 @@ class CanaryTests(unittest.TestCase):
                 }
 
             def create_limit_order(self, **kwargs):
+                submitted_order_kwargs.append(dict(kwargs))
                 return {"maker_amount": "500000"}
 
             def post_order(self, signed):
@@ -2481,23 +2887,12 @@ class CanaryTests(unittest.TestCase):
             ApiKeyCreds=FakeApiKeyCreds,
             SecureClient=SecureClient,
         )
-        values = {
-            "private_key": "key",
-            "wallet_address": "wallet",
-            "api_key": "clob-key",
-            "api_secret": "clob-secret",
-            "api_passphrase": "clob-passphrase",
-        }
         with patch.dict(os.environ, {"AXIOM_EXECUTION_PROFILE": "production"}), patch.dict(
             sys.modules, {"polymarket": sdk}
         ), patch.object(
             PolymarketClobV2Venue,
             "installed_sdk_version",
             return_value="0.9.0",
-        ), patch.object(
-            CredentialStore,
-            "load",
-            return_value=values,
         ), patch.object(
             PolymarketClobV2Venue,
             "geoblock",
@@ -2511,7 +2906,8 @@ class CanaryTests(unittest.TestCase):
         self.assertEqual(result["execution_status"], "MATCHED")
         self.assertEqual(result["status"], "matched")
         self.assertEqual(len(posted), 1)
-        self.assertEqual(book_assets, ["yes"])
+        self.assertEqual(submitted_order_kwargs[0]["size"], "1.00")
+        self.assertEqual(set(book_assets), {"yes"})
     def _assert_official_context_identity_blocked(
         self,
         signal_id,
@@ -4411,6 +4807,13 @@ class CanarySignalTests(unittest.TestCase):
         }
         self.model = {"probability": 0.80}
         self._add_candidate("C")
+        payload = self.store.load_candidate_lifecycle("C")["payload"]
+        _install_test_authority(
+            self.store,
+            self.service,
+            scope_hash=payload["market_scope_hash"],
+            scope_version=payload["market_scope_version"],
+        )
         self._save_snapshot("snap")
 
     def tearDown(self):
@@ -6400,4 +6803,45 @@ class CanaryForwardAuthorityContractTests(unittest.TestCase):
             },
         )
         self.assertEqual(before, after)
+class ExecutionFenceTests(unittest.TestCase):
+    def test_close_only_buy_is_blocked_before_fake_transport(self):
+        calls = []
+        venue = SimpleNamespace(
+            geoblock=lambda: {"blocked": False, "close_only": True},
+            account=lambda: {
+                "authenticated": True,
+                "wallet_address": "wallet",
+                "signer": "wallet",
+                "funder": "wallet",
+                "owner": "wallet",
+            },
+            market_context=lambda market_id, token_id: {
+                "token_id": token_id,
+                "asset_id": "asset",
+                "allowance": {"spender": "spender"},
+            },
+            submit_limit_order=lambda **kwargs: calls.append(kwargs),
+        )
+        service = SimpleNamespace(
+            allow_environment=False,
+            credentials=SimpleNamespace(
+                load=lambda **kwargs: {"wallet_address": "wallet"}
+            ),
+        )
+        with self.assertRaisesRegex(CanaryBlocked, "GEOBLOCK_CLOSE_ONLY"):
+            canary_module._final_venue_identity_fence(
+                service,
+                venue,
+                side="BUY",
+                market_id="market",
+                token_id="token",
+                asset_id="asset",
+                context={
+                    "selected_token_id": "token",
+                    "asset_id": "asset",
+                    "allowance": {"spender": "spender"},
+                },
+            )
+        self.assertEqual(calls, [])
+
 if __name__=="__main__": unittest.main()

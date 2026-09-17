@@ -63,8 +63,22 @@ from axiom.strategy import load_strategy, validate_strategy
 T0 = datetime(2025, 1, 1, tzinfo=timezone.utc)
 
 def market(market_id: str = "m", *, settlement: SettlementState = SettlementState.OPEN, expiry: datetime | None = None, yes_mid: float = 0.5) -> PredictionMarketSnapshot:
-    book = OrderBookSnapshot(T0, (OrderBookLevel(yes_mid - 0.01, 10.0),), (OrderBookLevel(yes_mid + 0.01, 10.0),), "yes")
     resolved = settlement is not SettlementState.OPEN
+    token_id = f"yes-{market_id}"
+    book = OrderBookSnapshot(
+        T0,
+        (OrderBookLevel(yes_mid - 0.01, 10.0),),
+        (OrderBookLevel(yes_mid + 0.01, 10.0),),
+        token_id,
+        condition_id=f"condition-{market_id}",
+        provider_timestamp=T0,
+        book_hash=f"book-{market_id}",
+        min_order_size=0.01,
+        tick_size=0.01,
+        neg_risk=False,
+        available=True,
+        source="POLYMARKET",
+    )
     return PredictionMarketSnapshot(
         timestamp=T0,
         market_id=market_id,
@@ -82,11 +96,13 @@ def market(market_id: str = "m", *, settlement: SettlementState = SettlementStat
         resolution_criteria="public result",
         order_book=book,
         source="POLYMARKET",
-        yes_token_id=f"yes-{market_id}",
+        yes_token_id=token_id,
         no_token_id=f"no-{market_id}",
         condition_id=f"condition-{market_id}",
+        provider_timestamp=T0,
         active=not resolved,
         closed=resolved,
+        archived=False,
         accepting_orders=not resolved,
         enable_order_book=True,
     )
@@ -606,6 +622,39 @@ class Phase3CollectionTests(unittest.TestCase):
                 4 * CollectorConfig().max_attempts,
             )
             self.assertFalse(any(item[0] in {"order", "submit", "sign"} for item in provider.calls))
+    def test_discovery_rejects_market_when_required_capital_exceeds_displayed_depth(self) -> None:
+        constrained = market("capital-constrained")
+        provider = _RecordingPredictionProvider((constrained,))
+        with AxiomStore(":memory:") as store:
+            collector = PolymarketCollector(
+                provider,
+                store,
+                CollectorConfig(
+                    interval_seconds=60,
+                    max_markets=1,
+                    discovery_budget_per_cycle=1,
+                    required_capital=20.0,
+                    max_attempts=1,
+                    jitter_seconds=0,
+                ),
+                clock=lambda: T0,
+                sleep=lambda _seconds: None,
+            )
+            cycle = collector.collect_once(now=T0)
+            state = store.get_collector_state("polymarket")
+
+        self.assertEqual(cycle.discovery_scheduled, ())
+        self.assertEqual(cycle.suitable_market_scheduled, ())
+        self.assertEqual(cycle.discovery_deferred, ("capital-constrained",))
+        self.assertEqual(len(cycle.discovery_exclusions), 1)
+        exclusion = cycle.discovery_exclusions[0]
+        self.assertEqual(exclusion["category"], "CAPITAL_OR_MARKET_CONSTRAINT")
+        self.assertEqual(exclusion["reason"], "NO_DEPTH")
+        self.assertEqual(exclusion["resolver"], "inspect_selected_token_depth")
+        self.assertEqual(exclusion["next_action"], "recheck_next_discovery_tick")
+        self.assertGreaterEqual(exclusion["observed_required_capital"], 19.0)
+        self.assertEqual(state["discovery_exclusions"], list(cycle.discovery_exclusions))
+
     def test_discovery_budget_rotates_with_persisted_carry_cursor(self) -> None:
         provider = _RecordingPredictionProvider(tuple(market(f"discovery-{index}") for index in range(3)))
         with AxiomStore(":memory:") as store:

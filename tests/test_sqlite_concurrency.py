@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import hashlib
 from contextlib import redirect_stdout
 import sqlite3
 import io
@@ -453,32 +454,118 @@ class SQLiteConcurrencyTests(unittest.TestCase):
             path = str(Path(directory) / "risk-slot.sqlite3")
             left = AxiomStore(path)
             right = AxiomStore(path)
-            service = CanarySettingsService(left, clock=lambda: T0)
-            draft = service.save_draft({"max_orders_per_day": 2}, "operator-a")
-            service.activate_draft(draft["config_id"], "operator-a", expected_generation=1)
+            settings = CanarySettingsService(left, clock=lambda: T0)
+            draft = settings.save_draft({"max_orders_per_day": 2}, "operator-a")
+            settings.activate_draft(
+                draft["config_id"],
+                "operator-a",
+                expected_generation=1,
+            )
+
+            owner_id = "sqlite-concurrency-controller"
+            lease = left.acquire_canary_controller_lease(
+                owner_id=owner_id,
+                lease_seconds=3600,
+                now=T0,
+            )
+            active_settings = left.load_canary_setting_config(status="ACTIVE")
+            self.assertIsNotNone(active_settings)
+            assert active_settings is not None
+            authorization_mode = "EXPLORATORY_MICRO_CANARY"
+            authorization_draft = left.register_execution_authorization_draft(
+                authorization_id="sqlite-concurrency-authorization",
+                mode=authorization_mode,
+                purpose="sqlite concurrency final submission slot",
+                exact_strategy_versions=("sqlite-concurrency-strategy",),
+                adverse_evidence_ack=True,
+                lifetime_budget={"max_notional_usd": "1000", "max_orders": 100},
+                stop_rules={"max_loss_usd": "1000"},
+                expires_at=T0 + timedelta(hours=1),
+                scope_hash=hashlib.sha256(
+                    b"sqlite-concurrency-scope"
+                ).hexdigest(),
+                scope_version="sqlite-concurrency-v1",
+                active_settings_hash=str(active_settings["config_hash"]),
+                active_settings_generation=int(active_settings["generation"]),
+                actor="operator-a",
+                timestamp=T0,
+            )
+            authorization = left.activate_execution_authorization(
+                str(authorization_draft["authorization_id"]),
+                "operator-a",
+                expected_generation=int(authorization_draft["generation"]),
+                timestamp=T0,
+            )
+
+            services = (
+                CanaryService(
+                    left,
+                    clock=lambda: T0,
+                    controller_owner_id=owner_id,
+                ),
+                CanaryService(
+                    right,
+                    clock=lambda: T0,
+                    controller_owner_id=owner_id,
+                ),
+            )
+            for contender in services:
+                contender.controller_generation = int(lease["generation"])
+                contender.execution_authorization_id = str(
+                    authorization["authorization_id"]
+                )
+                contender.execution_authorization_mode = authorization_mode
+
             results: list[dict[str, object]] = []
             errors: list[BaseException] = []
             barrier = threading.Barrier(2)
 
-            def worker(store: AxiomStore, intent: str) -> None:
+            def worker(service: CanaryService, intent: str) -> None:
                 try:
                     barrier.wait(5)
+                    reservation = service.store.reserve_canary_capacity(
+                        intent_id=intent,
+                        side="BUY",
+                        requested_cost="0.50",
+                        quantity="1",
+                        market_id=intent,
+                        execution_authorization_id=service.execution_authorization_id,
+                        controller_owner_id=service.controller_owner_id,
+                        controller_generation=service.controller_generation,
+                        detail={
+                            "execution_authorization_mode": (
+                                service.execution_authorization_mode
+                            ),
+                        },
+                        timestamp=T0,
+                    )
+                    attempt_id = service.store.record_canary_submission_attempt(
+                        attempt_id=f"attempt:{intent}",
+                        intent_id=intent,
+                        side="BUY",
+                        attempted_at=T0,
+                        status="SUBMITTED",
+                        execution_authorization_id=service.execution_authorization_id,
+                        controller_owner_id=service.controller_owner_id,
+                        controller_generation=service.controller_generation,
+                        detail={
+                            "execution_authorization_mode": (
+                                service.execution_authorization_mode
+                            ),
+                        },
+                    )
                     results.append(
-                        store.reserve_canary_capacity(
-                            intent_id=intent,
-                            side="BUY",
-                            requested_cost="0.50",
-                            quantity="1",
-                            market_id=intent,
-                            timestamp=T0,
-                        )
+                        {
+                            "reservation": reservation,
+                            "attempt_id": attempt_id,
+                        }
                     )
                 except BaseException as exc:
                     errors.append(exc)
 
             threads = [
-                threading.Thread(target=worker, args=(left, "slot-a")),
-                threading.Thread(target=worker, args=(right, "slot-b")),
+                threading.Thread(target=worker, args=(services[0], "slot-a")),
+                threading.Thread(target=worker, args=(services[1], "slot-b")),
             ]
             try:
                 for thread in threads:
@@ -488,6 +575,65 @@ class SQLiteConcurrencyTests(unittest.TestCase):
                 self.assertFalse(any(thread.is_alive() for thread in threads))
                 self.assertEqual(len(results), 1)
                 self.assertEqual(len(errors), 1)
+
+                winner = results[0]["reservation"]
+                self.assertIsInstance(winner, dict)
+                assert isinstance(winner, dict)
+                self.assertEqual(
+                    winner["execution_authorization_id"],
+                    authorization["authorization_id"],
+                )
+                self.assertEqual(winner["controller_owner_id"], owner_id)
+                self.assertEqual(
+                    winner["controller_generation"],
+                    lease["generation"],
+                )
+                self.assertEqual(
+                    winner["detail"]["execution_authorization_mode"],
+                    authorization_mode,
+                )
+
+                reservation_row = left.connection.execute(
+                    "SELECT execution_authorization_id,controller_owner_id,"
+                    "controller_generation,detail_json "
+                    "FROM canary_risk_reservations"
+                ).fetchone()
+                self.assertIsNotNone(reservation_row)
+                assert reservation_row is not None
+                self.assertEqual(
+                    reservation_row["execution_authorization_id"],
+                    authorization["authorization_id"],
+                )
+                self.assertEqual(reservation_row["controller_owner_id"], owner_id)
+                self.assertEqual(
+                    reservation_row["controller_generation"],
+                    lease["generation"],
+                )
+                self.assertIn(authorization_mode, reservation_row["detail_json"])
+
+                attempt_row = left.connection.execute(
+                    "SELECT execution_authorization_id,controller_owner_id,"
+                    "controller_generation,detail_json "
+                    "FROM canary_submission_attempts"
+                ).fetchone()
+                self.assertIsNotNone(attempt_row)
+                assert attempt_row is not None
+                self.assertEqual(
+                    attempt_row["execution_authorization_id"],
+                    authorization["authorization_id"],
+                )
+                self.assertEqual(attempt_row["controller_owner_id"], owner_id)
+                self.assertEqual(
+                    attempt_row["controller_generation"],
+                    lease["generation"],
+                )
+                self.assertIn(authorization_mode, attempt_row["detail_json"])
+                self.assertEqual(
+                    left.connection.execute(
+                        "SELECT COUNT(*) FROM canary_submission_attempts"
+                    ).fetchone()[0],
+                    1,
+                )
             finally:
                 right.close()
                 left.close()

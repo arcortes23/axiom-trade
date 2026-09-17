@@ -1137,6 +1137,11 @@ class RollingEvidence:
     evaluator_invoked: bool | None = None
     evaluator_completed: bool | None = None
     evaluated_observations: int | None = None
+    holding_period: int | None = None
+    exit_policy: Mapping[str, Any] | str | None = None
+    observation_horizon: Mapping[str, Any] | int | None = None
+    selection_excluded: bool = False
+    observation_gap_seconds: Decimal | None = None
     signal_count: int | None = None
     diagnostic_summary_count: int | None = None
     evaluator_name: str | None = None
@@ -1354,6 +1359,47 @@ class RollingEvidence:
             or bool(evaluation_kind)
             or bool(supersedes_evidence_id)
         )
+        holding_period = self.holding_period
+        if holding_period is not None:
+            holding_period = _integer(
+                holding_period,
+                "holding_period",
+                minimum=1,
+                maximum=10000,
+            )
+        object.__setattr__(self, "holding_period", holding_period)
+        exit_policy = self.exit_policy
+        if exit_policy is not None:
+            if isinstance(exit_policy, Mapping):
+                exit_policy = _freeze(dict(exit_policy))
+            else:
+                exit_policy = _text(
+                    exit_policy,
+                    "exit_policy",
+                    max_length=MAX_REASON_LENGTH,
+                    required=True,
+                )
+        object.__setattr__(self, "exit_policy", exit_policy)
+        observation_horizon = self.observation_horizon
+        if observation_horizon is not None:
+            if isinstance(observation_horizon, Mapping):
+                observation_horizon = _freeze(dict(observation_horizon))
+            else:
+                observation_horizon = _integer(
+                    observation_horizon,
+                    "observation_horizon",
+                    minimum=1,
+                    maximum=10000,
+                )
+        object.__setattr__(self, "observation_horizon", observation_horizon)
+        if not isinstance(self.selection_excluded, bool):
+            raise TypeError("selection_excluded must be bool")
+        gap = (
+            _nonnegative(self.observation_gap_seconds, "observation_gap_seconds")
+            if self.observation_gap_seconds is not None
+            else None
+        )
+        object.__setattr__(self, "observation_gap_seconds", gap)
         object.__setattr__(self, "strategy_version_id", _text(self.strategy_version_id, "strategy_version_id"))
         object.__setattr__(self, "evidence_window_id", _text(self.evidence_window_id, "evidence_window_id"))
         object.__setattr__(self, "candidate_id", _text(self.candidate_id, "candidate_id", required=False) or None)
@@ -1823,6 +1869,22 @@ class RollingEvidence:
         }
         if self.requested_source_class != self.source_class:
             projection["requested_source_class"] = self.requested_source_class
+        if (
+            self.holding_period is not None
+            or self.exit_policy is not None
+            or self.observation_horizon is not None
+            or self.selection_excluded
+            or self.observation_gap_seconds is not None
+        ):
+            projection.update(
+                {
+                    "holding_period": self.holding_period,
+                    "exit_policy": self.exit_policy,
+                    "observation_horizon": self.observation_horizon,
+                    "selection_excluded": self.selection_excluded,
+                    "observation_gap_seconds": self.observation_gap_seconds,
+                }
+            )
         # A v2 row is identified by evaluator version/run, evaluation kind, or
         # an append-only correction link.  The link itself is immutable
         # provenance and therefore must be digest-bound even when it is the
@@ -1959,6 +2021,48 @@ class RollingEvidence:
             or self.costs is None
         ):
             failures.append("accounting_unavailable")
+        minimum_overrides = policy.minimum_evidence
+        if isinstance(minimum_overrides, Mapping):
+            def _override(*names: str) -> Any:
+                for name in names:
+                    if name in minimum_overrides and minimum_overrides[name] is not None:
+                        return minimum_overrides[name]
+                return None
+
+            minimum_observations = _override(
+                "min_evaluated_observations",
+                "minimum_evaluated_observations",
+                "min_observations",
+                "minimum_observations",
+                "min_samples",
+                "minimum_samples",
+            )
+            if minimum_observations is not None:
+                required_observations = _integer(
+                    minimum_observations,
+                    "minimum_evaluated_observations",
+                    minimum=1,
+                    maximum=10_000_000,
+                )
+                observed = self.evaluated_observations
+                if observed is None:
+                    observed = self.evaluated_rows
+                if observed is None or observed < required_observations:
+                    failures.append("evaluated_observations")
+            maximum_gap = _override(
+                "max_observation_gap_seconds",
+                "maximum_observation_gap_seconds",
+                "max_gap_seconds",
+                "maximum_gap_seconds",
+                "max_cadence_seconds",
+            )
+            if maximum_gap is not None:
+                allowed_gap = _nonnegative(maximum_gap, "max_observation_gap_seconds")
+                if (
+                    self.observation_gap_seconds is None
+                    or self.observation_gap_seconds > allowed_gap
+                ):
+                    failures.append("observation_cadence")
         v2_provenance = (
             bool(self.evaluation_run_id)
             or bool(self.evaluation_version)
@@ -2062,6 +2166,11 @@ class RollingEvidence:
             "requested_rows": self.requested_rows,
             "available_rows": self.available_rows,
             "evaluated_rows": self.evaluated_rows,
+            "holding_period": self.holding_period,
+            "exit_policy": self.exit_policy,
+            "observation_horizon": self.observation_horizon,
+            "selection_excluded": self.selection_excluded,
+            "observation_gap_seconds": self.observation_gap_seconds,
             "evaluation_run_id": self.evaluation_run_id,
             "evaluation_version": self.evaluation_version,
             "evaluation_kind": self.evaluation_kind,
@@ -2598,6 +2707,33 @@ class RollingEvidence:
             requested_rows=row.get("requested_rows"),
             available_rows=row.get("available_rows"),
             evaluated_rows=row.get("evaluated_rows"),
+            holding_period=consistent_value(
+                "holding_period",
+                (row, evaluation_nested, metrics_evaluation),
+            ),
+            exit_policy=consistent_value(
+                "exit_policy",
+                (row, evaluation_nested, metrics_evaluation),
+            ),
+            observation_horizon=consistent_value(
+                "observation_horizon",
+                (row, evaluation_nested, metrics_evaluation),
+            ),
+            selection_excluded=(
+                consistent_value(
+                    "selection_excluded",
+                    (row, evaluation_nested, metrics_evaluation),
+                )
+                if any(
+                    "selection_excluded" in source
+                    for source in (row, evaluation_nested, metrics_evaluation)
+                )
+                else False
+            ),
+            observation_gap_seconds=consistent_value(
+                "observation_gap_seconds",
+                (row, evaluation_nested, metrics_evaluation),
+            ),
             evaluation_run_id=shared_value("evaluation_run_id"),
             evaluation_version=shared_value("evaluation_version"),
             evaluation_kind=evaluation_kind,
@@ -3277,7 +3413,13 @@ def _member_from_evidence(
         evidence_window_id=evidence.evidence_window_id,
         overlap_key=evidence.overlap_key,
         evidence_digest=evidence.evidence_digest,
-        position_management_state={"evidence_digest": evidence.evidence_digest},
+        position_management_state={
+            "evidence_digest": evidence.evidence_digest,
+            "holding_period": evidence.holding_period,
+            "exit_policy": evidence.exit_policy,
+            "observation_horizon": evidence.observation_horizon,
+            "selection_excluded": evidence.selection_excluded,
+        },
     )
 
 
@@ -3584,12 +3726,16 @@ def evaluate_rolling_selection(
 
     # First pass computes score and evidence quality.  All ties are deterministic.
     candidate_rows: dict[str, tuple[RollingEvidence, Decimal, tuple[str, ...], tuple[RollingEvidence, ...]]] = {}
+    selection_excluded_rows: dict[str, tuple[RollingEvidence, Decimal]] = {}
     for strategy_id, windows in grouped.items():
         # A provisional score identifies overlap winners.  The penalty is applied in
         # the second pass, so a unique member is never penalized for having a key.
         score, anchor, failures, selected = _aggregate_evidence(admission, windows)
         if anchor is not None:
-            candidate_rows[strategy_id] = (anchor, score, failures, selected)
+            if anchor.selection_excluded:
+                selection_excluded_rows[strategy_id] = (anchor, score)
+            else:
+                candidate_rows[strategy_id] = (anchor, score, failures, selected)
 
     overlap_groups: dict[str, list[str]] = {}
     for strategy_id, (anchor, score_value, failures, _selected) in candidate_rows.items():
@@ -3715,6 +3861,16 @@ def evaluate_rolling_selection(
 
     eligible: list[tuple[str, RollingEvidence, Decimal]] = []
     observed: list[RollingSelectionMember] = []
+    for strategy_id, (anchor, score) in sorted(selection_excluded_rows.items()):
+        observed.append(
+            _member_from_evidence(
+                anchor,
+                score=score,
+                status="OBSERVE",
+                reason="SELECTION_EXCLUDED",
+            )
+        )
+        reasons.append(f"{strategy_id}:SELECTION_EXCLUDED")
     for strategy_id, (anchor, score, failures, duplicate) in evaluated.items():
         if strategy_id in old_by_id:
             continue

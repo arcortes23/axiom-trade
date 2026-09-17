@@ -1411,6 +1411,70 @@ class CanaryReadinessTests(unittest.TestCase):
         return str(signal["signal_id"])
 
 
+    def _install_official_authority(
+        self,
+        store: AxiomStore,
+        service: CanaryService,
+        signal_id: str,
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        signal = service.get_signal(signal_id)
+        self.assertIsInstance(signal, dict)
+        assert isinstance(signal, dict)
+        evidence = signal.get("evidence")
+        self.assertIsInstance(evidence, dict)
+        assert isinstance(evidence, dict)
+        scope_hash = str(
+            evidence.get("scope_hash") or evidence["market_scope_hash"]
+        )
+        scope_version = str(
+            evidence.get("scope_version") or evidence["market_scope_version"]
+        )
+        owner_id = "official-sdk-fixture-controller"
+        service.controller_owner_id = owner_id
+        # These official SDK tests cover read-only transport and allowance
+        # precedence on a legacy signal without rolling selection lineage.
+        # Keep the persisted lease/authorization real while isolating only the
+        # unavailable rolling-selection binding fence.
+        binding_fence = patch(
+            "axiom.canary._canary_authorization_binding_fence",
+            return_value=None,
+        )
+        binding_fence.start()
+        self.addCleanup(binding_fence.stop)
+        lease = store.acquire_canary_controller_lease(
+            owner_id=owner_id,
+            lease_seconds=86_400,
+            now=T0,
+        )
+        _, settings_generation, settings_hash = service._settings_identity()
+        authorization_id = "official-sdk-fixture-authorization"
+        draft = store.register_execution_authorization_draft(
+            authorization_id=authorization_id,
+            mode="EXPLORATORY_MICRO_CANARY",
+            purpose="official-sdk-fixture",
+            exact_strategy_versions=("candidate-1",),
+            reviewed_selection_policy_hash=scope_hash.removeprefix("sha256:"),
+            adverse_evidence_ack=True,
+            lifetime_budget={"max_notional_usd": "1000", "max_orders": 100},
+            stop_rules={"max_loss_usd": "1000"},
+            expires_at=T0 + timedelta(days=1),
+            scope_hash=scope_hash,
+            scope_version=scope_version,
+            active_settings_hash=settings_hash,
+            active_settings_generation=int(settings_generation),
+            actor="official-sdk-fixture",
+            timestamp=T0,
+        )
+        authorization = store.activate_execution_authorization(
+            authorization_id,
+            "official-sdk-fixture",
+            expected_generation=int(draft["generation"]),
+            timestamp=T0,
+        )
+        service.execution_authorization_id = authorization_id
+        service.execution_authorization_mode = "EXPLORATORY_MICRO_CANARY"
+        return lease, authorization
+
     def _submit_official_fixture(self, client: _SDKClient) -> None:
         secure_factory = MagicMock(spec=["_create"])
         secure_factory._create.return_value = client
@@ -1430,7 +1494,7 @@ class CanaryReadinessTests(unittest.TestCase):
             "today_realized_pnl": 0.0,
             "total_exposure": 0.0,
             "limits": {
-                "target_notional_usd": "1.00",
+                "target_notional_usd": "0.501",
                 "max_exposure_usd": "5.00",
                 "max_daily_loss_usd": "2.00",
                 "max_open_positions": 3,
@@ -1439,6 +1503,9 @@ class CanaryReadinessTests(unittest.TestCase):
             },
         }
         context = {
+            "market_id": "market-1",
+            "exchange_spender": "0xexchange-v3",
+            "allowance": {"spender": "0xexchange-v3"},
             "asset_id": "position-yes",
             "token_id": "yes",
             "position_id": "position-yes",
@@ -1447,7 +1514,6 @@ class CanaryReadinessTests(unittest.TestCase):
             "identity_bindings": [
                 {
                     "index": 0,
-                    "outcome": "yes",
                     "token_id": "yes",
                     "position_id": "position-yes",
                 }
@@ -1508,6 +1574,7 @@ class CanaryReadinessTests(unittest.TestCase):
             )
             store.connection.commit()
             signal_id = self._seed_official_submission_fixture(store, service)
+            self._install_official_authority(store, service, signal_id)
             with patch.object(service, "authoritative_status", return_value=snapshot), patch.object(
                 store,
                 "polymarket_health",
@@ -1640,6 +1707,7 @@ class CanaryReadinessTests(unittest.TestCase):
             with AxiomStore(":memory:") as store:
                 service = CanaryService(store, credentials=credentials, clock=lambda: T0)
                 signal_id = self._seed_official_submission_fixture(store, service)
+                self._install_official_authority(store, service, signal_id)
                 snapshot = {
                     "micro_live_canary": "ARMED",
                     "candidate": "candidate-1",
@@ -1650,7 +1718,7 @@ class CanaryReadinessTests(unittest.TestCase):
                     "today_realized_pnl": 0.0,
                     "total_exposure": 0.0,
                     "limits": {
-                        "target_notional_usd": "1.00",
+                        "target_notional_usd": "0.501",
                         "max_exposure_usd": "5.00",
                         "max_daily_loss_usd": "2.00",
                         "max_open_positions": 3,
@@ -1662,6 +1730,9 @@ class CanaryReadinessTests(unittest.TestCase):
                 snapshot["settings_config_id"] = settings_config_id
                 snapshot["settings_generation"] = settings_generation
                 context = {
+                    "exchange_spender": "0xexchange-v3",
+                    "allowance": {"spender": "0xexchange-v3"},
+                    "market_id": "market-1",
                     "asset_id": "position-yes",
                     "token_id": "yes",
                     "position_id": "position-yes",
@@ -1735,7 +1806,7 @@ class CanaryReadinessTests(unittest.TestCase):
                         "asset_id": "position-yes",
                         "side": "BUY",
                         "price": "0.50",
-                        "size": "1",
+                        "size": "1.00",
                     }
                 ],
             )
@@ -1752,7 +1823,7 @@ class CanaryReadinessTests(unittest.TestCase):
             self.assertEqual(client.place_calls, [])
             self.assertEqual(client.approval_calls, [])
             self.assertEqual(client.update_calls, [])
-            self.assertEqual(client.close_calls, 6)
+            self.assertEqual(client.close_calls, 8)
     def test_official_venue_rejects_custom_geoblock_url(self) -> None:
         with self.assertRaises(TypeError):
             PolymarketClobV2Venue(

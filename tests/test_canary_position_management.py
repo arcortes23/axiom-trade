@@ -17,6 +17,16 @@ from axiom.storage import AxiomStore
 
 
 T0 = datetime(2026, 1, 2, 12, tzinfo=timezone.utc)
+ENTRY_STRATEGY_VERSION_ID = "v1"
+ENTRY_RESEARCH_TRIAL_ID = "trial-v1"
+ENTRY_SELECTION_ID = "selection-v1"
+ENTRY_ADMISSION_POLICY_ID = "fixture-policy"
+ENTRY_ADMISSION_POLICY_VERSION = "1"
+ENTRY_RISK_CONFIG_ID = "fixture-risk-config"
+ENTRY_RISK_CONFIG_GENERATION = 1
+ENTRY_RISK_CONFIG_HASH = hashlib.sha256(b"fixture-risk-config").hexdigest()
+ENTRY_SELECTION_POLICY_HASH = hashlib.sha256(b"fixture-selection-policy").hexdigest()
+ENTRY_SELECTION_HASH = hashlib.sha256(b"fixture-selection").hexdigest()
 
 
 class TestCredentials(CredentialStore):
@@ -49,6 +59,19 @@ class OfflineOfficialVenue:
         self.market_version = "v1"
         self.position_id: str | None = None
         self.asset_id: str | None = None
+        self.geoblock_result: dict[str, object] = {
+            "blocked": False,
+            "close_only": False,
+            "country": "ZZ",
+        }
+        wallet = TestCredentials._VALUES["wallet_address"]
+        self.account_result: dict[str, object] = {
+            "authenticated": True,
+            "wallet_address": wallet,
+            "signer": wallet,
+            "funder": wallet,
+            "owner": wallet,
+        }
         self.trades: list[dict[str, str]] = []
         self.trades_by_order: dict[str, list[dict[str, str]]] = {}
         self.order_assets_by_order: dict[str, str] = {}
@@ -57,8 +80,12 @@ class OfflineOfficialVenue:
         self.order_prices_by_order: dict[str, str] = {}
         self.market_versions_by_token: dict[str, str] = {}
         self.position_ids_by_token: dict[str, str] = {}
+
     def geoblock(self) -> dict[str, object]:
-        return {"blocked": False, "close_only": False, "country": "ZZ"}
+        return dict(self.geoblock_result)
+
+    def account(self) -> dict[str, object]:
+        return dict(self.account_result)
 
     def market_context(self, market_id: str, token_id: str) -> dict[str, object]:
         version = self.market_versions_by_token.get(
@@ -91,10 +118,12 @@ class OfflineOfficialVenue:
             "neg_risk": False,
             "accepting_orders": True,
             "min_order_size": "0.1",
-            "size_increment": "0.01",
-            "min_notional": "0.01",
+            "tick_size": "0.0001",
             "fee_bps": "10",
             "best_bid": "0.49",
+            "bids": [{"price": "0.49", "size": "1"}],
+            "allowance": {"spender": "fixture-spender"},
+            "exchange_spender": "fixture-spender",
         }
 
     def get_order(self, order_id: str) -> dict[str, str]:
@@ -158,7 +187,6 @@ class OfflineOfficialVenue:
     def submit_limit_order(self, **kwargs: object) -> dict[str, object]:
         raise AssertionError("production exits must use CanaryService._submit_position_order")
 
-
 class CanaryPositionManagementTests(unittest.TestCase):
     def setUp(self) -> None:
         # The release fixture is isolated by default; fake venue/control
@@ -184,6 +212,7 @@ class CanaryPositionManagementTests(unittest.TestCase):
         )
         self._venue_type_patch.start()
         self._arm_reviewed_candidate()
+        self._establish_authority()
         self._seed_owned_position()
         self.post_calls: list[dict[str, object]] = []
         self.next_order_id = "exit-1"
@@ -357,6 +386,83 @@ class CanaryPositionManagementTests(unittest.TestCase):
                 resolved_at=self.now,
             )
         )
+        self.store.save_strategy_version(
+            {
+                "strategy_version_id": ENTRY_STRATEGY_VERSION_ID,
+                "strategy_id": "strategy-1",
+                "version": "1",
+                "strategy_hash": "strategy-hash",
+                "config_hash": "config-hash",
+                "created_at": self.now.isoformat(),
+            }
+        )
+        self.store.save_research_trial(
+            {
+                "research_trial_id": ENTRY_RESEARCH_TRIAL_ID,
+                "strategy_version_id": ENTRY_STRATEGY_VERSION_ID,
+                "candidate_id": "candidate-1",
+                "status": "COMPLETED",
+                "created_at": self.now.isoformat(),
+            }
+        )
+        self.store.save_admission_policy(
+            {
+                "policy_id": ENTRY_ADMISSION_POLICY_ID,
+                "version": ENTRY_ADMISSION_POLICY_VERSION,
+                "config_hash": ENTRY_SELECTION_POLICY_HASH,
+                "global_budget": "100",
+                "max_members": 3,
+                "requested_window_days": [7],
+                "minimum_coverage_ratio": "0",
+                "min_completed_outcomes": 0,
+                "min_reliability": "0",
+                "created_at": self.now.isoformat(),
+            }
+        )
+        evidence_window_id = "entry-evidence-v1"
+        self.store.save_strategy_evidence_window(
+            {
+                "evidence_window_id": evidence_window_id,
+                "strategy_version_id": ENTRY_STRATEGY_VERSION_ID,
+                "research_trial_id": ENTRY_RESEARCH_TRIAL_ID,
+                "candidate_id": "candidate-1",
+                "available_from": (self.now - timedelta(days=7)).isoformat(),
+                "available_through": self.now.isoformat(),
+                "requested_days": 7,
+                "actual_coverage_seconds": 7 * 86400,
+                "observation_completeness": "1",
+                "source_class": "HISTORICAL",
+                "drawdown": "0",
+            }
+        )
+        selection_member = {
+            "portfolio_selection_id": ENTRY_SELECTION_ID,
+            "strategy_version_id": ENTRY_STRATEGY_VERSION_ID,
+            "research_trial_id": ENTRY_RESEARCH_TRIAL_ID,
+            "candidate_id": "candidate-1",
+            "allocation": "10",
+            "status": "ACTIVE",
+            "score": "1",
+            "reason": "fixture",
+            "evidence_window_id": evidence_window_id,
+        }
+        self.store.commit_portfolio_selection(
+            {
+                "portfolio_selection_id": ENTRY_SELECTION_ID,
+                "selection_id": ENTRY_SELECTION_ID,
+                "policy_id": ENTRY_ADMISSION_POLICY_ID,
+                "policy_version": ENTRY_ADMISSION_POLICY_VERSION,
+                "risk_config_id": ENTRY_RISK_CONFIG_ID,
+                "risk_config_generation": ENTRY_RISK_CONFIG_GENERATION,
+                "risk_config_hash": ENTRY_RISK_CONFIG_HASH,
+                "global_budget": "100",
+                "selected_at": self.now.isoformat(),
+                "review_due_at": (self.now + timedelta(days=1)).isoformat(),
+                "selection_hash": ENTRY_SELECTION_HASH,
+                "selection_policy_hash": ENTRY_SELECTION_POLICY_HASH,
+            },
+            [selection_member],
+        )
         self.service.mark_eligible("candidate-1", publish_readiness=False)
         settings = self.service.settings.snapshot(now=self.now)
         self.service.arm(
@@ -368,40 +474,272 @@ class CanaryPositionManagementTests(unittest.TestCase):
         )
         self.config = self.service.settings.snapshot(now=self.now)
 
+    def _establish_authority(self) -> None:
+        self.service.controller_owner_id = "fixture-controller"
+        self.controller_lease = self.store.acquire_canary_controller_lease(
+            owner_id=self.service.controller_owner_id,
+            lease_seconds=3600,
+            now=self.now,
+        )
+        scope_hash = hashlib.sha256(b"fixture-scope").hexdigest()
+        draft = self.store.register_execution_authorization_draft(
+            authorization_id="fixture-execution-authorization",
+            mode="EXPLORATORY_MICRO_CANARY",
+            purpose="managed-exit-tests",
+            exact_strategy_versions=(ENTRY_STRATEGY_VERSION_ID,),
+            reviewed_selection_policy_hash=ENTRY_SELECTION_POLICY_HASH,
+            selection_id=ENTRY_SELECTION_ID,
+            selection_hash=ENTRY_SELECTION_HASH,
+            adverse_evidence_ack={"acknowledged": True},
+            lifetime_budget={"max_notional_usd": "100", "max_orders": 100},
+            stop_rules={"max_daily_loss_usd": "100"},
+            expires_at=self.now + timedelta(hours=1),
+            scope_hash=scope_hash,
+            scope_version="1",
+            active_settings_hash=str(self.config["config_hash"]),
+            active_settings_generation=int(self.config["generation"]),
+            actor="fixture-operator",
+            timestamp=self.now,
+        )
+        self.execution_authorization = self.store.activate_execution_authorization(
+            str(draft["authorization_id"]),
+            "fixture-operator",
+            expected_generation=int(draft["generation"]),
+            timestamp=self.now,
+        )
+        self.service.execution_authorization_id = str(
+            self.execution_authorization["authorization_id"]
+        )
+        self.service.execution_authorization_mode = str(
+            self.execution_authorization["mode"]
+        )
+
+    def _opening_lineage(self) -> dict[str, object]:
+        return {
+            "strategy_version_id": ENTRY_STRATEGY_VERSION_ID,
+            "research_trial_id": ENTRY_RESEARCH_TRIAL_ID,
+            "candidate_id": "candidate-1",
+            "portfolio_selection_id": ENTRY_SELECTION_ID,
+            "admission_policy_id": ENTRY_ADMISSION_POLICY_ID,
+            "admission_policy_version": ENTRY_ADMISSION_POLICY_VERSION,
+            "risk_config_id": ENTRY_RISK_CONFIG_ID,
+            "risk_config_generation": ENTRY_RISK_CONFIG_GENERATION,
+            "risk_config_hash": ENTRY_RISK_CONFIG_HASH,
+            "allocation": "10",
+            "lineage_type": "ROLLING_PORTFOLIO",
+            "execution_authorization_id": self.execution_authorization[
+                "authorization_id"
+            ],
+            "execution_authorization_mode": self.execution_authorization["mode"],
+            "controller_owner_id": self.controller_lease["owner_id"],
+            "controller_generation": self.controller_lease["generation"],
+            "selection_hash": ENTRY_SELECTION_HASH,
+            "selection_policy_hash": ENTRY_SELECTION_POLICY_HASH,
+        }
+
+    def _opening_detail(
+        self,
+        token_id: str,
+        *,
+        settlement_status: str = "CONFIRMED",
+        extra: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        detail = {
+            "side": "BUY",
+            "token_id": token_id,
+            "settlement_status": settlement_status,
+            **self._opening_lineage(),
+        }
+        if extra:
+            detail.update(extra)
+        return detail
+
+    def _reserve_entry(
+        self,
+        *,
+        intent_id: str,
+        reservation_id: str,
+        event_id: str,
+        requested_cost: str,
+        fee_reserve: str,
+        quantity: str,
+        token_id: str = "token-yes",
+        detail: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        config = self.config
+        lineage = self._opening_lineage()
+        return self.store.reserve_canary_capacity(
+            intent_id=intent_id,
+            reservation_id=reservation_id,
+            side="BUY",
+            requested_cost=requested_cost,
+            fee_reserve=fee_reserve,
+            quantity=quantity,
+            market_id="market-1",
+            event_id=event_id,
+            config_id=str(config["config_id"]),
+            config_generation=int(config["generation"]),
+            config_hash=str(config["config_hash"]),
+            control_generation=int(config["control_generation"]),
+            execution_authorization_id=str(
+                lineage["execution_authorization_id"]
+            ),
+            controller_owner_id=str(lineage["controller_owner_id"]),
+            controller_generation=int(lineage["controller_generation"]),
+            strategy_version_id=str(lineage["strategy_version_id"]),
+            research_trial_id=str(lineage["research_trial_id"]),
+            candidate_id=str(lineage["candidate_id"]),
+            portfolio_selection_id=str(lineage["portfolio_selection_id"]),
+            admission_policy_id=str(lineage["admission_policy_id"]),
+            admission_policy_version=str(lineage["admission_policy_version"]),
+            risk_config_id=str(lineage["risk_config_id"]),
+            risk_config_generation=int(lineage["risk_config_generation"]),
+            risk_config_hash=str(lineage["risk_config_hash"]),
+            allocation=str(lineage["allocation"]),
+            detail=detail or self._opening_detail(token_id),
+            timestamp=self.now,
+        )
+
+    def _record_entry_fill(
+        self,
+        *,
+        fill_id: str,
+        reservation_id: str,
+        quantity: str,
+        price: str,
+        fee: str = "0",
+        token_id: str = "token-yes",
+        detail: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        lineage = self._opening_lineage()
+        return self.store.record_canary_fill(
+            fill_id=fill_id,
+            reservation_id=reservation_id,
+            quantity=quantity,
+            price=price,
+            cost=str(Decimal(quantity) * Decimal(price) + Decimal(fee)),
+            fee=fee,
+            filled_at=self.now,
+            execution_authorization_id=str(
+                lineage["execution_authorization_id"]
+            ),
+            controller_owner_id=str(lineage["controller_owner_id"]),
+            controller_generation=int(lineage["controller_generation"]),
+            strategy_version_id=str(lineage["strategy_version_id"]),
+            research_trial_id=str(lineage["research_trial_id"]),
+            candidate_id=str(lineage["candidate_id"]),
+            portfolio_selection_id=str(lineage["portfolio_selection_id"]),
+            admission_policy_id=str(lineage["admission_policy_id"]),
+            admission_policy_version=str(lineage["admission_policy_version"]),
+            risk_config_id=str(lineage["risk_config_id"]),
+            risk_config_generation=int(lineage["risk_config_generation"]),
+            risk_config_hash=str(lineage["risk_config_hash"]),
+            allocation=str(lineage["allocation"]),
+            detail=detail or self._opening_detail(token_id),
+        )
+
+    def _bind_entry_ledger(self, event_id: str) -> None:
+        lineage = self._opening_lineage()
+        row = self.store.connection.execute(
+            "SELECT evidence_json FROM canary_ledger WHERE event_id=?",
+            (event_id,),
+        ).fetchone()
+        evidence = {}
+        if row is not None:
+            try:
+                decoded = json.loads(row["evidence_json"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                decoded = {}
+            if isinstance(decoded, dict):
+                evidence = decoded
+        token_id = str(
+            evidence.get("token_id")
+            or evidence.get("selected_token_id")
+            or evidence.get("tokenId")
+            or "token-yes"
+        )
+        evidence.setdefault("side", "BUY")
+        evidence.setdefault("token_id", token_id)
+        evidence.setdefault("settlement_status", "CONFIRMED")
+        for name, value in {
+            **lineage,
+            "selection_hash": ENTRY_SELECTION_HASH,
+            "selection_policy_hash": ENTRY_SELECTION_POLICY_HASH,
+        }.items():
+            evidence[name] = value
+        with self.store.connection:
+            self.store.connection.execute(
+                "UPDATE canary_ledger SET strategy_version_id=?,research_trial_id=?,"
+                "portfolio_selection_id=?,admission_policy_id=?,admission_policy_version=?,"
+                "risk_config_id=?,risk_config_generation=?,risk_config_hash=?,"
+                "lineage_type=?,evidence_json=? WHERE event_id=?",
+                (
+                    lineage["strategy_version_id"],
+                    lineage["research_trial_id"],
+                    lineage["portfolio_selection_id"],
+                    lineage["admission_policy_id"],
+                    lineage["admission_policy_version"],
+                    lineage["risk_config_id"],
+                    lineage["risk_config_generation"],
+                    lineage["risk_config_hash"],
+                    lineage["lineage_type"],
+                    json.dumps(evidence, sort_keys=True),
+                    event_id,
+                ),
+            )
+
+    def _release_entry_remainder(self, reservation_id: str) -> None:
+        lineage = self._opening_lineage()
+        self.store.release_canary_capacity(
+            reservation_id,
+            status="RELEASED",
+            timestamp=self.now,
+            strategy_version_id=str(lineage["strategy_version_id"]),
+            research_trial_id=str(lineage["research_trial_id"]),
+            candidate_id=str(lineage["candidate_id"]),
+            portfolio_selection_id=str(lineage["portfolio_selection_id"]),
+            admission_policy_id=str(lineage["admission_policy_id"]),
+            admission_policy_version=str(lineage["admission_policy_version"]),
+            risk_config_id=str(lineage["risk_config_id"]),
+            risk_config_generation=int(lineage["risk_config_generation"]),
+            risk_config_hash=str(lineage["risk_config_hash"]),
+            allocation=str(lineage["allocation"]),
+            detail=self._opening_detail("token-yes"),
+        )
+
     def _seed_owned_position(self) -> None:
         from axiom.canary_positions import _ensure_schema
 
         _ensure_schema(self.service)
         config = self.config
-        self.store.reserve_canary_capacity(
+        lineage = self._opening_lineage()
+        self._reserve_entry(
             intent_id="entry-intent-1",
             reservation_id="entry-reservation-1",
-            side="BUY",
+            event_id="entry-event-1",
             requested_cost="0.50",
             fee_reserve="0",
             quantity="1",
-            market_id="market-1",
-            event_id="entry-event-1",
-            config_id=str(config["config_id"]),
-            config_generation=int(config["generation"]),
-            config_hash=str(config["config_hash"]),
-            control_generation=int(config["control_generation"]),
-            detail={"side": "BUY", "token_id": "token-yes", "settlement_status": "CONFIRMED"},
-            timestamp=self.now,
         )
-        self.store.record_canary_fill(
+        self._record_entry_fill(
             fill_id="entry-fill-1",
             reservation_id="entry-reservation-1",
             quantity="1",
             price="0.50",
-            cost="0.50",
-            fee="0",
-            filled_at=self.now,
-            detail={"side": "BUY", "token_id": "token-yes", "settlement_status": "CONFIRMED"},
         )
         with self.store.connection:
             self.store.connection.execute(
-                "INSERT INTO canary_position_lots(position_id,reservation_id,event_id,venue,market_id,token_id,candidate_id,strategy_id,strategy_version,strategy_hash,model_hash,config_id,config_generation,exit_policy_json,quantity,sold_quantity,cost_basis,fees,pending_exit_quantity,status,opened_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO canary_position_lots("
+                "position_id,reservation_id,event_id,venue,market_id,token_id,"
+                "asset_id,market_version,candidate_id,strategy_id,strategy_version,"
+                "strategy_hash,model_hash,config_id,config_generation,"
+                "strategy_version_id,research_trial_id,portfolio_selection_id,"
+                "admission_policy_id,admission_policy_version,risk_config_id,"
+                "risk_config_generation,risk_config_hash,lineage_type,"
+                "execution_authorization_id,execution_authorization_mode,"
+                "controller_owner_id,controller_generation,exit_policy_json,"
+                "quantity,sold_quantity,cost_basis,fees,pending_exit_quantity,status,"
+                "opened_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     "position-1",
                     "entry-reservation-1",
@@ -409,6 +747,8 @@ class CanaryPositionManagementTests(unittest.TestCase):
                     "POLYMARKET",
                     "market-1",
                     "token-yes",
+                    "token-yes",
+                    "v1",
                     "candidate-1",
                     "strategy-1",
                     "v1",
@@ -416,6 +756,19 @@ class CanaryPositionManagementTests(unittest.TestCase):
                     "model-hash",
                     str(config["config_id"]),
                     int(config["generation"]),
+                    lineage["strategy_version_id"],
+                    lineage["research_trial_id"],
+                    lineage["portfolio_selection_id"],
+                    lineage["admission_policy_id"],
+                    lineage["admission_policy_version"],
+                    lineage["risk_config_id"],
+                    lineage["risk_config_generation"],
+                    lineage["risk_config_hash"],
+                    lineage["lineage_type"],
+                    lineage["execution_authorization_id"],
+                    lineage["execution_authorization_mode"],
+                    lineage["controller_owner_id"],
+                    lineage["controller_generation"],
                     json.dumps(
                         {"type": "fixed_holding_period", "holding_period_seconds": 0},
                         sort_keys=True,
@@ -450,6 +803,130 @@ class CanaryPositionManagementTests(unittest.TestCase):
                 config_id=str(self.config["config_id"]),
             )
         )
+    def test_final_geoblock_close_only_allows_owned_lot_sell(self) -> None:
+        self.venue.geoblock_result = {
+            "blocked": False,
+            "close_only": True,
+            "country": "ZZ",
+        }
+        submitted = self._submit_exit()
+        self.assertEqual(submitted["status"], "SUBMITTED")
+        self.assertEqual(len(self.post_calls), 1)
+
+    def test_final_geoblock_block_rejects_exit_before_transport(self) -> None:
+        self.venue.geoblock_result = {
+            "blocked": True,
+            "close_only": False,
+            "country": "ZZ",
+        }
+        with self.assertRaisesRegex(CanaryBlocked, "GEOGRAPHICALLY_BLOCKED"):
+            self._submit_exit()
+        self.assertEqual(self.post_calls, [])
+        self.assertEqual(self._request()["status"], "REJECTED")
+
+    def test_final_fence_rejects_account_identity_mismatch(self) -> None:
+        self.venue.account_result["signer"] = "wrong-signer"
+        with self.assertRaisesRegex(CanaryBlocked, "SIGNER_MISMATCH"):
+            self._submit_exit()
+        self.assertEqual(self.post_calls, [])
+        self.assertEqual(self._request()["status"], "REJECTED")
+
+    def test_final_fence_rejects_selected_token_mismatch(self) -> None:
+        context = self.venue.market_context("market-1", "token-yes")
+        latest = {**context, "token_id": "token-no"}
+        with patch.object(
+            self.venue,
+            "market_context",
+            side_effect=[context, latest],
+        ):
+            with self.assertRaisesRegex(CanaryBlocked, "SELECTED_TOKEN_MISMATCH"):
+                self._submit_exit()
+        self.assertEqual(self.post_calls, [])
+
+    def test_final_fence_rejects_exchange_spender_mismatch(self) -> None:
+        context = self.venue.market_context("market-1", "token-yes")
+        latest = {**context, "allowance": {"spender": "wrong-spender"}}
+        with patch.object(
+            self.venue,
+            "market_context",
+            side_effect=[context, latest],
+        ):
+            with self.assertRaisesRegex(
+                CanaryBlocked,
+                "EXCHANGE_SPENDER_MISMATCH",
+            ):
+                self._submit_exit()
+        self.assertEqual(self.post_calls, [])
+
+    def test_exit_propagates_authority_metadata_to_request_reservation_and_attempt(
+        self,
+    ) -> None:
+        submitted = self._submit_exit()
+        request = self._request()
+        reservation = self._reservation(str(submitted["reservation_id"]))
+        attempt = self.store.connection.execute(
+            "SELECT * FROM canary_submission_attempts WHERE intent_id=?",
+            (request["request_id"],),
+        ).fetchone()
+        self.assertIsNotNone(attempt)
+        assert attempt is not None
+        expected = {
+            "execution_authorization_id": self.execution_authorization["authorization_id"],
+            "controller_owner_id": self.controller_lease["owner_id"],
+            "controller_generation": self.controller_lease["generation"],
+        }
+        for row in (request, reservation, dict(attempt)):
+            for field, value in expected.items():
+                self.assertEqual(row[field], value, msg=field)
+        self.assertEqual(
+            submitted["lineage"]["execution_authorization_id"],
+            expected["execution_authorization_id"],
+        )
+
+    def test_exit_fails_closed_without_active_controller_lease(self) -> None:
+        self.service.controller_owner_id = "missing-controller"
+        with self.assertRaisesRegex(
+            CanaryBlocked,
+            "CANARY_CONTROLLER_LEASE_REQUIRED",
+        ):
+            self._submit_exit()
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM canary_risk_reservations WHERE side='SELL'"
+            ).fetchone()[0],
+            0,
+        )
+        self.assertEqual(self.post_calls, [])
+
+    def test_exit_rechecks_active_controller_lease_generation_before_send(self) -> None:
+        original_lease = dict(self.controller_lease)
+
+        def replace_lease_before_send(**kwargs: object) -> dict[str, object]:
+            self.store.release_canary_controller_lease(
+                owner_id=str(original_lease["owner_id"]),
+                generation=int(original_lease["generation"]),
+                now=self.now,
+                reason="fixture-generation-fence",
+            )
+            self.controller_lease = self.store.acquire_canary_controller_lease(
+                owner_id=str(original_lease["owner_id"]),
+                lease_seconds=3600,
+                now=self.now,
+            )
+            before_post = kwargs["before_post"]
+            assert callable(before_post)
+            before_post()
+            raise AssertionError("stale lease should block before transport")
+
+        self.service._submit_position_order.side_effect = replace_lease_before_send
+        with self.assertRaisesRegex(
+            CanaryBlocked,
+            "CANARY_CONTROLLER_LEASE_CHANGED",
+        ):
+            self._submit_exit()
+        self.assertEqual(self.post_calls, [])
+        self.assertEqual(self._request()["status"], "REJECTED")
+
     def test_exit_requires_explicit_true_accepting_orders(self) -> None:
         context = self.venue.market_context("market-1", "token-yes")
         invalid_values = (False, None, 0, 1, "true", [], {})
@@ -472,6 +949,45 @@ class CanaryPositionManagementTests(unittest.TestCase):
                 self.assertEqual(self.post_calls, [])
         submitted = self._submit_exit()
         self.assertEqual(submitted["status"], "SUBMITTED")
+    def test_exit_uses_cumulative_selected_token_bid_depth(self) -> None:
+        context = self.venue.market_context("market-1", "token-yes")
+        context["bids"] = [
+            {"price": "0.49", "size": "0.4"},
+            {"price": "0.48", "size": "0.6"},
+        ]
+        with patch.object(self.venue, "market_context", return_value=context):
+            submitted = self._submit_exit()
+        self.assertEqual(submitted["status"], "SUBMITTED")
+        self.assertEqual(self.post_calls[-1]["price"], Decimal("0.49"))
+
+    def test_exit_blocks_when_cumulative_selected_token_bid_depth_is_insufficient(
+        self,
+    ) -> None:
+        context = self.venue.market_context("market-1", "token-yes")
+        context["bids"] = [
+            {"price": "0.49", "size": "0.4"},
+            {"price": "0.48", "size": "0.5"},
+        ]
+        with patch.object(self.venue, "market_context", return_value=context):
+            with self.assertRaisesRegex(
+                CanaryBlocked,
+                "CANARY_EXIT_INSUFFICIENT_DEPTH",
+            ):
+                self._submit_exit()
+        self.assertEqual(self.post_calls, [])
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM canary_position_requests WHERE side='SELL'"
+            ).fetchone()[0],
+            0,
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM canary_risk_reservations WHERE side='SELL'"
+            ).fetchone()[0],
+            0,
+        )
+
     def test_invalid_book_prices_block_mark_without_sink_or_loss_change(self) -> None:
         context = self.venue.market_context("market-1", "token-yes")
         before = self.store.canary_risk_accounting(self.now)
@@ -565,7 +1081,6 @@ class CanaryPositionManagementTests(unittest.TestCase):
                 invalid_context = {
                     **context,
                     "best_bid": value,
-                    "size_increment": None,
                 }
                 with patch.object(
                     self.venue,
@@ -592,19 +1107,24 @@ class CanaryPositionManagementTests(unittest.TestCase):
                     ).fetchone()[0],
                     0,
                 )
-
     def test_exit_rejects_missing_or_malformed_market_rules_before_reservation(
         self,
     ) -> None:
         context = self.venue.market_context("market-1", "token-yes")
         invalid_values = (None, "", "0", "-1", "NaN", "Infinity", False, [], {})
-        for field in ("min_order_size", "size_increment", "min_notional"):
+        for field in ("min_order_size", "tick_size"):
             for value in invalid_values:
                 with self.subTest(field=field, value=value):
                     self._assert_exit_context_blocked(
                         {**context, field: value},
                         "CANARY_EXIT_MARKET_RULES_UNAVAILABLE",
                     )
+        for value in (None, "", "false", 0, 1, [], {}):
+            with self.subTest(field="neg_risk", value=value):
+                self._assert_exit_context_blocked(
+                    {**context, "neg_risk": value},
+                    "CANARY_EXIT_MARKET_RULES_UNAVAILABLE",
+                )
 
 
     def test_boundary_adjacent_book_prices_are_valid_for_marks(self) -> None:
@@ -776,31 +1296,21 @@ class CanaryPositionManagementTests(unittest.TestCase):
         token_id = "token-v2-yes"
         asset_id = "position-v2-yes"
         config = self.config
-        self.store.reserve_canary_capacity(
+        self._reserve_entry(
             intent_id="v2-entry-intent",
             reservation_id=reservation_id,
-            side="BUY",
+            event_id=event_id,
             requested_cost="0.50",
             fee_reserve="0",
             quantity="1",
-            market_id="market-1",
-            event_id=event_id,
-            config_id=str(config["config_id"]),
-            config_generation=int(config["generation"]),
-            config_hash=str(config["config_hash"]),
-            control_generation=int(config["control_generation"]),
-            detail={"side": "BUY", "token_id": token_id},
-            timestamp=self.now,
+            token_id=token_id,
         )
-        self.store.record_canary_fill(
+        self._record_entry_fill(
             fill_id="v2-entry-fill",
             reservation_id=reservation_id,
             quantity="1",
             price="0.50",
-            cost="0.50",
-            fee="0",
-            filled_at=self.now,
-            detail={"side": "BUY", "token_id": token_id},
+            token_id=token_id,
         )
         evidence = {
             "market_version": "v2",
@@ -850,6 +1360,7 @@ class CanaryPositionManagementTests(unittest.TestCase):
                     int(config["control_generation"]),
                 ),
             )
+        self._bind_entry_ledger(event_id)
         self.venue.order_assets_by_order["v2-entry-order"] = asset_id
         self.venue.order_tokens_by_order["v2-entry-order"] = token_id
         self.venue.order_sides_by_order["v2-entry-order"] = "BUY"
@@ -1148,31 +1659,21 @@ class CanaryPositionManagementTests(unittest.TestCase):
             position_module._mark_owned_equity(self.service, self.venue, self.now)["status"],
             "KNOWN",
         )
-        self.store.reserve_canary_capacity(
+        self._reserve_entry(
             intent_id="legacy-v2-entry-intent",
             reservation_id=reservation_id,
-            side="BUY",
+            event_id=event_id,
             requested_cost="0.70",
             fee_reserve="0",
             quantity="1",
-            market_id="market-1",
-            event_id=event_id,
-            config_id=str(config["config_id"]),
-            config_generation=int(config["generation"]),
-            config_hash=str(config["config_hash"]),
-            control_generation=int(config["control_generation"]),
-            detail={"side": "BUY", "token_id": token_id},
-            timestamp=self.now,
+            token_id=token_id,
         )
-        self.store.record_canary_fill(
+        self._record_entry_fill(
             fill_id="legacy-v2-entry-fill",
             reservation_id=reservation_id,
             quantity="1",
             price="0.70",
-            cost="0.70",
-            fee="0",
-            filled_at=self.now,
-            detail={"side": "BUY", "token_id": token_id},
+            token_id=token_id,
         )
         with self.store.connection:
             self.store.connection.execute(
@@ -1214,6 +1715,7 @@ class CanaryPositionManagementTests(unittest.TestCase):
                     int(config["control_generation"]),
                 ),
             )
+        self._bind_entry_ledger(event_id)
         self.venue.order_assets_by_order["legacy-v2-entry-order"] = asset_id
         self.venue.order_tokens_by_order["legacy-v2-entry-order"] = token_id
         self.venue.order_sides_by_order["legacy-v2-entry-order"] = "BUY"
@@ -1510,7 +2012,7 @@ class CanaryPositionManagementTests(unittest.TestCase):
                 "filled_quantity": "0",
                 "status": "HELD",
                 "detail_json": json.dumps(
-                    {"side": "BUY", "token_id": "token-yes"},
+                    self._opening_detail("token-yes"),
                     sort_keys=True,
                 ),
                 "created_at": self.now.isoformat(),
@@ -1527,19 +2029,11 @@ class CanaryPositionManagementTests(unittest.TestCase):
                 + ")",
                 tuple(entry.values()),
             )
-        self.store.record_canary_fill(
+        self._record_entry_fill(
             fill_id="entry-fill-2",
             reservation_id="entry-reservation-2",
             quantity="1",
             price="0.50",
-            cost="0.50",
-            fee="0",
-            filled_at=self.now,
-            detail={
-                "side": "BUY",
-                "token_id": "token-yes",
-                "settlement_status": "CONFIRMED",
-            },
         )
         first = self._submit_exit()
         self.next_order_id = "exit-2"
@@ -2334,21 +2828,13 @@ class CanaryPositionManagementTests(unittest.TestCase):
             "KNOWN",
             msg=f"authoritative exact-token equity result={equity!r}",
         )
-        self.store.reserve_canary_capacity(
+        self._reserve_entry(
             intent_id="late-entry-intent",
             reservation_id="late-entry-reservation",
-            side="BUY",
+            event_id="late-entry-event",
             requested_cost="0.875",
             fee_reserve="0.000875",
             quantity="2",
-            market_id="market-1",
-            event_id="late-entry-event",
-            config_id=str(config["config_id"]),
-            config_generation=int(config["generation"]),
-            config_hash=str(config["config_hash"]),
-            control_generation=int(config["control_generation"]),
-            detail={"side": "BUY", "token_id": "token-yes"},
-            timestamp=self.now,
         )
         with self.store.connection:
             self.store.connection.execute(
@@ -2379,6 +2865,7 @@ class CanaryPositionManagementTests(unittest.TestCase):
                     int(config["control_generation"]),
                 ),
             )
+        self._bind_entry_ledger("late-entry-event")
         self.venue.order_status = "MATCHED"
         self.venue.trades_by_order["late-entry-order"] = [
             {
@@ -2408,6 +2895,10 @@ class CanaryPositionManagementTests(unittest.TestCase):
         assert late_lot is not None
         self.assertEqual(Decimal(late_lot["quantity"]), Decimal("0.5"))
         self.assertEqual(late_lot["status"], "OPEN")
+
+        # Release the unfilled remainder before selling the confirmed partial
+        # lot; delayed canonical fills may still reopen this BUY projection.
+        self._release_entry_remainder("late-entry-reservation")
 
         self.next_order_id = "late-exit-order"
         exit_request = position_module.submit_exit(
@@ -2628,21 +3119,13 @@ class CanaryPositionManagementTests(unittest.TestCase):
         position_module._mark_owned_equity(self.service, self.venue, self.now)
         event_id = "canceled-entry-no-fill"
         reservation_id = "canceled-entry-reservation"
-        self.store.reserve_canary_capacity(
+        self._reserve_entry(
             intent_id=event_id,
             reservation_id=reservation_id,
-            side="BUY",
+            event_id=event_id,
             requested_cost="1.00",
             fee_reserve="0",
             quantity="2",
-            market_id="market-1",
-            event_id=event_id,
-            config_id=str(config["config_id"]),
-            config_generation=int(config["generation"]),
-            config_hash=str(config["config_hash"]),
-            control_generation=int(config["control_generation"]),
-            detail={"side": "BUY", "token_id": "token-yes"},
-            timestamp=self.now,
         )
         with self.store.connection:
             self.store.connection.execute(
@@ -2673,6 +3156,7 @@ class CanaryPositionManagementTests(unittest.TestCase):
                     int(config["control_generation"]),
                 ),
             )
+        self._bind_entry_ledger(event_id)
         self.venue.order_prices_by_order["late-entry-order"] = "0.51"
         self.venue.order_status = "CANCELED"
 
@@ -2709,21 +3193,13 @@ class CanaryPositionManagementTests(unittest.TestCase):
     def test_canceled_entry_with_truncated_trade_history_stays_unknown_and_reserved(self) -> None:
         config = self.config
         position_module._mark_owned_equity(self.service, self.venue, self.now)
-        self.store.reserve_canary_capacity(
+        self._reserve_entry(
             intent_id="truncated-entry-intent",
             reservation_id="truncated-entry-reservation",
-            side="BUY",
+            event_id="truncated-entry-event",
             requested_cost="1.00",
             fee_reserve="0",
             quantity="2",
-            market_id="market-1",
-            event_id="truncated-entry-event",
-            config_id=str(config["config_id"]),
-            config_generation=int(config["generation"]),
-            config_hash=str(config["config_hash"]),
-            control_generation=int(config["control_generation"]),
-            detail={"side": "BUY", "token_id": "token-yes"},
-            timestamp=self.now,
         )
         with self.store.connection:
             self.store.connection.execute(
@@ -2754,6 +3230,7 @@ class CanaryPositionManagementTests(unittest.TestCase):
                     int(config["control_generation"]),
                 ),
             )
+        self._bind_entry_ledger("truncated-entry-event")
         self.venue.order_status = "CANCELED"
         visible_fill = {
             "trade_id": "entry-visible-before-truncation",

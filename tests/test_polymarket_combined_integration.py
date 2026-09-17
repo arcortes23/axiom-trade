@@ -478,6 +478,52 @@ def _seed_market(
     )
 
 
+def _install_fixture_authority(
+    store: AxiomStore,
+    service: CanaryService,
+    *,
+    candidate_id: str,
+    scope_hash: str,
+    scope_version: str,
+    now: datetime = T0,
+) -> tuple[dict[str, object], dict[str, object]]:
+    owner_id = f"{candidate_id}-controller"
+    authorization_id = f"{candidate_id}-authorization"
+    service.controller_owner_id = owner_id
+    lease = store.acquire_canary_controller_lease(
+        owner_id=owner_id,
+        lease_seconds=86_400,
+        now=now,
+    )
+    _, settings_generation, settings_hash = service._settings_identity()
+    draft = store.register_execution_authorization_draft(
+        authorization_id=authorization_id,
+        mode="EXPLORATORY_MICRO_CANARY",
+        purpose="combined-dashboard-canary-fixture",
+        exact_strategy_versions=(candidate_id,),
+        reviewed_selection_policy_hash=scope_hash.removeprefix("sha256:"),
+        adverse_evidence_ack=True,
+        lifetime_budget={"max_notional_usd": "1000", "max_orders": 100},
+        stop_rules={"max_loss_usd": "1000"},
+        expires_at=now + timedelta(days=1),
+        scope_hash=scope_hash,
+        scope_version=scope_version,
+        active_settings_hash=settings_hash,
+        active_settings_generation=int(settings_generation),
+        actor="combined-dashboard-canary-fixture",
+        timestamp=now,
+    )
+    authorization = store.activate_execution_authorization(
+        authorization_id,
+        "combined-dashboard-canary-fixture",
+        expected_generation=int(draft["generation"]),
+        timestamp=now,
+    )
+    service.execution_authorization_id = authorization_id
+    service.execution_authorization_mode = "EXPLORATORY_MICRO_CANARY"
+    return lease, authorization
+
+
 class PolymarketCombinedIntegrationTests(unittest.TestCase):
     def _store(self, *, legacy_worker: bool = False):
         directory = tempfile.TemporaryDirectory()
@@ -783,7 +829,7 @@ class PolymarketCombinedIntegrationTests(unittest.TestCase):
         candidate_id = "synthetic-qualified-position-candidate"
         market_id = "synthetic-position-market"
         _seed_market(store, market_id, snapshot=True)
-        _seed_candidate(
+        candidate_payload = _seed_candidate(
             store,
             service,
             candidate_id,
@@ -798,8 +844,26 @@ class PolymarketCombinedIntegrationTests(unittest.TestCase):
             credentials_configured=True,
             config_id=str(settings["config_id"]),
             expected_generation=int(settings["generation"]),
+            target_notional_usd=Decimal("0.003"),
         )
         self.assertEqual(armed["micro_live_canary"], "ARMED")
+        _install_fixture_authority(
+            store,
+            service,
+            candidate_id=candidate_id,
+            scope_hash=str(candidate_payload["market_scope_hash"]),
+            scope_version=str(candidate_payload["market_scope_version"]),
+            now=now[0],
+        )
+        # The combined fixture intentionally exercises legacy finite-campaign
+        # position mechanics, not rolling selection. Keep persisted authority
+        # real and isolate only the unavailable selection binding fence.
+        binding_fence = patch(
+            "axiom.canary._canary_authorization_binding_fence",
+            return_value=None,
+        )
+        binding_fence.start()
+        self.addCleanup(binding_fence.stop)
         positions = CanaryPositionManager(service)
         positions.reconcile_pending(venue, allow_test_venue=True)
 

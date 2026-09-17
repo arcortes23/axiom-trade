@@ -10,6 +10,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 import hashlib
 import json
+import uuid
 import logging
 import math
 import os
@@ -1275,6 +1276,9 @@ class AxiomStore:
                 prerequisite_fingerprint TEXT NOT NULL,
                 blocker TEXT NOT NULL,
                 detail TEXT NOT NULL DEFAULT '',
+                category TEXT NOT NULL DEFAULT 'EVIDENCE',
+                resolver TEXT NOT NULL DEFAULT 'refresh_rolling_evidence',
+                next_scheduled_action TEXT NOT NULL DEFAULT 'refresh_rolling_evidence',
                 first_seen_at TEXT NOT NULL,
                 last_attempted_at TEXT NOT NULL,
                 attempts INTEGER NOT NULL DEFAULT 1 CHECK(attempts >= 1),
@@ -1287,6 +1291,21 @@ class AxiomStore:
                 ON rolling_evidence_blockers(prerequisite_fingerprint, last_attempted_at DESC);
             """
         )
+        blocker_columns = {
+            str(row["name"])
+            for row in self._conn.execute(
+                "PRAGMA table_info(rolling_evidence_blockers)"
+            ).fetchall()
+        }
+        for name, definition in (
+            ("category", "TEXT NOT NULL DEFAULT 'EVIDENCE'"),
+            ("resolver", "TEXT NOT NULL DEFAULT 'refresh_rolling_evidence'"),
+            ("next_scheduled_action", "TEXT NOT NULL DEFAULT 'refresh_rolling_evidence'"),
+        ):
+            if name not in blocker_columns:
+                self._conn.execute(
+                    f"ALTER TABLE rolling_evidence_blockers ADD COLUMN {name} {definition}"
+                )
         enrollment_columns = {
             str(row["name"])
             for row in self._conn.execute(
@@ -1851,6 +1870,8 @@ class AxiomStore:
                 "config_generation": "INTEGER",
                 "config_hash": "TEXT",
                 "config_id": "TEXT",
+                "controller_owner_id": "TEXT",
+                "controller_generation": "INTEGER",
                 "control_generation": "INTEGER",
                 "candidate_id": "TEXT",
                 "strategy_version_id": "TEXT",
@@ -1864,18 +1885,20 @@ class AxiomStore:
                 "allocation": "TEXT",
                 "detail_json": "TEXT NOT NULL DEFAULT '{}'",
                 "created_at": "TEXT NOT NULL DEFAULT ''",
-                "submitted_at": "TEXT",
                 "updated_at": "TEXT NOT NULL DEFAULT ''",
                 "released_at": "TEXT",
+                "execution_authorization_id": "TEXT",
             },
             "canary_submission_attempts": {
                 "intent_id": "TEXT NOT NULL DEFAULT ''",
                 "side": "TEXT NOT NULL DEFAULT 'BUY'",
                 "attempted_at": "TEXT NOT NULL DEFAULT ''",
-                "status": "TEXT NOT NULL DEFAULT 'ATTEMPTED'",
                 "config_generation": "INTEGER",
                 "config_id": "TEXT",
+                "controller_owner_id": "TEXT",
+                "controller_generation": "INTEGER",
                 "control_generation": "INTEGER",
+                "execution_authorization_id": "TEXT",
                 "candidate_id": "TEXT",
                 "strategy_version_id": "TEXT",
                 "research_trial_id": "TEXT",
@@ -1894,7 +1917,9 @@ class AxiomStore:
                 "cost": "TEXT NOT NULL DEFAULT '0'",
                 "fee": "TEXT NOT NULL DEFAULT '0'",
                 "filled_at": "TEXT NOT NULL DEFAULT ''",
-                "candidate_id": "TEXT",
+                "execution_authorization_id": "TEXT",
+                "controller_owner_id": "TEXT",
+                "controller_generation": "INTEGER",
                 "strategy_version_id": "TEXT",
                 "research_trial_id": "TEXT",
                 "portfolio_selection_id": "TEXT",
@@ -2016,6 +2041,9 @@ class AxiomStore:
                 config_generation INTEGER,
                 config_hash TEXT,
                 config_id TEXT,
+                execution_authorization_id TEXT,
+                controller_owner_id TEXT,
+                controller_generation INTEGER,
                 control_generation INTEGER,
                 candidate_id TEXT,
                 strategy_version_id TEXT,
@@ -2046,7 +2074,10 @@ class AxiomStore:
                 config_generation INTEGER,
                 config_hash TEXT,
                 config_id TEXT,
+                controller_owner_id TEXT,
+                controller_generation INTEGER,
                 control_generation INTEGER,
+                execution_authorization_id TEXT,
                 candidate_id TEXT,
                 strategy_version_id TEXT,
                 research_trial_id TEXT,
@@ -2069,6 +2100,9 @@ class AxiomStore:
                 cost TEXT NOT NULL,
                 fee TEXT NOT NULL DEFAULT '0',
                 filled_at TEXT NOT NULL,
+                execution_authorization_id TEXT,
+                controller_owner_id TEXT,
+                controller_generation INTEGER,
                 candidate_id TEXT,
                 strategy_version_id TEXT,
                 research_trial_id TEXT,
@@ -2187,6 +2221,94 @@ class AxiomStore:
                     portfolio_selection_id, strategy_version_id, occurred_at, flow_id
                 );
             """
+        )
+        self._conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS canary_execution_authorizations (
+                authorization_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL CHECK(status IN ('DRAFT','ACTIVE','EXPIRED','REVOKED')),
+                generation INTEGER NOT NULL,
+                mode TEXT NOT NULL,
+                purpose TEXT NOT NULL,
+                strategy_versions_json TEXT NOT NULL DEFAULT '[]',
+                selection_policy_hash TEXT,
+                adverse_evidence_ack_json TEXT NOT NULL,
+                lifetime_budget_json TEXT NOT NULL,
+                stop_rules_json TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                scope_hash TEXT NOT NULL,
+                scope_version TEXT NOT NULL,
+                active_settings_hash TEXT NOT NULL,
+                active_settings_generation INTEGER NOT NULL,
+                selection_id TEXT,
+                selection_hash TEXT,
+                actor TEXT NOT NULL,
+                actor_version TEXT NOT NULL,
+                binding_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                activated_at TEXT,
+                revoked_at TEXT
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_canary_execution_authorizations_active
+                ON canary_execution_authorizations(mode) WHERE status='ACTIVE';
+            CREATE INDEX IF NOT EXISTS idx_canary_execution_authorizations_status
+                ON canary_execution_authorizations(status, expires_at, updated_at);
+            CREATE TABLE IF NOT EXISTS canary_execution_authorization_audit (
+                audit_id TEXT PRIMARY KEY,
+                authorization_id TEXT NOT NULL,
+                action TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                previous_status TEXT,
+                new_status TEXT NOT NULL,
+                generation INTEGER NOT NULL,
+                binding_hash TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                detail_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_canary_execution_authorization_audit_time
+                ON canary_execution_authorization_audit(timestamp DESC, audit_id DESC);
+            CREATE TABLE IF NOT EXISTS canary_controller_leases (
+                singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                owner_id TEXT,
+                generation INTEGER NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('ACTIVE','RELEASED','EXPIRED')),
+                acquired_at TEXT,
+                renewed_at TEXT,
+                expires_at TEXT,
+                released_at TEXT,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS canary_controller_lease_audit (
+                audit_id TEXT PRIMARY KEY,
+                owner_id TEXT,
+                generation INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                previous_status TEXT,
+                new_status TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                detail_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_canary_controller_lease_audit_time
+                ON canary_controller_lease_audit(timestamp DESC, audit_id DESC);
+            CREATE TRIGGER IF NOT EXISTS trg_canary_execution_authorization_immutable
+            BEFORE UPDATE OF mode,purpose,strategy_versions_json,selection_policy_hash,
+                adverse_evidence_ack_json,lifetime_budget_json,stop_rules_json,expires_at,
+                scope_hash,scope_version,active_settings_hash,active_settings_generation,
+                selection_id,selection_hash,actor,actor_version,binding_hash,generation
+            ON canary_execution_authorizations
+            BEGIN
+                SELECT RAISE(ABORT, 'execution authorization bindings are immutable');
+            END;
+            """
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_canary_risk_reservations_authorization "
+            "ON canary_risk_reservations(execution_authorization_id, side, status, created_at)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_canary_submission_attempts_authorization "
+            "ON canary_submission_attempts(execution_authorization_id, attempted_at)"
         )
 
     def save_canary_setting_config(
@@ -2460,6 +2582,760 @@ class AxiomStore:
             }
             for row in rows
         ]
+    def register_execution_authorization_draft(
+        self,
+        *,
+        authorization_id: str | None = None,
+        mode: str = "EXPLORATORY_MICRO_CANARY",
+        purpose: str,
+        exact_strategy_versions: Sequence[str] | None = None,
+        strategy_version_ids: Sequence[str] | None = None,
+        strategy_versions: Sequence[str] | None = None,
+        reviewed_selection_policy_hash: str | None = None,
+        selection_policy_hash: str | None = None,
+        adverse_evidence_ack: Any | None = None,
+        adverse_evidence_acknowledgment: Any | None = None,
+        lifetime_budget: Mapping[str, Any] | Any,
+        stop_rules: Mapping[str, Any],
+        expires_at: datetime,
+        scope_hash: str,
+        scope_version: str | int,
+        active_settings_hash: str | None = None,
+        active_settings_generation: int | None = None,
+        settings_hash: str | None = None,
+        settings_generation: int | None = None,
+        selection_id: str | None = None,
+        selection_hash: str | None = None,
+        actor: str,
+        actor_version: str = "1",
+        timestamp: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Create one immutable, reviewable exploratory authorization draft.
+
+        The risk envelope and all policy/evidence bindings are copied into the
+        row and hashed.  No existing draft is updated and no authorization is
+        enabled by this method.
+        """
+        identifier = str(authorization_id or "").strip() or (
+            "auth-" + uuid.uuid4().hex
+        )
+        normalized = _normalize_execution_authorization(
+            mode=mode,
+            purpose=purpose,
+            exact_strategy_versions=(
+                exact_strategy_versions
+                if exact_strategy_versions is not None
+                else strategy_version_ids
+                if strategy_version_ids is not None
+                else strategy_versions
+            ),
+            reviewed_selection_policy_hash=(
+                reviewed_selection_policy_hash
+                if reviewed_selection_policy_hash is not None
+                else selection_policy_hash
+            ),
+            adverse_evidence_ack=(
+                adverse_evidence_ack
+                if adverse_evidence_ack is not None
+                else adverse_evidence_acknowledgment
+            ),
+            lifetime_budget=lifetime_budget,
+            stop_rules=stop_rules,
+            expires_at=expires_at,
+            scope_hash=scope_hash,
+            scope_version=scope_version,
+            active_settings_hash=(
+                active_settings_hash
+                if active_settings_hash is not None
+                else settings_hash
+            ),
+            active_settings_generation=(
+                active_settings_generation
+                if active_settings_generation is not None
+                else settings_generation
+            ),
+            selection_id=selection_id,
+            selection_hash=selection_hash,
+            actor=actor,
+            actor_version=actor_version,
+            timestamp=timestamp,
+        )
+        stamp = normalized.pop("_timestamp")
+        binding_hash = _execution_authorization_binding_hash(normalized)
+        values = (
+            identifier,
+            "DRAFT",
+            1,
+            normalized["mode"],
+            normalized["purpose"],
+            _dump(normalized["strategy_versions"]),
+            normalized["selection_policy_hash"],
+            _dump(normalized["adverse_evidence_ack"]),
+            _dump(normalized["lifetime_budget"]),
+            _dump(normalized["stop_rules"]),
+            normalized["expires_at"],
+            normalized["scope_hash"],
+            normalized["scope_version"],
+            normalized["active_settings_hash"],
+            normalized["active_settings_generation"],
+            normalized["selection_id"],
+            normalized["selection_hash"],
+            normalized["actor"],
+            normalized["actor_version"],
+            binding_hash,
+            _iso(stamp),
+            _iso(stamp),
+            None,
+            None,
+        )
+        with self.transaction(immediate=True):
+            try:
+                self._conn.execute(
+                    "INSERT INTO canary_execution_authorizations("
+                    "authorization_id,status,generation,mode,purpose,"
+                    "strategy_versions_json,selection_policy_hash,"
+                    "adverse_evidence_ack_json,lifetime_budget_json,stop_rules_json,"
+                    "expires_at,scope_hash,scope_version,active_settings_hash,"
+                    "active_settings_generation,selection_id,selection_hash,actor,"
+                    "actor_version,binding_hash,created_at,updated_at,activated_at,revoked_at"
+                    ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    values,
+                )
+            except sqlite3.IntegrityError as exc:
+                prior = self._conn.execute(
+                    "SELECT * FROM canary_execution_authorizations "
+                    "WHERE authorization_id=?",
+                    (identifier,),
+                ).fetchone()
+                if prior is None or str(prior["binding_hash"]) != binding_hash:
+                    raise ValueError(
+                        "execution authorization draft identity conflict"
+                    ) from exc
+                return _execution_authorization_record(prior)
+            self._record_execution_authorization_audit_locked(
+                authorization_id=identifier,
+                action="DRAFT_CREATED",
+                actor=normalized["actor"],
+                previous_status=None,
+                new_status="DRAFT",
+                generation=1,
+                binding_hash=binding_hash,
+                timestamp=stamp,
+                detail={"immutable": True},
+            )
+            row = self._conn.execute(
+                "SELECT * FROM canary_execution_authorizations "
+                "WHERE authorization_id=?",
+                (identifier,),
+            ).fetchone()
+        return _execution_authorization_record(row)
+
+    def _record_execution_authorization_audit_locked(
+        self,
+        *,
+        authorization_id: str,
+        action: str,
+        actor: str,
+        previous_status: str | None,
+        new_status: str,
+        generation: int,
+        binding_hash: str,
+        timestamp: datetime,
+        detail: Mapping[str, Any] | None = None,
+    ) -> str:
+        body = {
+            "authorization_id": authorization_id,
+            "action": str(action).strip().upper(),
+            "actor": actor,
+            "previous_status": previous_status,
+            "new_status": new_status,
+            "generation": int(generation),
+            "binding_hash": binding_hash,
+            "timestamp": _iso(timestamp),
+            "detail": dict(detail or {}),
+        }
+        audit_id = "authorization-audit:" + hashlib.sha256(
+            _dump(body).encode("utf-8")
+        ).hexdigest()
+        self._conn.execute(
+            "INSERT OR IGNORE INTO canary_execution_authorization_audit("
+            "audit_id,authorization_id,action,actor,previous_status,new_status,"
+            "generation,binding_hash,timestamp,detail_json"
+            ") VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (
+                audit_id,
+                authorization_id,
+                body["action"],
+                actor,
+                previous_status,
+                new_status,
+                int(generation),
+                binding_hash,
+                _iso(timestamp),
+                _dump(detail or {}),
+            ),
+        )
+        return audit_id
+
+    def _expire_execution_authorizations_locked(self, timestamp: datetime) -> int:
+        stamp = _iso(timestamp)
+        rows = self._conn.execute(
+            "SELECT * FROM canary_execution_authorizations "
+            "WHERE status='ACTIVE' AND expires_at<=?",
+            (stamp,),
+        ).fetchall()
+        for row in rows:
+            self._conn.execute(
+                "UPDATE canary_execution_authorizations SET status='EXPIRED',"
+                "updated_at=? WHERE authorization_id=? AND status='ACTIVE'",
+                (stamp, row["authorization_id"]),
+            )
+            self._record_execution_authorization_audit_locked(
+                authorization_id=str(row["authorization_id"]),
+                action="EXPIRED",
+                actor="system:expiry",
+                previous_status="ACTIVE",
+                new_status="EXPIRED",
+                generation=int(row["generation"]),
+                binding_hash=str(row["binding_hash"]),
+                timestamp=timestamp,
+                detail={"expires_at": row["expires_at"]},
+            )
+        return len(rows)
+
+    def activate_execution_authorization(
+        self,
+        authorization_id: str,
+        actor: str,
+        *,
+        expected_generation: int | None = None,
+        timestamp: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Activate a reviewed draft only while its settings binding is current."""
+        identifier = str(authorization_id or "").strip()
+        owner = str(actor or "").strip()
+        if not identifier or not owner:
+            raise ValueError("authorization_id and actor are required")
+        if expected_generation is not None and (
+            isinstance(expected_generation, bool)
+            or not isinstance(expected_generation, int)
+            or expected_generation < 1
+        ):
+            raise ValueError("expected_generation must be a positive integer")
+        stamp = ensure_utc(timestamp or utc_now())
+        with self.transaction(immediate=True):
+            self._expire_execution_authorizations_locked(stamp)
+            row = self._conn.execute(
+                "SELECT * FROM canary_execution_authorizations "
+                "WHERE authorization_id=?",
+                (identifier,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("execution authorization draft not found")
+            if str(row["status"]).upper() != "DRAFT":
+                raise ValueError("execution authorization is not a draft")
+            if expected_generation is not None and int(row["generation"]) != expected_generation:
+                raise ValueError("execution authorization generation changed")
+            if str(row["expires_at"]) <= _iso(stamp):
+                raise ValueError("execution authorization is expired")
+            active_settings = self._conn.execute(
+                "SELECT config_hash,generation FROM canary_setting_configs "
+                "WHERE state='ACTIVE' ORDER BY generation DESC LIMIT 1"
+            ).fetchone()
+            if active_settings is None:
+                raise ValueError("active canary settings are unavailable")
+            if (
+                str(active_settings["config_hash"])
+                != str(row["active_settings_hash"])
+                or int(active_settings["generation"])
+                != int(row["active_settings_generation"])
+            ):
+                raise ValueError("execution authorization settings binding is stale")
+            existing = self._conn.execute(
+                "SELECT * FROM canary_execution_authorizations "
+                "WHERE mode=? AND status='ACTIVE' LIMIT 1",
+                (row["mode"],),
+            ).fetchone()
+            if existing is not None:
+                raise ValueError("an active execution authorization already exists")
+            updated = self._conn.execute(
+                "UPDATE canary_execution_authorizations SET status='ACTIVE',"
+                "updated_at=?,activated_at=? WHERE authorization_id=? AND "
+                "status='DRAFT' AND generation=?",
+                (_iso(stamp), _iso(stamp), identifier, int(row["generation"])),
+            )
+            if int(updated.rowcount or 0) != 1:
+                raise ValueError("execution authorization changed")
+            self._record_execution_authorization_audit_locked(
+                authorization_id=identifier,
+                action="ACTIVATED",
+                actor=owner,
+                previous_status="DRAFT",
+                new_status="ACTIVE",
+                generation=int(row["generation"]),
+                binding_hash=str(row["binding_hash"]),
+                timestamp=stamp,
+                detail={"settings_binding_verified": True},
+            )
+            result = self._conn.execute(
+                "SELECT * FROM canary_execution_authorizations "
+                "WHERE authorization_id=?",
+                (identifier,),
+            ).fetchone()
+        return _execution_authorization_record(result)
+
+    def load_active_execution_authorization(
+        self,
+        *,
+        mode: str = "EXPLORATORY_MICRO_CANARY",
+        purpose: str | None = None,
+        now: datetime | None = None,
+        scope_hash: str | None = None,
+        scope_version: str | int | None = None,
+        active_settings_hash: str | None = None,
+        active_settings_generation: int | None = None,
+        selection_id: str | None = None,
+        selection_hash: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Return an active authorization only when every requested binding matches."""
+        mode_value = str(mode or "").strip().upper()
+        if mode_value not in {"EXPLORATORY_MICRO_CANARY", "EVIDENCE_SELECTED"}:
+            raise ValueError("unsupported execution authorization mode")
+        observed = ensure_utc(now or utc_now())
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM canary_execution_authorizations "
+                "WHERE mode=? AND status='ACTIVE' AND expires_at>? "
+                "ORDER BY activated_at DESC,authorization_id DESC LIMIT 1",
+                (mode_value, _iso(observed)),
+            ).fetchone()
+            if row is None:
+                return None
+            if purpose is not None and str(row["purpose"]) != str(purpose):
+                return None
+            for name, expected, actual in (
+                ("scope_hash", scope_hash, row["scope_hash"]),
+                ("scope_version", scope_version, row["scope_version"]),
+                ("active_settings_hash", active_settings_hash, row["active_settings_hash"]),
+                ("selection_id", selection_id, row["selection_id"]),
+                ("selection_hash", selection_hash, row["selection_hash"]),
+            ):
+                if expected is not None and str(expected) != str(actual):
+                    return None
+            if active_settings_generation is not None and int(row["active_settings_generation"]) != int(
+                active_settings_generation
+            ):
+                return None
+            active_settings = self._conn.execute(
+                "SELECT config_hash,generation FROM canary_setting_configs "
+                "WHERE state='ACTIVE' ORDER BY generation DESC LIMIT 1"
+            ).fetchone()
+            if (
+                active_settings is None
+                or str(active_settings["config_hash"]) != str(row["active_settings_hash"])
+                or int(active_settings["generation"]) != int(row["active_settings_generation"])
+            ):
+                return None
+            return _execution_authorization_record(row)
+
+    def list_execution_authorizations(
+        self,
+        *,
+        status: str | None = None,
+        mode: str = "EXPLORATORY_MICRO_CANARY",
+        limit: int = 100,
+        now: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return a bounded authorization projection without widening authority."""
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0 or limit > 1000:
+            raise ValueError("limit must be a non-negative integer no greater than 1000")
+        mode_value = str(mode or "").strip().upper()
+        if mode_value not in {"EXPLORATORY_MICRO_CANARY", "EVIDENCE_SELECTED"}:
+            raise ValueError("unsupported execution authorization mode")
+        status_value = str(status or "").strip().upper()
+        if status_value and status_value not in {"DRAFT", "ACTIVE", "EXPIRED", "REVOKED"}:
+            raise ValueError("invalid execution authorization status")
+        observed = ensure_utc(now or utc_now())
+        with self._lock:
+            clauses = ["mode=?"]
+            values: list[Any] = [mode_value]
+            if status_value:
+                clauses.append("status=?")
+                values.append(status_value)
+            rows = self._conn.execute(
+                "SELECT * FROM canary_execution_authorizations WHERE "
+                + " AND ".join(clauses)
+                + " ORDER BY updated_at DESC,authorization_id DESC LIMIT ?",
+                (*values, int(limit)),
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            record = _execution_authorization_record(row)
+            if (
+                record["status"] == "ACTIVE"
+                and record["expires_at"] is not None
+                and record["expires_at"] <= observed
+            ):
+                record["status"] = "EXPIRED"
+                record["expiry_projection"] = True
+            result.append(record)
+        return result
+
+    def revoke_execution_authorization(
+        self,
+        authorization_id: str,
+        actor: str,
+        *,
+        expected_generation: int | None = None,
+        reason: str | None = None,
+        timestamp: datetime | None = None,
+    ) -> dict[str, Any]:
+        identifier = str(authorization_id or "").strip()
+        owner = str(actor or "").strip()
+        if not identifier or not owner:
+            raise ValueError("authorization_id and actor are required")
+        if expected_generation is not None and (
+            isinstance(expected_generation, bool)
+            or not isinstance(expected_generation, int)
+            or expected_generation < 1
+        ):
+            raise ValueError("expected_generation must be a positive integer")
+        stamp = ensure_utc(timestamp or utc_now())
+        with self.transaction(immediate=True):
+            self._expire_execution_authorizations_locked(stamp)
+            row = self._conn.execute(
+                "SELECT * FROM canary_execution_authorizations "
+                "WHERE authorization_id=?",
+                (identifier,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("execution authorization not found")
+            if expected_generation is not None and int(row["generation"]) != expected_generation:
+                raise ValueError("execution authorization generation changed")
+            status = str(row["status"]).upper()
+            if status in {"REVOKED", "EXPIRED"}:
+                return _execution_authorization_record(row)
+            updated = self._conn.execute(
+                "UPDATE canary_execution_authorizations SET status='REVOKED',"
+                "updated_at=?,revoked_at=? WHERE authorization_id=? AND status=? "
+                "AND generation=?",
+                (
+                    _iso(stamp),
+                    _iso(stamp),
+                    identifier,
+                    status,
+                    int(row["generation"]),
+                ),
+            )
+            if int(updated.rowcount or 0) != 1:
+                raise ValueError("execution authorization changed")
+            self._record_execution_authorization_audit_locked(
+                authorization_id=identifier,
+                action="REVOKED",
+                actor=owner,
+                previous_status=status,
+                new_status="REVOKED",
+                generation=int(row["generation"]),
+                binding_hash=str(row["binding_hash"]),
+                timestamp=stamp,
+                detail={"reason": str(reason or "").strip() or None},
+            )
+            result = self._conn.execute(
+                "SELECT * FROM canary_execution_authorizations "
+                "WHERE authorization_id=?",
+                (identifier,),
+            ).fetchone()
+        return _execution_authorization_record(result)
+
+    def list_execution_authorization_audit(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0 or limit > 1000:
+            raise ValueError("limit must be a non-negative integer no greater than 1000")
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM canary_execution_authorization_audit "
+                "ORDER BY timestamp DESC,audit_id DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+        return [
+            {
+                "audit_id": row["audit_id"],
+                "authorization_id": row["authorization_id"],
+                "action": row["action"],
+                "actor": row["actor"],
+                "previous_status": row["previous_status"],
+                "new_status": row["new_status"],
+                "generation": int(row["generation"]),
+                "binding_hash": row["binding_hash"],
+                "timestamp": _parse_datetime(row["timestamp"]),
+                "detail": _load(row["detail_json"]) if row["detail_json"] else {},
+            }
+            for row in rows
+        ]
+
+    def acquire_canary_controller_lease(
+        self,
+        *,
+        owner_id: str,
+        lease_seconds: float = 60.0,
+        now: datetime | None = None,
+        expected_generation: int | None = None,
+    ) -> dict[str, Any]:
+        owner = str(owner_id or "").strip()
+        if not owner or len(owner) > 256:
+            raise ValueError("owner_id is required")
+        seconds = float(lease_seconds)
+        if not math.isfinite(seconds) or seconds <= 0 or seconds > 86_400:
+            raise ValueError("lease_seconds must be finite and between 0 and 86400")
+        if expected_generation is not None and (
+            isinstance(expected_generation, bool)
+            or not isinstance(expected_generation, int)
+            or expected_generation < 0
+        ):
+            raise ValueError("expected_generation must be a non-negative integer")
+        stamp = ensure_utc(now or utc_now())
+        expiry = stamp + timedelta(seconds=seconds)
+        with self.transaction(immediate=True):
+            row = self._conn.execute(
+                "SELECT * FROM canary_controller_leases WHERE singleton=1"
+            ).fetchone()
+            prior_generation = int(row["generation"]) if row is not None else 0
+            if expected_generation is not None and prior_generation != expected_generation:
+                raise ValueError("controller lease generation changed")
+            if row is not None and str(row["status"]).upper() == "ACTIVE":
+                current_expiry = _parse_datetime(row["expires_at"])
+                if current_expiry is not None and current_expiry > stamp:
+                    raise ValueError("controller lease is held")
+                self._conn.execute(
+                    "UPDATE canary_controller_leases SET status='EXPIRED',"
+                    "updated_at=? WHERE singleton=1 AND status='ACTIVE'",
+                    (_iso(stamp),),
+                )
+                self._record_controller_lease_audit_locked(
+                    owner_id=row["owner_id"],
+                    generation=prior_generation,
+                    action="EXPIRED",
+                    previous_status="ACTIVE",
+                    new_status="EXPIRED",
+                    timestamp=stamp,
+                    detail={"expires_at": row["expires_at"]},
+                )
+            generation = prior_generation + 1
+            if row is None:
+                self._conn.execute(
+                    "INSERT INTO canary_controller_leases("
+                    "singleton,owner_id,generation,status,acquired_at,renewed_at,"
+                    "expires_at,released_at,updated_at) VALUES(1,?,?,?, ?,?,?,?,?)",
+                    (owner, generation, "ACTIVE", _iso(stamp), _iso(stamp), _iso(expiry), None, _iso(stamp)),
+                )
+            else:
+                self._conn.execute(
+                    "UPDATE canary_controller_leases SET owner_id=?,generation=?,"
+                    "status='ACTIVE',acquired_at=?,renewed_at=?,expires_at=?,"
+                    "released_at=NULL,updated_at=? WHERE singleton=1",
+                    (owner, generation, _iso(stamp), _iso(stamp), _iso(expiry), _iso(stamp)),
+                )
+            self._record_controller_lease_audit_locked(
+                owner_id=owner,
+                generation=generation,
+                action="ACQUIRED",
+                previous_status=str(row["status"]).upper() if row is not None else None,
+                new_status="ACTIVE",
+                timestamp=stamp,
+                detail={"lease_seconds": seconds},
+            )
+            result = self._conn.execute(
+                "SELECT * FROM canary_controller_leases WHERE singleton=1"
+            ).fetchone()
+        return _controller_lease_record(result)
+
+    def renew_canary_controller_lease(
+        self,
+        *,
+        owner_id: str,
+        generation: int,
+        lease_seconds: float = 60.0,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        owner = str(owner_id or "").strip()
+        if not owner:
+            raise ValueError("owner_id is required")
+        if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
+            raise ValueError("generation must be a positive integer")
+        seconds = float(lease_seconds)
+        if not math.isfinite(seconds) or seconds <= 0 or seconds > 86_400:
+            raise ValueError("lease_seconds must be finite and between 0 and 86400")
+        stamp = ensure_utc(now or utc_now())
+        expiry = stamp + timedelta(seconds=seconds)
+        with self.transaction(immediate=True):
+            row = self._conn.execute(
+                "SELECT * FROM canary_controller_leases WHERE singleton=1"
+            ).fetchone()
+            if (
+                row is None
+                or str(row["status"]).upper() != "ACTIVE"
+                or str(row["owner_id"]) != owner
+                or int(row["generation"]) != generation
+                or (_parse_datetime(row["expires_at"]) or stamp) <= stamp
+            ):
+                raise ValueError("controller lease is stale or owner mismatched")
+            updated = self._conn.execute(
+                "UPDATE canary_controller_leases SET renewed_at=?,expires_at=?,"
+                "updated_at=? WHERE singleton=1 AND owner_id=? AND generation=? "
+                "AND status='ACTIVE' AND expires_at>?",
+                (_iso(stamp), _iso(expiry), _iso(stamp), owner, generation, _iso(stamp)),
+            )
+            if int(updated.rowcount or 0) != 1:
+                raise ValueError("controller lease renewal lost")
+            self._record_controller_lease_audit_locked(
+                owner_id=owner,
+                generation=generation,
+                action="RENEWED",
+                previous_status="ACTIVE",
+                new_status="ACTIVE",
+                timestamp=stamp,
+                detail={"lease_seconds": seconds},
+            )
+            result = self._conn.execute(
+                "SELECT * FROM canary_controller_leases WHERE singleton=1"
+            ).fetchone()
+        return _controller_lease_record(result)
+
+    def load_canary_controller_lease(
+        self,
+        *,
+        owner_id: str | None = None,
+        generation: int | None = None,
+        now: datetime | None = None,
+    ) -> dict[str, Any] | None:
+        stamp = ensure_utc(now or utc_now())
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM canary_controller_leases WHERE singleton=1 "
+                "AND status='ACTIVE' AND expires_at>?",
+                (_iso(stamp),),
+            ).fetchone()
+            if row is None:
+                return None
+            if owner_id is not None and str(row["owner_id"]) != str(owner_id):
+                return None
+            if generation is not None and (
+                isinstance(generation, bool)
+                or not isinstance(generation, int)
+                or int(row["generation"]) != generation
+            ):
+                return None
+            return _controller_lease_record(row)
+
+    def release_canary_controller_lease(
+        self,
+        *,
+        owner_id: str,
+        generation: int,
+        now: datetime | None = None,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        owner = str(owner_id or "").strip()
+        if not owner:
+            raise ValueError("owner_id is required")
+        if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
+            raise ValueError("generation must be a positive integer")
+        stamp = ensure_utc(now or utc_now())
+        with self.transaction(immediate=True):
+            row = self._conn.execute(
+                "SELECT * FROM canary_controller_leases WHERE singleton=1"
+            ).fetchone()
+            if (
+                row is None
+                or str(row["owner_id"]) != owner
+                or int(row["generation"]) != generation
+                or str(row["status"]).upper() != "ACTIVE"
+            ):
+                raise ValueError("controller lease is stale or owner mismatched")
+            updated = self._conn.execute(
+                "UPDATE canary_controller_leases SET status='RELEASED',"
+                "released_at=?,updated_at=? WHERE singleton=1 AND owner_id=? "
+                "AND generation=? AND status='ACTIVE'",
+                (_iso(stamp), _iso(stamp), owner, generation),
+            )
+            if int(updated.rowcount or 0) != 1:
+                raise ValueError("controller lease release lost")
+            self._record_controller_lease_audit_locked(
+                owner_id=owner,
+                generation=generation,
+                action="RELEASED",
+                previous_status="ACTIVE",
+                new_status="RELEASED",
+                timestamp=stamp,
+                detail={"reason": str(reason or "").strip() or None},
+            )
+            result = self._conn.execute(
+                "SELECT * FROM canary_controller_leases WHERE singleton=1"
+            ).fetchone()
+        return _controller_lease_record(result)
+
+    def _record_controller_lease_audit_locked(
+        self,
+        *,
+        owner_id: str | None,
+        generation: int,
+        action: str,
+        previous_status: str | None,
+        new_status: str,
+        timestamp: datetime,
+        detail: Mapping[str, Any] | None = None,
+    ) -> str:
+        body = {
+            "owner_id": owner_id,
+            "generation": int(generation),
+            "action": str(action).strip().upper(),
+            "previous_status": previous_status,
+            "new_status": new_status,
+            "timestamp": _iso(timestamp),
+            "detail": dict(detail or {}),
+        }
+        audit_id = "controller-lease-audit:" + hashlib.sha256(
+            _dump(body).encode("utf-8")
+        ).hexdigest()
+        self._conn.execute(
+            "INSERT OR IGNORE INTO canary_controller_lease_audit("
+            "audit_id,owner_id,generation,action,previous_status,new_status,"
+            "timestamp,detail_json) VALUES(?,?,?,?,?,?,?,?)",
+            (
+                audit_id,
+                owner_id,
+                int(generation),
+                body["action"],
+                previous_status,
+                new_status,
+                _iso(timestamp),
+                _dump(detail or {}),
+            ),
+        )
+        return audit_id
+
+    def list_canary_controller_lease_audit(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0 or limit > 1000:
+            raise ValueError("limit must be a non-negative integer no greater than 1000")
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM canary_controller_lease_audit "
+                "ORDER BY timestamp DESC,audit_id DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+        return [
+            {
+                "audit_id": row["audit_id"],
+                "owner_id": row["owner_id"],
+                "generation": int(row["generation"]),
+                "action": row["action"],
+                "previous_status": row["previous_status"],
+                "new_status": row["new_status"],
+                "timestamp": _parse_datetime(row["timestamp"]),
+                "detail": _load(row["detail_json"]) if row["detail_json"] else {},
+            }
+            for row in rows
+        ]
+
     def _canary_authority_locked(self) -> dict[str, Any]:
         active = self._conn.execute(
             "SELECT config_id,generation,config_hash,values_json "
@@ -2975,6 +3851,10 @@ class AxiomStore:
         config_hash: str | None = None,
         config_id: str | None = None,
         control_generation: int | None = None,
+        execution_authorization_id: str | None = None,
+        authorization_id: str | None = None,
+        controller_owner_id: str | None = None,
+        controller_generation: int | None = None,
         strategy_version_id: str | None = None,
         research_trial_id: str | None = None,
         candidate_id: str | None = None,
@@ -2986,12 +3866,33 @@ class AxiomStore:
         risk_config_hash: str | None = None,
         allocation: Any | None = None,
         detail: Mapping[str, Any] | None = None,
+        compatibility_mode: bool | None = None,
     ) -> str:
         identifier = str(attempt_id or "").strip()
         intent = str(intent_id or "").strip()
         side_value = str(side or "").strip().upper()
         if not identifier or not intent or side_value not in {"BUY", "SELL"}:
             raise ValueError("attempt_id, intent_id, and side BUY/SELL are required")
+        auth_id = str(
+            execution_authorization_id
+            if execution_authorization_id is not None
+            else authorization_id
+            or ""
+        ).strip() or None
+        controller_owner = str(controller_owner_id or "").strip() or None
+        if controller_generation is not None and (
+            isinstance(controller_generation, bool)
+            or not isinstance(controller_generation, int)
+            or controller_generation < 1
+        ):
+            raise ValueError("controller_generation must be a positive integer")
+        if compatibility_mode is not None and not isinstance(compatibility_mode, bool):
+            raise ValueError("compatibility_mode must be a boolean")
+        legacy_compatibility = (
+            compatibility_mode
+            if compatibility_mode is not None
+            else not bool(self._database_filename())
+        )
         stamp = attempted_at or utc_now()
         requested_lineage = self._canary_normalize_lineage(
             {
@@ -3049,7 +3950,20 @@ class AxiomStore:
                         control_generation is None
                         or (prior_by_id["control_generation"] or None) == int(control_generation)
                     )
-                    and str(prior_by_id["detail_json"] or "{}") == detail_json
+                    and (
+                        auth_id is None
+                        or str(prior_by_id["execution_authorization_id"] or "").strip()
+                        == auth_id
+                    )
+                    and (
+                        controller_owner is None
+                        or str(prior_by_id["controller_owner_id"] or "").strip()
+                        == controller_owner
+                    )
+                    and (
+                        controller_generation is None
+                        or (prior_by_id["controller_generation"] or None) == int(controller_generation)
+                    )
                     and lineage_matches
                 )
                 if not identity_matches:
@@ -3082,6 +3996,76 @@ class AxiomStore:
                 if reservation["control_generation"] is not None
                 else None
             )
+            bound_auth_id = str(
+                reservation["execution_authorization_id"] or ""
+            ).strip() or None
+            bound_controller_owner = str(
+                reservation["controller_owner_id"] or ""
+            ).strip() or None
+            bound_controller_generation = (
+                int(reservation["controller_generation"])
+                if reservation["controller_generation"] is not None
+                else None
+            )
+            if controller_owner is not None and controller_owner != bound_controller_owner:
+                raise ValueError("controller owner conflicts with reservation")
+            if (
+                controller_generation is not None
+                and controller_generation != bound_controller_generation
+            ):
+                raise ValueError("controller generation conflicts with reservation")
+            controller_owner = bound_controller_owner or controller_owner
+            controller_generation = bound_controller_generation or controller_generation
+            if auth_id is not None and auth_id != bound_auth_id:
+                raise ValueError("authorization conflicts with reservation")
+            auth_id = bound_auth_id or auth_id
+            if auth_id is not None:
+                auth_row = self._conn.execute(
+                    "SELECT * FROM canary_execution_authorizations "
+                    "WHERE authorization_id=?",
+                    (auth_id,),
+                ).fetchone()
+                if auth_row is None:
+                    raise ValueError("execution authorization not found")
+                if side_value == "BUY" and (
+                    str(auth_row["status"]).upper() != "ACTIVE"
+                    or str(auth_row["expires_at"]) <= attempted_iso
+                    or str(auth_row["active_settings_hash"])
+                    != str(authority["config_hash"])
+                    or int(auth_row["active_settings_generation"])
+                    != int(authority["generation"])
+                ):
+                    raise ValueError("active exploratory authorization unavailable")
+                if controller_owner is None or controller_generation is None:
+                    raise ValueError("active controller lease is required")
+                lease_row = self._conn.execute(
+                    "SELECT 1 FROM canary_controller_leases WHERE singleton=1 "
+                    "AND status='ACTIVE' AND owner_id=? AND generation=? "
+                    "AND expires_at>?",
+                    (controller_owner, int(controller_generation), attempted_iso),
+                ).fetchone()
+                if lease_row is None:
+                    raise ValueError("controller lease is stale or owner mismatched")
+            elif controller_owner is not None or controller_generation is not None:
+                if controller_owner is None or controller_generation is None:
+                    raise ValueError("active controller lease is required")
+                lease_row = self._conn.execute(
+                    "SELECT 1 FROM canary_controller_leases WHERE singleton=1 "
+                    "AND status='ACTIVE' AND owner_id=? AND generation=? "
+                    "AND expires_at>?",
+                    (controller_owner, int(controller_generation), attempted_iso),
+                ).fetchone()
+                if lease_row is None:
+                    raise ValueError("controller lease is stale or owner mismatched")
+            if (
+                auth_id is None
+                and controller_owner is None
+                and controller_generation is None
+                and not legacy_compatibility
+            ):
+                raise ValueError(
+                    "active controller lease or explicit compatibility mode is required"
+                )
             if (
                 bound_generation != int(authority["generation"])
                 or bound_hash != str(authority["config_hash"])
@@ -3135,30 +4119,14 @@ class AxiomStore:
             max_orders = int(max_orders_raw or 0)
             if max_orders <= 0:
                 raise ValueError("daily submission limit is unavailable")
-            attempts = self._conn.execute(
-                "SELECT COUNT(*) AS n FROM canary_submission_attempts "
-                "WHERE attempted_at>=? AND attempted_at<?",
-                (start, end),
-            ).fetchone()
-            unsubmitted = self._conn.execute(
-                "SELECT COUNT(*) AS n FROM canary_risk_reservations r "
-                "WHERE r.created_at>=? AND r.created_at<? "
-                "AND (r.status IN ('HELD','RESERVED','SUBMITTING','ACKNOWLEDGED','UNKNOWN',"
-                "'PARTIAL','PARTIALLY_FILLED','OPEN') OR "
-                "(UPPER(r.status)='FILLED' AND CAST(COALESCE(r.filled_quantity,'0') AS NUMERIC) "
-                "< CAST(COALESCE(r.quantity,'0') AS NUMERIC))) "
-                "AND NOT EXISTS (SELECT 1 FROM canary_submission_attempts a WHERE a.intent_id=r.intent_id)",
-                (start, end),
-            ).fetchone()
-            if int(attempts["n"] or 0) + int(unsubmitted["n"] or 0) > max_orders:
-                raise ValueError("daily submission limit reached")
             self._conn.execute(
                 "INSERT INTO canary_submission_attempts("
                 "attempt_id,intent_id,side,attempted_at,status,config_generation,config_hash,"
-                "config_id,control_generation,strategy_version_id,research_trial_id,candidate_id,"
+                "config_id,controller_owner_id,controller_generation,control_generation,"
+                "execution_authorization_id,strategy_version_id,research_trial_id,candidate_id,"
                 "portfolio_selection_id,admission_policy_id,admission_policy_version,"
                 "risk_config_id,risk_config_generation,risk_config_hash,allocation,detail_json"
-                ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     identifier,
                     intent,
@@ -3168,7 +4136,10 @@ class AxiomStore:
                     bound_generation,
                     bound_hash,
                     bound_config_id,
+                    controller_owner,
+                    controller_generation,
                     bound_control_generation,
+                    auth_id,
                     bound_lineage["strategy_version_id"],
                     bound_lineage["research_trial_id"],
                     bound_lineage["candidate_id"],
@@ -3575,6 +4546,45 @@ class AxiomStore:
                 ).fetchone()
         return _canary_equity_mark_record(row)
 
+    def _exploratory_lifetime_usage_locked(
+        self,
+        authorization_id: str,
+    ) -> dict[str, Any]:
+        """Aggregate lifetime exploratory spend without using the PHT window."""
+        rows = self._conn.execute(
+            "SELECT reservation_id,status,filled_cost,remaining_cost "
+            "FROM canary_risk_reservations "
+            "WHERE execution_authorization_id=? AND UPPER(side)='BUY'",
+            (authorization_id,),
+        ).fetchall()
+        active_statuses = {
+            "HELD", "RESERVED", "SUBMITTING", "ACKNOWLEDGED", "UNKNOWN",
+            "PARTIALLY_FILLED", "PARTIAL", "OPEN", "SUBMITTED",
+        }
+        used = Decimal("0")
+        order_ids: set[str] = set()
+        for row in rows:
+            status = str(row["status"] or "").upper()
+            filled = _risk_decimal(row["filled_cost"], nonnegative=True)
+            remaining = _risk_decimal(row["remaining_cost"], nonnegative=True)
+            if status in active_statuses or status == "FILLED":
+                used += filled + (remaining if status in active_statuses else Decimal("0"))
+                order_ids.add(str(row["reservation_id"]))
+        attempts = self._conn.execute(
+            "SELECT DISTINCT r.reservation_id "
+            "FROM canary_submission_attempts a "
+            "JOIN canary_risk_reservations r ON r.intent_id=a.intent_id "
+            "WHERE r.execution_authorization_id=? AND UPPER(r.side)='BUY'",
+            (authorization_id,),
+        ).fetchall()
+        order_ids.update(str(row["reservation_id"]) for row in attempts)
+        return {
+            "lifetime_buy_usd": _risk_text(used),
+            "lifetime_orders": len(order_ids),
+            "exploratory_lifetime_used_usd": _risk_text(used),
+            "exploratory_lifetime_orders": len(order_ids),
+        }
+
     def reserve_canary_capacity(
         self,
         *,
@@ -3591,6 +4601,10 @@ class AxiomStore:
         config_generation: int | None = None,
         config_hash: str | None = None,
         control_generation: int | None = None,
+        execution_authorization_id: str | None = None,
+        authorization_id: str | None = None,
+        controller_owner_id: str | None = None,
+        controller_generation: int | None = None,
         strategy_version_id: str | None = None,
         research_trial_id: str | None = None,
         candidate_id: str | None = None,
@@ -3602,6 +4616,7 @@ class AxiomStore:
         risk_config_hash: str | None = None,
         allocation: Any | None = None,
         detail: Mapping[str, Any] | None = None,
+        compatibility_mode: bool | None = None,
         timestamp: datetime | None = None,
     ) -> dict[str, Any]:
         """Atomically reserve a config-fenced intent.
@@ -3619,7 +4634,27 @@ class AxiomStore:
         requested = _risk_decimal(requested_cost, name="requested_cost", nonnegative=True)
         fee = _risk_decimal(fee_reserve, name="fee_reserve", nonnegative=True)
         amount = _risk_decimal(quantity, name="quantity", nonnegative=True)
-        stamp = timestamp or utc_now()
+        stamp = ensure_utc(timestamp or utc_now())
+        auth_id = str(
+            execution_authorization_id
+            if execution_authorization_id is not None
+            else authorization_id
+            or ""
+        ).strip() or None
+        controller_owner = str(controller_owner_id or "").strip() or None
+        if controller_generation is not None and (
+            isinstance(controller_generation, bool)
+            or not isinstance(controller_generation, int)
+            or controller_generation < 1
+        ):
+            raise ValueError("controller_generation must be a positive integer")
+        if compatibility_mode is not None and not isinstance(compatibility_mode, bool):
+            raise ValueError("compatibility_mode must be a boolean")
+        legacy_compatibility = (
+            compatibility_mode
+            if compatibility_mode is not None
+            else not bool(self._database_filename())
+        )
         identifier = str(reservation_id or "reservation:" + intent).strip()
         market_key = str(market_id).strip() if market_id is not None and str(market_id).strip() else None
         event_key = str(event_id).strip() if event_id is not None and str(event_id).strip() else None
@@ -3670,6 +4705,20 @@ class AxiomStore:
                         or str(existing["config_hash"]) == str(config_hash)
                     )
                     and (
+                        auth_id is None
+                        or str(existing["execution_authorization_id"] or "").strip()
+                        == auth_id
+                    )
+                    and (
+                        controller_owner is None
+                        or str(existing["controller_owner_id"] or "").strip()
+                        == controller_owner
+                    )
+                    and (
+                        controller_generation is None
+                        or (existing["controller_generation"] or None) == int(controller_generation)
+                    )
+                    and (
                         config_id is None
                         or str(existing["config_id"]).strip() == str(config_id).strip()
                     )
@@ -3703,6 +4752,60 @@ class AxiomStore:
                 if int(control_generation) != int(authority["control_generation"]):
                     raise ValueError("canary control generation changed")
             bound_control_generation = authority["control_generation"]
+            auth_row: sqlite3.Row | None = None
+            if auth_id is not None:
+                auth_row = self._conn.execute(
+                    "SELECT * FROM canary_execution_authorizations "
+                    "WHERE authorization_id=?",
+                    (auth_id,),
+                ).fetchone()
+                if auth_row is None:
+                    raise ValueError("execution authorization not found")
+                if side_value == "BUY":
+                    if (
+                        str(auth_row["status"]).upper() != "ACTIVE"
+                        or str(auth_row["expires_at"]) <= _iso(stamp)
+                        or str(auth_row["active_settings_hash"])
+                        != str(authority["config_hash"])
+                        or int(auth_row["active_settings_generation"])
+                        != int(authority["generation"])
+                    ):
+                        raise ValueError("active exploratory authorization unavailable")
+            lease_required = (
+                auth_id is not None
+                or controller_owner is not None
+                or controller_generation is not None
+            )
+            if lease_required:
+                if controller_owner is None or controller_generation is None:
+                    raise ValueError("active controller lease is required")
+                lease_row = self._conn.execute(
+                    "SELECT * FROM canary_controller_leases WHERE singleton=1 "
+                    "AND status='ACTIVE' AND owner_id=? AND generation=? "
+                    "AND expires_at>?",
+                    (controller_owner, int(controller_generation), _iso(stamp)),
+                ).fetchone()
+                if lease_row is None:
+                    raise ValueError("controller lease is stale or owner mismatched")
+            if not lease_required and not legacy_compatibility:
+                raise ValueError("active controller lease or explicit compatibility mode is required")
+            if auth_row is not None and side_value == "BUY":
+                budget = _load(auth_row["lifetime_budget_json"])
+                lifetime_usage = self._exploratory_lifetime_usage_locked(auth_id)
+                if (
+                    budget.get("max_notional_usd") is not None
+                    and _risk_decimal(lifetime_usage["lifetime_buy_usd"])
+                    + requested
+                    + fee
+                    > _risk_decimal(budget["max_notional_usd"], nonnegative=True)
+                ):
+                    raise ValueError("exploratory lifetime budget exceeded")
+                if (
+                    budget.get("max_orders") is not None
+                    and int(lifetime_usage["lifetime_orders"]) + 1
+                    > int(budget["max_orders"])
+                ):
+                    raise ValueError("exploratory lifetime order budget exceeded")
             rolling_binding = self._canary_rolling_binding_locked(
                 lineage=lineage,
                 allow_exit=side_value == "SELL",
@@ -3968,10 +5071,11 @@ class AxiomStore:
                 "INSERT INTO canary_risk_reservations("
                 "reservation_id,intent_id,side,market_id,event_id,requested_cost,filled_cost,remaining_cost,"
                 "fee_reserve,quantity,filled_quantity,status,config_generation,config_hash,config_id,"
-                "control_generation,candidate_id,strategy_version_id,research_trial_id,portfolio_selection_id,"
+                "execution_authorization_id,controller_owner_id,controller_generation,control_generation,"
+                "candidate_id,strategy_version_id,research_trial_id,portfolio_selection_id,"
                 "admission_policy_id,admission_policy_version,risk_config_id,risk_config_generation,"
                 "risk_config_hash,allocation,detail_json,created_at,submitted_at,updated_at,released_at"
-                ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     identifier,
                     intent,
@@ -3988,6 +5092,9 @@ class AxiomStore:
                     int(authority["generation"]),
                     str(authority["config_hash"]),
                     str(authority["config_id"]),
+                    auth_id,
+                    controller_owner,
+                    controller_generation,
                     bound_control_generation,
                     bound_lineage["candidate_id"],
                     bound_lineage["strategy_version_id"],
@@ -4022,6 +5129,10 @@ class AxiomStore:
         cost: Any | None = None,
         fee: Any = "0",
         filled_at: datetime | None = None,
+        execution_authorization_id: str | None = None,
+        authorization_id: str | None = None,
+        controller_owner_id: str | None = None,
+        controller_generation: int | None = None,
         strategy_version_id: str | None = None,
         research_trial_id: str | None = None,
         candidate_id: str | None = None,
@@ -4048,6 +5159,19 @@ class AxiomStore:
         stamp = filled_at or utc_now()
         stamp_iso = _iso(stamp)
         detail_json = _dump(detail or {})
+        auth_id = str(
+            execution_authorization_id
+            if execution_authorization_id is not None
+            else authorization_id
+            or ""
+        ).strip() or None
+        controller_owner = str(controller_owner_id or "").strip() or None
+        if controller_generation is not None and (
+            isinstance(controller_generation, bool)
+            or not isinstance(controller_generation, int)
+            or controller_generation < 1
+        ):
+            raise ValueError("controller_generation must be a positive integer")
         lineage = self._canary_normalize_lineage(
             {
                 "strategy_version_id": strategy_version_id,
@@ -4069,6 +5193,34 @@ class AxiomStore:
             ).fetchone()
             if reservation_row is None:
                 raise ValueError("risk reservation not found")
+            reservation_auth_id = str(
+                reservation_row["execution_authorization_id"] or ""
+            ).strip() or None
+            reservation_controller_owner = str(
+                reservation_row["controller_owner_id"] or ""
+            ).strip() or None
+            reservation_controller_generation = (
+                int(reservation_row["controller_generation"])
+                if reservation_row["controller_generation"] is not None
+                else None
+            )
+            if auth_id is not None and auth_id != reservation_auth_id:
+                raise ValueError("fill authorization conflicts with reservation")
+            if (
+                controller_owner is not None
+                and controller_owner != reservation_controller_owner
+            ):
+                raise ValueError("fill controller owner conflicts with reservation")
+            if (
+                controller_generation is not None
+                and controller_generation != reservation_controller_generation
+            ):
+                raise ValueError("fill controller generation conflicts with reservation")
+            auth_id = reservation_auth_id or auth_id
+            controller_owner = reservation_controller_owner or controller_owner
+            controller_generation = (
+                reservation_controller_generation or controller_generation
+            )
             reservation_lineage = _canary_lineage_from_row(reservation_row)
             if _canary_lineage_is_rolling(reservation_lineage):
                 if lineage["candidate_id"] is None:
@@ -4217,6 +5369,11 @@ class AxiomStore:
                     or _risk_decimal(prior["cost"]) != value
                     or _risk_decimal(prior["fee"]) != charge
                     or str(prior["filled_at"]) != stamp_iso
+                    or (str(prior["execution_authorization_id"] or "").strip() or None)
+                    != auth_id
+                    or (str(prior["controller_owner_id"] or "").strip() or None)
+                    != controller_owner
+                    or (prior["controller_generation"] or None) != controller_generation
                     or not _canary_lineage_equal(
                         _canary_lineage_from_row(prior),
                         reservation_lineage,
@@ -4238,10 +5395,11 @@ class AxiomStore:
                 self._conn.execute(
                     "INSERT INTO canary_risk_fills("
                     "fill_id,reservation_id,quantity,price,cost,fee,filled_at,"
+                    "execution_authorization_id,controller_owner_id,controller_generation,"
                     "strategy_version_id,research_trial_id,candidate_id,portfolio_selection_id,"
                     "admission_policy_id,admission_policy_version,risk_config_id,"
                     "risk_config_generation,risk_config_hash,allocation,detail_json"
-                    ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         fill,
                         reservation,
@@ -4250,6 +5408,9 @@ class AxiomStore:
                         _risk_text(value),
                         _risk_text(charge),
                         stamp_iso,
+                        auth_id,
+                        controller_owner,
+                        controller_generation,
                         reservation_lineage["strategy_version_id"],
                         reservation_lineage["research_trial_id"],
                         reservation_lineage["candidate_id"],
@@ -4548,6 +5709,8 @@ class AxiomStore:
         risk_config_generation: int | None = None,
         risk_config_hash: str | None = None,
         allocation: Any | None = None,
+        execution_authorization_id: str | None = None,
+        authorization_id: str | None = None,
     ) -> dict[str, Any]:
         """Return exact Decimal usage while preserving both ledger generations."""
         observed = ensure_utc(now or utc_now())
@@ -4565,6 +5728,12 @@ class AxiomStore:
                 "allocation": allocation,
             }
         )
+        auth_id = str(
+            execution_authorization_id
+            if execution_authorization_id is not None
+            else authorization_id
+            or ""
+        ).strip() or None
         start, end = self._canary_window(observed)
         accounting_day_pht = datetime.fromisoformat(start).astimezone(
             ZoneInfo("Asia/Manila")
@@ -4606,6 +5775,9 @@ class AxiomStore:
             "rolling_global_budget_usd": Decimal("0"),
             "rolling_strategy_reserved_usd": {},
             "rolling_strategy_allocations": {},
+            "execution_authorization_id": auth_id,
+            "exploratory_lifetime_used_usd": Decimal("0"),
+            "exploratory_lifetime_orders": 0,
         }
         strict_candidate_scope = lineage_filter.get("candidate_id") not in (None, "")
 
@@ -4671,14 +5843,21 @@ class AxiomStore:
             reservation_rows = self._conn.execute(
                 "SELECT * FROM canary_risk_reservations"
             ).fetchall()
+            scoped_query = auth_id is not None or any(
+                value not in (None, "") for value in lineage_filter.values()
+            )
+            if auth_id is not None:
+                reservation_rows = [
+                    row
+                    for row in reservation_rows
+                    if str(row["execution_authorization_id"] or "").strip() == auth_id
+                ]
             if any(value not in (None, "") for value in lineage_filter.values()):
                 reservation_rows = [
                     row for row in reservation_rows if accounting_lineage_matches(row)
                 ]
-                selected_intents = {
-                    str(row["intent_id"])
-                    for row in reservation_rows
-                }
+            selected_intents = {str(row["intent_id"]) for row in reservation_rows}
+            if scoped_query:
                 result["submitted_orders"] = sum(
                     1
                     for row in attempt_rows
@@ -4698,6 +5877,8 @@ class AxiomStore:
             day_provisional: dict[str, Decimal] = {}
             for fill in fill_rows:
                 reservation_id = str(fill["reservation_id"])
+                if scoped_query and reservation_id not in reservation_by_id:
+                    continue
                 settlement = _canary_fill_settlement_status(
                     _load(fill["detail_json"]) if fill["detail_json"] else {}
                 )
@@ -5408,6 +6589,14 @@ class AxiomStore:
                 result["rolling_global_budget_usd"] = sum(
                     rolling_budgets.values(), Decimal("0")
                 )
+            if auth_id is not None:
+                lifetime = self._exploratory_lifetime_usage_locked(auth_id)
+                result["exploratory_lifetime_used_usd"] = _risk_decimal(
+                    lifetime["lifetime_buy_usd"], nonnegative=True
+                )
+                result["exploratory_lifetime_orders"] = int(
+                    lifetime["lifetime_orders"]
+                )
         for name in (
             "buy_filled_usd", "buy_pending_usd", "buy_unknown_usd", "gross_daily_buy_usd",
             "all_in_buy_reserved_usd", "aggregate_open_cost_usd", "aggregate_exposure_usd",
@@ -5415,6 +6604,11 @@ class AxiomStore:
             "external_flow_usd", "cumulative_buy_usd",
         ):
             result[name] = _risk_text(result[name])
+        result["exploratory_lifetime_used_usd"] = _risk_text(
+            result["exploratory_lifetime_used_usd"]
+        )
+        result["lifetime_buy_usd"] = result["exploratory_lifetime_used_usd"]
+        result["lifetime_orders"] = int(result["exploratory_lifetime_orders"])
         result["rolling_global_reserved_usd"] = _risk_text(result["rolling_global_reserved_usd"])
         result["rolling_global_budget_usd"] = _risk_text(result["rolling_global_budget_usd"])
         result["rolling_strategy_reserved_usd"] = {
@@ -10699,6 +11893,19 @@ class AxiomStore:
         )
         blocker = _rolling_required_text(data, "blocker", "reason", name="blocker")
         detail = _rolling_optional_text(data, "detail", "error") or ""
+        category = (_rolling_optional_text(data, "category") or "EVIDENCE").upper()
+        resolver = (
+            _rolling_optional_text(data, "resolver", "resolver_action")
+            or "refresh_rolling_evidence"
+        )
+        next_scheduled_action = (
+            _rolling_optional_text(
+                data,
+                "next_scheduled_action",
+                "next_action",
+            )
+            or "refresh_rolling_evidence"
+        )
         work_key = _rolling_optional_text(data, "work_key") or _rolling_hash(
             {
                 "strategy_version_id": strategy_id,
@@ -10738,9 +11945,12 @@ class AxiomStore:
                 "INSERT INTO rolling_evidence_blockers("
                 "blocker_id,work_key,strategy_version_id,research_trial_id,candidate_id,"
                 "requested_days,source_class,prerequisite_fingerprint,blocker,detail,"
-                "first_seen_at,last_attempted_at,attempts,payload_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "category,resolver,next_scheduled_action,first_seen_at,last_attempted_at,"
+                "attempts,payload_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(blocker_id) DO UPDATE SET "
-                "detail=excluded.detail,last_attempted_at=excluded.last_attempted_at,"
+                "detail=excluded.detail,category=excluded.category,resolver=excluded.resolver,"
+                "next_scheduled_action=excluded.next_scheduled_action,"
+                "last_attempted_at=excluded.last_attempted_at,"
                 "attempts=excluded.attempts,payload_json=excluded.payload_json",
                 (
                     blocker_id,
@@ -10753,6 +11963,9 @@ class AxiomStore:
                     fingerprint,
                     blocker,
                     detail[:1024],
+                    category,
+                    resolver,
+                    next_scheduled_action,
                     first,
                     now,
                     attempts,
@@ -10787,6 +12000,7 @@ class AxiomStore:
         except (TypeError, ValueError, json.JSONDecodeError):
             payload = {}
         result["payload"] = payload if isinstance(payload, Mapping) else {}
+        result["next_action"] = result.get("next_scheduled_action")
         return result
 
     def list_rolling_evidence_blockers(self, *, limit: int | None = 100) -> list[dict[str, Any]]:
@@ -10805,6 +12019,7 @@ class AxiomStore:
             except (TypeError, ValueError, json.JSONDecodeError):
                 payload = {}
             item["payload"] = payload if isinstance(payload, Mapping) else {}
+            item["next_action"] = item.get("next_scheduled_action")
             result.append(item)
         return result
 
@@ -19771,6 +20986,9 @@ def _canary_reservation_record(row: sqlite3.Row | None) -> dict[str, Any]:
         "config_generation": row["config_generation"],
         "config_hash": row["config_hash"],
         "config_id": row["config_id"],
+        "execution_authorization_id": row["execution_authorization_id"],
+        "controller_owner_id": row["controller_owner_id"],
+        "controller_generation": row["controller_generation"],
         "strategy_version_id": row["strategy_version_id"],
         "research_trial_id": row["research_trial_id"],
         "candidate_id": row["candidate_id"],
@@ -19788,6 +21006,283 @@ def _canary_reservation_record(row: sqlite3.Row | None) -> dict[str, Any]:
         "updated_at": _parse_datetime(row["updated_at"]),
         "released_at": _parse_datetime(row["released_at"]),
     }
+def _execution_authorization_text(value: Any, *, name: str, required: bool = True) -> str | None:
+    text = str(value or "").strip()
+    if not text and required:
+        raise ValueError(f"{name} is required")
+    if len(text) > 4096:
+        raise ValueError(f"{name} is too long")
+    return text or None
+
+
+def _execution_authorization_hash(value: Any, *, name: str) -> str:
+    text = _execution_authorization_text(value, name=name) or ""
+    if len(text) != 64 or any(char not in "0123456789abcdefABCDEF" for char in text):
+        raise ValueError(f"{name} must be a SHA-256 hex digest")
+    return text.lower()
+
+
+def _execution_authorization_strategy_versions(
+    exact_strategy_versions: Sequence[str] | None,
+) -> list[str]:
+    if exact_strategy_versions is None:
+        return []
+    if isinstance(exact_strategy_versions, (str, bytes)) or not isinstance(
+        exact_strategy_versions, Sequence
+    ):
+        raise ValueError("exact_strategy_versions must be a sequence")
+    result: list[str] = []
+    for value in exact_strategy_versions:
+        text = _execution_authorization_text(value, name="strategy version") or ""
+        if text in result:
+            raise ValueError("exact_strategy_versions must not contain duplicates")
+        result.append(text)
+    if len(result) > 1000:
+        raise ValueError("exact_strategy_versions is too large")
+    return result
+
+
+def _execution_authorization_budget(value: Mapping[str, Any] | Any) -> dict[str, Any]:
+    aliases = {
+        "notional_usd": "max_notional_usd",
+        "max_cost_usd": "max_notional_usd",
+        "cost_usd": "max_notional_usd",
+        "amount_usd": "max_notional_usd",
+        "max_lifetime_buy_usd": "max_notional_usd",
+        "max_lifetime_notional_usd": "max_notional_usd",
+        "orders": "max_orders",
+        "max_submitted_orders": "max_orders",
+        "max_submissions": "max_orders",
+        "max_lifetime_orders": "max_orders",
+    }
+    source: Mapping[str, Any]
+    if isinstance(value, Mapping):
+        source = value
+    else:
+        source = {"max_notional_usd": value}
+    normalized: dict[str, Any] = {}
+    for raw_name, raw_value in source.items():
+        name = aliases.get(str(raw_name).strip(), str(raw_name).strip())
+        if name not in {"max_notional_usd", "max_orders"}:
+            raise ValueError(f"unknown lifetime budget field: {raw_name}")
+        if name in normalized and normalized[name] != raw_value:
+            raise ValueError(f"conflicting lifetime budget field: {name}")
+        normalized[name] = raw_value
+    if not normalized:
+        raise ValueError("lifetime_budget must define a positive bound")
+    if "max_notional_usd" in normalized:
+        amount = _risk_decimal(
+            normalized["max_notional_usd"],
+            name="lifetime budget max_notional_usd",
+            nonnegative=True,
+        )
+        if amount <= 0:
+            raise ValueError("lifetime budget max_notional_usd must be positive")
+        normalized["max_notional_usd"] = _risk_text(amount)
+    if "max_orders" in normalized:
+        orders = normalized["max_orders"]
+        if isinstance(orders, bool):
+            raise ValueError("lifetime budget max_orders must be an integer")
+        try:
+            decimal_orders = Decimal(str(orders).strip())
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            raise ValueError("lifetime budget max_orders must be an integer") from exc
+        if (
+            not decimal_orders.is_finite()
+            or decimal_orders != decimal_orders.to_integral_value()
+            or decimal_orders <= 0
+            or decimal_orders > 100_000
+        ):
+            raise ValueError("lifetime budget max_orders must be a positive integer")
+        normalized["max_orders"] = int(decimal_orders)
+    return normalized
+
+
+def _normalize_execution_authorization(
+    *,
+    mode: str,
+    purpose: str,
+    exact_strategy_versions: Sequence[str] | None,
+    reviewed_selection_policy_hash: str | None,
+    adverse_evidence_ack: Any,
+    lifetime_budget: Mapping[str, Any] | Any,
+    stop_rules: Mapping[str, Any],
+    expires_at: datetime,
+    scope_hash: str,
+    scope_version: str | int,
+    active_settings_hash: str | None,
+    active_settings_generation: int | None,
+    selection_id: str | None,
+    selection_hash: str | None,
+    actor: str,
+    actor_version: str,
+    timestamp: datetime | None,
+) -> dict[str, Any]:
+    mode_value = str(mode or "").strip().upper()
+    if mode_value not in {"EXPLORATORY_MICRO_CANARY", "EVIDENCE_SELECTED"}:
+        raise ValueError(
+            "execution authorization mode must be EXPLORATORY_MICRO_CANARY or EVIDENCE_SELECTED"
+        )
+    purpose_value = _execution_authorization_text(purpose, name="purpose") or ""
+    versions = _execution_authorization_strategy_versions(exact_strategy_versions)
+    policy_hash = (
+        _execution_authorization_hash(
+            reviewed_selection_policy_hash,
+            name="selection_policy_hash",
+        )
+        if reviewed_selection_policy_hash is not None
+        else None
+    )
+    if not versions and policy_hash is None:
+        raise ValueError(
+            "authorization must bind exact strategy versions or a reviewed selection policy hash"
+        )
+    if isinstance(adverse_evidence_ack, Mapping):
+        acknowledgement = dict(adverse_evidence_ack)
+        accepted = acknowledgement.get(
+            "acknowledged",
+            acknowledgement.get(
+                "acknowledgment",
+                acknowledgement.get("accepted"),
+            ),
+        )
+        if accepted is not True:
+            raise ValueError("adverse evidence acknowledgment must be explicit")
+    elif adverse_evidence_ack is True:
+        acknowledgement = {"acknowledged": True}
+    else:
+        raise ValueError("adverse evidence acknowledgment must be explicit")
+    if not isinstance(stop_rules, Mapping) or not stop_rules:
+        raise ValueError("stop_rules must be a non-empty object")
+    # Validate JSON now, before a draft can become visible.  This also rejects
+    # NaN/Infinity and non-JSON values rather than failing later at activation.
+    try:
+        _dump(acknowledgement)
+        _dump(dict(stop_rules))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("authorization evidence/stop rules must be JSON") from exc
+    if not isinstance(expires_at, datetime):
+        raise ValueError("expires_at must be a datetime")
+    observed = ensure_utc(timestamp or utc_now())
+    expires = ensure_utc(expires_at)
+    if expires <= observed:
+        raise ValueError("expires_at must be in the future")
+    scope_hash_value = _execution_authorization_text(scope_hash, name="scope_hash") or ""
+    scope_version_value = _execution_authorization_text(
+        scope_version,
+        name="scope_version",
+    ) or ""
+    settings_hash_value = _execution_authorization_text(
+        active_settings_hash,
+        name="active_settings_hash",
+    ) or ""
+    if active_settings_generation is None or (
+        isinstance(active_settings_generation, bool)
+        or not isinstance(active_settings_generation, int)
+        or active_settings_generation < 1
+    ):
+        raise ValueError("active_settings_generation must be a positive integer")
+    actor_value = _execution_authorization_text(actor, name="actor") or ""
+    actor_version_value = _execution_authorization_text(
+        actor_version,
+        name="actor_version",
+    ) or ""
+    selection_id_value = _execution_authorization_text(
+        selection_id,
+        name="selection_id",
+        required=False,
+    )
+    selection_hash_value = (
+        _execution_authorization_hash(selection_hash, name="selection_hash")
+        if selection_hash is not None
+        else None
+    )
+    return {
+        "mode": mode_value,
+        "purpose": purpose_value,
+        "strategy_versions": versions,
+        "selection_policy_hash": policy_hash,
+        "adverse_evidence_ack": acknowledgement,
+        "lifetime_budget": _execution_authorization_budget(lifetime_budget),
+        "stop_rules": dict(stop_rules),
+        "expires_at": _iso(expires),
+        "scope_hash": scope_hash_value,
+        "scope_version": scope_version_value,
+        "active_settings_hash": settings_hash_value,
+        "active_settings_generation": int(active_settings_generation),
+        "selection_id": selection_id_value,
+        "selection_hash": selection_hash_value,
+        "actor": actor_value,
+        "actor_version": actor_version_value,
+        "_timestamp": observed,
+    }
+
+
+def _execution_authorization_binding_hash(values: Mapping[str, Any]) -> str:
+    binding = {
+        key: value
+        for key, value in values.items()
+        if key != "_timestamp"
+    }
+    return hashlib.sha256(_dump(binding).encode("utf-8")).hexdigest()
+
+
+def _execution_authorization_record(row: sqlite3.Row | None) -> dict[str, Any]:
+    if row is None:
+        raise ValueError("execution authorization not found")
+    versions = _load(row["strategy_versions_json"]) if row["strategy_versions_json"] else []
+    evidence = _load(row["adverse_evidence_ack_json"]) if row["adverse_evidence_ack_json"] else {}
+    budget = _load(row["lifetime_budget_json"]) if row["lifetime_budget_json"] else {}
+    stop_rules = _load(row["stop_rules_json"]) if row["stop_rules_json"] else {}
+    return {
+        "authorization_id": row["authorization_id"],
+        "status": str(row["status"]).upper(),
+        "generation": int(row["generation"]),
+        "mode": row["mode"],
+        "purpose": row["purpose"],
+        "strategy_versions": versions,
+        "exact_strategy_versions": versions,
+        "strategy_version_ids": versions,
+        "selection_policy_hash": row["selection_policy_hash"],
+        "reviewed_selection_policy_hash": row["selection_policy_hash"],
+        "adverse_evidence_ack": evidence,
+        "adverse_evidence_acknowledgment": evidence,
+        "lifetime_budget": budget,
+        "stop_rules": stop_rules,
+        "expires_at": _parse_datetime(row["expires_at"]),
+        "scope_hash": row["scope_hash"],
+        "scope_version": row["scope_version"],
+        "active_settings_hash": row["active_settings_hash"],
+        "active_settings_generation": int(row["active_settings_generation"]),
+        "selection_id": row["selection_id"],
+        "selection_hash": row["selection_hash"],
+        "actor": row["actor"],
+        "actor_version": row["actor_version"],
+        "binding_hash": row["binding_hash"],
+        "created_at": _parse_datetime(row["created_at"]),
+        "updated_at": _parse_datetime(row["updated_at"]),
+        "activated_at": _parse_datetime(row["activated_at"]),
+        "revoked_at": _parse_datetime(row["revoked_at"]),
+    }
+
+
+def _controller_lease_record(row: sqlite3.Row | None) -> dict[str, Any]:
+    if row is None:
+        raise ValueError("controller lease not found")
+    expires = _parse_datetime(row["expires_at"])
+    return {
+        "singleton": int(row["singleton"]),
+        "owner_id": row["owner_id"],
+        "generation": int(row["generation"]),
+        "status": str(row["status"]).upper(),
+        "acquired_at": _parse_datetime(row["acquired_at"]),
+        "renewed_at": _parse_datetime(row["renewed_at"]),
+        "expires_at": expires,
+        "lease_until": expires,
+        "released_at": _parse_datetime(row["released_at"]),
+        "updated_at": _parse_datetime(row["updated_at"]),
+    }
+
 
 
 __all__ = ["AxiomStore"]

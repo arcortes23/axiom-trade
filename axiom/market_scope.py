@@ -651,8 +651,11 @@ def _current_eligibility(raw: Mapping[str, Any], now: datetime) -> tuple[str, st
     expiry = parse_timestamp(_nested(raw, "expiry", "end_date", "endDate"))
     if expiry is not None and expiry <= now:
         return "exclude", "MARKET_EXPIRED"
+    suitability = raw.get("suitability_evidence", raw.get("suitability"))
+    if isinstance(suitability, Mapping) and str(suitability.get("action", "")).upper() not in {"", "SUITABLE"}:
+        reason = _text(suitability.get("reason")) or "NO_DEPTH"
+        return "exclude", reason
     return "eligible", ""
-    
     
 
 def _with_official_category(raw: Mapping[str, Any], filters: Mapping[str, Any]) -> dict[str, Any]:
@@ -706,6 +709,32 @@ def _rule_mismatch_reason(
         if not forward_market_matches(enriched, {key: value}, now=now):
             return field_reasons.get(str(key), "RULE_MISMATCH")
     return "RULE_MISMATCH"
+def _suitability_metadata(raw: Mapping[str, Any]) -> dict[str, Any]:
+    value = raw.get("suitability_evidence", raw.get("suitability"))
+    if not isinstance(value, Mapping):
+        return {}
+    result: dict[str, Any] = {}
+    for key in (
+        "category",
+        "action",
+        "reason",
+        "resolver",
+        "next_action",
+        "required_capital",
+        "observed_required_capital",
+        "observed_required_amount",
+        "intended_token",
+        "token_id",
+        "entry_depth",
+        "exit_depth",
+        "depth_score",
+        "activity_score",
+        "freshness_score",
+        "observed_at",
+    ):
+        if key in value:
+            result[key] = value[key]
+    return result
 
 
 def _policy_forward_filters(policy: Any) -> Mapping[str, Any]:
@@ -824,7 +853,13 @@ def resolve_market_scope(
             if action == "defer":
                 deferred.append(MarketScopeDisposition(market_id, eligibility_reason))
             elif action == "exclude":
-                excluded.append(MarketScopeDisposition(market_id, eligibility_reason))
+                excluded.append(
+                    MarketScopeDisposition(
+                        market_id,
+                        eligibility_reason,
+                        metadata=_suitability_metadata(raw),
+                    )
+                )
             else:
                 enriched = _with_official_category(raw, forward_filters)
                 if not forward_market_matches(
@@ -864,7 +899,13 @@ def resolve_market_scope(
                 deferred.append(MarketScopeDisposition(market_id, eligibility_reason))
                 continue
             if action == "exclude":
-                excluded.append(MarketScopeDisposition(market_id, eligibility_reason))
+                excluded.append(
+                    MarketScopeDisposition(
+                        market_id,
+                        eligibility_reason,
+                        metadata=_suitability_metadata(raw),
+                    )
+                )
                 continue
             enriched = _with_official_category(raw, forward_filters)
             if forward_market_matches(enriched, forward_filters, now=stamp, target_instrument=policy.instrument):

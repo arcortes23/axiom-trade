@@ -2129,12 +2129,52 @@ def _main_impl(argv: Sequence[str] | None = None) -> int:
                 data=DashboardData(store=dashboard_store, control=control),
             )
             server.start()
-            print(f"Axiom operator: {server.url} · node {node_status.get('status')}")
+            try:
+                control_status = control.status()
+            except Exception as exc:
+                control_status = {
+                    "status": "DEGRADED",
+                    "status_error": type(exc).__name__,
+                }
+            startup = {
+                "ready": True,
+                "message": f"Axiom operator: {server.url} · node {node_status.get('status')}",
+                "dashboard": {
+                    "url": server.url,
+                    "host": "127.0.0.1",
+                    "port": server.address[1] if server.address else operator_port,
+                    "token_required": True,
+                },
+                "node": node_status,
+                "identity": control_status.get("identity", {}),
+                "instance": control_status.get("instance", {}),
+                "mode": control_status.get("mode", "observing"),
+                "execution_profile": control_status.get("execution_profile"),
+                "policy": control_status.get("policy", {}),
+                "budgets": control_status.get(
+                    "budgets", control_status.get("economic_policy", {})
+                ),
+                "coverage": control_status.get("coverage", {}),
+                "strategies": control_status.get("strategies", {}),
+                "signals": control_status.get("signals", {}),
+                "execution": control_status.get(
+                    "execution", control_status.get("execution_summary", {})
+                ),
+                "last_work": control_status.get(
+                    "last_work", control_status.get("last_evaluation")
+                ),
+                "next_work": control_status.get("next_work"),
+                "next_action": control_status.get("next_action"),
+                "paper_only": True,
+                "live_execution": False,
+            }
+            print(json.dumps(startup, sort_keys=True, indent=2, default=str))
             if args.open_browser and server.url:
                 webbrowser.open(server.url)
             if args.once:
                 return 0
             server.serve_forever()
+            return 0
         except KeyboardInterrupt:
             return 0
         finally:

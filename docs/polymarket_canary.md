@@ -194,6 +194,24 @@ Historical research, forward evidence, paper signals, and simulated fills are
 not live execution evidence. A live fill is never promised by this guide; every
 order-capable path remains independently gated and fail-closed.
 
+## Execution admission and final POST fence
+
+Every order-capable path requires a persisted, unexpired
+`EXPLORATORY_MICRO_CANARY` authorization bound to the active settings
+generation/hash and (for rolling selections) the exact portfolio selection.
+It also requires the current controller lease owner and generation. Those
+authority IDs are stored on the risk reservation, submission-attempt record,
+and exit request; any mismatch or missing binding fails closed.
+
+Immediately before the irreversible POST, the venue geoblock, authenticated
+account, selected token/asset identity, signer/funder/owner wallet bindings,
+and exchange spender/allowance identity are read again. A fully blocked
+geoblock blocks both directions. Official close-only mode blocks BUY and
+permits only an otherwise valid, owned managed SELL. Accepted, partial, and
+timeout responses remain durable intents until authoritative reconciliation;
+UNKNOWN is never blindly retried. A fake transport test cannot establish
+live execution or live-fill evidence.
+
 ## Emergency rollback
 
 On a stop or emergency, pause new entries first, reconcile each UNKNOWN intent

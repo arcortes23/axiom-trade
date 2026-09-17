@@ -15,8 +15,14 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 import math
 from typing import Any, Callable
-
 from .domain import parse_timestamp, utc_now
+from .polymarket_rules import (
+    POLYMARKET_RULES_VERSION,
+    PolymarketRuleError,
+    PolymarketRules,
+    SIZE_PRECISION,
+    parse_polymarket_rules,
+)
 
 
 UNKNOWN = "UNKNOWN"
@@ -32,14 +38,13 @@ DEFAULT_MAX_AGE_SECONDS = Decimal("60")
 _ZERO = Decimal("0")
 _ONE = Decimal("1")
 _MISSING = object()
+_QUANTITY_STEP = Decimal(1).scaleb(-SIZE_PRECISION)
 
 
 class VenueFeasibilityError(ValueError):
     """Invalid assessor configuration (not a venue response)."""
 
 
-class _RuleConflict(ValueError):
-    """Multiple aliases supplied different values for one venue rule."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,8 +65,11 @@ class VenueFeasibilityAssessment(Mapping[str, Any]):
     timestamps: Mapping[str, str] = field(default_factory=dict)
     min_order_quantity: str = UNKNOWN
     tick_size: str = UNKNOWN
+    neg_risk: bool | str = UNKNOWN
+    # Report-only compatibility aliases; never required by Polymarket.
     min_notional: str = UNKNOWN
     size_increment: str = UNKNOWN
+    fee_reserve: str = "0"
     buy: Mapping[str, Any] = field(default_factory=dict)
     sell: Mapping[str, Any] = field(default_factory=dict)
     reason_codes: tuple[str, ...] = ()
@@ -86,11 +94,15 @@ class VenueFeasibilityAssessment(Mapping[str, Any]):
             "min_order_size": self.min_order_quantity,
             "tick_size": self.tick_size,
             "price_increment": self.tick_size,
+            "neg_risk": self.neg_risk,
+            # These aliases are retained for consumers that deserialize older
+            # reports; UNKNOWN means they were not part of official rules.
             "min_notional": self.min_notional,
             "size_increment": self.size_increment,
         }
         return {
-            "assessment_version": "polymarket-venue-feasibility-v1",
+            "assessment_version": "polymarket-venue-feasibility-v2",
+            "rules_version": POLYMARKET_RULES_VERSION,
             "provider": self.provider,
             "verdict": self.verdict,
             "status": self.verdict,
@@ -108,8 +120,10 @@ class VenueFeasibilityAssessment(Mapping[str, Any]):
             "min_order_size": self.min_order_quantity,
             "tick_size": self.tick_size,
             "price_increment": self.tick_size,
+            "neg_risk": self.neg_risk,
             "min_notional": self.min_notional,
             "size_increment": self.size_increment,
+            "fee_reserve": self.fee_reserve,
             "buy": _jsonable(self.buy),
             "sell": _jsonable(self.sell),
             # Top-level aliases keep reports simple while preserving the
@@ -149,6 +163,7 @@ def assess_venue_feasibility(
     target_notional_usd: Any | None = None,
     fee_rate: Any = _ZERO,
     fee_bps: Any | None = None,
+    fee_reserve: Any = _ZERO,
     slippage_bps: Any = _ZERO,
     slippage_rate: Any | None = None,
     depth: int = DEFAULT_BOOK_DEPTH,
@@ -158,12 +173,11 @@ def assess_venue_feasibility(
 ) -> VenueFeasibilityAssessment:
     """Assess public Polymarket execution evidence without side effects.
 
-    ``target_quantity`` defaults to the venue's explicit minimum order
-    quantity.  If neither is supplied, the quantity-dependent verdict is
-    ``UNKNOWN`` rather than assuming a one-share minimum.  ``cap_usd`` is an
-    all-in BUY cap: displayed price, adverse slippage, and fee are included.
-    Quantity calculations use :class:`~decimal.Decimal`; any configured size
-    increment is floored, never rounded upward over the cap.
+    ``target_quantity`` defaults to the official minimum order size. If neither
+    target quantity nor an official minimum is available, the quantity-dependent
+    verdict is ``UNKNOWN`` rather than assuming a one-share minimum. ``cap_usd``
+    is an all-in BUY cap including adverse slippage, venue fee, and any explicit
+    policy fee reserve. Quantities are exact Decimals and limited to two decimals.
     """
     identifier = _required_text(market_id, "market_id")
     bounded_depth = _bounded_depth(depth)
@@ -192,6 +206,7 @@ def assess_venue_feasibility(
         slip = raw_slippage_bps / Decimal("10000")
     if slip >= _ONE:
         raise VenueFeasibilityError("slippage must be less than 100 percent")
+    policy_fee_reserve = _positive_or_zero_decimal(fee_reserve, "fee_reserve")
 
     instant = _timestamp(now) if now is not None else _timestamp(utc_now())
     max_age = _nonnegative_decimal(
@@ -317,78 +332,20 @@ def assess_venue_feasibility(
         _record_timestamp(timestamps, "metadata", metadata_stamp)
         _check_fresh(metadata_stamp, instant, max_age, reasons, "METADATA")
 
-    # Malformed venue rule values are evidence failures, not caller
-    # configuration failures; preserve the UNKNOWN tri-state result.
-    min_order = _safe_rule_decimal(
-        metadata,
-        (
-            "min_order_quantity",
-            "min_order_size",
-            "order_min_size",
-            "orderMinSize",
-            "minQuantity",
-            "minOrderSize",
-            "minOrderQuantity",
-        ),
-        "min_order_quantity",
-        reasons,
-    )
-    tick = _safe_rule_decimal(
-        metadata,
-        (
-            "tick_size",
-            "price_increment",
-            "order_price_min_tick_size",
-            "orderPriceMinTickSize",
-            "tickSize",
-            "priceIncrement",
-        ),
-        "tick_size",
-        reasons,
-    )
-    min_notional = _safe_rule_decimal(
-        metadata,
-        (
-            "min_notional",
-            "minimum_notional",
-            "order_min_notional",
-            "minNotional",
-            "min_cost",
-            "minimum_cost",
-            "min_notional_usd",
-            "minimum_notional_usd",
-            "min_order_value",
-            "minimum_order_value",
-            "minOrderValue",
-            "minimumNotional",
-        ),
-        "min_notional",
-        reasons,
-    )
-    size_increment = _safe_rule_decimal(
-        metadata,
-        (
-            "size_increment",
-            "quantity_increment",
-            "quantity_step",
-            "order_size_increment",
-            "step_size",
-            "stepSize",
-            "sizeIncrement",
-            "quantityStep",
-        ),
-        "size_increment",
-        reasons,
-    )
-    for rule_name, rule_value in (
-        ("MIN_NOTIONAL", min_notional),
-        ("SIZE_INCREMENT", size_increment),
-    ):
-        if rule_value is None and not any(
-            reason.startswith(f"{rule_name}_RULE_") for reason in reasons
-        ):
-            reasons.append(f"{rule_name}_MISSING")
-            unknown_evidence = True
+    # The official CLOB book contract has exactly three required rule values.
+    # Do not infer venue rules from exchange-style ``min_notional`` or
+    # ``size_increment`` aliases.
+    official_rules: PolymarketRules | None = None
+    metadata_rule_error: str | None = None
+    if metadata is not None:
+        try:
+            official_rules = parse_polymarket_rules(metadata)
+        except PolymarketRuleError as exc:
+            metadata_rule_error = str(exc)
+    min_order = official_rules.min_order_size if official_rules is not None else None
+    tick = official_rules.tick_size if official_rules is not None else None
+    min_notional = None
+    size_increment = None
 
     books = _load_books(adapter, identifier, token_ids, bounded_depth, reasons)
     buy: dict[str, Any] = {}
@@ -409,7 +366,9 @@ def assess_venue_feasibility(
             )
             continue
 
-        book_ok, book_stamp, asks, bids = _validate_book(book, token, condition_id, instant, max_age, timestamps, outcome, reasons)
+        book_ok, book_stamp, asks, bids = _validate_book(
+            book, token, condition_id, instant, max_age, timestamps, outcome, reasons
+        )
         if not book_ok:
             unknown_evidence = True
             buy[outcome] = _unknown_leg(
@@ -425,28 +384,38 @@ def assess_venue_feasibility(
             )
             continue
 
-        book_min = _safe_book_rule_decimal(
-            book,
-            ("min_order_quantity", "min_order_size", "order_min_size", "orderMinSize"),
-            reasons,
-            f"{outcome.upper()}_MIN_ORDER",
-        )
-        book_tick = _safe_book_rule_decimal(
-            book,
-            ("tick_size", "price_increment", "order_price_min_tick_size", "orderPriceMinTickSize"),
-            reasons,
-            f"{outcome.upper()}_TICK",
-        )
-        min_order, conflict = _merge_rule(min_order, book_min)
-        if conflict:
-            reasons.append("MIN_ORDER_QUANTITY_CONFLICT")
-            unknown_evidence = True
-        tick, conflict = _merge_rule(tick, book_tick)
-        if conflict:
-            reasons.append("TICK_SIZE_CONFLICT")
+        # Books are authoritative for the documented rule triplet when they
+        # carry it.  A completely absent triplet can use metadata; a partial
+        # triplet is an evidence failure rather than a guessed default.
+        if _has_official_rule_fields(book):
+            try:
+                book_rules = parse_polymarket_rules(book)
+            except PolymarketRuleError as exc:
+                reasons.append(f"{outcome.upper()}_{exc}")
+                unknown_evidence = True
+                book_rules = None
+            if book_rules is not None:
+                if official_rules is None:
+                    official_rules = book_rules
+                    min_order = book_rules.min_order_size
+                    tick = book_rules.tick_size
+                elif (
+                    official_rules.min_order_size != book_rules.min_order_size
+                    or official_rules.tick_size != book_rules.tick_size
+                    or official_rules.neg_risk != book_rules.neg_risk
+                ):
+                    reasons.append("OFFICIAL_RULES_CONFLICT")
+                    unknown_evidence = True
+        if official_rules is not None and not _tick_aligned(
+            asks, bids, official_rules.tick_size
+        ):
+            reasons.append(f"{outcome.upper()}_BOOK_PRICE_TICK_MISMATCH")
             unknown_evidence = True
 
         effective_quantity = requested_quantity if requested_quantity is not None else min_order
+        if effective_quantity is not None and min_order is not None and effective_quantity < min_order:
+            reasons.append(f"{outcome.upper()}_QUANTITY_BELOW_MIN_ORDER")
+            known_infeasible = True
         if effective_quantity is None:
             unknown_evidence = True
             buy[outcome] = _unknown_leg(
@@ -458,6 +427,9 @@ def assess_venue_feasibility(
                 cap=cap,
             )
         else:
+            if _decimal_places(effective_quantity) > 2:
+                reasons.append("QUANTITY_PRECISION_INVALID")
+                unknown_evidence = True
             buy_leg, buy_bad, buy_unknown = _buy_leg(
                 outcome,
                 token,
@@ -466,8 +438,8 @@ def assess_venue_feasibility(
                 cap,
                 fee,
                 slip,
-                size_increment,
                 book_stamp,
+                fee_reserve=policy_fee_reserve,
             )
             buy[outcome] = buy_leg
             known_infeasible = known_infeasible or buy_bad
@@ -476,11 +448,6 @@ def assess_venue_feasibility(
                 reasons.append(f"{outcome.upper()}_BUY_DEPTH_INSUFFICIENT")
             elif buy_leg.get("depth_sufficient") == UNKNOWN:
                 unknown_evidence = True
-            if min_notional is not None and buy_leg.get("multilevel_raw_notional") not in (None, UNKNOWN):
-                if Decimal(str(buy_leg["multilevel_raw_notional"])) < min_notional:
-                    reasons.append(f"{outcome.upper()}_MIN_NOTIONAL_NOT_MET")
-                    known_infeasible = True
-
         sell_leg = _sell_leg(
             outcome,
             token,
@@ -489,6 +456,7 @@ def assess_venue_feasibility(
             slip,
             book_stamp,
             effective_quantity,
+            fee_reserve=policy_fee_reserve,
         )
         sell[outcome] = sell_leg
         sell_sufficient = sell_leg.get("depth_sufficient")
@@ -500,15 +468,18 @@ def assess_venue_feasibility(
             unknown_evidence = True
 
     effective_quantity = requested_quantity if requested_quantity is not None else min_order
-    if effective_quantity is not None and size_increment is not None:
-        if effective_quantity % size_increment != _ZERO:
-            reasons.append("QUANTITY_INCREMENT_MISMATCH")
-            unknown_evidence = True
+    if official_rules is None:
+        if metadata_rule_error:
+            reasons.append(metadata_rule_error)
+        else:
+            reasons.append("OFFICIAL_RULES_UNAVAILABLE")
+        unknown_evidence = True
 
     min_order_text = _decimal_text(min_order)
     tick_text = _decimal_text(tick)
-    min_notional_text = _decimal_text(min_notional)
-    size_increment_text = _decimal_text(size_increment)
+    min_notional_text = UNKNOWN
+    size_increment_text = UNKNOWN
+
 
     if any(
         code.endswith(
@@ -544,6 +515,8 @@ def assess_venue_feasibility(
         tick_size=tick_text,
         min_notional=min_notional_text,
         size_increment=size_increment_text,
+        neg_risk=official_rules.neg_risk if official_rules is not None else UNKNOWN,
+        fee_reserve=_decimal_text(policy_fee_reserve),
         buy=buy,
         sell=sell,
         reasons=reasons,
@@ -589,8 +562,10 @@ def _assessment(**kwargs: Any) -> VenueFeasibilityAssessment:
         timestamps=dict(kwargs.get("timestamps") or {}),
         min_order_quantity=str(kwargs.get("min_order_quantity", UNKNOWN)),
         tick_size=str(kwargs.get("tick_size", UNKNOWN)),
+        neg_risk=kwargs.get("neg_risk", UNKNOWN),
         min_notional=str(kwargs.get("min_notional", UNKNOWN)),
         size_increment=str(kwargs.get("size_increment", UNKNOWN)),
+        fee_reserve=str(kwargs.get("fee_reserve", "0")),
         buy=dict(kwargs.get("buy") or {}),
         sell=dict(kwargs.get("sell") or {}),
         reason_codes=tuple(dict.fromkeys(str(reason) for reason in kwargs.get("reasons", ()) if str(reason))),
@@ -631,42 +606,44 @@ def _market_projection(value: Any, requested_id: str, condition_id: str | None) 
         else:
             projection[output] = UNKNOWN
     return projection
-def _safe_rule_decimal(
-    source: Any,
-    names: tuple[str, ...],
-    label: str,
-    reasons: list[str],
-) -> Decimal | None:
-    try:
-        return _rule_decimal(source, names, label)
-    except _RuleConflict:
-        reasons.append(f"{label.upper()}_RULE_CONFLICT")
-        return None
-    except (TypeError, ValueError, InvalidOperation):
-        reasons.append(f"{label.upper()}_RULE_INVALID")
-        return None
+
+def _has_official_rule_fields(source: Any) -> bool:
+    """Return whether a source carries any official CLOB rule field."""
+    names = (
+        "min_order_size",
+        "orderMinSize",
+        "minOrderSize",
+        "order_min_size",
+        "tick_size",
+        "tickSize",
+        "orderPriceMinTickSize",
+        "order_price_min_tick_size",
+        "neg_risk",
+        "negRisk",
+    )
+    if isinstance(source, Mapping):
+        return any(name in source for name in names)
+    return any(_value(source, name, default=None) is not None for name in names)
 
 
+def _decimal_places(value: Decimal) -> int:
+    return max(0, -value.as_tuple().exponent)
 
 
-def _safe_book_rule_decimal(
-    source: Any,
-    names: tuple[str, ...],
-    reasons: list[str],
-    label: str,
-) -> Decimal | None:
-    try:
-        return _book_rule_decimal(source, *names)
-    except _RuleConflict:
-        reasons.append(f"{label}_RULE_CONFLICT")
-        return None
-    except (TypeError, ValueError, InvalidOperation):
-        reasons.append(f"{label}_RULE_INVALID")
-        return None
-
+def _tick_aligned(
+    asks: list[tuple[Decimal, Decimal]],
+    bids: list[tuple[Decimal, Decimal]],
+    tick: Decimal,
+) -> bool:
+    precision = _decimal_places(tick)
+    return all(
+        _decimal_places(price) <= precision and price % tick == _ZERO
+        for price, _ in (*asks, *bids)
+    )
 
 def _load_books(adapter: Any, market_id: str, token_ids: Mapping[str, str], depth: int, reasons: list[str]) -> dict[str, Any]:
     """Load exactly the two token-labelled public books when possible."""
+
     result: dict[str, Any] = {}
     direct = getattr(adapter, "order_book_for_token", None)
     if callable(direct):
@@ -755,19 +732,32 @@ def _buy_leg(
     cap: Decimal,
     fee: Decimal,
     slip: Decimal,
-    size_increment: Decimal | None,
     timestamp: str | None,
+    *,
+    fee_reserve: Decimal = _ZERO,
 ) -> tuple[dict[str, Any], bool, bool]:
     top = _walk(asks[:1], quantity, fee=fee, slip=slip, side="BUY")
     multi = _walk(asks, quantity, fee=fee, slip=slip, side="BUY")
-    cap_quantity = _cap_quantity(asks, cap, fee=fee, slip=slip, increment=size_increment)
+    available_cap = max(_ZERO, cap - fee_reserve)
+    cap_quantity = _cap_quantity(asks, available_cap, fee=fee, slip=slip)
     top_cost = _decimal_text(top["all_in"])
     multi_cost = _decimal_text(multi["all_in"])
     target_text = _decimal_text(quantity)
     filled_text = _decimal_text(multi["filled"])
     target_filled = multi["filled"] >= quantity
-    cap_ok = target_filled and multi["all_in"] <= cap
+    required_cost = multi["all_in"] + fee_reserve if target_filled else None
+    cap_ok = target_filled and required_cost is not None and required_cost <= cap
     leg = {
+        "action": "SUITABLE" if cap_ok else "UNSUITABLE",
+        "reason": (
+            "OK"
+            if cap_ok
+            else "NO_DEPTH"
+            if not asks
+            else "INSUFFICIENT_DEPTH"
+            if not target_filled
+            else "CAP_EXCEEDED"
+        ),
         "outcome": outcome.upper(),
         "token_id": token,
         "timestamp": timestamp or UNKNOWN,
@@ -782,6 +772,8 @@ def _buy_leg(
         "top_cost": top_cost if top["filled"] >= quantity else UNKNOWN,
         "multilevel_cost": multi_cost if target_filled else UNKNOWN,
         "top_buy_raw_notional": _decimal_text(top["raw"]) if top["filled"] >= quantity else UNKNOWN,
+        "required_cost": _decimal_text(required_cost),
+        "fee_reserve": _decimal_text(fee_reserve),
         "multilevel_raw_notional": _decimal_text(multi["raw"]) if target_filled else UNKNOWN,
         "top_buy_slippage_cost": _decimal_text(top["adjusted"] - top["raw"]) if top["filled"] >= quantity else UNKNOWN,
         "multilevel_slippage_cost": _decimal_text(multi["adjusted"] - multi["raw"]) if target_filled else UNKNOWN,
@@ -792,13 +784,11 @@ def _buy_leg(
         "cap_usd": _decimal_text(cap),
         "cap_satisfied": True if cap_ok else False if target_filled else UNKNOWN,
         "max_quantity_under_cap": _decimal_text(cap_quantity),
-        "size_increment": _decimal_text(size_increment),
+        "size_increment": UNKNOWN,
     }
-    # An empty, fresh book is a known depth failure, not an UNKNOWN venue.
-    bad = bool(target_filled and multi["all_in"] > cap) or not target_filled
+    bad = bool(target_filled and required_cost is not None and required_cost > cap) or not target_filled
     unknown = False
     return leg, bad, unknown
-
 
 def _sell_leg(
     outcome: str,
@@ -808,6 +798,8 @@ def _sell_leg(
     slip: Decimal,
     timestamp: str | None,
     position_quantity: Decimal | None,
+    *,
+    fee_reserve: Decimal = _ZERO,
 ) -> dict[str, Any]:
     depth_quantity = sum((size for _, size in bids), _ZERO)
     walk = (
@@ -818,8 +810,26 @@ def _sell_leg(
     depth_sufficient: bool | str = (
         UNKNOWN if position_quantity is None else depth_quantity >= position_quantity
     )
+    sell_action = (
+        "SUITABLE"
+        if depth_sufficient is True
+        else "UNSUITABLE"
+        if depth_sufficient is False
+        else UNKNOWN
+    )
+    sell_reason = (
+        "OK"
+        if depth_sufficient is True
+        else "NO_DEPTH"
+        if not bids
+        else "INSUFFICIENT_DEPTH"
+        if depth_sufficient is False
+        else "UNKNOWN"
+    )
     quantity_text = _decimal_text(position_quantity)
     return {
+        "action": sell_action,
+        "reason": sell_reason,
         "outcome": outcome.upper(),
         "token_id": token,
         "timestamp": timestamp or UNKNOWN,
@@ -832,6 +842,7 @@ def _sell_leg(
         "gross_proceeds_at_depth": _decimal_text(walk["adjusted"]),
         "fee_at_depth": _decimal_text(walk["fee"]),
         "net_proceeds_at_depth": _decimal_text(walk["net"]),
+        "fee_reserve": _decimal_text(fee_reserve),
         "depth_sufficient": depth_sufficient,
     }
 
@@ -941,7 +952,6 @@ def _cap_quantity(
     *,
     fee: Decimal,
     slip: Decimal,
-    increment: Decimal | None,
 ) -> Decimal:
     multiplier = (_ONE + slip) * (_ONE + fee)
     remaining_cap = cap
@@ -957,8 +967,11 @@ def _cap_quantity(
         remaining_cap -= take * unit
         if remaining_cap <= _ZERO:
             break
-    if increment is not None and increment > _ZERO:
-        quantity = (quantity / increment).to_integral_value(rounding=ROUND_DOWN) * increment
+
+    # Polymarket shares are executable only at the canonical two-decimal
+    # precision.  Floor before the exact walk so a cap-derived quantity never
+    # exposes a long Decimal expansion or rounds up over the cap.
+    quantity = (quantity / _QUANTITY_STEP).to_integral_value(rounding=ROUND_DOWN) * _QUANTITY_STEP
 
     # Recompute the exact Decimal walk after flooring.  A high-precision
     # division above can still leave a rounded quantity a hair over the cap.
@@ -971,10 +984,7 @@ def _cap_quantity(
         if cost <= cap:
             break
         quantity = quantity * cap / cost
-        if increment is not None and increment > _ZERO:
-            quantity = (quantity / increment).to_integral_value(rounding=ROUND_DOWN) * increment
-        else:
-            quantity = quantity.next_minus()
+        quantity = (quantity / _QUANTITY_STEP).to_integral_value(rounding=ROUND_DOWN) * _QUANTITY_STEP
     if quantity > _ZERO and _walk(levels, quantity, fee=fee, slip=slip, side="BUY")["all_in"] > cap:
         return _ZERO
     return max(_ZERO, quantity)
@@ -992,83 +1002,20 @@ def _levels(value: Any, *, reverse: bool) -> list[tuple[Decimal, Decimal]]:
         elif isinstance(row, (list, tuple)) and len(row) >= 2:
             price_raw, size_raw = row[0], row[1]
         else:
-            raise ValueError("book level is malformed")
-        price = _positive_or_zero_decimal(price_raw, "book price")
+            price_raw = getattr(row, "price", None)
+            size_raw = getattr(row, "size", getattr(row, "quantity", None))
+            if price_raw is None or size_raw is None:
+                raise ValueError("book level is malformed")
+        price = _positive_decimal(price_raw, "book price")
         size = _positive_decimal(size_raw, "book size")
         if price > _ONE:
             raise ValueError("prediction price must be at most one")
+        if _decimal_places(size) > 2:
+            raise ValueError("book size precision exceeds documented CLOB precision")
         result.append((price, size))
     result.sort(key=lambda item: item[0], reverse=reverse)
     return result
 
-def _rule_decimal(source: Any, names: tuple[str, ...], label: str) -> Decimal | None:
-    if source is None:
-        return None
-    candidates: list[Any] = []
-    if isinstance(source, Mapping):
-        for name in names:
-            if name in source:
-                candidates.append(source[name])
-        extra = source.get("extra")
-    else:
-        for name in names:
-            try:
-                value = getattr(source, name)
-            except Exception:
-                continue
-            if value is not None:
-                candidates.append(value)
-        extra = _value(source, "extra", default=None)
-    if isinstance(extra, Mapping):
-        for name in names:
-            if name in extra:
-                candidates.append(extra[name])
-    parsed: list[Decimal] = []
-    for value in candidates:
-        parser = _positive_decimal
-        parsed.append(parser(value, label))
-    return _unique_rule(parsed)
-
-
-def _book_rule_decimal(book: Any, *names: str) -> Decimal | None:
-    values: list[Any] = []
-    if isinstance(book, Mapping):
-        for name in names:
-            if name in book:
-                values.append(book[name])
-        extra = book.get("extra")
-    else:
-        for name in names:
-            try:
-                value = getattr(book, name)
-            except Exception:
-                continue
-            if value is not None:
-                values.append(value)
-        extra = _value(book, "extra", default=None)
-    if isinstance(extra, Mapping):
-        for name in names:
-            if name in extra:
-                values.append(extra[name])
-    parsed = [_positive_decimal(value, "book rule") for value in values]
-    return _unique_rule(parsed)
-
-
-def _unique_rule(values: list[Decimal]) -> Decimal | None:
-    if not values:
-        return None
-    first = values[0]
-    if any(item != first for item in values[1:]):
-        raise _RuleConflict("rule aliases disagree")
-    return first
-
-
-def _merge_rule(current: Decimal | None, incoming: Decimal | None) -> tuple[Decimal | None, bool]:
-    if current is None:
-        return incoming, False
-    if incoming is None:
-        return current, False
-    return current, current != incoming
 
 
 def _record_timestamp(target: dict[str, str], name: str, value: str | None) -> None:

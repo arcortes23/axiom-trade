@@ -8,8 +8,10 @@ import json
 from pathlib import Path
 import sqlite3
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
+from axiom.auto_canary import AutonomousCanaryWorker
 
 from axiom.rolling_portfolio import (
     MAX_REASON_LENGTH,
@@ -39,6 +41,7 @@ from axiom.autonomous import (
     _rolling_rule_scope_market_ids,
     _rolling_work_items,
 )
+from axiom.research_bus import ResearchQueueItem, ResearchQueueStatus
 
 
 UTC = timezone.utc
@@ -884,6 +887,36 @@ class TestRollingPortfolio(unittest.TestCase):
         self.assertEqual(restored.evidence_digest, first.evidence_digest)
         self.assertEqual(restored.valid_observations, 3)
         self.assertEqual(restored.net_result, Decimal("1.25"))
+
+    def test_evidence_lifecycle_fields_roundtrip_through_metrics(self) -> None:
+        source = _evidence(
+            "sv-lifecycle-fields",
+            "window-lifecycle-fields",
+            metrics={
+                "evaluation": {
+                    "holding_period": 3,
+                    "exit_policy": {
+                        "type": "fixed_holding_period",
+                        "holding_period": 3,
+                    },
+                    "observation_horizon": {"days": 30},
+                    "selection_excluded": True,
+                    "observation_gap_seconds": "17.5",
+                }
+            },
+        )
+        evidence = RollingEvidence.from_mapping(source)
+        payload = json.loads(json.dumps(evidence.as_dict()))
+        restored = RollingEvidence.from_mapping(payload)
+        self.assertEqual(restored.evidence_digest, evidence.evidence_digest)
+        self.assertEqual(restored.holding_period, 3)
+        self.assertEqual(restored.exit_policy, {
+            "type": "fixed_holding_period",
+            "holding_period": 3,
+        })
+        self.assertEqual(restored.observation_horizon, {"days": 30})
+        self.assertTrue(restored.selection_excluded)
+        self.assertEqual(restored.observation_gap_seconds, Decimal("17.5"))
 
     def test_operational_projection_conflicts_do_not_override_canonical_counts(self) -> None:
         base = _v2_evidence("sv-operational-conflict", "window-operational-conflict")
@@ -5071,3 +5104,113 @@ class TestRollingPortfolio(unittest.TestCase):
                 store=store,
             )
             self.assertNotEqual(present, absent)
+    def test_worker_policy_split_defaults_to_evidence_and_recognizes_exploratory(self) -> None:
+        self.assertEqual(
+            AutonomousCanaryWorker._rolling_execution_mode({}),
+            "EVIDENCE_SELECTED",
+        )
+        self.assertEqual(
+            AutonomousCanaryWorker._rolling_execution_mode(
+                {"execution_authorization_mode": "EXPLORATORY_MICRO_CANARY"}
+            ),
+            "EXPLORATORY_MICRO_CANARY",
+        )
+        self.assertEqual(
+            AutonomousCanaryWorker._rolling_execution_mode(
+                {"execution_policy": {"mode": "EVIDENCE_SELECTED"}}
+            ),
+            "EVIDENCE_SELECTED",
+        )
+
+    def test_worker_renews_same_controller_generation_and_releases_on_stop(self) -> None:
+        with _store(self.tmp_path) as store:
+            first = AutonomousCanaryWorker(store, clock=lambda: NOW, interval_seconds=1)
+            acquired = first._acquire_controller_lease(NOW)
+            self.assertIsNotNone(acquired)
+            assert acquired is not None
+            generation = int(acquired["generation"])
+
+            renewed = first._acquire_controller_lease(NOW + timedelta(seconds=1))
+            self.assertIsNotNone(renewed)
+            assert renewed is not None
+            self.assertEqual(int(renewed["generation"]), generation)
+
+            competing = AutonomousCanaryWorker(store, clock=lambda: NOW, interval_seconds=1)
+            self.assertIsNone(
+                competing._acquire_controller_lease(NOW + timedelta(seconds=2))
+            )
+
+            stop_event = threading.Event()
+            first.tick = lambda **_: stop_event.set()  # type: ignore[method-assign]
+            first.run(stop_event)
+            released = store.load_canary_controller_lease(
+                owner_id=first.controller_owner_id,
+                generation=generation,
+                now=NOW + timedelta(seconds=2),
+            )
+            self.assertIsNone(released)
+
+    def test_disarmed_rolling_tick_observes_without_constructing_venue(self) -> None:
+        venue_calls: list[bool] = []
+        with _store(self.tmp_path) as store:
+            worker = AutonomousCanaryWorker(
+                store,
+                clock=lambda: NOW,
+                venue_factory=lambda: venue_calls.append(True),
+            )
+            result = worker.tick_rolling(now=NOW)
+            self.assertEqual(result["operating_state"], "observing")
+            self.assertEqual(result["status"], "OBSERVING")
+            self.assertEqual(venue_calls, [])
+
+    def test_software_campaign_error_is_terminal_and_non_resumable(self) -> None:
+        with _store(self.tmp_path) as store:
+            processor = AutonomousResearchProcessor(store, clock=lambda: NOW)
+            campaign_job = processor.campaign_job_name("software-error")
+            store.set_operator_job(
+                campaign_job,
+                "RUNNING",
+                {
+                    "campaign_id": "software-error",
+                    "status": "RUNNING",
+                    "trials": [{"trial_id": "trial-1", "status": "RUNNING"}],
+                    "counts": {"running": 1},
+                    "budget_remaining": 1,
+                    "next_real_job": None,
+                },
+                resumable=True,
+                timestamp=NOW,
+            )
+            item = ResearchQueueItem(
+                "item-software-error",
+                "CAMPAIGN_TRIAL",
+                ResearchQueueStatus.TESTING,
+                {"campaign_id": "software-error", "campaign_trial_id": "trial-1"},
+                "test",
+                "test",
+                (),
+                NOW,
+                NOW,
+                1,
+            )
+            processor._advance_campaign_after_result(
+                item,
+                {
+                    "accepted": False,
+                    "reason_code": "PROCESSING_FAILED",
+                    "reason": "malformed input",
+                },
+                NOW,
+            )
+            record = store.get_operator_job(campaign_job)
+            self.assertIsNotNone(record)
+            assert record is not None
+            self.assertEqual(record["status"], "SOFTWARE_OR_INPUT_ERROR")
+            self.assertFalse(record["resumable"])
+            self.assertTrue(record["payload"]["terminal"])
+            self.assertFalse(record["payload"]["retry_scheduled"])
+            self.assertIsNone(record["payload"]["next_real_job"])
+            self.assertEqual(
+                record["payload"]["next_scheduled_action"],
+                "operator_review_terminal_error",
+            )

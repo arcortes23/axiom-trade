@@ -30,6 +30,7 @@ from ..domain import (
     ensure_utc,
 )
 from ._http import HTTPFetchError, as_float, decode_jsonish, fetch_json_strict, parse_timestamp, query_url
+from ..polymarket_rules import PolymarketRuleError, parse_polymarket_rules
 from .interfaces import PredictionMarketDataProvider
 
 
@@ -527,9 +528,23 @@ class PolymarketAdapter(PredictionMarketDataProvider):
             timestamp = parse_timestamp(timestamp_raw)
             if timestamp_raw not in (None, "") and timestamp is None:
                 raise ValueError("CLOB timestamp is malformed")
-            min_order_size = _optional_number(payload, "min_order_size", "minOrderSize", positive=True)
-            tick_size = _optional_number(payload, "tick_size", "tickSize", positive=True)
-            neg_risk = _optional_bool(payload, "neg_risk", "negRisk")
+            # A deployed official book includes all three rule fields. Older
+            # recorded public fixtures may omit them entirely; preserve those
+            # read-only observations, but never accept a partial rule set.
+            rule_keys = (
+                "min_order_size", "orderMinSize", "minOrderSize", "order_min_size",
+                "tick_size", "tickSize", "orderPriceMinTickSize",
+                "order_price_min_tick_size", "neg_risk", "negRisk",
+            )
+            if any(key in payload for key in rule_keys):
+                rules = parse_polymarket_rules(payload)
+                min_order_size = float(rules.min_order_size)
+                tick_size = float(rules.tick_size)
+                neg_risk = rules.neg_risk
+            else:
+                min_order_size = None
+                tick_size = None
+                neg_risk = None
             book_hash = _present_text(payload, "hash", "book_hash")
             snapshot = OrderBookSnapshot(
                 timestamp=timestamp or _EPOCH,
@@ -545,7 +560,7 @@ class PolymarketAdapter(PredictionMarketDataProvider):
                 available=True,
                 source=self.provider_name,
             )
-        except (PolymarketPayloadError, TypeError, ValueError) as exc:
+        except (PolymarketPayloadError, PolymarketRuleError, TypeError, ValueError) as exc:
             self._validation_errors.append(
                 exc if isinstance(exc, PolymarketPayloadError) else PolymarketPayloadError(str(exc))
             )
@@ -895,12 +910,21 @@ class PolymarketAdapter(PredictionMarketDataProvider):
         timestamps.update(raw_timestamps)
         rules_field = _first_present_key(raw, "resolutionCriteria", "resolution_criteria", "rules", "description")
         try:
-            min_order_size = _optional_number(raw, "orderMinSize", "order_min_size", positive=True)
-            tick_size = _optional_number(
-                raw, "orderPriceMinTickSize", "order_price_min_tick_size", "tickSize", "tick_size", positive=True
+            rule_keys = (
+                "orderMinSize", "minOrderSize", "order_min_size", "min_order_size",
+                "orderPriceMinTickSize", "order_price_min_tick_size", "tickSize", "tick_size",
+                "negRisk", "neg_risk",
             )
-            neg_risk = _optional_bool(raw, "negRisk", "neg_risk")
-        except ValueError:
+            if any(key in raw for key in rule_keys):
+                parsed_rules = parse_polymarket_rules(raw)
+                min_order_size = float(parsed_rules.min_order_size)
+                tick_size = float(parsed_rules.tick_size)
+                neg_risk = parsed_rules.neg_risk
+            else:
+                min_order_size = None
+                tick_size = None
+                neg_risk = None
+        except (PolymarketRuleError, ValueError):
             return None
         return InstrumentMetadata(
             symbol=snapshot.slug or snapshot.market_id,

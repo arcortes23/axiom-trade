@@ -83,6 +83,7 @@ class FakeVenue:
             "token_id": token_id,
             "market_version": "v1",
             "asset_id": token_id,
+            "neg_risk": False,
             "accepting_orders": True,
             "min_order_size": "0.01",
             "size_increment": "0.01",
@@ -361,6 +362,24 @@ def _selection(
         "global_budget": str(policy.global_budget),
         "members": members,
     }
+
+
+def _selection_binding_hash(selection: Mapping[str, object]) -> str:
+    """Hash the persisted selection payload without a self-referential hash."""
+    payload = {
+        key: value
+        for key, value in selection.items()
+        if key not in {"selection_hash"}
+    }
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def _member_map(decision: object) -> dict[str, object]:
@@ -2032,6 +2051,54 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
         )
         return payload
 
+    def _activate_worker_authorization(
+        self,
+        settings: CanarySettingsService,
+        *,
+        strategy_version_id: str,
+        selection_id: str,
+        selection_hash: str | None = None,
+        selection_policy_hash: str | None = None,
+        mode: str = "EXPLORATORY_MICRO_CANARY",
+    ) -> dict[str, object]:
+        config = settings.snapshot(now=NOW)
+        active = settings.load_active_execution_authorization(
+            mode=mode,
+            now=NOW,
+        )
+        if active is not None:
+            settings.revoke_execution_authorization(
+                str(active["authorization_id"]),
+                "acceptance",
+                expected_generation=int(active["generation"]),
+                reason="replace acceptance binding",
+            )
+        authorization_suffix = (selection_hash or "unbound")[:16]
+        draft = settings.register_execution_authorization_draft(
+            authorization_id=f"authorization:{selection_id}:{authorization_suffix}",
+            mode=mode,
+            purpose="rolling-worker",
+            exact_strategy_versions=(strategy_version_id,),
+            reviewed_selection_policy_hash=selection_policy_hash,
+            adverse_evidence_ack={"acknowledged": True},
+            lifetime_budget={"max_notional_usd": "100.00", "max_orders": 100},
+            stop_rules={"max_loss_usd": "100.00"},
+            expires_at=NOW + timedelta(days=1),
+            scope_hash=hashlib.sha256(selection_id.encode("utf-8")).hexdigest(),
+            scope_version="1",
+            selection_id=selection_id,
+            selection_hash=selection_hash,
+            actor="acceptance",
+            actor_version="acceptance-v1",
+            active_settings_hash=str(config["config_hash"]),
+            active_settings_generation=int(config["generation"]),
+        )
+        return settings.activate_execution_authorization(
+            str(draft["authorization_id"]),
+            "acceptance",
+            expected_generation=int(draft["generation"]),
+        )
+
     def _rolling_worker_fixture(
         self,
         store: AxiomStore,
@@ -2041,9 +2108,11 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
         selection_id: str = "selection-rolling-worker",
         venue: RollingLifecycleVenue,
         exit_policy: dict[str, object] | None = None,
+        authorization_mode: str = "EXPLORATORY_MICRO_CANARY",
     ) -> tuple[RollingAdmissionPolicy, CanaryService, AutonomousCanaryWorker]:
         policy = _policy(
             policy_id,
+            config_hash=hashlib.sha256(policy_id.encode("utf-8")).hexdigest(),
             max_members=1,
             experimental_allocation_enabled=True,
             replacement_margin="0",
@@ -2101,9 +2170,19 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
                 "risk_config_id": config["config_id"],
                 "risk_config_generation": config["generation"],
                 "risk_config_hash": config["config_hash"],
+                "execution_authorization_mode": authorization_mode,
             }
         )
+        selection["selection_hash"] = _selection_binding_hash(selection)
         store.commit_portfolio_selection(selection, [member])
+        self._activate_worker_authorization(
+            settings,
+            strategy_version_id=strategy_id,
+            selection_id=selection_id,
+            selection_hash=str(selection["selection_hash"]),
+            selection_policy_hash=policy.config_hash,
+            mode=authorization_mode,
+        )
         service = CanaryService(
             store,
             credentials=AcceptanceCredentials(),
@@ -2135,6 +2214,7 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
         cost: str = "0.25",
         quantity: str = "1",
         lineage: dict[str, object] | None = None,
+        compatibility_mode: bool = True,
     ) -> dict[str, object]:
         values: dict[str, object] = {
             "intent_id": intent,
@@ -2148,6 +2228,7 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
         }
         if lineage:
             values.update(lineage)
+        values["compatibility_mode"] = compatibility_mode
         return store.reserve_canary_capacity(**values)
     def _activate_isolated_risk_settings(
         self,
@@ -2656,7 +2737,12 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
                 )
 
     def test_position_service_allows_paused_replaced_opening_lineage_sell(self) -> None:
-        policy = _policy("policy-position-lineage", max_members=1, global_budget="10.00")
+        policy = _policy(
+            "policy-position-lineage",
+            config_hash=hashlib.sha256(b"policy-position-lineage").hexdigest(),
+            max_members=1,
+            global_budget="10.00",
+        )
         old_member = _member("sv-position-old", "selection-position-old", allocation="10.00")
         new_member = _member("sv-position-new", "selection-position-new", allocation="10.00")
         old_lineage = self._lineage(
@@ -2674,16 +2760,41 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
                 ("sv-position-old", "sv-position-new"),
                 evidence=[_evidence("sv-position-old"), _evidence("sv-position-new")],
             )
-            store.commit_portfolio_selection(
-                _selection("selection-position-old", policy, members=[old_member]),
-                [old_member],
+            old_selection = _selection(
+                "selection-position-old",
+                policy,
+                members=[old_member],
             )
+            old_selection["execution_authorization_mode"] = "EVIDENCE_SELECTED"
+            old_selection["policy_hash"] = policy.config_hash
+            old_selection["selection_hash"] = _selection_binding_hash(old_selection)
+            store.commit_portfolio_selection(old_selection, [old_member])
+            lease = store.acquire_canary_controller_lease(
+                owner_id="position-manager",
+                lease_seconds=86400,
+                now=NOW,
+            )
+            authorization = self._activate_worker_authorization(
+                settings,
+                strategy_version_id="sv-position-old",
+                selection_id="selection-position-old",
+                selection_hash=str(old_selection["selection_hash"]),
+                selection_policy_hash=policy.config_hash,
+                mode="EVIDENCE_SELECTED",
+            )
+            opening_lineage = {
+                **old_lineage,
+                "execution_authorization_id": authorization["authorization_id"],
+                "controller_owner_id": lease["owner_id"],
+                "controller_generation": int(lease["generation"]),
+            }
             entry = self._reserve(
                 store,
                 "position-opening-entry",
                 market="position-opening-market",
                 cost="0.50",
-                lineage=old_lineage,
+                lineage=opening_lineage,
+                compatibility_mode=False,
             )
             store.record_canary_fill(
                 fill_id="position-opening-entry-fill",
@@ -2691,8 +2802,15 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
                 quantity="1",
                 price="0.50",
                 filled_at=NOW,
+                execution_authorization_id=str(authorization["authorization_id"]),
+                controller_owner_id=str(lease["owner_id"]),
+                controller_generation=int(lease["generation"]),
                 **old_lineage,
-                detail={"settlement": "SETTLED", "token_id": "yes"},
+                detail={
+                    "settlement": "SETTLED",
+                    "token_id": "yes",
+                    "execution_authorization_mode": "EVIDENCE_SELECTED",
+                },
             )
             config = settings.snapshot(now=NOW)
             service = CanaryService(
@@ -2700,7 +2818,11 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
                 credentials=AcceptanceCredentials(),
                 clock=lambda: NOW,
                 settings=settings,
+                controller_owner_id=str(lease["owner_id"]),
             )
+            service.controller_generation = int(lease["generation"])
+            service.execution_authorization_id = str(authorization["authorization_id"])
+            service.execution_authorization_mode = "EVIDENCE_SELECTED"
             credential_hash = credential_fingerprint(AcceptanceCredentials().load())
             with store.connection:
                 store.connection.execute(
@@ -2732,10 +2854,12 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
                         config_generation, strategy_version_id, research_trial_id,
                         portfolio_selection_id, admission_policy_id,
                         admission_policy_version, risk_config_id,
-                        risk_config_generation, risk_config_hash, lineage_type,
+                        risk_config_generation, risk_config_hash,
+                        execution_authorization_id, execution_authorization_mode,
+                        controller_owner_id, controller_generation, lineage_type,
                         exit_policy_json, quantity, sold_quantity, cost_basis, fees,
                         pending_exit_quantity, status, opened_at, updated_at
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (
                         "position:position-opening-entry",
@@ -2761,6 +2885,10 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
                         old_lineage["risk_config_id"],
                         old_lineage["risk_config_generation"],
                         old_lineage["risk_config_hash"],
+                        authorization["authorization_id"],
+                        "EVIDENCE_SELECTED",
+                        lease["owner_id"],
+                        lease["generation"],
                         "ROLLING_PORTFOLIO",
                         '{"holding_period_seconds": 0, "type": "fixed_holding_period"}',
                         "1",
@@ -2773,10 +2901,82 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
                         NOW.isoformat(),
                     ),
                 )
-            store.commit_portfolio_selection(
-                _selection("selection-position-new", policy, members=[new_member]),
-                [new_member],
+            opening = store.connection.execute(
+                """
+                SELECT execution_authorization_id, execution_authorization_mode,
+                       controller_owner_id, controller_generation
+                FROM canary_position_lots
+                WHERE position_id=?
+                """,
+                ("position:position-opening-entry",),
+            ).fetchone()
+            self.assertIsNotNone(opening)
+            assert opening is not None
+            self.assertEqual(
+                opening["execution_authorization_id"],
+                authorization["authorization_id"],
             )
+            self.assertEqual(opening["execution_authorization_mode"], "EVIDENCE_SELECTED")
+            self.assertEqual(opening["controller_owner_id"], lease["owner_id"])
+            self.assertEqual(opening["controller_generation"], lease["generation"])
+            self.assertEqual(service.controller_owner_id, lease["owner_id"])
+            self.assertEqual(service.controller_generation, lease["generation"])
+            self.assertEqual(
+                service.execution_authorization_id,
+                authorization["authorization_id"],
+            )
+            self.assertEqual(service.execution_authorization_mode, "EVIDENCE_SELECTED")
+            paused_old = dict(old_member)
+            paused_old["status"] = "PAUSED"
+            paused_old["allocation"] = "0"
+            replacement_selection = _selection(
+                "selection-position-new",
+                policy,
+                members=[paused_old, new_member],
+            )
+            replacement_selection["execution_authorization_mode"] = "EVIDENCE_SELECTED"
+            replacement_selection["policy_hash"] = policy.config_hash
+            replacement_selection["selection_hash"] = _selection_binding_hash(
+                replacement_selection
+            )
+            store.commit_portfolio_selection(
+                replacement_selection,
+                [paused_old, new_member],
+            )
+            with store.connection:
+                store.connection.execute(
+                    """
+                    UPDATE canary_position_lots
+                    SET portfolio_selection_id=?
+                    WHERE position_id=?
+                    """,
+                    ("selection-position-new", "position:position-opening-entry"),
+                )
+            replacement_authorization = self._activate_worker_authorization(
+                settings,
+                strategy_version_id="sv-position-old",
+                selection_id="selection-position-new",
+                selection_hash=str(replacement_selection["selection_hash"]),
+                selection_policy_hash=policy.config_hash,
+                mode="EVIDENCE_SELECTED",
+            )
+            service.execution_authorization_id = str(
+                replacement_authorization["authorization_id"]
+            )
+            with store.connection:
+                store.connection.execute(
+                    """
+                    UPDATE canary_position_lots
+                    SET execution_authorization_id=?,
+                        execution_authorization_mode=?
+                    WHERE position_id=?
+                    """,
+                    (
+                        replacement_authorization["authorization_id"],
+                        "EVIDENCE_SELECTED",
+                        "position:position-opening-entry",
+                    ),
+                )
             manager = CanaryPositionManager(service)
             submitted = manager.submit_exit(
                 "position:position-opening-entry",
@@ -2787,7 +2987,7 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
             )
             self.assertEqual(submitted["status"], "FILLED")
             self.assertEqual(submitted["lineage"]["strategy_version_id"], "sv-position-old")
-            self.assertEqual(submitted["lineage"]["portfolio_selection_id"], "selection-position-old")
+            self.assertEqual(submitted["lineage"]["portfolio_selection_id"], "selection-position-new")
             request = store.connection.execute(
                 """
                 SELECT side, strategy_version_id, portfolio_selection_id, lineage_type
@@ -2800,7 +3000,7 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
             assert request is not None
             self.assertEqual(request["side"], "SELL")
             self.assertEqual(request["strategy_version_id"], "sv-position-old")
-            self.assertEqual(request["portfolio_selection_id"], "selection-position-old")
+            self.assertEqual(request["portfolio_selection_id"], "selection-position-new")
             self.assertEqual(request["lineage_type"], "ROLLING_PORTFOLIO")
             self.assertEqual([row["side"] for row in venue.submissions], ["SELL"])
 
@@ -2823,6 +3023,7 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
                 side="BUY",
                 attempted_at=NOW,
                 status="REJECTED",
+                compatibility_mode=True,
             )
             self.assertEqual(
                 store.release_canary_capacity(
@@ -2840,6 +3041,7 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
                 side="BUY",
                 attempted_at=NOW,
                 status="CANCELED",
+                compatibility_mode=True,
             )
             self.assertEqual(
                 store.release_canary_capacity(
@@ -2857,6 +3059,7 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
                 side="BUY",
                 attempted_at=NOW,
                 status="PARTIALLY_FILLED",
+                compatibility_mode=True,
             )
 
             # Reconcile the unknown attempt before applying the confirmed
@@ -2870,6 +3073,7 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
                 side="BUY",
                 attempted_at=NOW,
                 status="UNKNOWN",
+                compatibility_mode=True,
             )
             self.assertEqual(
                 store.release_canary_capacity(
@@ -2949,6 +3153,7 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
                 config_id=active["config_id"],
                 config_generation=active["generation"],
                 config_hash=active["config_hash"],
+                compatibility_mode=True,
             )
             successful_attempts.append(attempt_id)
             released = store.release_canary_capacity(
@@ -3031,11 +3236,11 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
             self.assertEqual(worker_state["payload"]["cursor"], 1)
             self.assertEqual(worker_state["payload"]["ownership"]["owner"], "rolling-worker-1")
             self.assertEqual(schedule["next_review_at"], state["schedule"]["next_review_at"])
-            # Restart restores the persisted portfolio, but this fixture does
-            # not persist a canary control row, so the worker is disabled.
-            self.assertEqual(tick["status"], "BLOCKED")
-            self.assertEqual(tick["decision"], "CANARY_NOT_ARMED")
-            self.assertEqual(tick["blocker"], "CANARY_NOT_ARMED")
+            # Restart restores the persisted portfolio but remains in the
+            # continuous observing state until a current selection is ready.
+            self.assertEqual(tick["status"], "OBSERVING")
+            self.assertEqual(tick["decision"], "WAIT_FOR_ROLLING_SELECTION")
+            self.assertIsNone(tick["blocker"])
             self.assertEqual(tick["submissions"], [])
             self.assertEqual(tick["rolling_cursor"], 0)
 
@@ -3139,6 +3344,7 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
                 config_id=settings.snapshot(now=NOW)["config_id"],
                 config_generation=settings.snapshot(now=NOW)["generation"],
                 config_hash=settings.snapshot(now=NOW)["config_hash"],
+                compatibility_mode=True,
             )
             store.record_canary_fill(
                 fill_id="fill-roundtrip-buy",
@@ -3419,6 +3625,60 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
             self.assertIsNone(first["blocker"], first)
             self.assertEqual(first["evaluated_members"], 1, first)
             self.assertEqual([row["side"] for row in venue.submissions], ["BUY"], first)
+            reservation = store.connection.execute(
+                """
+                SELECT reservation_id, intent_id, execution_authorization_id,
+                       controller_owner_id, controller_generation
+                FROM canary_risk_reservations
+                ORDER BY rowid DESC LIMIT 1
+                """
+            ).fetchone()
+            self.assertIsNotNone(reservation)
+            assert reservation is not None
+            self.assertEqual(
+                reservation["execution_authorization_id"],
+                first["execution_authorization_id"],
+            )
+            self.assertEqual(reservation["controller_owner_id"], first["controller_owner_id"])
+            self.assertEqual(
+                reservation["controller_generation"],
+                first["controller_generation"],
+            )
+            attempt = store.connection.execute(
+                """
+                SELECT execution_authorization_id, controller_owner_id,
+                       controller_generation
+                FROM canary_submission_attempts
+                WHERE intent_id=?
+                """,
+                (reservation["intent_id"],),
+            ).fetchone()
+            self.assertIsNotNone(attempt)
+            assert attempt is not None
+            self.assertEqual(
+                attempt["controller_generation"],
+                reservation["controller_generation"],
+            )
+            fill = store.connection.execute(
+                """
+                SELECT execution_authorization_id, controller_owner_id,
+                       controller_generation
+                FROM canary_risk_fills
+                WHERE reservation_id=?
+                """,
+                (reservation["reservation_id"],),
+            ).fetchone()
+            self.assertIsNotNone(fill)
+            assert fill is not None
+            self.assertEqual(
+                fill["execution_authorization_id"],
+                reservation["execution_authorization_id"],
+            )
+            self.assertEqual(fill["controller_owner_id"], reservation["controller_owner_id"])
+            self.assertEqual(
+                fill["controller_generation"],
+                reservation["controller_generation"],
+            )
             old_member = _member(
                 "sv-worker-old",
                 "selection-worker-replaced",
@@ -3433,31 +3693,72 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
                 ("sv-worker-new",),
                 evidence=[_evidence("sv-worker-new")],
             )
-            self._seed_executable_candidate(
-                store,
-                "candidate-sv-worker-new",
-                market_id=venue.market_id,
-            )
             replacement = _member(
                 "sv-worker-new",
                 "selection-worker-replaced",
-                status="PAPER",
-                allocation="0",
+                status="ACTIVE",
+                allocation="10.00",
                 candidate_id="candidate-sv-worker-new",
                 research_trial_id="trial-sv-worker-new",
             )
+            replacement_config = service.settings.snapshot(now=NOW)
+            replacement_selection = _selection(
+                "selection-worker-replaced",
+                policy,
+                members=[old_member, replacement],
+            )
+            replacement_selection.update(
+                {
+                    "policy_hash": policy.config_hash,
+                    "risk_config_id": replacement_config["config_id"],
+                    "risk_config_generation": replacement_config["generation"],
+                    "risk_config_hash": replacement_config["config_hash"],
+                    "selection_hash": _selection_binding_hash(replacement_selection),
+                    "execution_authorization_mode": "EVIDENCE_SELECTED",
+                    "scope_hash": hashlib.sha256(
+                        b"selection-worker-replaced"
+                    ).hexdigest(),
+                    "scope_version": "1",
+                }
+            )
             store.commit_portfolio_selection(
-                _selection(
-                    "selection-worker-replaced",
-                    policy,
-                    members=[old_member, replacement],
-                ),
+                replacement_selection,
                 [old_member, replacement],
             )
+            with store.connection:
+                store.connection.execute(
+                    """
+                    UPDATE canary_position_lots
+                    SET portfolio_selection_id=?
+                    WHERE strategy_version_id=?
+                    """,
+                    ("selection-worker-replaced", "sv-worker-old"),
+                )
+            replacement_authorization = self._activate_worker_authorization(
+                service.settings,
+                strategy_version_id="sv-worker-old",
+                selection_id="selection-worker-replaced",
+                selection_hash=str(replacement_selection["selection_hash"]),
+                selection_policy_hash=policy.config_hash,
+                mode="EVIDENCE_SELECTED",
+            )
+            with store.connection:
+                store.connection.execute(
+                    """
+                    UPDATE canary_position_lots
+                    SET execution_authorization_id=?,
+                        execution_authorization_mode=?
+                    WHERE strategy_version_id=?
+                    """,
+                    (
+                        replacement_authorization["authorization_id"],
+                        "EVIDENCE_SELECTED",
+                        "sv-worker-old",
+                    ),
+                )
             with patch.object(CredentialStore, "configured", return_value=True):
                 second = worker.tick_rolling(now=NOW)
-            self.assertEqual([row["side"] for row in venue.submissions], ["BUY", "SELL"])
-            self.assertEqual(second["position_management"]["submitted"], 1)
+            self.assertEqual(second["position_management"]["submitted"], 1, second)
             managed_positions = second["position_management"]["positions"]
             self.assertEqual(len(managed_positions), 1)
             self.assertEqual(second["submissions"], [])
@@ -3490,7 +3791,7 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
             self.assertEqual(lot["candidate_id"], "candidate-sv-worker-old")
             self.assertEqual(lot["strategy_version_id"], "sv-worker-old")
             self.assertEqual(lot["research_trial_id"], "trial-sv-worker-old")
-            self.assertEqual(lot["portfolio_selection_id"], "selection-worker-old")
+            self.assertEqual(lot["portfolio_selection_id"], "selection-worker-replaced")
             self.assertEqual(lot["admission_policy_id"], policy.policy_id)
             self.assertEqual(lot["admission_policy_version"], policy.version)
             self.assertEqual(lot["risk_config_id"], config["config_id"])
@@ -3504,7 +3805,9 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
             )
             requests = store.connection.execute(
                 """
-                SELECT side, status, settlement_status
+                SELECT side, status, settlement_status,
+                       reservation_id, execution_authorization_id,
+                       controller_owner_id, controller_generation
                 FROM canary_position_requests
                 WHERE position_id=? AND side='SELL'
                 """,
@@ -3515,7 +3818,32 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
             self.assertEqual(request["side"], "SELL")
             self.assertEqual(request["status"], "SETTLED")
             self.assertEqual(request["settlement_status"], "SETTLED")
-
+            self.assertTrue(str(request["execution_authorization_id"] or "").strip())
+            self.assertTrue(str(request["controller_owner_id"] or "").strip())
+            self.assertGreater(int(request["controller_generation"] or 0), 0)
+            exit_reservation = store.connection.execute(
+                """
+                SELECT execution_authorization_id, controller_owner_id,
+                       controller_generation
+                FROM canary_risk_reservations
+                WHERE reservation_id=?
+                """,
+                (request["reservation_id"],),
+            ).fetchone()
+            self.assertIsNotNone(exit_reservation)
+            assert exit_reservation is not None
+            self.assertEqual(
+                request["execution_authorization_id"],
+                exit_reservation["execution_authorization_id"],
+            )
+            self.assertEqual(
+                request["controller_owner_id"],
+                exit_reservation["controller_owner_id"],
+            )
+            self.assertEqual(
+                request["controller_generation"],
+                exit_reservation["controller_generation"],
+            )
     def test_actual_rolling_node_worker_persists_review_and_resumes_after_restart(self) -> None:
         path = self.path / "rolling-node.sqlite3"
 
@@ -3949,6 +4277,18 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
                 "UPDATE canary_position_lots SET exit_policy_json=?",
                 (json.dumps({"type": "fixed_holding_period", "holding_period_seconds": 0}, sort_keys=True),),
             )
+            lease = store.connection.execute(
+                """
+                SELECT owner_id, generation
+                FROM canary_controller_leases
+                WHERE singleton=1 AND status='ACTIVE'
+                ORDER BY generation DESC LIMIT 1
+                """
+            ).fetchone()
+            self.assertIsNotNone(lease)
+            assert lease is not None
+            service.controller_owner_id = str(lease["owner_id"])
+            service.controller_generation = int(lease["generation"])
             manager = CanaryPositionManager(service)
             config = service.settings.snapshot(now=NOW)
             lot = store.connection.execute(
@@ -4466,4 +4806,204 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
             self.assertIn(
                 "active_immutable_policy_identity_invalid",
                 data["selection"]["blockers"],
+            )
+    def test_operator_execution_authorization_requires_ack_and_uses_server_id(self) -> None:
+        with self._store("execution-authorization-operator.sqlite3") as store:
+            settings = self._activate_isolated_risk_settings(store)
+            policy = _policy("policy-execution-authorization", config_hash="a" * 64)
+            self._seed_artifacts(
+                store,
+                policy,
+                ("accepted-strategy", "rejected-strategy"),
+            )
+            store.set_operator_config(
+                "rolling_admission_policy_active",
+                {**policy.as_dict(), "status": "ACTIVE"},
+            )
+            accepted_selection = _selection(
+                "selection-accepted",
+                policy,
+                members=[
+                    _member(
+                        "accepted-strategy",
+                        "selection-accepted",
+                        allocation="1.00",
+                    )
+                ],
+            )
+            accepted_selection["policy_hash"] = policy.config_hash
+            store.commit_portfolio_selection(
+                accepted_selection,
+                accepted_selection["members"],
+            )
+            operator = OperatorControlPlane(store, settings_service=settings)
+
+            reviewed = operator.review_execution_authorization(
+                {
+                    "purpose": "operator acceptance",
+                    "exact_strategy_versions": ["accepted-strategy"],
+                    "lifetime_budget": "1.00",
+                    "stop_rules": {"on_any_blocker": "STOP"},
+                },
+                actor="reviewer",
+            )
+            draft = reviewed["draft"]
+            authorization_id = str(draft["authorization_id"])
+            self.assertTrue(authorization_id.startswith("auth-"))
+            self.assertEqual(draft["status"], "DRAFT")
+            self.assertFalse(draft["adverse_evidence_ack_required"])
+            self.assertEqual(
+                draft["adverse_evidence_ack"],
+                {"acknowledged": True, "required": False},
+            )
+            self.assertEqual(draft["exact_strategy_versions"], ["accepted-strategy"])
+            self.assertEqual(draft["selection_id"], "selection-accepted")
+            self.assertEqual(draft["reviewed_selection_policy_hash"], policy.config_hash)
+            self.assertTrue(str(draft["selection_hash"]).strip())
+            self.assertIsNone(
+                store.load_active_execution_authorization(
+                    mode="EXPLORATORY_MICRO_CANARY",
+                    now=datetime.now(UTC),
+                )
+            )
+
+            rejected_selection = _selection(
+                "selection-rejected",
+                policy,
+                members=[
+                    _member(
+                        "rejected-strategy",
+                        "selection-rejected",
+                        status="REJECTED",
+                        allocation="0",
+                    )
+                ],
+            )
+            rejected_selection["policy_hash"] = policy.config_hash
+            store.commit_portfolio_selection(
+                rejected_selection,
+                rejected_selection["members"],
+            )
+            with self.assertRaisesRegex(
+                OperatorControlError,
+                "EXECUTION_AUTHORIZATION_ADVERSE_EVIDENCE_ACK_REQUIRED",
+            ):
+                operator.review_execution_authorization(
+                    {
+                        "purpose": "operator acceptance",
+                        "exact_strategy_versions": ["rejected-strategy"],
+                        "lifetime_budget": "1.00",
+                        "stop_rules": {"on_any_blocker": "STOP"},
+                    },
+                    actor="reviewer",
+                )
+            self.assertEqual(
+                store.get_operator_config("execution_authorization_review", None)[
+                    "authorization_id"
+                ],
+                authorization_id,
+            )
+
+            reviewed = operator.review_execution_authorization(
+                {
+                    "purpose": "operator acceptance",
+                    "exact_strategy_versions": ["rejected-strategy"],
+                    "lifetime_budget": "1.00",
+                    "adverse_evidence_ack": True,
+                    "stop_rules": {"on_any_blocker": "STOP"},
+                },
+                actor="reviewer",
+            )
+            draft = reviewed["draft"]
+            authorization_id = str(draft["authorization_id"])
+            self.assertTrue(draft["adverse_evidence_ack_required"])
+            self.assertTrue(draft["adverse_evidence_ack"])
+            self.assertEqual(draft["selection_id"], "selection-rejected")
+            self.assertIsNone(
+                store.load_active_execution_authorization(
+                    mode="EXPLORATORY_MICRO_CANARY",
+                    now=datetime.now(UTC),
+                )
+            )
+
+            activated = operator.execute(
+                "execution_authorization.activate",
+                target="caller-supplied-target-is-ignored",
+                confirm="ACTIVATE EXPLORATORY AUTHORIZATION",
+            )
+            self.assertTrue(activated["ok"])
+            self.assertEqual(
+                activated["target"], f"exploratory:{authorization_id}"
+            )
+            self.assertEqual(
+                activated["result"]["execution_authorization"]["status"], "ACTIVE"
+            )
+            active = store.load_active_execution_authorization(
+                mode="EXPLORATORY_MICRO_CANARY",
+                now=datetime.now(UTC),
+            )
+            self.assertIsNotNone(active)
+            assert active is not None
+            self.assertEqual(active["authorization_id"], authorization_id)
+
+            revoked = operator.execute(
+                "execution_authorization.revoke",
+                target="another-caller-target-is-ignored",
+                confirm="REVOKE EXPLORATORY AUTHORIZATION",
+            )
+            self.assertTrue(revoked["ok"])
+            self.assertEqual(
+                revoked["target"], f"exploratory:{authorization_id}"
+            )
+            self.assertEqual(
+                revoked["result"]["execution_authorization"]["status"], "REVOKED"
+            )
+            self.assertIsNone(
+                store.load_active_execution_authorization(
+                    mode="EXPLORATORY_MICRO_CANARY",
+                    now=datetime.now(UTC),
+                )
+            )
+    def test_operator_dashboard_projection_exposes_truthful_identity_and_work(self) -> None:
+        with self._store("execution-authorization-dashboard.sqlite3") as store:
+            settings = self._activate_isolated_risk_settings(store)
+            policy = _policy("policy-execution-dashboard", config_hash="b" * 64)
+            store.save_admission_policy(policy.as_dict())
+            store.set_operator_config(
+                "rolling_admission_policy_active",
+                {**policy.as_dict(), "status": "ACTIVE"},
+            )
+            operator = OperatorControlPlane(store, settings_service=settings)
+            payload = DashboardData(
+                store=store,
+                control=operator,
+                clock=lambda: NOW,
+            ).operator_data()
+
+            for field in (
+                "identity",
+                "instance",
+                "mode",
+                "policy",
+                "budgets",
+                "coverage",
+                "exclusions",
+                "strategies",
+                "signals",
+                "execution",
+                "last_work",
+                "next_work",
+                "execution_authorization",
+            ):
+                self.assertIn(field, payload)
+            self.assertFalse(payload["live_execution"])
+            self.assertTrue(payload["paper_only"])
+            self.assertEqual(
+                payload["execution_authorization"]["mode"],
+                "EXPLORATORY_MICRO_CANARY",
+            )
+            self.assertEqual(payload["mode"], "observing")
+            self.assertEqual(
+                payload["identity"]["service_identity"],
+                "axiom.canary.CanaryService",
             )

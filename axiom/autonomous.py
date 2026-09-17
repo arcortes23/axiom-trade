@@ -5194,6 +5194,14 @@ class AutonomousResearchProcessor:
             document = definition.to_dict()
             document.pop("strategy_id", None)
             strategy_hash = _rolling_hash(document)
+            document["holding_period"] = holding_period
+            document["exit_policy"] = {**dict(exit_value), "holding_period": holding_period}
+            document["observation_horizon"] = {
+                "unit": "observations",
+                "count": holding_period,
+                "semantics": "per_market_observation_count",
+            }
+            document["selection_excluded"] = definition.id == "probability_mispricing"
             config_hash = source_value(lifecycle_payload, "config_hash", "source_config_hash")
             computed_strategy_version_id = "strategy-version-" + _rolling_hash(
                 {"strategy_hash": strategy_hash, "candidate_id": candidate}
@@ -5239,6 +5247,14 @@ class AutonomousResearchProcessor:
             origin = _rolling_provenance_bound(origin)
             return {
                 "strategy_document": document,
+                "holding_period": holding_period,
+                "exit_policy": {**dict(exit_value), "holding_period": holding_period},
+                "observation_horizon": {
+                    "unit": "observations",
+                    "count": holding_period,
+                    "semantics": "per_market_observation_count",
+                },
+                "selection_excluded": definition.id == "probability_mispricing",
                 "model_document": model_document,
                 "plan_id": _binding_value(origin.get("plan_id")),
                 "model_hash": _binding_value(origin.get("model_hash")),
@@ -5599,6 +5615,15 @@ class AutonomousResearchProcessor:
                 "config_hash": str(item.get("config_hash", strategy_hash)),
                 "created_at": now.isoformat(),
                 "strategy_document": document,
+                "holding_period": item.get("holding_period", document.get("holding_period")),
+                "exit_policy": item.get("exit_policy", document.get("exit_policy")),
+                "observation_horizon": item.get(
+                    "observation_horizon",
+                    document.get("observation_horizon"),
+                ),
+                "selection_excluded": bool(
+                    item.get("selection_excluded", document.get("selection_excluded", False))
+                ),
                 "model_document": model_document,
                 "canonical_strategy": document,
                 "enrollment_mode": enrollment_mode,
@@ -5620,6 +5645,15 @@ class AutonomousResearchProcessor:
                 }
                 trial_id = "research-trial-" + _rolling_hash(trial_identity).removeprefix("sha256:")[:40]
             trial = {
+                "holding_period": item.get("holding_period", document.get("holding_period")),
+                "exit_policy": item.get("exit_policy", document.get("exit_policy")),
+                "observation_horizon": item.get(
+                    "observation_horizon",
+                    document.get("observation_horizon"),
+                ),
+                "selection_excluded": bool(
+                    item.get("selection_excluded", document.get("selection_excluded", False))
+                ),
                 "research_trial_id": trial_id,
                 "trial_id": trial_id,
                 "strategy_version_id": strategy_version_id,
@@ -7887,6 +7921,62 @@ class AutonomousResearchProcessor:
         requested_source = _rolling_source_name(source_class)
         if requested_source not in {"HISTORICAL", "REPLAY", "LIVE"}:
             return None
+        strategy_document = strategy.get("strategy_document", strategy.get("canonical_strategy"))
+        declared_holding = strategy.get("holding_period")
+        if declared_holding is None and isinstance(strategy_document, Mapping):
+            declared_holding = strategy_document.get("holding_period")
+        try:
+            holding_period = int(declared_holding or 1)
+        except (TypeError, ValueError, OverflowError):
+            holding_period = 1
+        if isinstance(declared_holding, bool) or holding_period < 1:
+            holding_period = 1
+        declared_exit = strategy.get("exit_policy")
+        if declared_exit is None and isinstance(strategy_document, Mapping):
+            declared_exit = strategy_document.get("exit_policy")
+        if isinstance(declared_exit, Mapping):
+            exit_policy: Mapping[str, Any] | str = {
+                **dict(declared_exit),
+                "type": str(
+                    declared_exit.get(
+                        "type",
+                        declared_exit.get("kind", "fixed_holding_period"),
+                    )
+                ),
+                "holding_period": holding_period,
+            }
+        else:
+            exit_policy = str(declared_exit or "fixed_holding_period")
+        observation_horizon = strategy.get("observation_horizon")
+        if observation_horizon is None and isinstance(strategy_document, Mapping):
+            observation_horizon = strategy_document.get("observation_horizon")
+        if not isinstance(observation_horizon, Mapping):
+            observation_horizon = {
+                "unit": "observations",
+                "count": holding_period,
+                "semantics": "per_market_observation_count",
+            }
+        else:
+            observation_horizon = {
+                **dict(observation_horizon),
+                "unit": str(observation_horizon.get("unit", "observations")),
+                "count": int(observation_horizon.get("count", holding_period)),
+                "semantics": str(
+                    observation_horizon.get(
+                        "semantics",
+                        "per_market_observation_count",
+                    )
+                ),
+            }
+        selection_excluded = bool(
+            strategy.get(
+                "selection_excluded",
+                isinstance(strategy_document, Mapping)
+                and strategy_document.get("selection_excluded", False),
+            )
+        ) or str(
+            strategy.get("strategy_id", strategy_document.get("family", "") if isinstance(strategy_document, Mapping) else "")
+        ).strip().lower() == "probability_mispricing"
 
         def view_of(row: Mapping[str, Any]) -> dict[str, Any]:
             return _rolling_snapshot_view(row)
@@ -8083,6 +8173,10 @@ class AutonomousResearchProcessor:
                 "evaluation_kind": "CANONICAL_SIMULATION",
                 "evaluation_run_id": run_identity(material),
                 "source_digest": source_digest,
+                "holding_period": holding_period,
+                "exit_policy": exit_policy,
+                "observation_horizon": observation_horizon,
+                "selection_excluded": selection_excluded,
                 "loaded_rows": len(rows),
                 "valid_input_rows": len(valid_rows),
                 "evaluator_invoked": False,
@@ -8136,8 +8230,9 @@ class AutonomousResearchProcessor:
                 definition,
                 mode=mode,
                 model_document=model_document if isinstance(model_document, Mapping) else None,
-                holding_period=int(strategy.get("holding_period", 1) or 1),
-                exit_policy=strategy.get("exit_policy", "fixed_holding_period"),
+                holding_period=holding_period,
+                observation_horizon=observation_horizon,
+                exit_policy=exit_policy,
             )
         except Exception as exc:
             error = str(exc) or type(exc).__name__
@@ -8193,6 +8288,10 @@ class AutonomousResearchProcessor:
                 "evaluation": evaluation,
             }
             return {
+                "holding_period": holding_period,
+                "exit_policy": exit_policy,
+                "observation_horizon": observation_horizon,
+                "selection_excluded": selection_excluded,
                 "evaluation_version": "rolling-evaluation:v2:diagnostic",
                 "evaluation_kind": "CANONICAL_SIMULATION",
                 "evaluation_run_id": run_identity(material),
@@ -8466,6 +8565,10 @@ class AutonomousResearchProcessor:
             "evaluation_kind": "CANONICAL_SIMULATION",
             "evaluation_run_id": evaluation_run_id,
             "source_digest": source_digest,
+            "holding_period": holding_period,
+            "exit_policy": exit_policy,
+            "observation_horizon": observation_horizon,
+            "selection_excluded": selection_excluded,
             "loaded_rows": len(rows),
             "valid_input_rows": len(valid_rows),
             "evaluator_invoked": evaluation["evaluator_invoked"],
@@ -9488,8 +9591,50 @@ class AutonomousResearchProcessor:
                 )
         evaluation_map["operational_evidence"] = dict(operational_evidence)
         canonical_evaluation["operational_evidence"] = dict(operational_evidence)
+        declared_holding = evaluation_map.get(
+            "holding_period",
+            strategy.get("holding_period"),
+        )
+        if declared_holding is None:
+            document = strategy.get("strategy_document", strategy.get("canonical_strategy"))
+            if isinstance(document, Mapping):
+                declared_holding = document.get("holding_period")
+        try:
+            evidence_holding_period = int(declared_holding or 1)
+        except (TypeError, ValueError, OverflowError):
+            evidence_holding_period = 1
+        if isinstance(declared_holding, bool) or evidence_holding_period < 1:
+            evidence_holding_period = 1
+        evidence_exit_policy = evaluation_map.get("exit_policy", strategy.get("exit_policy"))
+        evidence_horizon = evaluation_map.get(
+            "observation_horizon",
+            strategy.get("observation_horizon"),
+        )
+        if not isinstance(evidence_horizon, Mapping):
+            evidence_horizon = {
+                "unit": "observations",
+                "count": evidence_holding_period,
+                "semantics": "per_market_observation_count",
+            }
+        observation_gap_seconds = max(
+            (
+                Decimal(str((later - earlier).total_seconds()))
+                for earlier, later in zip(sorted(valid_times), sorted(valid_times)[1:])
+            ),
+            default=Decimal("0"),
+        )
         record = {
             "strategy_version_id": strategy["strategy_version_id"],
+            "holding_period": evidence_holding_period,
+            "exit_policy": evidence_exit_policy,
+            "observation_horizon": dict(evidence_horizon),
+            "selection_excluded": bool(
+                evaluation_map.get(
+                    "selection_excluded",
+                    strategy.get("selection_excluded", False),
+                )
+            ),
+            "observation_gap_seconds": str(observation_gap_seconds),
             "candidate_id": candidate_id,
             "research_trial_id": trial_id,
             "evidence_window_id": window_id,
@@ -10299,7 +10444,7 @@ class AutonomousResearchProcessor:
             )
         )
         state = _rolling_state_payload(
-            status="SCHEDULED" if pending else "READY",
+            status="SCHEDULED",
             scheduled_at=current.isoformat(),
             queue_item_id=queue_item.item_id,
             queue_status=queue_item.status.value,
@@ -10361,6 +10506,44 @@ class AutonomousResearchProcessor:
                 "completed_outcomes",
             )
         }
+        state["operating_state"] = "observing"
+        state["next_work"] = "refresh_rolling_evidence"
+        state["next_portfolio_review_at"] = (
+            current + timedelta(days=1)
+        ).isoformat()
+        latest_evaluation = max(
+            (
+                item
+                for item in evidence_rows
+                if item.get("evaluation_run_id")
+            ),
+            key=lambda item: str(item.get("measured_at", "")),
+            default=None,
+        )
+        state["last_successful_evaluation"] = (
+            {
+                "evaluation_run_id": latest_evaluation.get("evaluation_run_id"),
+                "strategy_version_id": latest_evaluation.get("strategy_version_id"),
+                "measured_at": latest_evaluation.get("measured_at"),
+            }
+            if latest_evaluation is not None
+            else None
+        )
+        state["evaluation_counts"] = {
+            "attempted": attempted,
+            "successful": len(evidence_rows),
+            "pending": pending_total,
+        }
+        state["no_entry_reason"] = (
+            {
+                "category": "EVIDENCE",
+                "reason": "NO_QUALIFYING_SELECTION",
+                "resolver": "refresh_rolling_evidence",
+                "next_scheduled_action": "refresh_rolling_evidence",
+            }
+            if not evidence_rows or not any(item.get("admitted") is True for item in evidence_rows)
+            else None
+        )
         blocker_lister = getattr(self.store, "list_rolling_evidence_blockers", None)
         try:
             blockers = (
@@ -10381,7 +10564,7 @@ class AutonomousResearchProcessor:
         state = _rolling_bound_operator_state(state)
         setter = getattr(self.store, "set_operator_job", None)
         if callable(setter):
-            setter("rolling-research-evidence", "SCHEDULED" if pending else "COMPLETED", state, resumable=True)
+            setter("rolling-research-evidence", "SCHEDULED", state, resumable=True)
         return state
 
     def _rolling_risk_binding(self, policy: RollingAdmissionPolicy) -> dict[str, Any]:
@@ -13253,7 +13436,12 @@ class AutonomousResearchProcessor:
                 reason=str(result.get("reason", "insufficient observations")),
             )
         elif classification == "SOFTWARE_OR_INPUT_ERROR":
+            # A software/input fault is not a data-readiness condition.  Do
+            # not enqueue a prerequisite job that cannot repair the same
+            # malformed input; surface a durable operator-review terminal.
             payload["status"] = "SOFTWARE_OR_INPUT_ERROR"
+            payload["terminal"] = True
+            payload["retry_scheduled"] = False
             payload["next_real_job"] = None
         else:
             payload["status"] = "RUNNING"
@@ -13266,7 +13454,19 @@ class AutonomousResearchProcessor:
             if queued_next is None:
                 self._campaign_final_assessment(payload, now=now)
         if classification in {"DATA_INSUFFICIENT", "SOFTWARE_OR_INPUT_ERROR"}:
-            self.store.set_operator_job(job_name, payload["status"], payload, resumable=True, timestamp=now)
+            payload["next_work"] = payload.get("next_real_job")
+            payload["next_scheduled_action"] = (
+                "run_campaign_retry"
+                if payload.get("next_real_job")
+                else "operator_review_terminal_error"
+            )
+            self.store.set_operator_job(
+                job_name,
+                payload["status"],
+                payload,
+                resumable=bool(payload.get("next_real_job")),
+                timestamp=now,
+            )
         elif payload.get("status") in {"CAMPAIGN_EXHAUSTED_NO_QUALIFIED_STRATEGY", "COMPLETED_QUALIFIED"}:
             self.store.set_operator_job(job_name, payload["status"], payload, resumable=False, timestamp=now)
 

@@ -2176,7 +2176,7 @@ class ResearchNode:
                     successful_candidates=result.get("candidate_id"),
                     successful_markets=result.get("market_ids", result.get("markets")),
                     decision=str(result.get("decision") or "WAIT_FOR_NEXT_DECISION"),
-                    next_work=result.get("next_work"),
+                    next_work=result.get("next_work") or "refresh_rolling_evidence",
                     error=(
                         result_blocker
                         or str(result.get("error_type") or "")
@@ -2185,8 +2185,10 @@ class ResearchNode:
                     ),
                     extra={
                         "candidate_id": result.get("candidate_id"),
-                        "signal_id": result.get("signal_id"),
                         "decision": result.get("decision"),
+                        "operating_state": result.get("operating_state"),
+                        "next_work": result.get("next_work") or "refresh_rolling_evidence",
+                        "no_entry_reason": result.get("no_entry_reason"),
                     },
                 )
                 self._save_autonomous_worker_state(

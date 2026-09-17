@@ -22,7 +22,12 @@ from .domain import ensure_utc, utc_now
 from .ranker import CandidateCanaryRanker
 from .lifecycle import _canonical_scope_gate_error
 from .storage import AxiomStore
-from .canary_positions import reconcile_pending, manage_positions, _ensure_schema
+from .canary_positions import (
+    reconcile_pending,
+    manage_positions,
+    _ensure_schema,
+    _sync_entry_lots,
+)
 class AutonomousCanaryWorker:
     """Run one serialized rank/signal/submit decision at a bounded cadence."""
     _SUBMISSION_SUCCESS_STATUSES = frozenset(
@@ -53,12 +58,102 @@ class AutonomousCanaryWorker:
         self._decision_lock = threading.Lock()
         self._consecutive_failures = 0
         self._next_retry_at: datetime | None = None
+        self.controller_owner_id = (
+            f"autonomous-canary:{uuid.uuid4().hex[:20]}"
+        )
+        self._controller_lease: Mapping[str, Any] | None = None
         self._unknown_signal_ids: set[str] = set()
         self._rolling_cursor: dict[str, int] = {}
         self._rolling_overlap_cursor: dict[str, tuple[str, str]] = {}
         self._last_scan_skip_reasons: dict[str, int] = {
             reason: 0 for reason in self._SCAN_SKIP_REASONS
         }
+    def _acquire_controller_lease(self, timestamp: datetime) -> Mapping[str, Any] | None:
+        acquire = getattr(self.store, "acquire_canary_controller_lease", None)
+        if not callable(acquire):
+            return None
+        # A worker that is still running owns the same generation across
+        # decision windows.  Renew it before attempting a fresh acquisition;
+        # otherwise every direct tick would race itself and lose authority.
+        if isinstance(self._controller_lease, Mapping):
+            renewed = self._renew_controller_lease(timestamp)
+            if renewed is not None:
+                return renewed
+            self._controller_lease = None
+        try:
+            lease = acquire(
+                owner_id=self.controller_owner_id,
+                lease_seconds=max(60, int(self.interval_seconds * 2)),
+                now=timestamp,
+            )
+        except (TypeError, ValueError, RuntimeError):
+            return None
+        if not isinstance(lease, Mapping):
+            return None
+        owner = str(lease.get("owner_id") or "").strip()
+        generation = lease.get("generation")
+        if owner != self.controller_owner_id or generation in (None, ""):
+            return None
+        self._controller_lease = dict(lease)
+        return self._controller_lease
+
+    def _renew_controller_lease(self, timestamp: datetime) -> Mapping[str, Any] | None:
+        lease = self._controller_lease
+        renew = getattr(self.store, "renew_canary_controller_lease", None)
+        if not callable(renew) or not isinstance(lease, Mapping):
+            return lease if isinstance(lease, Mapping) else None
+        try:
+            renewed = renew(
+                owner_id=self.controller_owner_id,
+                generation=lease.get("generation"),
+                lease_seconds=max(60, int(self.interval_seconds * 2)),
+                now=timestamp,
+            )
+        except (TypeError, ValueError, RuntimeError):
+            return None
+        if not isinstance(renewed, Mapping):
+            return None
+        self._controller_lease = dict(renewed)
+        return self._controller_lease
+
+    def _release_controller_lease(
+        self,
+        timestamp: datetime,
+        *,
+        reason: str = "worker_stop",
+    ) -> None:
+        lease = self._controller_lease
+        release = getattr(self.store, "release_canary_controller_lease", None)
+        if callable(release) and isinstance(lease, Mapping):
+            try:
+                release(
+                    owner_id=self.controller_owner_id,
+                    generation=lease.get("generation"),
+                    now=timestamp,
+                    reason=reason,
+                )
+            except (TypeError, ValueError, RuntimeError):
+                pass
+        self._controller_lease = None
+
+    @staticmethod
+    def _rolling_execution_mode(selection: Mapping[str, Any]) -> str:
+        """Resolve the persisted execution policy without broadening authority."""
+        candidates = (
+            selection.get("execution_authorization_mode"),
+            selection.get("authorization_mode"),
+            selection.get("execution_mode"),
+            selection.get("execution_policy"),
+            selection.get("policy_mode"),
+        )
+        raw: Any = next((value for value in candidates if value not in (None, "")), None)
+        if isinstance(raw, Mapping):
+            raw = raw.get("mode") or raw.get("name") or raw.get("type")
+        mode = str(raw or "EVIDENCE_SELECTED").strip().upper()
+        if mode in {"EXPLORATORY", "EXPLORATORY_MICRO_CANARY", "MICRO_CANARY"}:
+            return "EXPLORATORY_MICRO_CANARY"
+        return "EVIDENCE_SELECTED"
+
 
     @staticmethod
     def _position_obligations(service: CanaryService) -> bool:
@@ -987,12 +1082,31 @@ class AutonomousCanaryWorker:
         scan_payload_fn: Callable[[], dict[str, Any]] | None = None
         try:
             service = CanaryService(self.store, clock=self.clock)
+            # Position tables are part of the worker's durable startup
+            # contract.  Initialize them before checking control state so a
+            # disarmed worker can reconstruct inventory without constructing a
+            # venue or attempting an exit.
+            _ensure_schema(service)
             self._record_start(service, timestamp)
+            control = service.authoritative_status()
+            control_state = str(control.get("micro_live_canary") or "").upper()
+            controller_lease = self._acquire_controller_lease(timestamp)
+            if isinstance(controller_lease, Mapping):
+                generation = controller_lease.get("generation")
+                setattr(service, "controller_owner_id", self.controller_owner_id)
+                setattr(service, "controller_lease_generation", generation)
+                setattr(service, "controller_generation", generation)
+            if control_state == "DISARMED":
+                # Rebuild the durable ownership projection from confirmed
+                # ledger/risk fills while disarmed.  This is deliberately
+                # venue-free: no network read or exit submission is allowed
+                # until the operator arms the worker again.
+                _sync_entry_lots(service, timestamp)
             position_venue: Any | None = None
-            # Position reconciliation is read-only when disarmed/killed, but
-            # there is no reason to construct a credentialed venue for a tick
-            # with no durable position/order obligations.
-            if self._position_obligations(service):
+            # A disarmed worker must not construct a venue or invoke any sink.
+            # Durable position obligations remain visible, but are resumed only
+            # after the operator arms the controller again.
+            if control_state != "DISARMED" and self._position_obligations(service):
                 try:
                     service.require_current_credential_binding()
                 except CanaryBlocked as exc:
@@ -1348,7 +1462,6 @@ class AutonomousCanaryWorker:
                     "ranking": ranking,
                 }
 
-            control = service.authoritative_status()
             if control.get("micro_live_canary") == "KILLED":
                 finish(
                     next_decision="KILL_LATCHED",
@@ -1791,7 +1904,6 @@ class AutonomousCanaryWorker:
                         service,
                         timestamp=timestamp,
                         next_decision="WORKER_ERROR_REVIEW_REQUIRED",
-                        blocker="AUTONOMOUS_WORKER_EXCEPTION",
                         worker_status="DEGRADED",
                         candidates_evaluated=candidates_evaluated,
                         signals_generated=signals_generated,
@@ -1816,6 +1928,9 @@ class AutonomousCanaryWorker:
                 "ranking": ranking,
             }
         finally:
+            # ``run`` owns the lease for the life of the worker.  Keep it
+            # across legacy decision windows so the next tick renews the same
+            # generation; the run-level finally releases it on shutdown.
             self._decision_lock.release()
 
     @staticmethod
@@ -1831,11 +1946,22 @@ class AutonomousCanaryWorker:
         evidence_digest = str(member.get("evidence_digest") or "").strip()
         if not strategy_version_id or not research_trial_id or not candidate_id:
             raise CanaryBlocked("ROLLING_LINEAGE_INCOMPLETE")
+        position_state = member.get("position_management_state")
+        position_state = position_state if isinstance(position_state, Mapping) else {}
         context: dict[str, Any] = {
             "lineage_type": "ROLLING_PORTFOLIO",
             "strategy_version_id": strategy_version_id,
             "research_trial_id": research_trial_id,
             "candidate_id": candidate_id,
+            "holding_period": member.get("holding_period", position_state.get("holding_period")),
+            "exit_policy": member.get("exit_policy", position_state.get("exit_policy")),
+            "observation_horizon": member.get(
+                "observation_horizon",
+                position_state.get("observation_horizon"),
+            ),
+            "selection_excluded": bool(
+                member.get("selection_excluded", position_state.get("selection_excluded", False))
+            ),
             "allocation": member.get("allocation"),
             "evidence_window_id": evidence_window_id,
             "evidence_digest": evidence_digest,
@@ -1918,7 +2044,20 @@ class AutonomousCanaryWorker:
         if not isinstance(raw_members, (list, tuple)):
             return []
         active: list[Mapping[str, Any]] = []
-        for raw in raw_members[:10]:
+        policy_config = selection.get("policy_config")
+        policy_config = policy_config if isinstance(policy_config, Mapping) else {}
+        try:
+            member_limit = int(
+                policy_config.get(
+                    "max_members",
+                    policy_config.get("max_k", selection.get("max_members", 10)),
+                )
+                or 10
+            )
+        except (TypeError, ValueError, OverflowError):
+            member_limit = 10
+        member_limit = max(1, min(member_limit, 64))
+        for raw in raw_members[:member_limit]:
             if not isinstance(raw, Mapping):
                 continue
             try:
@@ -2213,13 +2352,26 @@ class AutonomousCanaryWorker:
         position_reconciliation: Mapping[str, Any] = {}
         position_management: Mapping[str, Any] = {}
         position_blocker: str | None = None
-        evaluated: list[dict[str, Any]] = []
-        ready: list[tuple[Mapping[str, Any], Mapping[str, Any], dict[str, Any]]] = []
-        submissions: list[dict[str, Any]] = []
         global_blocker: str | None = None
         selection_blocker: str | None = None
+        evaluated: list[dict[str, Any]] = []
+        submissions: list[dict[str, Any]] = []
+        ready: list[tuple[Mapping[str, Any], Mapping[str, Any], dict[str, Any]]] = []
+        controller_lease: Mapping[str, Any] | None = None
+        lease_required = callable(
+            getattr(self.store, "acquire_canary_controller_lease", None)
+        )
         try:
             service = CanaryService(self.store, clock=self.clock)
+            # Initialize durable position tables even while disarmed.  This
+            # is schema-only and must not construct a venue or submit exits.
+            _ensure_schema(service)
+            setattr(service, "controller_owner_id", self.controller_owner_id)
+            controller_lease = self._acquire_controller_lease(timestamp)
+            if isinstance(controller_lease, Mapping):
+                generation = controller_lease.get("generation")
+                setattr(service, "controller_lease_generation", generation)
+                setattr(service, "controller_generation", generation)
             selection_error_type: str | None = None
             selection_missing = False
             try:
@@ -2234,6 +2386,11 @@ class AutonomousCanaryWorker:
                 selection_missing = True
                 selection_blocker = "ROLLING_SELECTION_MISSING"
             active = self._rolling_active_members(selection)
+            execution_mode = self._rolling_execution_mode(selection)
+            exploratory_authorization_required = (
+                execution_mode == "EXPLORATORY_MICRO_CANARY"
+            )
+            setattr(service, "execution_authorization_mode", execution_mode)
             selection_id = str(
                 selection.get("portfolio_selection_id")
                 or selection.get("selection_id")
@@ -2293,7 +2450,26 @@ class AutonomousCanaryWorker:
                 except Exception:
                     pass
 
-            if self._position_obligations(service):
+            control = service.authoritative_status()
+            control_state = str(control.get("micro_live_canary") or "").upper()
+            enabled = control_state == AUTONOMOUS_MICRO_LIVE
+            control_blocker = (
+                "CANARY_KILLED"
+                if control_state == "KILLED"
+                else "ENTRY_PAUSED"
+                if control_state in {"ENTRY_PAUSED", "PAUSED"}
+                else "CANARY_NOT_ARMED"
+                if control_state != AUTONOMOUS_MICRO_LIVE
+                else None
+            )
+            lease_blocker = (
+                "CONTROLLER_LEASE_UNAVAILABLE"
+                if lease_required and controller_lease is None
+                else None
+            )
+            if control_state == "DISARMED":
+                _sync_entry_lots(service, timestamp)
+            if control_state != "DISARMED" and self._position_obligations(service):
                 try:
                     service.require_current_credential_binding()
                     venue_for_positions = self.venue_factory()
@@ -2342,49 +2518,46 @@ class AutonomousCanaryWorker:
                     "blocked": [],
                     "positions": [],
                 }
-            control = service.authoritative_status()
-            control_state = str(control.get("micro_live_canary") or "").upper()
-            enabled = control_state == AUTONOMOUS_MICRO_LIVE
-            control_blocker = (
-                "CANARY_KILLED"
-                if control_state == "KILLED"
-                else "ENTRY_PAUSED"
-                if control_state in {"ENTRY_PAUSED", "PAUSED"}
-                else "CANARY_NOT_ARMED"
-                if control_state != AUTONOMOUS_MICRO_LIVE
-                else None
-            )
-            if selection_blocker is not None and control_state == AUTONOMOUS_MICRO_LIVE:
-                # No current funded selection authorizes entries.  Reconcile
-                # and manage obligations first, then pause the live entry
-                # control without weakening DISARMED/KILLED precedence.
-                try:
-                    with self.store._lock, self.store.connection:
-                        row = self.store.connection.execute(
-                            "SELECT control_generation,state FROM canary_control "
-                            "WHERE singleton=1"
-                        ).fetchone()
-                        if (
-                            row is not None
-                            and str(row["state"] or "").upper()
-                            == AUTONOMOUS_MICRO_LIVE
-                        ):
-                            try:
-                                generation = int(row["control_generation"] or 0)
-                            except (TypeError, ValueError, OverflowError):
-                                generation = 0
-                            self.store.connection.execute(
-                                "UPDATE canary_control SET state='ENTRY_PAUSED',"
-                                "candidate_id=NULL,control_generation=?,updated_at=? "
-                                "WHERE singleton=1 AND state=?",
-                                (
-                                    max(1, generation + 1),
-                                    timestamp.isoformat(),
-                                    AUTONOMOUS_MICRO_LIVE,
-                                ),
-                            )
-                except Exception:
-                    pass
+            execution_authorization: Mapping[str, Any] | None = None
+            authorization_blocker: str | None = None
+            if enabled and active:
+                authorization_loader = getattr(
+                    getattr(service, "settings", None),
+                    "load_active_execution_authorization",
+                    None,
+                )
+                authorization_requirement = (
+                    "EXPLORATORY_AUTHORIZATION_REQUIRED"
+                    if exploratory_authorization_required
+                    else "EXECUTION_AUTHORIZATION_REQUIRED"
+                )
+                if not callable(authorization_loader):
+                    authorization_blocker = authorization_requirement
+                else:
+                    try:
+                        execution_authorization = authorization_loader(
+                            mode=execution_mode,
+                            purpose=selection.get("authorization_purpose"),
+                            now=timestamp,
+                            scope_hash=selection.get("scope_hash")
+                            or selection.get("market_scope_hash"),
+                            scope_version=selection.get("scope_version")
+                            or selection.get("market_scope_version"),
+                            selection_id=selection_id or None,
+                            selection_hash=selection.get("selection_hash"),
+                        )
+                    except (TypeError, ValueError, RuntimeError):
+                        execution_authorization = None
+                    if not isinstance(execution_authorization, Mapping):
+                        authorization_blocker = authorization_requirement
+                if isinstance(execution_authorization, Mapping):
+                    auth_id = (
+                        execution_authorization.get("authorization_id")
+                        or execution_authorization.get("id")
+                    )
+                    auth_generation = execution_authorization.get("generation")
+                    setattr(service, "execution_authorization_id", auth_id)
+                    setattr(service, "execution_authorization_generation", auth_generation)
             cycle_id = f"rolling-{uuid.uuid4().hex[:24]}"
             members_to_evaluate = (
                 ordered
@@ -2403,6 +2576,25 @@ class AutonomousCanaryWorker:
                 }
                 try:
                     context = self._rolling_member_context(selection, member)
+                    context["execution_authorization_mode"] = execution_mode
+                    context["controller_owner_id"] = self.controller_owner_id
+                    context["controller_lease_generation"] = (
+                        controller_lease.get("generation")
+                        if isinstance(controller_lease, Mapping)
+                        else None
+                    )
+                    context["controller_generation"] = context["controller_lease_generation"]
+                    context["execution_authorization_id"] = (
+                        execution_authorization.get("authorization_id")
+                        or execution_authorization.get("id")
+                        if isinstance(execution_authorization, Mapping)
+                        else None
+                    )
+                    context["execution_authorization_generation"] = (
+                        execution_authorization.get("generation")
+                        if isinstance(execution_authorization, Mapping)
+                        else None
+                    )
                     candidate_id = self._rolling_candidate_id(member)
                     row.update(
                         {
@@ -2454,20 +2646,31 @@ class AutonomousCanaryWorker:
                 status = "ENTRY_PAUSED"
                 global_blocker = "ENTRY_PAUSED"
             elif control_blocker == "CANARY_NOT_ARMED":
-                decision = "DISARMED" if control_state == "DISARMED" else "CANARY_NOT_ARMED"
-                status = "DISARMED" if control_state == "DISARMED" else "BLOCKED"
-                global_blocker = "CANARY_NOT_ARMED"
+                if selection_blocker is not None:
+                    decision = "WAIT_FOR_ROLLING_SELECTION"
+                    status = "OBSERVING"
+                else:
+                    decision = "DISARMED" if control_state == "DISARMED" else "CANARY_NOT_ARMED"
+                    status = "DISARMED" if control_state == "DISARMED" else "BLOCKED"
+                    global_blocker = "CANARY_NOT_ARMED"
             elif selection_blocker is not None:
-                decision = "ENTRY_PAUSED"
-                status = "ENTRY_PAUSED"
-                global_blocker = selection_blocker
+                decision = "WAIT_FOR_ROLLING_SELECTION"
+                status = "OBSERVING"
             elif not active:
                 decision = "WAIT_FOR_ACTIVE_ROLLING_MEMBER"
-                status = "NO_SELECTION"
+                status = "OBSERVING"
             elif position_blocker is not None:
                 decision = "POSITION_RECONCILIATION_BLOCKED"
                 status = "BLOCKED"
                 global_blocker = position_blocker
+            elif lease_blocker is not None:
+                decision = lease_blocker
+                status = "BLOCKED"
+                global_blocker = lease_blocker
+            elif authorization_blocker is not None:
+                decision = authorization_blocker
+                status = "BLOCKED"
+                global_blocker = authorization_blocker
             elif global_blocker is not None:
                 decision = global_blocker
                 status = "BLOCKED"
@@ -2549,6 +2752,24 @@ class AutonomousCanaryWorker:
                 "decision": decision,
                 "blocker": global_blocker,
                 "portfolio_selection_id": selection_id,
+                "execution_authorization_mode": execution_mode,
+                "execution_authorization_id": (
+                    execution_authorization.get("authorization_id")
+                    or execution_authorization.get("id")
+                    if isinstance(execution_authorization, Mapping)
+                    else None
+                ),
+                "execution_authorization_generation": (
+                    execution_authorization.get("generation")
+                    if isinstance(execution_authorization, Mapping)
+                    else None
+                ),
+                "controller_owner_id": self.controller_owner_id,
+                "controller_generation": (
+                    controller_lease.get("generation")
+                    if isinstance(controller_lease, Mapping)
+                    else None
+                ),
                 "active_members": len(active),
                 "reducing_members": len(reducing),
                 "evaluated_members": len(evaluated),
@@ -2579,6 +2800,61 @@ class AutonomousCanaryWorker:
                 "paper_only": True,
                 "live_execution": False,
             }
+            live_submitted = bool(
+                enabled
+                and any(
+                    item.get("status") in self._SUBMISSION_SUCCESS_STATUSES
+                    for item in submissions
+                )
+            )
+            payload["paper_only"] = not live_submitted
+            payload["live_execution"] = live_submitted
+            payload["live_canary"] = live_submitted
+            payload["execution_mode"] = "live-canary" if live_submitted else "paper"
+            payload["operating_state"] = (
+                "observing"
+                if selection_blocker is not None or not active
+                else "evidence_selected"
+            )
+            payload["next_work"] = (
+                "refresh_rolling_evidence"
+                if selection_blocker is not None or not active
+                else "evaluate_selected_strategies"
+            )
+            payload["no_entry_reason"] = (
+                {
+                    "category": "SELECTION",
+                    "reason": selection_blocker or "NO_ACTIVE_ROLLING_MEMBER",
+                    "resolver": "refresh_rolling_evidence",
+                    "next_scheduled_action": "refresh_rolling_evidence",
+                }
+                if selection_blocker is not None or not active
+                else None
+            )
+            if global_blocker is not None:
+                payload["blocker_projection"] = {
+                    "category": (
+                        "AUTHORIZATION"
+                        if "AUTHORIZATION" in global_blocker
+                        else "CONTROLLER"
+                        if "LEASE" in global_blocker
+                        else "POSITION"
+                        if "POSITION" in global_blocker or "RECONCILIATION" in global_blocker
+                        else "CONTROL"
+                    ),
+                    "reason": global_blocker,
+                    "resolver": (
+                        "activate_execution_authorization"
+                        if "AUTHORIZATION" in global_blocker
+                        else "renew_canary_controller_lease"
+                        if "LEASE" in global_blocker
+                        else "reconcile_canary_positions"
+                        if "POSITION" in global_blocker or "RECONCILIATION" in global_blocker
+                        else "review_canary_control"
+                    ),
+                    "next_scheduled_action": payload.get("next_work")
+                    or "evaluate_selected_strategies",
+                }
             if selection_error_type is not None:
                 payload["error_type"] = selection_error_type
             try:
@@ -2609,6 +2885,8 @@ class AutonomousCanaryWorker:
                 pass
             return payload
         finally:
+            # The lease spans decision windows; run() releases it when the
+            # worker receives a normal stop signal.
             self._decision_lock.release()
 
     def tick_rolling(self, *, now: datetime | None = None) -> dict[str, Any]:
@@ -2616,23 +2894,54 @@ class AutonomousCanaryWorker:
         return self._rolling_tick(now=now)
 
     def tick(self, *, now: datetime | None = None) -> dict[str, Any]:
-        """Use only the durable rolling selection as execution authority."""
+        """Use rolling authority only when a persisted selection is present."""
         loader = getattr(self.store, "load_current_portfolio_selection", None)
         if callable(loader):
-            return self.tick_rolling(now=now)
+            # The real storage API is a bound method and must fail closed into
+            # rolling mode even when its persisted selection is absent or
+            # malformed.  A policy-only callable is an authorization context,
+            # not a selection; retain the legacy ranker path for that
+            # compatibility context and avoid treating it as an empty rolling
+            # portfolio.
+            bound_to_store = getattr(loader, "__self__", None) is self.store
+            if bound_to_store:
+                return self.tick_rolling(now=now)
+            try:
+                selection = loader()
+            except Exception:
+                return self.tick_rolling(now=now)
+            if not isinstance(selection, Mapping):
+                return self.tick_rolling(now=now)
+            if any(
+                name in selection
+                for name in (
+                    "portfolio_selection_id",
+                    "selection_id",
+                    "members",
+                    "selected_members",
+                )
+            ):
+                return self.tick_rolling(now=now)
+            if not set(selection).issubset(
+                {"selection_policy_hash", "reviewed_selection_policy_hash"}
+            ):
+                return self.tick_rolling(now=now)
         return self._legacy_tick(now=now)
 
     def run(self, stop_event: threading.Event) -> None:
         """Run immediately, then wait for the next bounded decision window."""
-        while not stop_event.is_set():
-            try:
-                self.tick()
-            except BaseException:
-                # Keep this loop alive even if a caller replaces tick with an
-                # unsafe implementation; the node supervisor persists the
-                # degraded worker state on its next boundary.
-                pass
-            stop_event.wait(self.interval_seconds)
+        try:
+            while not stop_event.is_set():
+                try:
+                    self.tick()
+                except BaseException:
+                    # Keep this loop alive even if a caller replaces tick with
+                    # an unsafe implementation; the node supervisor persists
+                    # the degraded worker state on its next boundary.
+                    pass
+                stop_event.wait(self.interval_seconds)
+        finally:
+            self._release_controller_lease(ensure_utc(self.clock()), reason="worker_stop")
 
 
 __all__ = ["AutonomousCanaryWorker"]

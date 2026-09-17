@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 import json
 import unittest
 
 from axiom.collector import CollectorConfig, PolymarketCollector
 from axiom.data import InMemoryPredictionProvider
+from axiom.polymarket_rules import assess_selected_token_depth, parse_polymarket_rules
 from axiom.domain import (
     InstrumentMetadata,
     MarketType,
@@ -43,6 +45,9 @@ def market(
         (OrderBookLevel(max(0.0, yes_mid - 0.01), 10.0),),
         (OrderBookLevel(min(1.0, yes_mid + 0.01), 10.0),),
         f"yes-{market_id}",
+        min_order_size=0.01,
+        tick_size=0.01,
+        neg_risk=False,
     )
     return PredictionMarketSnapshot(
         timestamp=T0,
@@ -1236,6 +1241,346 @@ class MarketScopeCollectorTests(unittest.TestCase):
             [None, "metadata-cursor"],
         )
         self.assertEqual(provider.book_calls, ["metadata-first"])
+
+
+    def test_missing_official_rules_and_freshness_never_authorize_suitability(self) -> None:
+        base = market("unknown-rules")
+        base_book = base.order_book
+        self.assertIsNotNone(base_book)
+        assert base_book is not None
+        provider = _RecordingProvider((base,))
+        collector = self._collector(provider, _ScopeStore({}), ())
+
+        unknown_rules = (
+            ("min_order_size", replace(base_book, min_order_size=None), "MIN_ORDER_SIZE_MISSING"),
+            ("tick_size", replace(base_book, tick_size=None), "TICK_SIZE_MISSING"),
+            ("neg_risk", replace(base_book, neg_risk=None), "NEG_RISK_MISSING"),
+        )
+        for field, book, reason in unknown_rules:
+            with self.subTest(field=field):
+                snapshot = replace(base, order_book=book)
+                assessment = collector._suitable_market_assessment(snapshot, T0, provider)
+                self.assertEqual(assessment["action"], "UNSUITABLE")
+                self.assertEqual(assessment["category"], "RULES_UNKNOWN")
+                self.assertEqual(assessment["reason"], reason)
+                self.assertEqual(assessment["next_action"], "recheck_next_discovery_tick")
+
+        accepting_unknown = replace(base, accepting_orders=None)
+        accepting_assessment = collector._suitable_market_assessment(accepting_unknown, T0, provider)
+        self.assertEqual(accepting_assessment["category"], "MARKET_LIFECYCLE")
+        self.assertEqual(accepting_assessment["reason"], "ACCEPTING_ORDERS_UNKNOWN")
+        self.assertEqual(accepting_assessment["next_action"], "recheck_next_discovery_tick")
+
+        depth_unknown = replace(base, order_book=replace(base_book, bids=(), asks=()))
+        depth_assessment = collector._suitable_market_assessment(depth_unknown, T0, provider)
+        self.assertEqual(depth_assessment["category"], "CAPITAL_OR_MARKET_CONSTRAINT")
+        self.assertEqual(depth_assessment["reason"], "NO_DEPTH")
+        self.assertEqual(depth_assessment["next_action"], "recheck_next_discovery_tick")
+
+        freshness_unknown = replace(base)
+        object.__setattr__(freshness_unknown, "timestamp", None)
+        freshness_assessment = collector._suitable_market_assessment(freshness_unknown, T0, provider)
+        self.assertEqual(freshness_assessment["category"], "DATA_FRESHNESS")
+        self.assertEqual(freshness_assessment["reason"], "FRESHNESS_UNKNOWN")
+        self.assertEqual(freshness_assessment["next_action"], "recheck_next_discovery_tick")
+
+    def test_unknown_rules_page_is_deferred_before_verified_later_page(self) -> None:
+        unknown = market("unknown-first")
+        unknown_book = unknown.order_book
+        self.assertIsNotNone(unknown_book)
+        assert unknown_book is not None
+        unknown = replace(unknown, order_book=replace(unknown_book, tick_size=None))
+        verified = market("verified-later")
+        provider = _PagedProvider(
+            (unknown, verified),
+            (
+                {"snapshots": (unknown,), "next_cursor": "unknown-next"},
+                {"snapshots": (verified,), "next_cursor": None, "coverage_status": "COMPLETE"},
+            ),
+        )
+        collector = _ScopeCollector(
+            provider,
+            _ScopeStore({}),
+            CollectorConfig(
+                max_markets=1,
+                discovery_budget_per_cycle=1,
+                max_suitable_pages_per_cycle=3,
+                required_capital=1.0,
+                max_attempts=1,
+                backoff_initial_seconds=0,
+                jitter_seconds=0,
+            ),
+            candidate_ids=(),
+            clock=lambda: T0,
+            sleep=lambda _seconds: None,
+        )
+
+        cycle = collector.collect_once(now=T0)
+
+        self.assertEqual([call["after_cursor"] for call in provider.page_calls], [None, "unknown-next"])
+        self.assertEqual(cycle.discovery_scheduled, ("verified-later",))
+        self.assertEqual(cycle.discovery_deferred, ("unknown-first",))
+        self.assertEqual(cycle.discovery_coverage_status, "COMPLETE")
+        unknown_evidence = next(
+            item for item in collector._suitable_market_evidence if item["market_id"] == "unknown-first"
+        )
+        self.assertEqual(unknown_evidence["category"], "RULES_UNKNOWN")
+        self.assertEqual(unknown_evidence["reason"], "TICK_SIZE_MISSING")
+
+    def test_suitable_discovery_advances_past_unsuitable_page_and_persists_scores(self) -> None:
+        constrained = replace(
+            market("capital-constrained"),
+            order_book=OrderBookSnapshot(
+                T0,
+                (OrderBookLevel(0.49, 0.5),),
+                (OrderBookLevel(0.51, 0.5),),
+                "yes-capital-constrained",
+                min_order_size=0.01,
+                tick_size=0.01,
+                neg_risk=False,
+            ),
+        )
+        low_activity = replace(market("low-activity"), volume=1.0)
+        high_activity = replace(market("high-activity"), volume=10_000.0)
+        provider = _PagedProvider(
+            (constrained, low_activity, high_activity),
+            (
+                {
+                    "snapshots": (constrained,),
+                    "next_cursor": "unsuitable-first-next",
+                    "coverage_status": "PARTIAL",
+                },
+                {
+                    "snapshots": (low_activity, high_activity),
+                    "next_cursor": None,
+                    "coverage_status": "COMPLETE",
+                },
+            ),
+        )
+        collector = _ScopeCollector(
+            provider,
+            _ScopeStore({}),
+            CollectorConfig(
+                max_markets=1,
+                discovery_budget_per_cycle=1,
+                max_suitable_pages_per_cycle=3,
+                required_capital=1.0,
+                max_attempts=1,
+                backoff_initial_seconds=0,
+                jitter_seconds=0,
+            ),
+            candidate_ids=(),
+            clock=lambda: T0,
+            sleep=lambda _seconds: None,
+        )
+
+        cycle = collector.collect_once(now=T0)
+        continuation = collector.store.states["polymarket"]["discovery_continuation"]
+
+        self.assertEqual([call["after_cursor"] for call in provider.page_calls], [None, "unsuitable-first-next"])
+        self.assertEqual(cycle.discovery_scheduled, ("high-activity",))
+        self.assertEqual(cycle.suitable_market_scheduled, ("high-activity",))
+        self.assertEqual(cycle.suitable_market_deferred, ("capital-constrained", "low-activity"))
+        self.assertEqual(cycle.discovery_deferred, ("capital-constrained", "low-activity"))
+        self.assertEqual(cycle.discovery_coverage_status, "COMPLETE")
+        self.assertEqual(continuation["after_cursor"], None)
+        self.assertEqual(continuation["coverage_status"], "COMPLETE")
+        exclusion = continuation["suitability_exclusions"][0]
+        self.assertEqual(exclusion["market_id"], "capital-constrained")
+        self.assertEqual(exclusion["category"], "CAPITAL_OR_MARKET_CONSTRAINT")
+        self.assertEqual(exclusion["reason"], "NO_DEPTH")
+        self.assertEqual(exclusion["observed_required_capital"], 0.51 * exclusion["required_quantity"])
+        self.assertEqual(exclusion["intended_token"], "yes")
+        scores = {
+            item["market_id"]: item
+            for item in collector._suitable_market_evidence
+        }
+        self.assertGreater(scores["high-activity"]["activity_score"], scores["low-activity"]["activity_score"])
+        self.assertGreater(scores["high-activity"]["freshness_score"], 0.0)
+        self.assertEqual(scores["high-activity"]["depth_score"], 10.0)
+        self.assertGreater(scores["high-activity"]["entry_depth"], 0.0)
+        self.assertGreater(scores["high-activity"]["exit_depth"], 0.0)
+        self.assertEqual(cycle.market_authorization["coverage_status"], "COMPLETE")  # type: ignore[index]
+
+    def test_scope_authorizes_verified_market_before_inventory_completion(self) -> None:
+        suitable = market("verified-scope", category="politics")
+        later = market("later-scope", category="politics")
+        provider = _PagedProvider(
+            (suitable, later),
+            (
+                {
+                    "snapshots": (suitable,),
+                    "next_cursor": "scope-next",
+                },
+                {
+                    "snapshots": (later,),
+                    "next_cursor": None,
+                    "coverage_status": "COMPLETE",
+                },
+            ),
+        )
+        policy = scope("RULE_BASED_MARKETS", category="politics")
+        store = _ScopeStore(
+            {
+                "scoped-candidate": {
+                    "experiment_plan": {"market_scope": policy},
+                    "required_capital": 1.0,
+                }
+            }
+        )
+        cycle = self._collector(provider, store, ("scoped-candidate",), max_markets=1).collect_once(now=T0)
+
+        continuation = store.states["polymarket"]["scope_inventory_continuation"]
+        self.assertEqual(cycle.candidate_bound_scheduled, ("verified-scope",))
+        self.assertEqual(cycle.inventory_coverage, "BUDGET_EXHAUSTED")
+        self.assertEqual(cycle.market_authorization["status"], "VERIFIED_MARKET_AUTHORIZED")  # type: ignore[index]
+        self.assertEqual(cycle.market_authorization["verified_market_ids"], ["verified-scope"])  # type: ignore[index]
+        self.assertEqual(continuation["after_cursor"], "scope-next")
+        self.assertEqual(continuation["verified_market_ids"], ["verified-scope"])
+        self.assertEqual(len(store.resolutions), 1)
+        resolution = store.resolutions[0]
+        expected = resolve_market_scope(
+            "scope-check",
+            {"market_scope": policy},
+            [PolymarketCollector._scope_market_record(suitable, T0, provider)],
+            resolved_at=T0,
+        )
+        self.assertEqual(resolution.scope_hash, expected.scope_hash)  # type: ignore[union-attr]
+        self.assertEqual(resolution.scope_version, expected.scope_version)  # type: ignore[union-attr]
+        self.assertEqual(
+            cycle.market_authorization["scope_bindings"],  # type: ignore[index]
+            [{
+                "candidate_id": "scoped-candidate",
+                "scope_hash": expected.scope_hash,
+                "scope_version": expected.scope_version,
+            }],
+        )
+    def test_selected_token_book_never_uses_wrong_singleton(self) -> None:
+        base = market("exact-book")
+        wrong = replace(base.order_book, token_id="no-other-market")
+
+        class WrongSingletonProvider(_RecordingProvider):
+            def order_books(self, market_id: str, depth: int = 20):
+                del market_id, depth
+                return {"other": wrong}
+
+        provider = WrongSingletonProvider((base,))
+        collector = self._collector(provider, _ScopeStore({}), ())
+        assessment = collector._suitable_market_assessment(
+            base,
+            T0,
+            provider,
+            intended_token="no",
+        )
+
+        self.assertEqual(assessment["action"], "UNSUITABLE")
+        self.assertEqual(assessment["reason"], "NO_DEPTH")
+
+    def test_frozen_suitability_assumptions_apply_fee_to_capital(self) -> None:
+        base = market("frozen-assumptions")
+        provider = _RecordingProvider((base,))
+        collector = self._collector(provider, _ScopeStore({}), ())
+        document = {
+            "assumptions": {
+                "required_capital": 1.0,
+                "min_entry_depth": 1.0,
+                "min_exit_depth": 1.0,
+                "min_activity": 100.0,
+                "intended_token": "yes",
+                "venue_fee_rate": 0.10,
+            }
+        }
+        kwargs = collector._suitability_kwargs(document)
+        assessment = collector._suitable_market_assessment(base, T0, provider, **kwargs)
+
+        self.assertEqual(kwargs["intended_token"], "yes")
+        self.assertEqual(kwargs["venue_fee_rate"], 0.10)
+        self.assertEqual(assessment["action"], "SUITABLE")
+        self.assertEqual(assessment["required_quantity"], 1.78)
+        self.assertLessEqual(assessment["observed_required_capital"], 1.0)
+
+    def test_fractional_displayed_depth_is_not_rejected_as_size_precision(self) -> None:
+        book = {
+            "token_id": "yes-fractional",
+            "min_order_size": "0.01",
+            "tick_size": "0.01",
+            "neg_risk": False,
+            "asks": [["0.50", "0.1234"]],
+            "bids": [["0.49", "0.1234"]],
+        }
+        rules = parse_polymarket_rules(book)
+
+        assessment = assess_selected_token_depth(
+            book,
+            rules,
+            side="BUY",
+            quantity=Decimal("0.12"),
+        )
+
+        self.assertEqual(assessment.action, "SUITABLE")
+        self.assertEqual(assessment.available_quantity, Decimal("0.1234"))
+        self.assertEqual(assessment.filled_quantity, Decimal("0.12"))
+
+    def test_keyset_list_page_is_consumed_and_repeated_cursor_rebases(self) -> None:
+        constrained = replace(
+            market("cursor-constrained"),
+            order_book=replace(
+                market("cursor-constrained").order_book,
+                bids=(OrderBookLevel(0.49, 0.5),),
+                asks=(OrderBookLevel(0.51, 0.5),),
+            ),
+        )
+        suitable = market("cursor-suitable")
+        class CursorList(list):
+            def __init__(self, values, *, next_cursor=None):
+                super().__init__(values)
+                self.next_cursor = next_cursor
+
+        class ListPageProvider(_PagedProvider):
+            def market_page(self, **kwargs):
+                self.page_calls.append(dict(kwargs))
+                if not self.pages:
+                    raise AssertionError("unexpected metadata page")
+                return self.pages.pop(0)
+
+        provider = ListPageProvider(
+            (constrained, suitable),
+            (
+                CursorList([constrained], next_cursor="loop"),
+                {"snapshots": (constrained,), "next_cursor": "loop"},
+                (suitable,),
+            ),
+        )
+        collector = _ScopeCollector(
+            provider,
+            _ScopeStore({}),
+            CollectorConfig(
+                max_markets=1,
+                discovery_budget_per_cycle=1,
+                max_suitable_pages_per_cycle=2,
+                required_capital=1.0,
+                max_attempts=1,
+                backoff_initial_seconds=0,
+                jitter_seconds=0,
+            ),
+            candidate_ids=(),
+            clock=lambda: T0,
+            sleep=lambda _seconds: None,
+        )
+
+        first = collector.collect_once(now=T0)
+        first_continuation = collector.store.states["polymarket"]["discovery_continuation"]
+        second = collector.collect_once(now=T0)
+
+        self.assertEqual(first.discovery_scheduled, ())
+        self.assertEqual(second.discovery_scheduled, ("cursor-suitable",))
+        self.assertEqual(
+            [call["after_cursor"] for call in provider.page_calls],
+            [None, "loop", None],
+        )
+        self.assertIsNone(first_continuation["after_cursor"])
+        self.assertTrue(first_continuation["query_reset"])
+        self.assertTrue(first_continuation["rebase_required"])
 
 
 if __name__ == "__main__":

@@ -27,6 +27,14 @@ from axiom.venue_feasibility import (
     UNKNOWN,
     assess_venue_feasibility,
 )
+from axiom.polymarket_rules import (
+    POLYMARKET_RULES_DOCS_VERSION,
+    DepthAssessment,
+    PolymarketRuleError,
+    UNSUITABLE,
+    assess_selected_token_depth,
+    parse_polymarket_rules,
+)
 
 
 UTC = timezone.utc
@@ -189,10 +197,9 @@ class _FeasibilityAdapter:
             "market_id": MARKET_ID,
             "condition_id": CONDITION_ID,
             "provider_timestamp": T0.isoformat(),
-            "min_order_quantity": "1",
+            "min_order_size": "1",
             "tick_size": "0.01",
-            "min_notional": "0.10",
-            "size_increment": "0.01",
+            "neg_risk": False,
         }
         self.books: dict[str, dict[str, object]] = {
             "yes": self._book(YES_TOKEN, asks=(("0.40", "5"),), bids=(("0.35", "5"),)),
@@ -556,8 +563,9 @@ class ShadowVenueFeasibilityTests(unittest.TestCase):
             "min_order_size": "1",
             "tick_size": "0.01",
             "price_increment": "0.01",
-            "min_notional": "0.10",
-            "size_increment": "0.01",
+            "neg_risk": False,
+            "min_notional": "UNKNOWN",
+            "size_increment": "UNKNOWN",
         })
         self.assertEqual(
             set(report["timestamps"]),
@@ -569,21 +577,18 @@ class ShadowVenueFeasibilityTests(unittest.TestCase):
         self.assertEqual(adapter.calls[-1], ("order_books", 7))
         self.assertEqual(adapter.danger_calls, [])
 
-    def test_feasibility_reports_known_infeasible_minimum_depth_and_cap(self) -> None:
+    def test_feasibility_reports_known_infeasible_depth_and_cap(self) -> None:
         cases = (
-            ("minimum", {"min_notional": "0.90"}, "0.10", "YES_MIN_NOTIONAL_NOT_MET"),
             ("depth", {"target": "6"}, "0.99", "YES_BUY_DEPTH_INSUFFICIENT"),
             ("cap", {"target": "2"}, "0.50", ""),
         )
         for name, mutation, cap, reason_fragment in cases:
             with self.subTest(name=name):
                 adapter = _FeasibilityAdapter()
-                if "min_notional" in mutation:
-                    adapter.metadata_payload["min_notional"] = mutation["min_notional"]
-                    target = "1"
-                else:
-                    target = mutation["target"]
-                result = assess_venue_feasibility(adapter, MARKET_ID, target_quantity=target, cap_usd=cap, now=T0)
+                target = mutation["target"]
+                result = assess_venue_feasibility(
+                    adapter, MARKET_ID, target_quantity=target, cap_usd=cap, now=T0
+                )
                 self.assertEqual(result.verdict, INFEASIBLE)
                 self.assertIs(result["feasible"], False)
                 if name == "cap":
@@ -596,11 +601,12 @@ class ShadowVenueFeasibilityTests(unittest.TestCase):
         cases: list[tuple[str, callable, str]] = []
 
         def missing_rules(adapter: _FeasibilityAdapter) -> None:
-            adapter.metadata_payload.pop("min_notional")
-            adapter.metadata_payload.pop("size_increment")
+            adapter.metadata_payload.pop("min_order_size")
+            adapter.metadata_payload.pop("tick_size")
+            adapter.metadata_payload.pop("neg_risk")
 
         def conflicting_alias(adapter: _FeasibilityAdapter) -> None:
-            adapter.metadata_payload["minimum_notional"] = "0.20"
+            adapter.metadata_payload["orderMinSize"] = "2"
 
         def invalid_flags(adapter: _FeasibilityAdapter) -> None:
             adapter.market_payload["active"] = True
@@ -608,8 +614,8 @@ class ShadowVenueFeasibilityTests(unittest.TestCase):
 
         cases.extend(
             (
-                ("missing_rules", missing_rules, "MIN_NOTIONAL_MISSING"),
-                ("conflicting_alias", conflicting_alias, "MIN_NOTIONAL_RULE_CONFLICT"),
+                ("missing_rules", missing_rules, "MIN_ORDER_SIZE_MISSING"),
+                ("conflicting_alias", conflicting_alias, "MIN_ORDER_SIZE_CONFLICT"),
                 ("invalid_flags", invalid_flags, "MARKET_ACTIVE_FLAG_INVALID"),
             )
         )
@@ -617,7 +623,9 @@ class ShadowVenueFeasibilityTests(unittest.TestCase):
             with self.subTest(name=name):
                 adapter = _FeasibilityAdapter()
                 mutate(adapter)
-                result = assess_venue_feasibility(adapter, MARKET_ID, target_quantity="1", now=T0)
+                result = assess_venue_feasibility(
+                    adapter, MARKET_ID, target_quantity="1", now=T0
+                )
                 self.assertEqual(result.verdict, UNKNOWN)
                 self.assertEqual(result["feasible"], UNKNOWN)
                 self.assertIn(reason, result.reasons)
@@ -663,10 +671,9 @@ class ShadowVenueFeasibilityTests(unittest.TestCase):
         self.assertIn("YES_SELL_DEPTH_INSUFFICIENT", result.reasons)
         self.assertEqual(adapter.danger_calls, [])
 
-    def test_feasibility_increment_alignment_and_fee_slippage_floor_exactly(self) -> None:
+    def test_feasibility_quantity_precision_and_fee_slippage(self) -> None:
         misaligned = _FeasibilityAdapter()
-        misaligned.metadata_payload["min_order_quantity"] = "0.01"
-        misaligned.metadata_payload["min_notional"] = "0.01"
+        misaligned.metadata_payload["min_order_size"] = "0.01"
         result = assess_venue_feasibility(
             misaligned,
             MARKET_ID,
@@ -675,13 +682,27 @@ class ShadowVenueFeasibilityTests(unittest.TestCase):
             now=T0,
         )
         self.assertEqual(result.verdict, UNKNOWN)
-        self.assertIn("QUANTITY_INCREMENT_MISMATCH", result.reasons)
+        self.assertIn("QUANTITY_PRECISION_INVALID", result.reasons)
         self.assertEqual(misaligned.danger_calls, [])
+        flooring = _FeasibilityAdapter()
+        flooring.metadata_payload["min_order_size"] = "0.01"
+        flooring.books["yes"] = flooring._book(
+            YES_TOKEN,
+            asks=(("0.50", "5"),),
+            bids=(("0.40", "5"),),
+        )
+        flooring_result = assess_venue_feasibility(
+            flooring,
+            MARKET_ID,
+            target_quantity="0.99",
+            cap_usd="0.499",
+            now=T0,
+        )
+        self.assertEqual(flooring_result["buy"]["yes"]["max_quantity_under_cap"], "0.99")
+
 
         charged = _FeasibilityAdapter()
-        charged.metadata_payload["min_order_quantity"] = "0.01"
-        charged.metadata_payload["min_notional"] = "0.01"
-        charged.metadata_payload["size_increment"] = "0.01"
+        charged.metadata_payload["min_order_size"] = "0.01"
         charged.books["yes"] = charged._book(
             YES_TOKEN,
             asks=(("0.50", "5"),),
@@ -710,6 +731,163 @@ class ShadowVenueFeasibilityTests(unittest.TestCase):
         self.assertEqual(result["sell"]["yes"]["depth_sufficient"], True)
         self.assertEqual(charged.danger_calls, [])
 
+    def test_official_rule_parser_binds_documented_book_fields_only(self) -> None:
+        rules = parse_polymarket_rules(
+            {
+                "min_order_size": "5",
+                "tick_size": "0.001",
+                "neg_risk": True,
+                "min_notional": "999",
+                "size_increment": "999",
+            }
+        )
+        self.assertEqual(rules.min_order_size, Decimal("5"))
+        self.assertEqual(rules.tick_size, Decimal("0.001"))
+        self.assertTrue(rules.neg_risk)
+        self.assertEqual(rules.price_precision, 3)
+        self.assertEqual(rules.size_precision, 2)
+        self.assertEqual(rules.amount_precision, 5)
+        finer_tick = parse_polymarket_rules(
+            {"min_order_size": "1", "tick_size": "0.0025", "neg_risk": False}
+        )
+        self.assertEqual(finer_tick.price_precision, 4)
+        self.assertEqual(finer_tick.amount_precision, 6)
+
+        self.assertEqual(rules.docs_version, POLYMARKET_RULES_DOCS_VERSION)
+        with self.assertRaises(PolymarketRuleError):
+            parse_polymarket_rules(
+                {"min_order_size": "5", "tick_size": "0.01"}
+            )
+
+    def test_selected_token_depth_walks_levels_and_applies_price_bound(self) -> None:
+        rules = parse_polymarket_rules(
+            {"min_order_size": "5", "tick_size": "0.01", "neg_risk": False}
+        )
+        book = {
+            "token_id": YES_TOKEN,
+            "asks": [["0.40", "2"], ["0.42", "3"]],
+            "bids": [["0.35", "5"]],
+        }
+        assessment = assess_selected_token_depth(
+            book,
+            rules,
+            side="BUY",
+            quantity="5",
+            cap_usd="2.06",
+        )
+        self.assertIsInstance(assessment, DepthAssessment)
+        self.assertEqual(assessment.action, "SUITABLE")
+        self.assertEqual(assessment.reason, "OK")
+        self.assertEqual(assessment.required_cost, Decimal("2.06"))
+        self.assertEqual(assessment.filled_quantity, Decimal("5"))
+        self.assertEqual(assessment.available_quantity, Decimal("5"))
+        self.assertEqual(assessment.to_dict()["depth_quantity"], "5")
+        self.assertEqual(assessment.levels_used, 2)
+
+        sell = assess_selected_token_depth(
+            {
+                "token_id": YES_TOKEN,
+                "asks": [],
+                "bids": [["0.35", "2"], ["0.34", "3"]],
+            },
+            rules,
+            side="SELL",
+            quantity="5",
+            venue_fee_rate="0.01",
+            fee_reserve="0.25",
+        )
+        self.assertEqual(sell.action, "SUITABLE")
+        self.assertEqual(sell.available_quantity, Decimal("5"))
+        self.assertEqual(sell.gross_proceeds, Decimal("1.72"))
+        self.assertEqual(sell.net_proceeds, Decimal("1.7028"))
+        self.assertEqual(sell.fee_reserve, Decimal("0.25"))
+
+        bounded = assess_selected_token_depth(
+            book,
+            rules,
+            side="BUY",
+            quantity="5",
+            price_bound="0.41",
+        )
+        self.assertEqual(bounded.action, UNSUITABLE)
+        self.assertEqual(bounded.reason, "INSUFFICIENT_DEPTH")
+        self.assertEqual(bounded.filled_quantity, Decimal("2"))
+
+    def test_selected_token_thin_and_one_sided_books_are_unsuitable_without_aliasing(self) -> None:
+        rules = parse_polymarket_rules(
+            {"min_order_size": "1", "tick_size": "0.01", "neg_risk": False}
+        )
+        thin = assess_selected_token_depth(
+            {
+                "token_id": YES_TOKEN,
+                "asks": [["0.40", "0.25"], ["0.41", "0.50"]],
+                "bids": [["0.35", "3"]],
+            },
+            rules,
+            side="BUY",
+            quantity="1",
+        )
+        self.assertEqual(thin.action, UNSUITABLE)
+        self.assertEqual(thin.reason, "INSUFFICIENT_DEPTH")
+
+        one_sided = assess_selected_token_depth(
+            {
+                "token_id": YES_TOKEN,
+                "asks": [],
+                # This bid cannot be used as a BUY/ask fallback.
+                "bids": [["0.35", "3"]],
+            },
+            rules,
+            side="BUY",
+            quantity="1",
+        )
+        self.assertEqual(one_sided.action, UNSUITABLE)
+        self.assertEqual(one_sided.reason, "NO_DEPTH")
+        sell = assess_selected_token_depth(
+            {
+                "token_id": YES_TOKEN,
+                "asks": [],
+                "bids": [["0.35", "3"]],
+            },
+            rules,
+            side="SELL",
+            quantity="1",
+        )
+        self.assertEqual(sell.action, "SUITABLE")
+        self.assertEqual(sell.net_proceeds, Decimal("0.35"))
+
+    def test_selected_token_precision_min_size_cap_and_fee_reserve(self) -> None:
+        rules = parse_polymarket_rules(
+            {"min_order_size": "1", "tick_size": "0.01", "neg_risk": False}
+        )
+        book = {
+            "token_id": YES_TOKEN,
+            "asks": [["0.50", "5"]],
+            "bids": [["0.40", "5"]],
+        }
+        self.assertEqual(
+            assess_selected_token_depth(book, rules, side="BUY", quantity="0.99").reason,
+            "MIN_ORDER_SIZE",
+        )
+        self.assertEqual(
+            assess_selected_token_depth(book, rules, side="BUY", quantity="1.005").reason,
+            "QUANTITY_PRECISION",
+        )
+        capped = assess_selected_token_depth(
+            book,
+            rules,
+            side="BUY",
+            quantity="2",
+            cap_usd="1.01",
+            venue_fee_rate="0.01",
+            fee_reserve="0.01",
+        )
+        self.assertEqual(capped.action, UNSUITABLE)
+        self.assertEqual(capped.reason, "CAP_EXCEEDED")
+        self.assertEqual(capped.to_dict()["fee_reserve"], "0.01")
+
+
+
     def test_venue_assessment_rejects_conflicting_quantity_aliases_without_adapter_access(self) -> None:
         adapter = _FeasibilityAdapter()
         with self.assertRaises(ValueError):
@@ -722,7 +900,6 @@ class ShadowVenueFeasibilityTests(unittest.TestCase):
             )
         self.assertEqual(adapter.calls, [])
         self.assertEqual(adapter.danger_calls, [])
-
 
 if __name__ == "__main__":
     unittest.main()

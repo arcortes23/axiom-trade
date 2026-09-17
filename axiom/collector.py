@@ -73,6 +73,15 @@ class CollectorConfig:
     max_provider_clock_skew_seconds: float = 5.0
     retain_cycles: int = 1
     discovery_budget_per_cycle: int = 20
+    # Suitable-market production is deliberately bounded and read-only.  The
+    # defaults describe the smallest observable paper probe; policies may
+    # tighten them through their own frozen scope filters.
+    intended_token: str = "yes"
+    required_capital: float = 1.0
+    min_entry_depth: float = 0.0
+    min_exit_depth: float = 0.0
+    min_activity: float = 0.0
+    max_suitable_pages_per_cycle: int = 20
     max_concurrency: int = 1
     freshness_sla_seconds: float | None = None
     poll_plan: Callable[..., Any] | None = None
@@ -95,6 +104,24 @@ class CollectorConfig:
             raise ValueError("max_markets must be a positive integer")
         if isinstance(self.discovery_budget_per_cycle, bool) or not isinstance(self.discovery_budget_per_cycle, int) or self.discovery_budget_per_cycle < 0:
             raise ValueError("discovery_budget_per_cycle must be a non-negative integer")
+        token = str(self.intended_token).strip().lower()
+        if token not in {"yes", "no"}:
+            raise ValueError("intended_token must be yes or no")
+        object.__setattr__(self, "intended_token", token)
+        for name in ("required_capital", "min_entry_depth", "min_exit_depth", "min_activity"):
+            value = getattr(self, name)
+            if isinstance(value, bool):
+                raise ValueError(f"{name} must be finite and non-negative")
+            number = float(value)
+            if not math.isfinite(number) or number < 0:
+                raise ValueError(f"{name} must be finite and non-negative")
+            object.__setattr__(self, name, number)
+        if (
+            isinstance(self.max_suitable_pages_per_cycle, bool)
+            or not isinstance(self.max_suitable_pages_per_cycle, int)
+            or self.max_suitable_pages_per_cycle <= 0
+        ):
+            raise ValueError("max_suitable_pages_per_cycle must be a positive integer")
         if isinstance(self.max_concurrency, bool) or not isinstance(self.max_concurrency, int) or self.max_concurrency not in {1, 2}:
             raise ValueError("max_concurrency must be one or two")
         if not str(self.collector_name).strip():
@@ -156,6 +183,11 @@ class CollectionCycle:
     discovery_scheduled: tuple[str, ...] = ()
     discovery_deferred: tuple[str, ...] = ()
     candidate_references: Mapping[str, Sequence[str]] | None = None
+    suitable_market_scheduled: tuple[str, ...] = ()
+    suitable_market_deferred: tuple[str, ...] = ()
+    discovery_exclusions: Sequence[Mapping[str, Any]] = ()
+    inventory_coverage: str | None = None
+    market_authorization: Mapping[str, Any] | None = None
     tier_attempts: Mapping[str, int] | None = None
     tier_successes: Mapping[str, int] | None = None
     tier_failures: Mapping[str, int] | None = None
@@ -198,6 +230,11 @@ class CollectionCycle:
             "candidate_bound_markets": list(self.candidate_bound_markets),
             "candidate_bound_scheduled": list(self.candidate_bound_scheduled),
             "candidate_bound_fresh": list(self.candidate_bound_fresh),
+            "suitable_market_scheduled": list(self.suitable_market_scheduled),
+            "suitable_market_deferred": list(self.suitable_market_deferred),
+            "discovery_exclusions": [dict(item) for item in self.discovery_exclusions],
+            "inventory_coverage": self.inventory_coverage,
+            "market_authorization": dict(self.market_authorization or {}),
             "candidate_bound_stale": list(self.candidate_bound_stale),
             "candidate_bound_missing": list(self.candidate_bound_missing),
             "paper_forward_markets": list(self.paper_forward_markets),
@@ -236,6 +273,7 @@ class PolymarketCollector:
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self.provider = provider
+        self._suitable_market_evidence: list[dict[str, Any]] = []
         self.store = store
         self.config = config or CollectorConfig()
         self.clock = clock
@@ -275,6 +313,7 @@ class PolymarketCollector:
         requested = tuple(dict.fromkeys(str(item).strip() for item in (market_ids or ()) if str(item).strip()))
         rolling_scope_ids = self._rolling_scope_market_ids()
         configured = requested or self.config.market_ids
+        self._suitable_market_evidence = []
         configured_values = tuple(dict.fromkeys([*configured, *rolling_scope_ids]))
         primary_candidate_ids = self._active_primary_candidate_ids() or []
         paper_ids = self._active_paper_forward_ids()
@@ -283,6 +322,7 @@ class PolymarketCollector:
         paper_set = set(paper_ids)
         observation_set = set(observation_intent_ids)
         counters = self._new_counters()
+        discovery_exclusions: list[Mapping[str, Any]] = []
         self._scope_resolutions = {}
         scope_candidate_ids, scope_candidate_markets, scope_discovered, scope_cursor = (
             self._resolve_market_scopes(
@@ -296,6 +336,14 @@ class PolymarketCollector:
                 counters,
             )
         )
+        if isinstance(self._scope_inventory_continuation, Mapping):
+            discovery_exclusions = [
+                *(
+                    dict(item)
+                    for item in self._scope_inventory_continuation.get("suitability_exclusions", ())
+                    if isinstance(item, Mapping)
+                ),
+            ]
         self._materialize_observation_intents(
             started,
             observation_intent_ids,
@@ -431,6 +479,15 @@ class PolymarketCollector:
             str((self._discovery_continuation or {}).get("coverage_status", "")).upper()
             or None
         )
+        discovery_exclusions.extend(
+            dict(item)
+            for item in (
+                (self._discovery_continuation or {}).get("suitability_exclusions", ())
+                if isinstance(self._discovery_continuation, Mapping)
+                else ()
+            )
+            if isinstance(item, Mapping)
+        )
         # A scope-bearing candidate has already consumed the one shared public
         # inventory pass above.  Never append unqualified inventory to its
         # schedule; this is what prevents research-only/invalid scopes from
@@ -472,6 +529,32 @@ class PolymarketCollector:
                 counters["errors"] += 1
                 discovery_coverage_status = "ERROR"
                 self.store.save_collection_error(None, started, "discovery", str(exc))
+                discovery_exclusions.extend(
+                    dict(item)
+                    for item in self._suitable_market_evidence
+                    if isinstance(item, Mapping)
+                    and str(item.get("action", "")).upper() == "UNSUITABLE"
+                )
+                discovery_exclusions = list(
+                    {
+                        str(item.get("market_id", "")): item
+                        for item in discovery_exclusions
+                        if item.get("market_id")
+                    }.values()
+                )[-256:]
+        discovery_exclusions.extend(
+            dict(item)
+            for item in self._suitable_market_evidence
+            if isinstance(item, Mapping)
+            and str(item.get("action", "")).upper() == "UNSUITABLE"
+        )
+        discovery_exclusions = list(
+            {
+                str(item.get("market_id", "")): item
+                for item in discovery_exclusions
+                if item.get("market_id")
+            }.values()
+        )[-256:]
         if (
             not configured
             and not scope_candidate_set
@@ -615,6 +698,41 @@ class PolymarketCollector:
                 else None
             )
         )
+        scope_continuation = (
+            self._scope_inventory_continuation
+            if isinstance(self._scope_inventory_continuation, Mapping)
+            else {}
+        )
+        inventory_coverage = str(
+            scope_continuation.get("coverage_status")
+            or discovery_coverage_status
+            or ""
+        ).upper() or None
+        scope_bindings = [
+            {
+                "candidate_id": str(candidate_id),
+                "scope_hash": str(proof.get("scope_hash")),
+                "scope_version": str(proof.get("scope_version")),
+            }
+            for candidate_id, proof in self._scope_resolutions.items()
+            if isinstance(proof, Mapping)
+            and proof.get("scope_hash")
+            and proof.get("scope_version")
+        ]
+        market_authorization = {
+            "status": (
+                "VERIFIED_MARKET_AUTHORIZED"
+                if scope_continuation.get("verified_market_ids")
+                else "OBSERVATION_ONLY"
+            ),
+            "verified_market_ids": list(scope_continuation.get("verified_market_ids", ())),
+            "coverage_status": inventory_coverage,
+            "scope_bindings": scope_bindings,
+        }
+        suitable_deferred = tuple(
+            item for item in discovery_deferred
+            if item not in discovery_scheduled
+        )
         cycle = CollectionCycle(
             started,
             ended,
@@ -634,6 +752,11 @@ class PolymarketCollector:
             tier_successes=tier_successes,
             tier_failures=tier_failures,
             request_latency_summary=self._latency_summary(counters.pop("_request_latencies", [])),
+            suitable_market_scheduled=tuple(discovery_scheduled),
+            suitable_market_deferred=suitable_deferred,
+            discovery_exclusions=tuple(discovery_exclusions),
+            inventory_coverage=inventory_coverage,
+            market_authorization=market_authorization,
             capacity_reason=capacity_reason,
             discovery_coverage_status=discovery_coverage_status,
             discovery_cursor=(
@@ -725,6 +848,12 @@ class PolymarketCollector:
                 "discovery_complete": discovery_complete,
                 "scope_discovery_carry_cursor": scope_cursor,
                 "scope_inventory_continuation": self._scope_inventory_continuation,
+                "suitable_market_scheduled": list(discovery_scheduled),
+                "suitable_market_deferred": list(suitable_deferred),
+                "discovery_exclusions": [dict(item) for item in discovery_exclusions],
+                "suitable_market_evidence": [dict(item) for item in self._suitable_market_evidence[-256:]],
+                "inventory_coverage": inventory_coverage,
+                "market_authorization": market_authorization,
                 "candidate_bound_markets": list(candidate_bound),
                 "candidate_bound_scheduled": list(candidate_scheduled),
                 "candidate_bound_fresh": list(candidate_fresh),
@@ -1323,33 +1452,89 @@ class PolymarketCollector:
                 # input.  Keep the candidate scoped so legacy authority cannot
                 # leak into scheduling while the next cycle rebases.
                 return scope_candidates, {}, {}, next_cursor
-            if callable(getattr(self.provider, "market_page", None)):
-                coverage = (
-                    str(self._scope_inventory_continuation.get("coverage_status", "")).upper()
-                    if isinstance(self._scope_inventory_continuation, Mapping)
-                    else ""
-                )
-                if coverage != "COMPLETE":
-                    # A page-local match is not scope authority.  Wait until
-                    # every bounded keyset page has been accumulated before
-                    # invoking the resolver or persisting a proof.
-                    return scope_candidates, {}, {}, next_cursor
         else:
             current_records, snapshots, next_cursor = [], {}, carry_cursor
+        coverage = (
+            str(self._scope_inventory_continuation.get("coverage_status", "")).upper()
+            if isinstance(self._scope_inventory_continuation, Mapping)
+            else ""
+        )
+        if not coverage and current_records and self._scope_inventory_continuation is None:
+            # The legacy markets(active=True) endpoint returns a complete
+            # bounded inventory and has no continuation metadata.
+            coverage = "COMPLETE"
         # Resolver limits are independently bounded from the scheduler's
         # global market cap.  A candidate may have up to the canonical 100
         # matches, while this cycle still schedules at most max_markets.
         max_scope_markets = min(1000, max(0, len(current_records)))
         candidate_markets: dict[str, list[str]] = {}
         for candidate_id, document in documents:
+            candidate_records = list(current_records)
+            candidate_snapshots = dict(snapshots)
+            suitability_configured = self._suitability_is_configured(document)
+            if coverage != "COMPLETE" and not suitability_configured:
+                # A page-local match is not authority without a current
+                # selected-token suitability proof.
+                continue
+            if suitability_configured:
+                parameters = self._suitability_parameters(document)
+                kwargs = self._suitability_kwargs(document)
+                refreshed_records: list[Mapping[str, Any]] = []
+                refreshed_snapshots: dict[str, PredictionMarketSnapshot] = {}
+                for raw_record in candidate_records:
+                    if not isinstance(raw_record, Mapping):
+                        continue
+                    market_id = str(raw_record.get("market_id", "")).strip()
+                    snapshot = candidate_snapshots.get(market_id)
+                    if snapshot is None:
+                        snapshot = self._scope_snapshot_from_record(raw_record, observed_at)
+                        if snapshot is not None:
+                            snapshot = self._refresh_scope_snapshot(snapshot, self.provider)
+                    if snapshot is None:
+                        refreshed = dict(raw_record)
+                        refreshed["suitability_evidence"] = {
+                            "market_id": market_id,
+                            "action": "UNSUITABLE",
+                            "category": "RULES_UNKNOWN",
+                            "reason": "SUITABILITY_UNKNOWN",
+                            "resolver": "refresh_market_suitability",
+                            "next_action": "recheck_next_discovery_tick",
+                            "observed_at": observed_at.isoformat(),
+                        }
+                        refreshed_records.append(refreshed)
+                        continue
+                    assessment = self._suitable_market_assessment(
+                        snapshot,
+                        observed_at,
+                        self.provider,
+                        **kwargs,
+                    )
+                    self._suitable_market_evidence.append(dict(assessment))
+                    refreshed = dict(self._scope_market_record(snapshot, observed_at, self.provider))
+                    refreshed["suitability_evidence"] = dict(assessment)
+                    refreshed["suitable_market"] = assessment.get("action") == "SUITABLE"
+                    refreshed_records.append(refreshed)
+                    refreshed_snapshots[market_id] = snapshot
+                candidate_records = refreshed_records
+                candidate_snapshots = refreshed_snapshots
+                if coverage != "COMPLETE":
+                    candidate_records = [
+                        record
+                        for record in candidate_records
+                        if isinstance(record.get("suitability_evidence"), Mapping)
+                        and str(record["suitability_evidence"].get("action", "")).upper() == "SUITABLE"
+                    ]
+                    if not candidate_records:
+                        continue
+            candidate_limit = min(1000, max(0, len(candidate_records)))
             try:
                 result = resolve_market_scope(
                     candidate_id,
                     document,
-                    current_records,
+                    candidate_records,
                     resolved_at=observed_at,
                     max_matches=100,
-                    max_markets=max_scope_markets,
+                    max_markets=candidate_limit,
                 )
             except Exception as exc:
                 counters["errors"] += 1
@@ -1706,6 +1891,22 @@ class PolymarketCollector:
         return default if value is _UNSET else value
 
     @staticmethod
+    def _refresh_scope_snapshot(
+        snapshot: PredictionMarketSnapshot,
+        provider: Any,
+    ) -> PredictionMarketSnapshot | None:
+        """Refresh carried inventory metadata before using its evidence."""
+        fetcher = getattr(provider, "market", None)
+        if not callable(fetcher):
+            return None
+        try:
+            current = fetcher(snapshot.market_id)
+        except Exception:
+            return None
+        return current if isinstance(current, PredictionMarketSnapshot) else None
+
+
+    @staticmethod
     def _scope_snapshot_from_record(
         record: Mapping[str, Any],
         observed_at: datetime,
@@ -1771,6 +1972,25 @@ class PolymarketCollector:
     ) -> tuple[list[Mapping[str, Any]], dict[str, PredictionMarketSnapshot], Any]:
         """Fetch exactly one bounded scope page, preserving opaque continuation."""
         provider = provider or self.provider
+        suitability_enabled = any(
+            self._suitability_is_configured(document)
+            for document in documents
+            if isinstance(document, Mapping)
+        )
+        suitability_documents = [
+            document
+            for document in documents
+            if isinstance(document, Mapping) and self._suitability_is_configured(document)
+        ]
+        suitability_kwargs: dict[str, Any] = {}
+        if suitability_documents:
+            candidate_kwargs = [self._suitability_kwargs(document) for document in suitability_documents]
+            suitability_kwargs = candidate_kwargs[0]
+            if any(
+                _stable_payload(item) != _stable_payload(suitability_kwargs)
+                for item in candidate_kwargs[1:]
+            ):
+                suitability_kwargs = {"intended_token": "__unknown__"}
         method_page = getattr(provider, "market_page", None)
         if callable(method_page) and self.config.discovery_budget_per_cycle > 0:
             limit = min(100, max(1, int(self.config.discovery_budget_per_cycle)))
@@ -1983,18 +2203,29 @@ class PolymarketCollector:
                     "opaque_cursor": current_cursor,
                     "cursor": current_cursor,
                     "coverage_status": "BUDGET_EXHAUSTED",
+                    "verified_market_ids": (
+                        []
+                        if suitability_enabled
+                        else list(base_state.get("verified_market_ids", ()))
+                    ),
+                    "authorization_status": (
+                        "UNAUTHORIZED"
+                        if suitability_enabled
+                        else base_state.get("authorization_status")
+                    ),
                     "inventory_records": list(inventory_records_by_id.values()),
                     "seen_market_ids": sorted(inventory_records_by_id),
                     "updated_at": observed_at.isoformat(),
                 }
-                return list(inventory_records_by_id.values()), {
-                    market_id: snapshot
-                    for market_id, snapshot in (
-                        (record.get("market_id"), self._scope_snapshot_from_record(record, observed_at))
-                        for record in inventory_records_by_id.values()
-                    )
-                    if isinstance(market_id, str) and snapshot is not None
-                }, current_cursor
+                snapshot_by_id: dict[str, PredictionMarketSnapshot] = {}
+                for record in inventory_records_by_id.values():
+                    market_id = str(record.get("market_id", "")).strip()
+                    snapshot = self._scope_snapshot_from_record(record, observed_at)
+                    if suitability_enabled and snapshot is not None:
+                        snapshot = self._refresh_scope_snapshot(snapshot, provider)
+                    if market_id and snapshot is not None:
+                        snapshot_by_id[market_id] = snapshot
+                return list(inventory_records_by_id.values()), snapshot_by_id, current_cursor
 
 
             try:
@@ -2035,6 +2266,8 @@ class PolymarketCollector:
                     "expected_query_fingerprint": expected_fingerprint,
                     "after_cursor": current_cursor,
                     "opaque_cursor": current_cursor,
+                    "verified_market_ids": [] if suitability_enabled else list(base_state.get("verified_market_ids", ())),
+                    "authorization_status": "UNAUTHORIZED" if suitability_enabled else base_state.get("authorization_status"),
                     "coverage_status": "ERROR",
                     "raw_count": 0,
                     "unique_count": 0,
@@ -2124,6 +2357,22 @@ class PolymarketCollector:
                 duplicate_computed,
                 self._scope_count(supplied_duplicate, 0) if supplied_duplicate is not _UNSET else 0,
             )
+            suitability_enabled = any(self._suitability_is_configured(document) for document in documents)
+            suitability_evidence: list[dict[str, Any]] = []
+            if not suitability_enabled:
+                suitability_evidence = [
+                    dict(item)
+                    for item in base_state.get("suitable_market_evidence", ())
+                    if isinstance(item, Mapping)
+                ]
+            suitability_exclusions: list[dict[str, Any]] = [
+                dict(item)
+                for item in base_state.get("suitability_exclusions", ())
+                if isinstance(item, Mapping)
+            ]
+            # A verified id from an earlier cycle is not current authority.
+            # It is revalidated below against the present selected-token book.
+            verified_market_ids: set[str] = set()
             page_error_reason = self._scope_page_value(page, "error_reason", None)
             page_error_reason = (
                 str(page_error_reason).strip().upper()
@@ -2204,10 +2453,54 @@ class PolymarketCollector:
                 coverage_status = explicit_status if explicit_status in {"PARTIAL", "BUDGET_EXHAUSTED"} else "BUDGET_EXHAUSTED"
             else:
                 coverage_status = "BUDGET_EXHAUSTED"
-            page_records = [
-                self._scope_market_record(item, observed_at, provider)
-                for item in new_snapshots
-            ]
+            suitability_evidence: list[dict[str, Any]] = []
+            if not suitability_enabled:
+                suitability_evidence = [
+                    dict(item)
+                    for item in base_state.get("suitable_market_evidence", ())
+                    if isinstance(item, Mapping)
+                ]
+            page_records: list[dict[str, Any]] = []
+            freshly_assessed_ids: set[str] = set()
+            for item in new_snapshots:
+                record = dict(self._scope_market_record(item, observed_at, provider))
+                if suitability_enabled:
+                    assessment = self._suitable_market_assessment(
+                        item,
+                        observed_at,
+                        provider,
+                        **suitability_kwargs,
+                    )
+                    suitability_evidence.append(dict(assessment))
+                    record["suitability_evidence"] = dict(assessment)
+                    record["suitable_market"] = assessment.get("action") == "SUITABLE"
+                    if record["suitable_market"]:
+                        verified_market_ids.add(str(item.market_id).strip())
+                    else:
+                        suitability_exclusions.append(dict(assessment))
+                page_records.append(record)
+            if suitability_enabled:
+                for market_id, record in tuple(inventory_records_by_id.items()):
+                    if market_id in freshly_assessed_ids:
+                        continue
+                    snapshot = self._scope_snapshot_from_record(record, observed_at)
+                    if snapshot is not None:
+                        snapshot = self._refresh_scope_snapshot(snapshot, provider)
+                    if snapshot is None:
+                        continue
+                    assessment = self._suitable_market_assessment(
+                        snapshot,
+                        observed_at,
+                        provider,
+                        **suitability_kwargs,
+                    )
+                    self._suitable_market_evidence.append(dict(assessment))
+                    record["suitability_evidence"] = dict(assessment)
+                    record["suitable_market"] = assessment.get("action") == "SUITABLE"
+                    if record["suitable_market"]:
+                        verified_market_ids.add(market_id)
+                    else:
+                        suitability_exclusions.append(dict(assessment))
             for record in page_records:
                 market_id = str(record.get("market_id", "")).strip()
                 if market_id:
@@ -2268,6 +2561,14 @@ class PolymarketCollector:
                 "last_page_at": observed_at.isoformat(),
                 "first_page_at": base_state.get("first_page_at", observed_at.isoformat()),
             }
+            if suitability_enabled:
+                continuation["suitability_enabled"] = True
+                continuation["suitable_market_evidence"] = suitability_evidence[-256:]
+                continuation["suitability_exclusions"] = suitability_exclusions[-256:]
+                continuation["verified_market_ids"] = sorted(verified_market_ids)[:_MAX_SCOPE_INVENTORY]
+                continuation["authorization_status"] = (
+                    "VERIFIED_MARKET_AUTHORIZED" if verified_market_ids else "UNAUTHORIZED"
+                )
             if coverage_status != "COMPLETE":
                 continuation["inventory_records"] = list(inventory_records_by_id.values())[:_MAX_SCOPE_INVENTORY]
             if page_error_reason is not None:
@@ -2282,6 +2583,8 @@ class PolymarketCollector:
                 for market_id, record in inventory_records_by_id.items():
                     if market_id not in record_by_id:
                         snapshot = self._scope_snapshot_from_record(record, observed_at)
+                        if snapshot is not None and suitability_enabled:
+                            snapshot = self._refresh_scope_snapshot(snapshot, provider)
                         if snapshot is not None:
                             record_by_id[market_id] = snapshot
             records = list(inventory_records_by_id.values())
@@ -2306,6 +2609,19 @@ class PolymarketCollector:
 
         # Legacy/fake providers retain the original bounded offset behavior.
         method = getattr(provider, "markets", None)
+        legacy_previous = (
+            dict(self._scope_inventory_continuation)
+            if isinstance(self._scope_inventory_continuation, Mapping)
+            else {}
+        )
+        # A prior cycle's suitability proof is expired before this page is
+        # assessed; only current selected-token evidence may authorize.
+        verified_market_ids: set[str] = set()
+        suitability_exclusions = [
+            dict(item)
+            for item in legacy_previous.get("suitability_exclusions", ())
+            if isinstance(item, Mapping)
+        ]
         if not callable(method):
             return [], {}, carry_cursor
         kwargs: dict[str, Any] = {"active": True}
@@ -2355,13 +2671,50 @@ class PolymarketCollector:
             offset = 0
         rotated = snapshots[offset:] + snapshots[:offset]
         page = rotated[:scan_budget]
-        records = [self._scope_market_record(item, observed_at, provider) for item in page]
-        record_by_id = {
-            str(item.market_id).strip(): item
-            for item in page
-            if str(item.market_id).strip()
-        }
+        records: list[Mapping[str, Any]] = []
+        record_by_id: dict[str, PredictionMarketSnapshot] = {}
+        suitability_evidence: list[dict[str, Any]] = [
+            dict(item)
+            for item in legacy_previous.get("suitable_market_evidence", ())
+            if isinstance(item, Mapping)
+        ]
+        for item in page:
+            record = dict(self._scope_market_record(item, observed_at, provider))
+            if suitability_enabled:
+                assessment = self._suitable_market_assessment(
+                    item,
+                    observed_at,
+                    provider,
+                    **suitability_kwargs,
+                )
+                suitability_evidence.append(dict(assessment))
+                record["suitability_evidence"] = dict(assessment)
+                record["suitable_market"] = assessment.get("action") == "SUITABLE"
+                if record["suitable_market"]:
+                    verified_market_ids.add(str(item.market_id).strip())
+                else:
+                    suitability_exclusions.append(dict(assessment))
+            records.append(record)
+            record_by_id[str(item.market_id).strip()] = item
         next_cursor = (offset + len(page)) % len(snapshots)
+        if suitability_enabled:
+            self._scope_inventory_continuation = {
+                **legacy_previous,
+                "request_path": "/markets",
+                "request_query": dict(kwargs),
+                "after_cursor": next_cursor,
+                "coverage_status": "BUDGET_EXHAUSTED",
+                "suitability_enabled": True,
+                "suitable_market_evidence": suitability_evidence[-256:],
+                "suitability_exclusions": suitability_exclusions[-256:],
+                "verified_market_ids": sorted(verified_market_ids)[:_MAX_SCOPE_INVENTORY],
+                "authorization_status": (
+                    "VERIFIED_MARKET_AUTHORIZED"
+                    if verified_market_ids
+                    else "UNAUTHORIZED"
+                ),
+                "updated_at": observed_at.isoformat(),
+            }
         return records, record_by_id, next_cursor
 
 
@@ -2438,6 +2791,746 @@ class PolymarketCollector:
                 "observed_at": observed_at.isoformat(),
             },
         }
+    @staticmethod
+    def _book_levels(book: Any, side: str) -> list[tuple[float, float]]:
+        """Return finite ``(price, size)`` rows without treating missing depth as malformed."""
+        values = getattr(book, "asks" if side == "BUY" else "bids", None)
+        if values is None and isinstance(book, Mapping):
+            values = book.get("asks" if side == "BUY" else "bids", ())
+        if not isinstance(values, (list, tuple)):
+            return []
+        levels: list[tuple[float, float]] = []
+        for value in values:
+            price = getattr(value, "price", None)
+            size = getattr(value, "size", None)
+            if isinstance(value, Mapping):
+                price = value.get("price", value.get("px", price))
+                size = value.get("size", value.get("quantity", value.get("qty", size)))
+            try:
+                price_number = float(price)
+                size_number = float(size)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if math.isfinite(price_number) and math.isfinite(size_number) and price_number > 0 and size_number > 0:
+                levels.append((price_number, size_number))
+        levels.sort(key=lambda item: item[0], reverse=side != "BUY")
+        return levels
+    @staticmethod
+    def _book_token_id(book: Any) -> str | None:
+        value = getattr(book, "token_id", None)
+        if isinstance(book, Mapping):
+            value = book.get(
+                "token_id",
+                book.get("tokenId", book.get("asset_id", book.get("assetId", value))),
+            )
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
+
+    def _suitable_market_assessment(
+        self,
+        snapshot: PredictionMarketSnapshot,
+        observed_at: datetime,
+        provider: Any,
+        *,
+        intended_token: str | None = None,
+        required_capital: float | None = None,
+        min_entry_depth: float | None = None,
+        min_exit_depth: float | None = None,
+        min_activity: float | None = None,
+        venue_fee_rate: float | None = None,
+    ) -> dict[str, Any]:
+        """Assess one public market for a bounded paper-observation probe.
+
+        This is intentionally a producer-side assessment, not execution
+        authority.  A later execution controller must re-read canonical rules,
+        token identity, and depth immediately before any order decision.
+        """
+        token = str(intended_token if intended_token is not None else self.config.intended_token).strip().lower()
+        capital = float(self.config.required_capital if required_capital is None else required_capital)
+        entry_floor = float(self.config.min_entry_depth if min_entry_depth is None else min_entry_depth)
+        exit_floor = float(self.config.min_exit_depth if min_exit_depth is None else min_exit_depth)
+        fee_rate = float(0.0 if venue_fee_rate is None else venue_fee_rate)
+        activity_floor = float(self.config.min_activity if min_activity is None else min_activity)
+        if (
+            token not in {"yes", "no"}
+            or not all(math.isfinite(value) and value >= 0 for value in (capital, entry_floor, exit_floor, fee_rate, activity_floor))
+        ):
+            return {
+                "market_id": str(snapshot.market_id),
+                "category": "RULES_UNKNOWN",
+                "action": "UNSUITABLE",
+                "reason": "SUITABILITY_ASSUMPTIONS_UNKNOWN",
+                "resolver": "refresh_frozen_scope_assumptions",
+                "next_action": "recheck_next_discovery_tick",
+                "intended_token": token,
+                "required_capital": capital if math.isfinite(capital) and capital >= 0 else None,
+                "observed_required_capital": None,
+                "observed_required_amount": None,
+                "venue_fee_rate": fee_rate if math.isfinite(fee_rate) and fee_rate >= 0 else None,
+                "observed_at": ensure_utc(observed_at).isoformat(),
+            }
+        evidence: dict[str, Any] = {
+            "market_id": str(snapshot.market_id),
+            "category": "MARKET_CONSTRAINT",
+            "action": "UNSUITABLE",
+            "reason": "",
+            "resolver": "inspect_market_depth",
+            "next_action": "recheck_next_discovery_tick",
+            "intended_token": token,
+            "required_capital": capital,
+            "observed_required_capital": None,
+            "observed_required_amount": None,
+            "venue_fee_rate": fee_rate,
+            "observed_at": ensure_utc(observed_at).isoformat(),
+        }
+        try:
+            snapshot_timestamp = ensure_utc(snapshot.timestamp)
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            evidence.update(
+                category="DATA_FRESHNESS",
+                reason="FRESHNESS_UNKNOWN",
+                resolver="refresh_market_snapshot",
+                next_action="recheck_next_discovery_tick",
+            )
+            return evidence
+        if snapshot.active is None:
+            evidence.update(
+                category="MARKET_LIFECYCLE",
+                reason="ACTIVE_UNKNOWN",
+                resolver="refresh_market_metadata",
+                next_action="recheck_next_discovery_tick",
+            )
+            return evidence
+        if snapshot.closed is None:
+            evidence.update(
+                category="MARKET_LIFECYCLE",
+                reason="CLOSED_UNKNOWN",
+                resolver="refresh_market_metadata",
+                next_action="recheck_next_discovery_tick",
+            )
+            return evidence
+        if snapshot.active is False or snapshot.closed is True or snapshot.archived is True:
+            evidence.update(
+                category="MARKET_LIFECYCLE",
+                reason="INACTIVE_MARKET",
+                resolver="wait_for_market_reopen",
+                next_action="recheck_next_discovery_tick",
+            )
+            return evidence
+        if snapshot.accepting_orders is None:
+            evidence.update(
+                category="MARKET_LIFECYCLE",
+                reason="ACCEPTING_ORDERS_UNKNOWN",
+                resolver="refresh_market_metadata",
+                next_action="recheck_next_discovery_tick",
+            )
+            return evidence
+        if snapshot.accepting_orders is False:
+            evidence.update(
+                category="MARKET_LIFECYCLE",
+                reason="ACCEPTING_ORDERS_FALSE",
+                resolver="wait_for_accepting_orders",
+                next_action="recheck_next_discovery_tick",
+            )
+            return evidence
+        if snapshot.enable_order_book is None:
+            evidence.update(
+                category="MARKET_LIFECYCLE",
+                reason="ORDER_BOOK_UNKNOWN",
+                resolver="refresh_market_metadata",
+                next_action="recheck_next_discovery_tick",
+            )
+            return evidence
+        if snapshot.enable_order_book is False:
+            evidence.update(
+                category="CAPITAL_OR_MARKET_CONSTRAINT",
+                reason="ORDER_BOOK_UNAVAILABLE",
+                resolver="wait_for_order_book",
+                next_action="recheck_next_discovery_tick",
+            )
+            return evidence
+        token_id = getattr(snapshot, f"{token}_token_id", None)
+        evidence["token_id"] = str(token_id) if token_id else None
+        if not token_id:
+            evidence.update(
+                category="CAPITAL_OR_MARKET_CONSTRAINT",
+                reason="TOKEN_ID_MISSING",
+                resolver="refresh_market_metadata",
+                next_action="recheck_next_discovery_tick",
+            )
+            return evidence
+        book: Any = snapshot.order_book
+        attached_token = self._book_token_id(book)
+        if attached_token != str(token_id).strip():
+            # A snapshot normally carries a YES book.  It must not be reused
+            # when the configured intended token is NO, and an unbound book is
+            # not evidence for either token.
+            book = None
+        if book is None:
+            fetch_for_token = getattr(provider, "order_book_for_token", None)
+            if callable(fetch_for_token):
+                try:
+                    book = fetch_for_token(str(token_id), depth=self.config.depth)
+                except Exception:
+                    book = None
+        if book is None:
+            fetcher = getattr(provider, "order_books", None)
+            if callable(fetcher):
+                try:
+                    books = fetcher(snapshot.market_id, depth=self.config.depth)
+                    if isinstance(books, Mapping):
+                        # The provider's map key is only a lookup hint.  The
+                        # returned book must carry the exact selected token
+                        # identity; never guess from a singleton response.
+                        for key in (token, str(token_id).strip()):
+                            candidate = books.get(key)
+                            if candidate is not None and self._book_token_id(candidate) == str(token_id).strip():
+                                book = candidate
+                                break
+                except Exception:
+                    book = None
+        if getattr(book, "available", True) is False or (
+            isinstance(book, Mapping) and book.get("available") is False
+        ):
+            book = None
+        if book is None:
+            evidence.update(
+                category="CAPITAL_OR_MARKET_CONSTRAINT",
+                reason="NO_DEPTH",
+                resolver="inspect_selected_token_depth",
+                next_action="recheck_next_discovery_tick",
+            )
+            return evidence
+        attached_token = self._book_token_id(book)
+        if attached_token != str(token_id).strip():
+            evidence.update(
+                category="DATA_QUALITY",
+                reason="SELECTED_TOKEN_MISMATCH",
+                resolver="refresh_selected_token_order_book",
+                next_action="recheck_next_discovery_tick",
+            )
+            return evidence
+        try:
+            from .polymarket_rules import assess_selected_token_depth, parse_polymarket_rules
+
+            rules = parse_polymarket_rules(book)
+        except Exception as exc:
+            reason = str(exc).strip() or "RULES_UNKNOWN"
+            evidence.update(
+                category="RULES_UNKNOWN",
+                reason=reason,
+                resolver="refresh_market_rules",
+                next_action="recheck_next_discovery_tick",
+                rules_error=reason,
+            )
+            return evidence
+        evidence["rules_version"] = str(
+            getattr(rules, "rules_version", getattr(rules, "sdk_version", ""))
+        )
+        asks = self._book_levels(book, "BUY")
+        bids = self._book_levels(book, "SELL")
+        if not asks or not bids:
+            evidence.update(
+                category="CAPITAL_OR_MARKET_CONSTRAINT",
+                reason="NO_DEPTH",
+                resolver="inspect_selected_token_depth",
+                next_action="recheck_next_discovery_tick",
+            )
+            return evidence
+        best_ask = asks[0][0]
+        minimum_order = float(rules.min_order_size)
+        # Polymarket quantities are two-decimal orders.  Round the requested
+        # quantity up to a valid two-decimal representation when an unusual
+        # venue minimum has finer precision; displayed level sizes remain
+        # untouched and are assessed at their original precision.
+        minimum_order = math.ceil(minimum_order * 100.0 - 1e-12) / 100.0
+        quantity = max(
+            minimum_order,
+            0.01,
+            math.floor(
+                (
+                    capital / (best_ask * (1.0 + fee_rate))
+                    if capital > 0 and fee_rate >= 0
+                    else minimum_order
+                )
+                * 100.0
+                + 1e-12
+            )
+            / 100.0,
+        )
+        observed_required = quantity * best_ask * (1.0 + fee_rate)
+        evidence["observed_required_capital"] = observed_required
+        entry_depth = sum(size for _, size in asks)
+        exit_depth = sum(size for _, size in bids)
+        age_seconds = max(
+            0.0,
+            (ensure_utc(observed_at) - snapshot_timestamp).total_seconds(),
+        )
+        evidence.update({
+            "entry_depth": entry_depth,
+            "exit_depth": exit_depth,
+            "depth_score": min(entry_depth, exit_depth),
+            "entry_activity": float(snapshot.volume or 0.0),
+            "exit_activity": float(snapshot.volume or 0.0),
+            "activity_score": float(snapshot.volume or 0.0),
+            "freshness_score": 1.0 / (1.0 + age_seconds),
+            "required_quantity": quantity,
+            "entry_price": best_ask,
+        })
+        canonical_action: str | None = None
+        canonical_reason: str | None = None
+        try:
+            assessments = (
+                assess_selected_token_depth(
+                    book,
+                    rules,
+                    side="BUY",
+                    quantity=quantity,
+                    cap_usd=capital,
+                    venue_fee_rate=fee_rate,
+                ),
+                assess_selected_token_depth(
+                    book,
+                    rules,
+                    side="SELL",
+                    quantity=quantity,
+                    venue_fee_rate=fee_rate,
+                ),
+            )
+            assessment = assessments[0]
+            action_value = getattr(assessment, "action", None)
+            if action_value is None and isinstance(assessment, Mapping):
+                action_value = assessment.get("action")
+            canonical_action = str(getattr(action_value, "value", action_value) or "").upper() or None
+            reason_value = getattr(assessment, "reason", None)
+            if reason_value is None and isinstance(assessment, Mapping):
+                reason_value = assessment.get("reason")
+            canonical_reason = str(getattr(reason_value, "value", reason_value) or "").upper() or None
+            for candidate_assessment in assessments[1:]:
+                candidate_action = getattr(candidate_assessment, "action", None)
+                if candidate_action is None and isinstance(candidate_assessment, Mapping):
+                    candidate_action = candidate_assessment.get("action")
+                normalized_action = str(getattr(candidate_action, "value", candidate_action) or "").upper()
+                if normalized_action != "SUITABLE":
+                    canonical_action = normalized_action or "UNKNOWN"
+                    candidate_reason = getattr(candidate_assessment, "reason", None)
+                    if candidate_reason is None and isinstance(candidate_assessment, Mapping):
+                        candidate_reason = candidate_assessment.get("reason")
+                    canonical_reason = (
+                        str(getattr(candidate_reason, "value", candidate_reason) or "").upper()
+                        or canonical_reason
+                    )
+            required_value = getattr(assessment, "required_cost", None)
+            if required_value is None and isinstance(assessment, Mapping):
+                required_value = assessment.get("required_cost", assessment.get("required_amount"))
+            try:
+                if required_value is not None and math.isfinite(float(required_value)):
+                    evidence["observed_required_capital"] = float(required_value)
+            except (TypeError, ValueError, OverflowError):
+                pass
+            evidence["observed_required_amount"] = evidence.get("observed_required_capital")
+        except Exception as exc:
+            reason = str(exc).strip() or "RULES_UNKNOWN"
+            evidence.update(
+                category="RULES_UNKNOWN",
+                reason=reason,
+                resolver="refresh_market_rules",
+                next_action="recheck_next_discovery_tick",
+                rules_error=reason,
+            )
+            return evidence
+        if canonical_action in {None, "UNKNOWN"}:
+            evidence.update(
+                category="RULES_UNKNOWN",
+                reason="RULES_UNKNOWN",
+                resolver="refresh_market_rules",
+                next_action="recheck_next_discovery_tick",
+            )
+            return evidence
+        if canonical_action is not None and canonical_action != "SUITABLE":
+            canonical_category = (
+                "DATA_QUALITY"
+                if canonical_action == "MALFORMED" or canonical_reason == "MALFORMED_BOOK"
+                else "CAPITAL_OR_MARKET_CONSTRAINT"
+            )
+            canonical_reason = canonical_reason or canonical_action
+            if canonical_reason == "INSUFFICIENT_DEPTH":
+                canonical_reason = "NO_DEPTH"
+            evidence.update(
+                category=canonical_category,
+                reason=canonical_reason,
+                resolver=(
+                    "refresh_selected_token_order_book"
+                    if canonical_category == "DATA_QUALITY"
+                    else "inspect_selected_token_depth"
+                ),
+                next_action="recheck_next_discovery_tick",
+            )
+            return evidence
+        if entry_depth < max(entry_floor, quantity) or exit_depth < max(exit_floor, quantity):
+            evidence.update(
+                category="CAPITAL_OR_MARKET_CONSTRAINT",
+                reason="NO_DEPTH",
+                resolver="inspect_selected_token_depth",
+                next_action="recheck_next_discovery_tick",
+            )
+            return evidence
+        if activity_floor > 0 and float(snapshot.volume or 0.0) < activity_floor:
+            evidence.update(
+                category="CAPITAL_OR_MARKET_CONSTRAINT",
+                reason="INSUFFICIENT_ACTIVITY",
+                resolver="wait_for_market_activity",
+                next_action="recheck_next_discovery_tick",
+            )
+            return evidence
+        fresh = True
+        if self.config.freshness_sla_seconds is not None:
+            age = (ensure_utc(observed_at) - snapshot_timestamp).total_seconds()
+            fresh = age <= float(self.config.freshness_sla_seconds)
+            if not fresh:
+                evidence.update(
+                    category="DATA_FRESHNESS",
+                    reason="STALE_MARKET",
+                    resolver="refresh_market_snapshot",
+                    next_action="recheck_next_discovery_tick",
+                )
+                return evidence
+        evidence.update(
+            category="SUITABLE_MARKET",
+            action="SUITABLE",
+            reason="SUITABLE",
+            fresh=fresh,
+            freshness_rank=0 if fresh else 1,
+        )
+        return evidence
+
+    @staticmethod
+    def _suitability_parameters(document: Mapping[str, Any]) -> dict[str, Any]:
+        """Read immutable probe assumptions without silently changing them.
+
+        Scope assumptions are commonly carried beside the canonical policy,
+        but older frozen artifacts place them under the plan or an assumptions
+        container.  All recognized locations are read in deterministic order;
+        conflicting aliases are marked unknown instead of selecting one.
+        """
+        sources: list[Mapping[str, Any]] = []
+        pending: list[Mapping[str, Any]] = [document]
+        seen: set[int] = set()
+        while pending and len(sources) < 32:
+            source = pending.pop(0)
+            marker = id(source)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            sources.append(source)
+            for key in (
+                "experiment_plan",
+                "market_scope",
+                "suitability",
+                "suitability_assumptions",
+                "assumptions",
+                "cost_assumptions",
+                "fees",
+                "paper_fee_assumptions",
+            ):
+                child = source.get(key)
+                if isinstance(child, Mapping):
+                    pending.append(child)
+
+        result: dict[str, Any] = {}
+        errors: list[str] = []
+
+        def add_number(name: str, value: Any, *, scale: float = 1.0) -> None:
+            try:
+                if isinstance(value, bool):
+                    raise ValueError
+                number = float(value) / scale
+            except (TypeError, ValueError, OverflowError):
+                errors.append(f"{name}_INVALID")
+                return
+            if not math.isfinite(number) or number < 0:
+                errors.append(f"{name}_INVALID")
+                return
+            previous = result.get(name)
+            if previous is not None and not math.isclose(float(previous), number, rel_tol=0.0, abs_tol=1e-12):
+                errors.append(f"{name}_CONFLICT")
+                return
+            result[name] = number
+
+        for source in sources:
+            for name, aliases in (
+                ("required_capital", ("required_capital", "min_required_capital")),
+                ("min_entry_depth", ("min_entry_depth",)),
+                ("min_exit_depth", ("min_exit_depth",)),
+                ("min_activity", ("min_activity",)),
+            ):
+                for alias in aliases:
+                    if alias in source:
+                        add_number(name, source[alias])
+                        break
+            if "intended_token" in source:
+                token = str(source["intended_token"]).strip().lower()
+                if token not in {"yes", "no"}:
+                    errors.append("INTENDED_TOKEN_INVALID")
+                elif "intended_token" in result and result["intended_token"] != token:
+                    errors.append("INTENDED_TOKEN_CONFLICT")
+                else:
+                    result["intended_token"] = token
+            for alias in ("venue_fee_rate", "fee_rate", "feeRate"):
+                if alias in source:
+                    add_number("venue_fee_rate", source[alias])
+                    break
+            for alias in ("venue_fee_bps", "fee_bps", "feeRateBps"):
+                if alias in source:
+                    add_number("venue_fee_rate", source[alias], scale=10_000.0)
+                    break
+        if errors:
+            result["_assumption_error"] = ",".join(dict.fromkeys(errors))
+        return result
+
+    @classmethod
+    def _suitability_kwargs(cls, document: Mapping[str, Any]) -> dict[str, Any]:
+        values = cls._suitability_parameters(document)
+        if values.get("_assumption_error"):
+            # An invalid or conflicting frozen assumption is never replaced
+            # with a process default; force a truthful unknown assessment.
+            return {"intended_token": "__unknown__"}
+        return {
+            key: value
+            for key, value in values.items()
+            if key in {
+                "intended_token",
+                "required_capital",
+                "min_entry_depth",
+                "min_exit_depth",
+                "min_activity",
+                "venue_fee_rate",
+            }
+        }
+
+    @classmethod
+    def _suitability_is_configured(cls, document: Mapping[str, Any]) -> bool:
+        return bool(cls._suitability_parameters(document))
+
+    def _discover_markets_keyset_suitable(
+        self,
+        observed_at: datetime,
+        counters: dict[str, Any],
+        *,
+        budget: int,
+        carry_cursor: Any,
+        provider: Any,
+        exclude: set[str],
+    ) -> tuple[Sequence[PredictionMarketSnapshot], Any, Sequence[str]]:
+        """Page through unsuitable rows until a bounded suitable batch appears."""
+        previous = (
+            dict(self._discovery_continuation)
+            if isinstance(self._discovery_continuation, Mapping)
+            else {}
+        )
+        cursor = carry_cursor if isinstance(carry_cursor, str) and carry_cursor.strip() else None
+        limit = min(100, max(1, int(budget)))
+        # The market budget limits returned candidates, not the number of
+        # pages inspected.  A small budget must still be able to advance past
+        # an arbitrary bounded run of unsuitable pages.
+        max_pages = max(1, int(self.config.max_suitable_pages_per_cycle))
+        selected: list[PredictionMarketSnapshot] = []
+        suitable_evidence: list[dict[str, Any]] = []
+        deferred: list[str] = []
+        exclusions: list[dict[str, Any]] = [
+            dict(item)
+            for item in previous.get("suitability_exclusions", ())
+            if isinstance(item, Mapping)
+        ]
+        page_count = 0
+        seen_cursors: list[str] = []
+        raw_total = unique_total = duplicate_total = malformed_total = 0
+        while page_count < max_pages:
+            kwargs: dict[str, Any] = {
+                "limit": limit,
+                "after_cursor": cursor,
+                "closed": not self.config.active,
+                "include_tag": True,
+            }
+            method_page = getattr(provider, "market_page")
+            try:
+                parameters = inspect.signature(method_page).parameters
+            except (TypeError, ValueError):
+                parameters = {}
+            if parameters and not any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
+                kwargs = {key: value for key, value in kwargs.items() if key in parameters}
+            try:
+                page = self._call_provider("discovery", lambda: method_page(**kwargs), observed_at, counters, provider=provider)
+            except Exception as exc:
+                counters["errors"] += 1
+                self._discovery_continuation = {
+                    **dict(self._discovery_continuation or {}),
+                    "coverage_status": "ERROR",
+                    "after_cursor": cursor,
+                    "error_reason": str(exc),
+                    "updated_at": observed_at.isoformat(),
+                }
+                self.store.save_collection_error(None, observed_at, "discovery", str(exc))
+                return tuple(selected), cursor, tuple(dict.fromkeys(deferred))
+            if page is None or (
+                not isinstance(page, (Mapping, list, tuple))
+                and not hasattr(page, "snapshots")
+            ):
+                counters["errors"] += 1
+                self._discovery_continuation = {
+                    **previous,
+                    "request_path": "/markets/keyset",
+                    "request_query": {**kwargs, "after_cursor": cursor},
+                    "after_cursor": None,
+                    "opaque_cursor": None,
+                    "cursor": None,
+                    "coverage_status": "ERROR",
+                    "error_reason": "INVALID_PAGE",
+                    "query_reset": True,
+                    "rebase_required": True,
+                    "seen_cursor_history": [],
+                    "updated_at": observed_at.isoformat(),
+                }
+                self.store.save_collection_error(None, observed_at, "discovery", "invalid discovery page")
+                return tuple(selected), None, tuple(dict.fromkeys(deferred))
+            page_status = str(self._scope_page_value(page, "coverage_status", "") or "").upper()
+            if page_status == "ERROR":
+                counters["errors"] += 1
+                self._discovery_continuation = {
+                    **dict(self._discovery_continuation or {}),
+                    "coverage_status": "ERROR",
+                    "after_cursor": cursor,
+                    "error_reason": str(
+                        self._scope_page_value(page, "error_reason", "provider page error")
+                    ),
+                    "updated_at": observed_at.isoformat(),
+                }
+                self.store.save_collection_error(
+                    None,
+                    observed_at,
+                    "discovery",
+                    str(self._scope_page_value(page, "error_reason", "provider page error")),
+                )
+                return tuple(selected), cursor, tuple(dict.fromkeys(deferred))
+            raw_items = self._scope_page_value(page, "snapshots", _UNSET)
+            if raw_items is _UNSET and isinstance(page, Mapping):
+                raw_items = page.get("markets", page.get("data", ()))
+            if raw_items is _UNSET:
+                raw_items = page if isinstance(page, (list, tuple)) else ()
+            try:
+                raw_values = list(raw_items or ())
+            except TypeError:
+                raw_values = []
+            snapshots = [item for item in raw_values if isinstance(item, PredictionMarketSnapshot)]
+            malformed = len(raw_values) - len(snapshots)
+            raw_total += self._scope_count(self._scope_page_value(page, "raw_count", len(raw_values)), len(raw_values))
+            malformed_total += max(malformed, self._scope_count(self._scope_page_value(page, "malformed_count", 0)))
+            page_ids: set[str] = set()
+            unique_page: list[PredictionMarketSnapshot] = []
+            for snapshot in snapshots:
+                if snapshot.market_id in page_ids:
+                    duplicate_total += 1
+                    continue
+                page_ids.add(snapshot.market_id)
+                unique_page.append(snapshot)
+            unique_total += len(unique_page)
+            next_cursor = self._scope_page_value(page, "next_cursor", None)
+            if next_cursor is not None and (
+                not isinstance(next_cursor, str)
+                or not next_cursor.strip()
+                or next_cursor == cursor
+                or next_cursor in seen_cursors
+            ):
+                counters["errors"] += 1
+                reason = (
+                    "REPEATED_CURSOR"
+                    if isinstance(next_cursor, str)
+                    and (next_cursor == cursor or next_cursor in seen_cursors)
+                    else "INVALID_NEXT_CURSOR"
+                )
+                self._discovery_continuation = {
+                    **previous,
+                    "request_path": "/markets/keyset",
+                    "request_query": {**kwargs, "after_cursor": cursor},
+                    "after_cursor": None,
+                    "opaque_cursor": None,
+                    "cursor": None,
+                    "coverage_status": "ERROR",
+                    "error_reason": reason,
+                    "query_reset": True,
+                    "rebase_required": True,
+                    "seen_cursor_history": [],
+                    "suitable_market_ids": [item.market_id for item in selected],
+                    "updated_at": observed_at.isoformat(),
+                }
+                self.store.save_collection_error(None, observed_at, "discovery", reason)
+                return tuple(selected), None, tuple(dict.fromkeys(deferred))
+            candidates: list[tuple[PredictionMarketSnapshot, dict[str, Any]]] = []
+            for snapshot in unique_page:
+                if snapshot.market_id in exclude:
+                    continue
+                assessment = self._suitable_market_assessment(snapshot, observed_at, provider)
+                self._suitable_market_evidence.append(assessment)
+                if assessment.get("action") == "SUITABLE":
+                    candidates.append((snapshot, assessment))
+                else:
+                    deferred.append(snapshot.market_id)
+                    exclusions.append(assessment)
+            candidates.sort(
+                key=lambda item: (
+                    int(item[1].get("freshness_rank", 1)),
+                    -float(item[1].get("freshness_score", 0.0)),
+                    -float(item[1].get("activity_score", 0.0)),
+                    -float(item[1].get("depth_score", 0.0)),
+                    -float(item[1].get("entry_depth", 0.0)),
+                    -float(item[1].get("exit_depth", 0.0)),
+                    str(item[0].market_id),
+                )
+            )
+            for snapshot, assessment in candidates:
+                if len(selected) >= budget:
+                    deferred.append(snapshot.market_id)
+                    continue
+                selected.append(snapshot)
+                suitable_evidence.append(dict(assessment))
+            page_count += 1
+            cursor = next_cursor if isinstance(next_cursor, str) and next_cursor.strip() else None
+            if selected or cursor is None:
+                break
+            seen_cursors.append(cursor)
+        status = (
+            page_status
+            if cursor is None and page_status in {"PARTIAL", "BUDGET_EXHAUSTED"}
+            else ("COMPLETE" if cursor is None else "BUDGET_EXHAUSTED")
+        )
+        if malformed_total:
+            counters["errors"] += malformed_total
+            status = "PARTIAL"
+            self.store.save_collection_error(
+                None,
+                observed_at,
+                "discovery_malformed_rows",
+                f"{malformed_total} malformed public market rows",
+            )
+        self._discovery_continuation = {
+            "request_path": "/markets/keyset",
+            "request_query": {"limit": limit, "after_cursor": cursor, "closed": not self.config.active, "include_tag": True},
+            "after_cursor": cursor,
+            "coverage_status": status,
+            "raw_count": raw_total,
+            "unique_count": unique_total,
+            "duplicate_count": duplicate_total,
+            "malformed_count": malformed_total,
+            "suitability_exclusions": exclusions[-256:],
+            "suitable_market_ids": [item.market_id for item in selected],
+            "suitable_market_evidence": suitable_evidence[-256:],
+            "updated_at": observed_at.isoformat(),
+        }
+        return tuple(selected), cursor, tuple(dict.fromkeys(deferred))
+
     @staticmethod
     def _scope_result_market_ids(result: Any) -> list[str]:
         raw = getattr(result, "matched_markets", _UNSET)
@@ -2523,204 +3616,14 @@ class PolymarketCollector:
         # legacy offset path only for in-memory/test providers without it.
         method_page = getattr(provider, "market_page", None)
         if callable(method_page):
-            cursor = carry_cursor if isinstance(carry_cursor, str) and carry_cursor.strip() else None
-            limit = min(100, max(1, budget))
-            kwargs: dict[str, Any] = {
-                "limit": limit,
-                "after_cursor": cursor,
-                "closed": not self.config.active,
-                "include_tag": True,
-            }
-            try:
-                parameters = inspect.signature(method_page).parameters
-            except (TypeError, ValueError):
-                parameters = {}
-            if parameters and not any(
-                parameter.kind is inspect.Parameter.VAR_KEYWORD
-                for parameter in parameters.values()
-            ):
-                kwargs = {key: value for key, value in kwargs.items() if key in parameters}
-            try:
-                page = self._call_provider(
-                    "discovery",
-                    lambda: method_page(**kwargs),
-                    observed_at,
-                    counters,
-                    provider=provider,
-                )
-            except Exception as exc:
-                counters["errors"] += 1
-                self._discovery_continuation = {
-                    **dict(self._discovery_continuation or {}),
-                    "coverage_status": "ERROR",
-                    "after_cursor": cursor,
-                    "error_reason": str(exc),
-                    "updated_at": observed_at.isoformat(),
-                }
-                self.store.save_collection_error(None, observed_at, "discovery", str(exc))
-                return (), cursor, ()
-            page_invalid = (
-                page is None
-                or (
-                    not isinstance(page, (Mapping, list, tuple))
-                    and not hasattr(page, "snapshots")
-                )
+            return self._discover_markets_keyset_suitable(
+                observed_at,
+                counters,
+                budget=budget,
+                carry_cursor=carry_cursor,
+                provider=provider,
+                exclude=excluded,
             )
-            if page_invalid:
-                counters["errors"] += 1
-                self._discovery_continuation = {
-                    **dict(self._discovery_continuation or {}),
-                    "coverage_status": "ERROR",
-                    "after_cursor": cursor,
-                    "error_reason": "invalid discovery page",
-                    "updated_at": observed_at.isoformat(),
-                }
-                self.store.save_collection_error(None, observed_at, "discovery", "invalid discovery page")
-                return (), cursor, ()
-            raw_status = self._scope_page_value(page, "coverage_status", _UNSET)
-            status = (
-                str(raw_status).strip().upper()
-                if raw_status not in (_UNSET, None)
-                else ""
-            )
-            status_declared = raw_status not in (_UNSET, None) and bool(status)
-            next_cursor = self._scope_page_value(page, "next_cursor", None)
-            page_error_reason = self._scope_page_value(page, "error_reason", None)
-            page_error_reason = (
-                str(page_error_reason).strip()
-                if page_error_reason is not None and str(page_error_reason).strip()
-                else None
-            )
-            request_failed = self._scope_page_value(page, "request_failed", False) is True
-            raw_items = self._scope_page_value(page, "snapshots", _UNSET)
-            if raw_items is _UNSET and isinstance(page, Mapping):
-                raw_items = page.get("markets", page.get("data", ()))
-            if raw_items is _UNSET:
-                raw_items = ()
-            malformed_computed = 0
-            if isinstance(raw_items, (str, bytes, bytearray, Mapping)):
-                raw_values: list[Any] = []
-                malformed_computed = 1
-            else:
-                try:
-                    raw_values = list(raw_items or ())
-                except TypeError:
-                    raw_values = []
-                    malformed_computed = 1
-            snapshots = []
-            for item in raw_values:
-                if isinstance(item, PredictionMarketSnapshot):
-                    snapshots.append(item)
-                else:
-                    malformed_computed += 1
-            supplied_raw = self._scope_page_value(page, "raw_count", _UNSET)
-            raw_count = self._scope_count(
-                supplied_raw,
-                len(raw_values) if supplied_raw is _UNSET else 0,
-            )
-            supplied_malformed = self._scope_page_value(page, "malformed_count", _UNSET)
-            malformed_count = max(
-                malformed_computed,
-                self._scope_count(supplied_malformed, 0)
-                if supplied_malformed is not _UNSET
-                else 0,
-            )
-            supplied_unique = self._scope_page_value(page, "unique_count", _UNSET)
-            unique_count = self._scope_count(
-                supplied_unique,
-                len(snapshots) if supplied_unique is _UNSET else 0,
-            )
-            supplied_duplicate = self._scope_page_value(page, "duplicate_count", _UNSET)
-            duplicate_count = self._scope_count(
-                supplied_duplicate,
-                0,
-            )
-
-            def persist_page_error(
-                reason: str,
-                *,
-                kind: str = "discovery",
-            ) -> None:
-                self._discovery_continuation = {
-                    **dict(self._discovery_continuation or {}),
-                    "coverage_status": "ERROR",
-                    "after_cursor": cursor,
-                    "error_reason": reason,
-                    "raw_count": raw_count,
-                    "unique_count": unique_count,
-                    "duplicate_count": duplicate_count,
-                    "malformed_count": malformed_count,
-                    "updated_at": observed_at.isoformat(),
-                }
-                self.store.save_collection_error(None, observed_at, kind, reason)
-
-            if status_declared and status not in {"PARTIAL", "COMPLETE", "BUDGET_EXHAUSTED", "ERROR"}:
-                counters["errors"] += 1
-                persist_page_error(f"INVALID_COVERAGE_STATUS:{status}")
-                return (), cursor, ()
-            if request_failed:
-                counters["errors"] += 1
-                persist_page_error(page_error_reason or "REQUEST_FAILED")
-                return (), cursor, ()
-            if next_cursor is not None and (
-                not isinstance(next_cursor, str)
-                or not next_cursor.strip()
-                or next_cursor == cursor
-            ):
-                counters["errors"] += 1
-                persist_page_error(page_error_reason or "INVALID_NEXT_CURSOR")
-                return (), cursor, ()
-            if status == "ERROR":
-                counters["errors"] += 1
-                persist_page_error(page_error_reason or "PAGE_ERROR")
-                return (), cursor, ()
-            if malformed_count:
-                counters["errors"] += malformed_count
-                if page_error_reason is None:
-                    page_error_reason = f"REJECTED_PAGE_ITEMS:{malformed_count}"
-                self.store.save_collection_error(
-                    None,
-                    observed_at,
-                    "discovery_malformed_rows",
-                    f"{malformed_count} malformed public market rows",
-                )
-                # The incoming cursor identifies the retryable frontier.  A
-                # page containing malformed rows must never advance to its
-                # returned cursor, even if the page advertises COMPLETE.
-                status = "PARTIAL"
-                continuation_cursor = cursor
-            else:
-                continuation_cursor = next_cursor
-            selected = [item for item in snapshots if item.market_id not in excluded][:budget]
-            selected_ids = {item.market_id for item in selected}
-            deferred = [
-                item.market_id
-                for item in snapshots
-                if item.market_id not in excluded and item.market_id not in selected_ids
-            ]
-            if not malformed_count:
-                if not selected and not deferred and continuation_cursor is None:
-                    status = "NO_MATCHING_MARKETS"
-                elif continuation_cursor is not None:
-                    status = status if status in {"PARTIAL", "BUDGET_EXHAUSTED"} else "PARTIAL"
-                else:
-                    status = status if status in {"PARTIAL", "COMPLETE"} else "COMPLETE"
-            self._discovery_continuation = {
-                "request_path": str(self._scope_page_value(page, "request_path", "/markets/keyset")),
-                "request_query": dict(kwargs),
-                "query_fingerprint": self._scope_page_value(page, "query_fingerprint", None),
-                "after_cursor": continuation_cursor,
-                "coverage_status": status,
-                "raw_count": raw_count,
-                "unique_count": unique_count,
-                "duplicate_count": duplicate_count,
-                "malformed_count": malformed_count,
-                "requested_at": observed_at.isoformat(),
-                "updated_at": observed_at.isoformat(),
-            }
-            if page_error_reason is not None:
-                self._discovery_continuation["error_reason"] = page_error_reason
-            return tuple(selected), continuation_cursor, tuple(deferred)
 
         method = getattr(provider, "markets", None)
         if not callable(method):
@@ -2766,18 +3669,41 @@ class PolymarketCollector:
             return (), legacy_cursor, ()
         offset = legacy_cursor % len(snapshots)
         rotated = snapshots[offset:] + snapshots[:offset]
-        selected = [item for item in rotated if item.market_id not in excluded][:budget]
-        selected_ids = {item.market_id for item in selected}
-        deferred = [
-            item.market_id
-            for item in rotated
-            if item.market_id not in excluded and item.market_id not in selected_ids
+        selected: list[PredictionMarketSnapshot] = []
+        deferred: list[str] = []
+        suitability_exclusions: list[dict[str, Any]] = [
+            dict(item)
+            for item in (
+                (self._discovery_continuation or {}).get("suitability_exclusions", ())
+                if isinstance(self._discovery_continuation, Mapping)
+                else ()
+            )
+            if isinstance(item, Mapping)
         ]
-        scanned = len(selected) + sum(1 for item in rotated if item.market_id in excluded)
+        unsuitable_count = 0
+        for item in rotated:
+            if item.market_id in excluded:
+                continue
+            assessment = self._suitable_market_assessment(item, observed_at, provider)
+            self._suitable_market_evidence.append(assessment)
+            if assessment.get("action") != "SUITABLE":
+                deferred.append(item.market_id)
+                suitability_exclusions.append(assessment)
+                unsuitable_count += 1
+                continue
+            if len(selected) < budget:
+                selected.append(item)
+            else:
+                deferred.append(item.market_id)
+        scanned = len(selected) + unsuitable_count + sum(
+            1 for item in rotated if item.market_id in excluded
+        )
         next_cursor = (offset + scanned) % len(snapshots)
         self._discovery_continuation = {
             "coverage_status": "PARTIAL",
             "after_cursor": next_cursor,
+            "suitability_exclusions": suitability_exclusions[-256:],
+            "suitable_market_ids": [item.market_id for item in selected],
             "updated_at": observed_at.isoformat(),
         }
         return selected, next_cursor, deferred

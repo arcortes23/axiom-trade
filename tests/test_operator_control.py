@@ -1447,6 +1447,34 @@ class OperatorControlTests(unittest.TestCase):
         with patch.object(CanaryService, "latest_signal", return_value=latest_signal):
             status = self.control.status()
         self.assertEqual(status["canary"]["latest_signal"], latest_signal)
+    def test_operator_status_projects_mocked_service_without_qualname(self) -> None:
+        mocked_service = Mock(spec=[])
+        with patch("axiom.operator.CanaryService", mocked_service):
+            status = self.control.status()
+        service_identity = status["identity"]["service_identity"]
+        self.assertIsInstance(service_identity, str)
+        self.assertTrue(service_identity)
+
+    def test_operator_status_observes_without_current_selection_despite_old_authorization(self) -> None:
+        with patch.object(
+            self.control,
+            "rolling_portfolio_state",
+            return_value={"selection_status": "NONE", "selection": None},
+        ), patch.object(
+            self.control,
+            "execution_authorization_snapshot",
+            return_value={
+                "active": {
+                    "status": "ACTIVE",
+                    "authorization_id": "old-server-authorization",
+                },
+                "status": "ACTIVE",
+            },
+        ):
+            status = self.control.status()
+        self.assertEqual(status["mode"], "observing")
+        self.assertEqual(status["execution_state"]["mode"], "observing")
+
     def test_generation_fences_reject_bool_and_fraction_before_side_effect(self) -> None:
         initial = self.control.risk_settings_snapshot()
         draft_response = self.control.execute(
@@ -2431,6 +2459,176 @@ class OperatorControlTests(unittest.TestCase):
         encoded = json.dumps({"operator": operator, "canary": canary}, default=str)
         for secret in secrets:
             self.assertNotIn(secret, encoded)
+        self.assertEqual(operator["historical_count"], 1)
+        self.assertEqual(operator["historical_rows"], 1)
+        for field in (
+            "instance",
+            "revision",
+            "mode",
+            "armed",
+            "armed_state",
+            "policy",
+            "daily_budget",
+            "lifetime_budget",
+            "qualification_coverage",
+            "active_strategies",
+            "suspended_strategies",
+            "current_signals",
+            "execution_state",
+            "blockers",
+            "last_review",
+            "next_review",
+            "execution_authorization_id",
+        ):
+            self.assertIn(field, operator)
+
+    def test_authorization_projection_preserves_unknown_terminal_states_and_server_ids(self) -> None:
+        dashboard = DashboardData(store=self.store, control=self.control)
+        for state in ("UNKNOWN", "EXPIRED", "REVOKED"):
+            authorization_id = f"server-generated-{state.lower()}"
+            self.store.set_operator_config(
+                "execution_authorization_review",
+                {
+                    "status": state,
+                    "mode": "EVIDENCE_SELECTED",
+                    "authorization_id": authorization_id,
+                    "private_key": f"{state}-PRIVATE-KEY-SENTINEL",
+                },
+            )
+            projected = dashboard.execution_authorization_data()
+            self.assertEqual(projected["status"], state)
+            self.assertEqual(projected["mode"], "EVIDENCE_SELECTED")
+            self.assertEqual(projected["authorization_id"], authorization_id)
+            self.assertNotIn("PRIVATE-KEY-SENTINEL", json.dumps(projected))
+
+    def test_execution_authorization_acknowledgment_only_required_for_rejected_funding(self) -> None:
+        base_context = {
+            "now": datetime(2026, 1, 2, 12, tzinfo=timezone.utc),
+            "selection_id": "selection-auth-review",
+            "selection_hash": "selection-hash",
+            "strategy_versions": ["accepted-strategy"],
+            "rejected_strategy_versions": [],
+            "selection_policy_hash": "policy-hash",
+            "scope_hash": "scope-hash",
+            "scope_version": "scope-v1",
+            "active_settings_hash": "settings-hash",
+            "active_settings_generation": 4,
+        }
+        values = {
+            "purpose": "review accepted strategy",
+            "exact_strategy_versions": ["accepted-strategy"],
+            "lifetime_budget": "1.00",
+            "stop_rules": {"max_submissions": 1},
+        }
+        with patch.object(self.control, "_authorization_context", return_value=base_context), patch.object(
+            self.store,
+            "register_execution_authorization_draft",
+            return_value={"authorization_id": "accepted-auth", "generation": 1, "status": "DRAFT"},
+        ) as register:
+            accepted = self.control.review_execution_authorization(values)
+        self.assertEqual(accepted["status"], "DRAFT")
+        self.assertFalse(accepted["draft"]["adverse_evidence_ack_required"])
+        self.assertEqual(
+            register.call_args.kwargs["adverse_evidence_ack"],
+            {"acknowledged": True, "required": False},
+        )
+
+        rejected_context = dict(base_context)
+        rejected_context["strategy_versions"] = ["rejected-strategy"]
+        rejected_context["rejected_strategy_versions"] = ["rejected-strategy"]
+        rejected_values = dict(values)
+        rejected_values["exact_strategy_versions"] = ["rejected-strategy"]
+        with patch.object(
+            self.control, "_authorization_context", return_value=rejected_context
+        ), patch.object(
+            self.store, "register_execution_authorization_draft"
+        ) as rejected_register:
+            with self.assertRaisesRegex(
+                OperatorControlError,
+                "^EXECUTION_AUTHORIZATION_ADVERSE_EVIDENCE_ACK_REQUIRED$",
+            ):
+                self.control.review_execution_authorization(rejected_values)
+        rejected_register.assert_not_called()
+
+        rejected_values["adverse_evidence_ack"] = True
+        with patch.object(
+            self.control, "_authorization_context", return_value=rejected_context
+        ), patch.object(
+            self.store,
+            "register_execution_authorization_draft",
+            return_value={"authorization_id": "rejected-auth", "generation": 2, "status": "DRAFT"},
+        ):
+            acknowledged = self.control.review_execution_authorization(rejected_values)
+        self.assertTrue(acknowledged["draft"]["adverse_evidence_ack_required"])
+
+    def test_dashboard_authorization_actions_forward_server_id_and_generation(self) -> None:
+        assert self.server._server is not None
+        self.store.set_operator_config(
+            "execution_authorization_review",
+            {
+                "status": "DRAFT",
+                "authorization_id": "auth-server",
+                "generation": 11,
+            },
+        )
+        with patch.object(
+            self.control,
+            "activate_execution_authorization",
+            return_value={"status": "ACTIVE"},
+        ) as activate:
+            status, result = self._post(
+                {
+                    "action": "execution_authorization.activate",
+                    "confirm": "ACTIVATE EXPLORATORY AUTHORIZATION",
+                    "payload": {
+                        "authorization_id": "auth-server",
+                        "expected_generation": 11,
+                    },
+                },
+                token=self.server._server.control_token,
+            )
+        self.assertEqual(status, 200)
+        self.assertTrue(result["ok"])
+        activate.assert_called_once_with(
+            "auth-server",
+            actor="operator",
+            expected_generation=11,
+        )
+
+        active = {
+            "status": "ACTIVE",
+            "authorization_id": "auth-server",
+            "generation": 11,
+        }
+        with patch.object(
+            self.control,
+            "execution_authorization_snapshot",
+            return_value={"active": active},
+        ), patch.object(
+            self.control,
+            "revoke_execution_authorization",
+            return_value={"status": "REVOKED"},
+        ) as revoke:
+            status, result = self._post(
+                {
+                    "action": "execution_authorization.revoke",
+                    "confirm": "REVOKE EXPLORATORY AUTHORIZATION",
+                    "payload": {
+                        "authorization_id": "auth-server",
+                        "expected_generation": 11,
+                        "reason": "operator_test",
+                    },
+                },
+                token=self.server._server.control_token,
+            )
+        self.assertEqual(status, 200)
+        self.assertTrue(result["ok"])
+        revoke.assert_called_once_with(
+            "auth-server",
+            actor="operator",
+            expected_generation=11,
+            reason="operator_test",
+        )
 
     def test_candidate_provenance_is_explicit_and_complete(self) -> None:
         self._seed_candidate()

@@ -992,6 +992,93 @@ def _bounded_book(book: Any, depth: int) -> Any:
         if isinstance(values, (list, tuple)):
             result[side] = list(values[:depth])
     return _scrub(result)
+def _suitable_market_evidence(
+    raw: Mapping[str, Any],
+    books: Sequence[Mapping[str, Any]],
+    *,
+    required_capital: float = 1.0,
+) -> dict[str, Any]:
+    """Project bounded producer evidence without granting execution authority."""
+    market_id = _market_identity(raw) or "<unknown>"
+    capital = max(0.0, _finite(required_capital))
+    evidence: dict[str, Any] = {
+        "market_id": market_id,
+        "category": "CAPITAL_OR_MARKET_CONSTRAINT",
+        "action": "UNSUITABLE",
+        "reason": "NO_DEPTH",
+        "resolver": "inspect_selected_token_depth",
+        "next_action": "recheck_next_acceptance_probe",
+        "required_capital": capital,
+        "observed_required_capital": None,
+        "observed_required_amount": None,
+        "intended_token": "yes",
+    }
+    if raw.get("active") is False or raw.get("closed") is True:
+        evidence.update(
+            category="MARKET_LIFECYCLE",
+            reason="INACTIVE_MARKET",
+            resolver="wait_for_market_reopen",
+        )
+        return evidence
+    if raw.get("acceptingOrders", raw.get("accepting_orders")) is False:
+        evidence.update(
+            category="MARKET_LIFECYCLE",
+            reason="ACCEPTING_ORDERS_FALSE",
+            resolver="wait_for_accepting_orders",
+        )
+        return evidence
+    selected = next(
+        (
+            item for item in books
+            if str(item.get("outcome", item.get("token", ""))).strip().lower() == "yes"
+        ),
+        None,
+    )
+    book = selected.get("book", selected) if isinstance(selected, Mapping) else {}
+    bids = book.get("bids", ()) if isinstance(book, Mapping) else ()
+    asks = book.get("asks", ()) if isinstance(book, Mapping) else ()
+    if not isinstance(bids, (list, tuple)) or not isinstance(asks, (list, tuple)) or not bids or not asks:
+        return evidence
+    def level(value: Any) -> tuple[float, float] | None:
+        mapped = _mapping(value)
+        price, size = _number(mapped.get("price")), _number(mapped.get("size", mapped.get("quantity")))
+        if price[0] is None or size[0] is None or price[0] <= 0 or size[0] <= 0:
+            return None
+        return float(price[0]), float(size[0])
+    bid_levels = [item for item in (level(value) for value in bids) if item is not None]
+    ask_levels = [item for item in (level(value) for value in asks) if item is not None]
+    if not bid_levels or not ask_levels:
+        return evidence
+    bid_levels.sort(reverse=True)
+    ask_levels.sort()
+    ask = ask_levels[0][0]
+    quantity = capital / ask if ask > 0 else 0.0
+    required = quantity * ask
+    observed_at = _parse_datetime(raw.get("timestamp", raw.get("observed_at")))
+    fixture_at = _parse_datetime(FIXTURE_TIMESTAMP)
+    age_seconds = (
+        max(0.0, (fixture_at - observed_at).total_seconds())
+        if observed_at is not None and fixture_at is not None
+        else 0.0
+    )
+    activity_score = _finite(raw.get("volume", raw.get("volume24h", raw.get("liquidity"))))
+    evidence.update({
+        "entry_depth": sum(size for _, size in ask_levels),
+        "exit_depth": sum(size for _, size in bid_levels),
+        "depth_score": min(sum(size for _, size in ask_levels), sum(size for _, size in bid_levels)),
+        "activity_score": max(0.0, activity_score),
+        "freshness_score": 1.0 / (1.0 + age_seconds),
+        "required_quantity": quantity,
+        "entry_price": ask,
+        "observed_required_capital": required,
+        "observed_required_amount": required,
+    })
+    if evidence["entry_depth"] < quantity or evidence["exit_depth"] < quantity:
+        evidence["reason"] = "NO_DEPTH"
+        return evidence
+    evidence.update(category="SUITABLE_MARKET", action="SUITABLE", reason="SUITABLE")
+    return evidence
+
 
 
 def _source_hash() -> str:
@@ -6260,6 +6347,7 @@ def run_acceptance(
                 probe_reasons.append(f"book_fetch_error:{outcome}:{type(exc).__name__}")
         identity_record = _scrub(identity)
         identity_hash = _sha256_json(identity_record) if identity is not None else None
+        evidence = _suitable_market_evidence(identity_map, books)
         return {
             "market_id": selected_id,
             "selection_rule": selection_rule,
@@ -6272,6 +6360,7 @@ def run_acceptance(
             "book_hashes": book_hashes,
             "book_count": len(books),
             "book_depth": config.book_depth,
+            "suitability": evidence,
             "reasons": probe_reasons,
         }
 
@@ -6420,6 +6509,54 @@ def run_acceptance(
         }
         for name in relaxed_criteria
     }
+    selected_suitability = (
+        candidate_outcome.get("suitability")
+        if isinstance(candidate_outcome, Mapping)
+        else None
+    )
+    producer_exclusions: list[dict[str, Any]] = []
+    for evaluation in evaluations:
+        if evaluation.get("policy_match"):
+            continue
+        reason = str(evaluation.get("canonical_first_failure") or "RULE_MISMATCH")
+        producer_exclusions.append({
+            "market_id": evaluation.get("market_id"),
+            "category": "MARKET_SCOPE_CONSTRAINT",
+            "action": "UNSUITABLE",
+            "reason": reason,
+            "resolver": "review_market_scope_filters",
+            "next_action": "recheck_next_acceptance_probe",
+            "required_capital": 1.0,
+            "observed_required_capital": None,
+            "observed_required_amount": None,
+        })
+    if (
+        isinstance(selected_suitability, Mapping)
+        and selected_suitability.get("action") != "SUITABLE"
+    ):
+        producer_exclusions.insert(0, dict(selected_suitability))
+    suitable_market_producer = {
+        "inventory_coverage": coverage_status,
+        "verified_market_ids": (
+            [candidate_outcome.get("market_id")]
+            if isinstance(selected_suitability, Mapping)
+            and selected_suitability.get("action") == "SUITABLE"
+            and candidate_outcome.get("market_id")
+            else []
+        ),
+        "exclusions": producer_exclusions[: config.sample_limit],
+        "selected_evidence": dict(selected_suitability) if isinstance(selected_suitability, Mapping) else None,
+        "authorization": {
+            "status": (
+                "VERIFIED_MARKET_AUTHORIZED"
+                if isinstance(selected_suitability, Mapping)
+                and selected_suitability.get("action") == "SUITABLE"
+                else "UNAUTHORIZED"
+            ),
+            "market_id": candidate_outcome.get("market_id") if isinstance(candidate_outcome, Mapping) else None,
+            "scope_hash": scope_hash,
+        },
+    }
     report = {
         "schema_version": SCHEMA_VERSION,
         "generated_at": generated_at or run_timestamp_iso,
@@ -6458,6 +6595,7 @@ def run_acceptance(
             "opaque_cursor_only": opaque_cursor_only and all(isinstance(item, str) for item in seen_cursors),
             "cursor_reuse_detected": "opaque_cursor_repeated" in coverage_reasons,
         },
+        "suitable_market_producer": suitable_market_producer,
         "order": {
             "observed_ids": list(first_seen)[: config.sample_limit],
             "unique_ids": unique_rows,
