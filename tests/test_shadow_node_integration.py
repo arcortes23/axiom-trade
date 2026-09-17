@@ -25,12 +25,14 @@ from axiom.domain import (
     Side,
 )
 from axiom.forward import (
+    ForwardTestRegistry,
     _canonical_forward_config,
     _content_hash,
     _operational_setup_for_strategy,
     _operational_setup_hash,
 )
 from axiom.node import NodeConfig, ResearchNode
+from axiom.lifecycle import CandidateLifecycleManager, CandidateStage
 from axiom.operator import OperatorControlPlane
 from axiom.paper_engine import PaperEngineCycle
 from axiom.shadow import (
@@ -219,7 +221,7 @@ class ShadowFixtureMixin:
         )
         return policy.as_dict(), policy.scope_hash, policy.scope_version
 
-    def candidate_payload(self, candidate_id: str, family: str) -> dict[str, object]:
+    def candidate_payload(self, store: AxiomStore, candidate_id: str, family: str) -> dict[str, object]:
         scope, scope_hash, scope_version = self._scope()
         strategy = load_strategy(
             {
@@ -244,9 +246,17 @@ class ShadowFixtureMixin:
             }
         ).to_dict()
         model = {"version": "fixture-model-v1", "probability": 0.5}
+        risk_limits = {
+            "max_order_notional": 1.0,
+            "max_account_exposure": 5.0,
+            "max_loss": 2.0,
+        }
         config = _canonical_forward_config(
             {
+                "candidate_id": candidate_id,
                 "market_scope": scope,
+                "exit_policy": {"type": "fixed_holding_period", "holding_period": 100},
+                "shadow_assessment": True,
                 "paper_assumptions": {
                     "version": "paper-assumptions-v1",
                     "currency": "USD",
@@ -257,11 +267,22 @@ class ShadowFixtureMixin:
                 "paper_assumptions_explicit": True,
             }
         )
-        setup = _operational_setup_for_strategy(strategy, config)
-        assert setup is not None
-        strategy_hash = _content_hash(strategy)
-        model_hash = _content_hash(model)
-        config_hash = _content_hash({"config": config, "risk_limits": {}})
+        spec = ForwardTestRegistry(store).freeze(
+            strategy=strategy,
+            model=model,
+            config=config,
+            start_timestamp=T0,
+            bankroll=4.0,
+            allowed_markets=("market-1",),
+            risk_limits=risk_limits,
+            experiment_id=f"candidate-forward-{candidate_id}",
+        )
+        config = spec.as_record()["config"]
+        setup = config["operational_setup"]
+        assert isinstance(setup, dict)
+        strategy_hash = spec.strategy_hash
+        model_hash = spec.model_hash
+        config_hash = _content_hash({"config": config, "risk_limits": risk_limits})
         frozen_hash = __import__("hashlib").sha256(
             "|".join((strategy_hash, model_hash, config_hash)).encode("utf-8")
         ).hexdigest()
@@ -283,9 +304,11 @@ class ShadowFixtureMixin:
             "market_scope_version": scope_version,
             "exit_policy": {"type": "fixed_holding_period", "holding_period": 100},
             "cost_provenance": config["paper_assumptions"],
-            "risk_limits": {},
+            "risk_limits": risk_limits,
             "frozen_hash": frozen_hash,
-            "rejection_reason": "NEGATIVE_VALIDATION_EXPECTANCY",
+            "rejection_reason": "historical_candidate_not_admitted_to_live_execution",
+            "paper_only": True,
+            "live_execution": False,
             "rejection_evidence": {"reason_code": "NEGATIVE_VALIDATION_EXPECTANCY"},
         }
 
@@ -293,18 +316,50 @@ class ShadowFixtureMixin:
         momentum = f"candidate-momentum{suffix}"
         reversion = f"candidate-mean-reversion{suffix}"
         for candidate_id, family in ((momentum, "momentum"), (reversion, "mean_reversion")):
+            payload = self.candidate_payload(store, candidate_id, family)
             store.save_candidate_lifecycle(
                 candidate_id,
                 "IDEA",
                 {"candidate_id": candidate_id, "family": family},
             )
+            stages = (
+                ("SCHEMA_VALIDATED", {"schema_valid": True}, "fixture schema validated"),
+                ("BACKTESTED", {"backtest_complete": True}, "fixture backtest completed"),
+                ("VALIDATED", {"validation_complete": True, "holdout_used": False}, "fixture validation completed"),
+                ("ROBUSTNESS_CHECKED", {"robustness_passed": True, "holdout_used": False}, "fixture robustness completed"),
+                (
+                    "FROZEN",
+                    {
+                        "frozen": True,
+                        "holdout_used": False,
+                        "strategy_hash": payload["strategy_hash"],
+                        "model_hash": payload["model_hash"],
+                        "config_hash": payload["config_hash"],
+                        "risk_snapshot": payload["risk_limits"],
+                    },
+                    "fixture forward configuration frozen",
+                ),
+            )
+            previous = "IDEA"
+            for stage, evidence, reason in stages:
+                body = dict(payload)
+                body.update(evidence)
+                store.save_candidate_lifecycle(
+                    candidate_id,
+                    stage,
+                    body,
+                    from_stage=previous,
+                    reason=reason,
+                )
+                previous = stage
             store.save_candidate_lifecycle(
                 candidate_id,
                 "REJECTED",
-                self.candidate_payload(candidate_id, family),
+                payload,
+                from_stage="FROZEN",
+                reason="historical_candidate_not_admitted_to_live_execution",
             )
         return momentum, reversion
-
     def initialize_settings(self, store: AxiomStore, *, now: datetime = T0) -> None:
         settings = CanarySettingsService(store, clock=lambda: now)
         CanaryService(store, clock=lambda: now, settings=settings).disarm()
@@ -428,7 +483,7 @@ class ShadowServiceAndNodeIntegrationTests(ShadowFixtureMixin, unittest.TestCase
                 store.save_candidate_lifecycle(
                     "historical-only",
                     "FROZEN",
-                    self.candidate_payload("historical-only", "momentum"),
+                    self.candidate_payload(store, "historical-only", "momentum"),
                 )
                 with self.assertRaises(Exception):
                     ShadowAssessmentService(store, clock=lambda: T0).register(

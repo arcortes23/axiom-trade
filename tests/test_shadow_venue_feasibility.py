@@ -17,6 +17,7 @@ from axiom.forward import (
     _content_hash,
 )
 from axiom.node import NodeConfig, ResearchNode
+from axiom.lifecycle import CandidateStage
 from axiom.shadow import ShadowAssessmentError, ShadowAssessmentService
 from axiom.storage import AxiomStore
 from axiom.strategy.signals import evaluate_signal_evaluation
@@ -99,8 +100,10 @@ def _candidate_payload(store: AxiomStore, candidate_id: str, family: str) -> dic
     strategy = directional_strategy(family)
     model = {"probability": 0.50}
     config: dict[str, object] = {
+        "candidate_id": candidate_id,
         "market_scope": _scope(),
         "exit_policy": {"type": "fixed_holding_period", "holding_period": 1},
+        "shadow_assessment": True,
         "paper_assumptions_explicit": True,
         "paper_assumptions": {
             "version": "paper-assumptions-v1",
@@ -113,6 +116,11 @@ def _candidate_payload(store: AxiomStore, candidate_id: str, family: str) -> dic
             "slippage": {"model": "proportional", "slippage_bps": "5"},
         },
     }
+    risk_limits = {
+        "max_order_notional": 1.0,
+        "max_account_exposure": 5.0,
+        "max_loss": 2.0,
+    }
     spec = ForwardTestRegistry(store).freeze(
         strategy=strategy,
         model=model,
@@ -120,7 +128,7 @@ def _candidate_payload(store: AxiomStore, candidate_id: str, family: str) -> dic
         start_timestamp=T0,
         bankroll=1.0,
         allowed_markets=(MARKET_ID,),
-        risk_limits={},
+        risk_limits=risk_limits,
         experiment_id=f"candidate-forward-{candidate_id}",
     )
     frozen_config = _thaw(spec.config)
@@ -129,7 +137,7 @@ def _candidate_payload(store: AxiomStore, candidate_id: str, family: str) -> dic
     assert isinstance(setup, dict)
     scope = frozen_config["market_scope"]
     assert isinstance(scope, dict)
-    config_hash = _content_hash({"config": frozen_config, "risk_limits": {}})
+    config_hash = _content_hash({"config": frozen_config, "risk_limits": risk_limits})
     frozen_hash = hashlib.sha256(
         "|".join((spec.strategy_hash, spec.model_hash, config_hash)).encode()
     ).hexdigest()
@@ -151,7 +159,7 @@ def _candidate_payload(store: AxiomStore, candidate_id: str, family: str) -> dic
         "market_scope_version": frozen_config["market_scope_version"],
         "exit_policy": dict(frozen_config["exit_policy"]),
         "cost_provenance": deepcopy(frozen_config["paper_assumptions"]),
-        "risk_limits": {},
+        "risk_limits": risk_limits,
         "rejection_reason": "historical_candidate_not_admitted_to_live_execution",
         "paper_only": True,
         "synthetic_fixture": True,
@@ -383,12 +391,47 @@ class ShadowVenueFeasibilityTests(unittest.TestCase):
                 }
                 for family, payload in payloads.items():
                     candidate_id = str(payload["candidate_id"])
-                    store.save_candidate_lifecycle(candidate_id, "IDEA", payload, timestamp=T0)
+                    store.save_candidate_lifecycle(
+                        candidate_id,
+                        "IDEA",
+                        {"candidate_id": candidate_id, "family": family},
+                        timestamp=T0,
+                    )
+                    previous = "IDEA"
+                    stages = (
+                        ("SCHEMA_VALIDATED", {"schema_valid": True}),
+                        ("BACKTESTED", {"backtest_complete": True}),
+                        ("VALIDATED", {"validation_complete": True, "holdout_used": False}),
+                        ("ROBUSTNESS_CHECKED", {"robustness_passed": True, "holdout_used": False}),
+                        (
+                            "FROZEN",
+                            {
+                                "frozen": True,
+                                "holdout_used": False,
+                                "strategy_hash": payload["strategy_hash"],
+                                "model_hash": payload["model_hash"],
+                                "config_hash": payload["config_hash"],
+                                "risk_snapshot": payload["risk_limits"],
+                            },
+                        ),
+                    )
+                    for stage, evidence in stages:
+                        body = dict(payload)
+                        body.update(evidence)
+                        store.save_candidate_lifecycle(
+                            candidate_id,
+                            stage,
+                            body,
+                            from_stage=previous,
+                            timestamp=T0,
+                        )
+                        previous = stage
                     store.save_candidate_lifecycle(
                         candidate_id,
                         "REJECTED",
                         payload,
-                        from_stage="IDEA",
+                        from_stage="FROZEN",
+                        reason="historical_candidate_not_admitted_to_live_execution",
                         timestamp=T0,
                     )
                 service = ShadowAssessmentService(store, clock=lambda: T0, max_markets=2, max_observations=8)

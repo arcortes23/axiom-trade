@@ -23,7 +23,7 @@ from axiom.forward import (
 )
 from axiom.lifecycle import CandidateLifecycleManager, CandidateStage
 from axiom.node import NodeConfig, ResearchNode
-from axiom.shadow import ShadowAssessmentService
+from axiom.shadow import ShadowAssessmentError, ShadowAssessmentService, _rejected_strategy
 from axiom.storage import AxiomStore
 from axiom.strategy import load_strategy
 
@@ -353,6 +353,101 @@ class ShadowAssessmentIntegrationTests(unittest.TestCase):
             evidence={"historical_evidence": payload["historical_evidence"]},
         )
 
+    @classmethod
+    def _pre_freeze_rejected_payload(
+        cls,
+        store: AxiomStore,
+        candidate_id: str,
+        family: str,
+        *,
+        malformed: str | None = None,
+    ) -> dict[str, Any]:
+        source = cls._candidate_payload(store, candidate_id, family)
+        strategy_parameters = source["strategy_document"]["parameters"]
+        payload: dict[str, Any] = {
+            "candidate_id": candidate_id,
+            "family": family,
+            "strategy": copy.deepcopy(source["strategy_document"]),
+            "parameters": {
+                name: copy.deepcopy(strategy_parameters[name])
+                for name in ("lookback", "threshold")
+            },
+            "market_scope": copy.deepcopy(source["market_scope"]),
+            "market_scope_hash": source["market_scope_hash"],
+            "market_scope_version": source["market_scope_version"],
+            "operational_setup": copy.deepcopy(source["operational_setup"]),
+            "operational_setup_hash": source["operational_setup_hash"],
+            "setup_id": source["setup_id"],
+            "exit_policy": copy.deepcopy(source["exit_policy"]),
+            "cost_assumptions": {
+                key: copy.deepcopy(value)
+                for key, value in source["cost_provenance"].items()
+                if key != "sizing"
+            },
+            "paper_only": True,
+            "research_only": True,
+            "rejection_reason": "REJECTED_BEFORE_FORWARD_CONFIG_FREEZE",
+            "rejection_evidence": {
+                "reason_code": "REJECTED_BEFORE_FORWARD_CONFIG_FREEZE",
+                "source_type": "HISTORICAL",
+            },
+            "historical_evidence": {
+                "source_type": "HISTORICAL",
+                "status": "REJECTED",
+            },
+        }
+        payload.pop("model_document", None)
+        if malformed == "missing_predicate":
+            payload["strategy"]["parameters"].pop("entry_predicate", None)
+        elif malformed == "missing_scope_hash":
+            payload.pop("market_scope_hash", None)
+        elif malformed == "missing_costs":
+            payload.pop("cost_assumptions", None)
+        return payload
+
+    @classmethod
+    def _seed_pre_freeze_rejected(
+        cls,
+        store: AxiomStore,
+        candidate_id: str,
+        family: str,
+        *,
+        malformed: str | None = None,
+        payload_override: Mapping[str, Any] | None = None,
+        rejection_reason: str = "negative_validation_expectancy",
+    ) -> None:
+        payload = (
+            copy.deepcopy(dict(payload_override))
+            if payload_override is not None
+            else cls._pre_freeze_rejected_payload(
+                store,
+                candidate_id,
+                family,
+                malformed=malformed,
+            )
+        )
+        lifecycle = CandidateLifecycleManager(store)
+        lifecycle.register_idea(candidate_id, payload)
+        lifecycle.advance(
+            candidate_id,
+            CandidateStage.SCHEMA_VALIDATED,
+            {"schema_valid": True},
+            reason="fixture schema validated",
+        )
+        backtested = lifecycle.advance(
+            candidate_id,
+            CandidateStage.BACKTESTED,
+            {"backtest_complete": True},
+            reason="fixture historical simulation completed",
+        )
+        lifecycle.reject(
+            candidate_id,
+            rejection_reason,
+            evidence={"validation_complete": True},
+            expected_stage=CandidateStage.BACKTESTED,
+            expected_payload=backtested.payload,
+        )
+
     @staticmethod
     def _fill_projection(fill: Any) -> dict[str, Any]:
         return {
@@ -364,11 +459,372 @@ class ShadowAssessmentIntegrationTests(unittest.TestCase):
             "quantity": fill.quantity,
             "price": fill.price,
             "fees": fill.fees,
+
             "slippage": fill.slippage,
             "strategy_id": fill.strategy_id,
             "order_id": fill.order_id,
             "metadata": dict(fill.metadata),
         }
+    def test_pre_freeze_rejected_pair_projects_from_candidate_and_current_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with AxiomStore(str(Path(directory) / DB_NAME)) as store:
+                settings = CanarySettingsService(store, clock=lambda: T0)
+                CanaryService(store, clock=lambda: T0, settings=settings).disarm()
+                candidate_ids = ("pre-freeze-momentum", "pre-freeze-mean-reversion")
+                for candidate_id, family in zip(
+                    candidate_ids,
+                    ("momentum", "mean_reversion"),
+                ):
+                    self._seed_pre_freeze_rejected(store, candidate_id, family)
+                expected_strategies = {
+                    candidate_id: copy.deepcopy(
+                        store.load_candidate_lifecycle(candidate_id)["payload"]["strategy"]
+                    )
+                    for candidate_id in candidate_ids
+                }
+                lifecycle_before = {
+                    candidate_id: copy.deepcopy(
+                        store.load_candidate_lifecycle(candidate_id)
+                    )
+                    for candidate_id in candidate_ids
+                }
+
+                registration = ShadowAssessmentService(
+                    store,
+                    clock=lambda: T0,
+                    max_markets=1,
+                ).register(
+                    candidate_ids,
+                    max_cycles=1,
+                    now=T0,
+                )
+                manifest = registration["manifest"]
+                shared = manifest["shared"]
+                self.assertEqual(shared["budget"]["bankroll_source"], "derived")
+                self.assertEqual(shared["budget"]["cap"], "5.00")
+                self.assertEqual(shared["spec"]["bankroll"], 5.0)
+                self.assertEqual(
+                    shared["spec"]["config"]["paper_assumptions"]["sizing"][
+                        "allocated_capital"
+                    ],
+                    "2.50",
+                )
+                self.assertEqual(
+                    shared["risk_settings_identity"],
+                    {
+                        "config_id": settings.snapshot(T0)["config_id"],
+                        "generation": 1,
+                        "config_hash": settings.snapshot(T0)["config_hash"],
+                    },
+                )
+                self.assertEqual(
+                    shared["projection_provenance"]["kind"],
+                    "HISTORICAL_REJECTED_SETUP_CURRENT_SETTINGS",
+                )
+                self.assertEqual(
+                    shared["projection_provenance"]["settings_identity"],
+                    shared["risk_settings_identity"],
+                )
+                self.assertEqual(
+                    shared["spec"]["risk_limits"]["max_account_exposure"],
+                    5.0,
+                )
+                members = manifest["members"]
+                self.assertEqual(
+                    [(member["family"], member["candidate_id"]) for member in members],
+                    [
+                        ("momentum", candidate_ids[0]),
+                        ("mean_reversion", candidate_ids[1]),
+                    ],
+                )
+                for member in members:
+                    self.assertEqual(
+                        member["strategy"],
+                        expected_strategies[member["candidate_id"]],
+                    )
+                    self.assertTrue(
+                        {
+                            "version",
+                            "market_type",
+                            "family",
+                            "operations",
+                            "probability_model",
+                            "resolution_aware",
+                            "resolution_inputs",
+                            "parameters",
+                        }
+                        <= set(member["strategy"])
+                    )
+                for member in members:
+                    self.assertEqual(
+                        member["projection_provenance"]["kind"],
+                        "HISTORICAL_REJECTED_SETUP_CURRENT_SETTINGS",
+                    )
+                    self.assertFalse(member["historical_frozen_config"])
+                    self.assertNotIn("frozen_hash", member)
+                    self.assertTrue(member["config"]["paper_only"])
+                    self.assertTrue(member["config"]["research_only"])
+                    self.assertFalse(member["config"]["live_execution"])
+                    self.assertEqual(
+                        member["projection_provenance"]["current_derived"][
+                            "settings_identity"
+                        ],
+                        shared["risk_settings_identity"],
+                    )
+                    self.assertEqual(
+                        member["strategy"]["parameters"]["entry_predicate"]["version"],
+                        "absolute-move-v1",
+                    )
+                    self.assertNotIn(
+                        "model",
+                        member["projection_provenance"]["candidate_declared"],
+                    )
+                for candidate_id in candidate_ids:
+                    self.assertEqual(
+                        store.load_candidate_lifecycle(candidate_id),
+                        lifecycle_before[candidate_id],
+                    )
+
+                bad_ids = ("pre-freeze-bad-momentum", "pre-freeze-bad-reversion")
+                self._seed_pre_freeze_rejected(
+                    store,
+                    bad_ids[0],
+                    "momentum",
+                    malformed="missing_predicate",
+                )
+                self._seed_pre_freeze_rejected(store, bad_ids[1], "mean_reversion")
+                bad_before = {
+                    candidate_id: copy.deepcopy(
+                        store.load_candidate_lifecycle(candidate_id)
+                    )
+                    for candidate_id in bad_ids
+                }
+                with self.assertRaisesRegex(
+                    ShadowAssessmentError,
+                    "entry predicate",
+                ):
+                    ShadowAssessmentService(store, clock=lambda: T0).register(
+                        bad_ids,
+                        max_cycles=1,
+                        now=T0,
+                    )
+                for candidate_id in bad_ids:
+                    self.assertEqual(
+                        store.load_candidate_lifecycle(candidate_id),
+                        bad_before[candidate_id],
+                    )
+
+    def test_adversarial_candidate_provenance_fails_closed(self) -> None:
+        cases: tuple[str, Any, str] = (
+            (
+                "forged_config",
+                lambda payload, source: payload.update(
+                    {
+                        "config": copy.deepcopy(source["config"]),
+                        "forward_config": copy.deepcopy(source["config"]),
+                    }
+                ),
+                "frozen candidate config provenance is ambiguous",
+            ),
+            (
+                "parameters_only",
+                lambda payload, source: (
+                    payload.pop("strategy", None),
+                    payload.pop("strategy_document", None),
+                ),
+                "missing rejected strategy document",
+            ),
+            (
+                "boolean_cost",
+                lambda payload, source: payload["cost_assumptions"]["fees"].update(
+                    {"fee_bps": True}
+                ),
+                "finite and non-negative",
+            ),
+            (
+                "allocation_alias",
+                lambda payload, source: payload["cost_assumptions"].update(
+                    {"sizing": {"allocated_capital": "0.01"}}
+                ),
+                "candidate allocation declaration",
+            ),
+            (
+                "numeric_setup_id",
+                lambda payload, source: payload.update({"setup_id": 123}),
+                "setup id must be a non-empty string",
+            ),
+        )
+        for name, mutate, message in cases:
+            with self.subTest(case=name):
+                with tempfile.TemporaryDirectory() as directory:
+                    with AxiomStore(str(Path(directory) / f"{name}.sqlite")) as store:
+                        settings = CanarySettingsService(store, clock=lambda: T0)
+                        CanaryService(store, clock=lambda: T0, settings=settings).disarm()
+                        source = self._candidate_payload(
+                            store, f"{name}-momentum", "momentum"
+                        )
+                        payload = self._pre_freeze_rejected_payload(
+                            store, f"{name}-momentum", "momentum"
+                        )
+                        mutate(payload, source)
+                        self._seed_pre_freeze_rejected(
+                            store,
+                            f"{name}-momentum",
+                            "momentum",
+                            payload_override=payload,
+                        )
+                        self._seed_pre_freeze_rejected(
+                            store, f"{name}-reversion", "mean_reversion"
+                        )
+                        with self.assertRaisesRegex(ShadowAssessmentError, message):
+                            ShadowAssessmentService(store, clock=lambda: T0).register(
+                                (f"{name}-momentum", f"{name}-reversion"),
+                                max_cycles=1,
+                                now=T0,
+                            )
+
+    def test_rejected_strategy_requires_production_declaration(self) -> None:
+        required_fields = (
+            "version",
+            "market_type",
+            "family",
+            "operations",
+            "probability_model",
+            "resolution_aware",
+            "resolution_inputs",
+            "parameters",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with AxiomStore(str(Path(directory) / "strategy-contract.sqlite")) as store:
+                for field in required_fields:
+                    with self.subTest(missing=field):
+                        payload = self._pre_freeze_rejected_payload(
+                            store, f"missing-{field}", "momentum"
+                        )
+                        payload["strategy"].pop(field, None)
+                        message = (
+                            "missing rejected strategy parameters"
+                            if field == "parameters"
+                            else f"missing rejected strategy fields: {field}"
+                        )
+                        with self.assertRaisesRegex(ShadowAssessmentError, message):
+                            _rejected_strategy(
+                                payload,
+                                payload["operational_setup"],
+                                "momentum",
+                            )
+
+                payload = self._pre_freeze_rejected_payload(
+                    store, "missing-entry-predicate", "momentum"
+                )
+                payload["strategy"]["parameters"].pop("entry_predicate", None)
+                payload["parameters"].pop("entry_predicate", None)
+                with self.assertRaisesRegex(
+                    ShadowAssessmentError,
+                    "missing rejected strategy entry predicate",
+                ):
+                    _rejected_strategy(
+                        payload,
+                        payload["operational_setup"],
+                        "momentum",
+                    )
+
+                payload = self._pre_freeze_rejected_payload(
+                    store, "wrong-family", "momentum"
+                )
+                payload["strategy"]["family"] = "mean_reversion"
+                with self.assertRaisesRegex(
+                    ShadowAssessmentError,
+                    "family disagrees with root family",
+                ):
+                    _rejected_strategy(
+                        payload,
+                        payload["operational_setup"],
+                        "momentum",
+                    )
+
+                payload = self._pre_freeze_rejected_payload(
+                    store, "conflicting-strategy", "momentum"
+                )
+                payload["strategy_document"] = copy.deepcopy(payload["strategy"])
+                payload["strategy_document"]["probability_model"] = "forged-model"
+                with self.assertRaisesRegex(
+                    ShadowAssessmentError,
+                    "conflicting rejected strategy provenance",
+                ):
+                    _rejected_strategy(
+                        payload,
+                        payload["operational_setup"],
+                        "momentum",
+                    )
+
+                payload = self._pre_freeze_rejected_payload(
+                    store, "conflicting-parameters", "momentum"
+                )
+                payload["parameters"]["threshold"] = 0.10
+                with self.assertRaisesRegex(
+                    ShadowAssessmentError,
+                    "conflicting rejected strategy parameters",
+                ):
+                    _rejected_strategy(
+                        payload,
+                        payload["operational_setup"],
+                        "momentum",
+                    )
+                payload = self._pre_freeze_rejected_payload(
+                    store, "unknown-root-parameter", "momentum"
+                )
+                payload["parameters"]["forged"] = "not-in-strategy"
+                with self.assertRaisesRegex(
+                    ShadowAssessmentError,
+                    "root strategy parameters are not explicit",
+                ):
+                    _rejected_strategy(
+                        payload,
+                        payload["operational_setup"],
+                        "momentum",
+                    )
+
+                payload = self._pre_freeze_rejected_payload(
+                    store, "missing-root-target", "momentum"
+                )
+                payload["parameters"]["entry_predicate"] = copy.deepcopy(
+                    payload["strategy"]["parameters"]["entry_predicate"]
+                )
+                payload["strategy"]["parameters"].pop("entry_predicate")
+                with self.assertRaisesRegex(
+                    ShadowAssessmentError,
+                    "root strategy parameters are not explicit",
+                ):
+                    _rejected_strategy(
+                        payload,
+                        payload["operational_setup"],
+                        "momentum",
+                    )
+
+
+    def test_unrelated_rejection_reason_is_not_a_shadow_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with AxiomStore(str(Path(directory) / "unrelated.sqlite")) as store:
+                settings = CanarySettingsService(store, clock=lambda: T0)
+                CanaryService(store, clock=lambda: T0, settings=settings).disarm()
+                self._seed_pre_freeze_rejected(
+                    store,
+                    "unrelated-momentum",
+                    "momentum",
+                    rejection_reason="unrelated_rejection",
+                )
+                self._seed_pre_freeze_rejected(
+                    store, "unrelated-reversion", "mean_reversion"
+                )
+                with self.assertRaisesRegex(
+                    ShadowAssessmentError, "authoritative negative validation expectancy"
+                ):
+                    ShadowAssessmentService(store, clock=lambda: T0).register(
+                        ("unrelated-momentum", "unrelated-reversion"),
+                        max_cycles=1,
+                        now=T0,
+                    )
 
     def test_shadow_observation_isolated_from_live_admission_and_operationally_complete(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

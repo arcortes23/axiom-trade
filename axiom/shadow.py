@@ -224,6 +224,558 @@ def _candidate_config(payload: Mapping[str, Any]) -> dict[str, Any]:
     if any(_canonical(value) != first for value in canonical[1:]):
         raise ShadowAssessmentError("conflicting frozen candidate config provenance")
     return dict(canonical[0])
+_HISTORICAL_REJECTED_PROJECTION = "HISTORICAL_REJECTED_SETUP_CURRENT_SETTINGS"
+_FORWARD_EVIDENCE_STAGES = frozenset(
+    {"ROBUSTNESS_CHECKED", "FROZEN", "PAPER_FORWARD", "PAPER_PROMOTABLE"}
+)
+_ABSOLUTE_MOVE_PREDICATE = {
+    "version": "absolute-move-v1",
+    "minimum_move": 0.05,
+    "units": "probability",
+    "boundary": "inclusive",
+}
+
+
+def _candidate_fallback_value(payload: Mapping[str, Any], names: Sequence[str]) -> Any:
+    """Return one direct candidate declaration, rejecting conflicting aliases."""
+    values = [
+        payload[name]
+        for name in names
+        if name in payload and payload[name] not in (None, "")
+    ]
+    if not values:
+        return None
+    first = values[0]
+    if any(_canonical(value) != _canonical(first) for value in values[1:]):
+        raise ShadowAssessmentError(
+            f"conflicting rejected candidate declaration: {names[0]}"
+        )
+    return first
+
+
+def _rejected_strategy(
+    payload: Mapping[str, Any],
+    setup: Mapping[str, Any],
+    family: str,
+) -> tuple[dict[str, Any], str]:
+    values = _declared_values(
+        payload,
+        ("strategy_document", "strategy", "strategy_definition"),
+    )
+    mappings = [value for value in values if isinstance(value, Mapping)]
+    if not mappings:
+        raise ShadowAssessmentError("missing rejected strategy document")
+    for value in values:
+        if not isinstance(value, Mapping):
+            raise ShadowAssessmentError("rejected strategy provenance is invalid")
+    if len(mappings) > 1 and any(
+        _canonical(value) != _canonical(mappings[0]) for value in mappings[1:]
+    ):
+        raise ShadowAssessmentError("conflicting rejected strategy provenance")
+    source = dict(mappings[0])
+
+    required_fields = (
+        "version",
+        "market_type",
+        "family",
+        "operations",
+        "probability_model",
+        "resolution_aware",
+        "resolution_inputs",
+        "parameters",
+    )
+    missing_fields = [name for name in required_fields if name not in source]
+    if missing_fields:
+        if "parameters" in missing_fields:
+            raise ShadowAssessmentError("missing rejected strategy parameters")
+        raise ShadowAssessmentError(
+            "missing rejected strategy fields: " + ", ".join(missing_fields)
+        )
+
+    source_family = source["family"]
+    if not isinstance(source_family, str) or source_family != family:
+        raise ShadowAssessmentError("rejected strategy family disagrees with root family")
+    if isinstance(source["version"], bool) or source["version"] != 1:
+        raise ShadowAssessmentError("rejected strategy version is unsupported")
+    if source["market_type"] != "prediction":
+        raise ShadowAssessmentError("rejected strategy market type is invalid")
+    operations = source["operations"]
+    if not isinstance(operations, (list, tuple)):
+        raise ShadowAssessmentError("rejected strategy operations are invalid")
+    if operations:
+        raise ShadowAssessmentError(
+            "rejected strategy operations are incompatible with the directional setup"
+        )
+    probability_model = source["probability_model"]
+    if not isinstance(probability_model, str) or not probability_model.strip():
+        raise ShadowAssessmentError("rejected strategy probability model is invalid")
+    if source["resolution_aware"] is not True:
+        raise ShadowAssessmentError("rejected strategy resolution awareness is invalid")
+    resolution_inputs = source["resolution_inputs"]
+    if (
+        not isinstance(resolution_inputs, (list, tuple))
+        or not resolution_inputs
+        or any(not isinstance(item, str) or not item.strip() for item in resolution_inputs)
+    ):
+        raise ShadowAssessmentError("rejected strategy resolution inputs are invalid")
+
+    source_parameters = source["parameters"]
+    if not isinstance(source_parameters, Mapping):
+        raise ShadowAssessmentError("rejected strategy parameters are invalid")
+    top_parameters = payload.get("parameters")
+    if top_parameters is not None:
+        top_parameters = _mapping(top_parameters, "strategy parameters")
+        unknown_parameters = [
+            name for name in top_parameters if name not in source_parameters
+        ]
+        if unknown_parameters:
+            raise ShadowAssessmentError(
+                "rejected root strategy parameters are not explicit: "
+                + ", ".join(str(name) for name in unknown_parameters)
+            )
+        if any(
+            _canonical(top_parameters[name]) != _canonical(source_parameters[name])
+            for name in top_parameters
+        ):
+            raise ShadowAssessmentError("conflicting rejected strategy parameters")
+    parameters = dict(source_parameters)
+
+    parameter_names = ("lookback", "threshold")
+
+    def scalar_declaration(names: Sequence[str], label: str) -> Any:
+        found: list[Any] = []
+        for name in names:
+            if name in source_parameters and source_parameters[name] not in (None, ""):
+                found.append(source_parameters[name])
+            if name in payload and payload[name] not in (None, ""):
+                found.append(payload[name])
+        if not found:
+            raise ShadowAssessmentError(f"missing rejected strategy {label}")
+        first = found[0]
+        if any(_canonical(value) != _canonical(first) for value in found[1:]):
+            raise ShadowAssessmentError(f"conflicting rejected strategy {label}")
+        return first
+
+    missing_parameters = [name for name in (*parameter_names, "entry_predicate") if name not in parameters]
+    if missing_parameters:
+        if "entry_predicate" in missing_parameters:
+            raise ShadowAssessmentError("missing rejected strategy entry predicate")
+        raise ShadowAssessmentError(
+            "missing rejected strategy parameters: " + ", ".join(missing_parameters)
+        )
+
+    raw_lookback = scalar_declaration(("lookback", "window"), "lookback")
+    if isinstance(raw_lookback, bool) or type(raw_lookback) is not int:
+        raise ShadowAssessmentError("rejected strategy lookback must be an integer")
+    if raw_lookback < 1 or raw_lookback > _MAX_LOOKBACK:
+        raise ShadowAssessmentError("rejected strategy lookback is out of bounds")
+    raw_threshold = scalar_declaration(("threshold",), "threshold")
+    if isinstance(raw_threshold, bool):
+        raise ShadowAssessmentError("rejected strategy threshold is invalid")
+    try:
+        threshold = float(raw_threshold)
+    except (TypeError, ValueError, OverflowError):
+        threshold = math.nan
+    if not math.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
+        raise ShadowAssessmentError("rejected strategy threshold is invalid")
+
+    predicate = _mapping(parameters["entry_predicate"], "entry predicate")
+    if payload.get("entry_predicate") not in (None, ""):
+        if _canonical(payload["entry_predicate"]) != _canonical(predicate):
+            raise ShadowAssessmentError("conflicting rejected strategy entry predicate")
+    if _canonical(predicate) != _canonical(_ABSOLUTE_MOVE_PREDICATE):
+        raise ShadowAssessmentError("rejected strategy entry predicate is not canonical")
+    try:
+        predicate_minimum = float(predicate["minimum_move"])
+    except (KeyError, TypeError, ValueError, OverflowError):
+        raise ShadowAssessmentError("rejected strategy entry predicate is invalid") from None
+    if abs(threshold - predicate_minimum) > 1e-12:
+        raise ShadowAssessmentError("rejected strategy threshold and entry predicate disagree")
+
+    # The strategy mapping is the immutable declaration.  Do not complete it
+    # from wrapper fields or overwrite any required dimension before parsing.
+    document = dict(source)
+    try:
+        from .strategy import load_strategy
+        canonical = load_strategy(document).to_dict()
+    except Exception as exc:
+        raise ShadowAssessmentError("rejected strategy document is invalid") from exc
+    for field_name in required_fields:
+        if _canonical(canonical.get(field_name)) != _canonical(source[field_name]):
+            raise ShadowAssessmentError(
+                f"rejected strategy {field_name} is not canonical"
+            )
+    canonical_family = _text(canonical.get("family")).lower()
+    if canonical_family != family or canonical.get("market_type") != "prediction":
+        raise ShadowAssessmentError("rejected strategy family or market type is invalid")
+    canonical_parameters = canonical.get("parameters")
+    if not isinstance(canonical_parameters, Mapping):
+        raise ShadowAssessmentError("rejected strategy parameters are invalid")
+    if canonical_parameters.get("lookback") != raw_lookback:
+        raise ShadowAssessmentError("rejected strategy lookback is not canonical")
+    if abs(float(canonical_parameters.get("threshold", math.nan)) - threshold) > 1e-12:
+        raise ShadowAssessmentError("rejected strategy threshold is not canonical")
+    if _canonical(canonical_parameters.get("entry_predicate")) != _canonical(predicate):
+        raise ShadowAssessmentError("rejected strategy entry predicate is not canonical")
+
+    # The setup is candidate-declared and immutable.  Validate the directional
+    # fields it carries, but do not regenerate or write it as historical config.
+    setup_family = _text(setup.get("family")).lower()
+    if setup_family != family:
+        raise ShadowAssessmentError("rejected operational setup family disagrees")
+    setup_market_type = setup.get("market_type")
+    if setup_market_type not in (None, "", "prediction"):
+        raise ShadowAssessmentError("rejected operational setup market type disagrees")
+    setup_lookback = setup.get("lookback")
+    if setup_lookback not in (None, "") and setup_lookback != raw_lookback:
+        raise ShadowAssessmentError("rejected operational setup lookback disagrees")
+    setup_predicate = setup.get("entry_predicate")
+    if setup_predicate not in (None, "") and _canonical(setup_predicate) != _canonical(predicate):
+        raise ShadowAssessmentError("rejected operational setup entry predicate disagrees")
+    return canonical, _content_hash(canonical)
+
+
+def _rejected_model(payload: Mapping[str, Any]) -> tuple[dict[str, Any], str, bool]:
+    values = _declared_values(payload, ("model_document", "model"))
+    mappings = [value for value in values if isinstance(value, Mapping)]
+    if values and len(mappings) != len(values):
+        raise ShadowAssessmentError("rejected model provenance is invalid")
+    if len(mappings) > 1 and any(
+        _canonical(value) != _canonical(mappings[0]) for value in mappings[1:]
+    ):
+        raise ShadowAssessmentError("conflicting rejected model provenance")
+    model = _json_copy(mappings[0]) if mappings else {}
+    return model, _content_hash(model), bool(mappings)
+def _rejected_flags(payload: Mapping[str, Any]) -> None:
+    for name in ("paper_only", "research_only"):
+        values = _declared_values(payload, (name,))
+        if not values or any(not isinstance(value, bool) or value is not True for value in values):
+            raise ShadowAssessmentError(f"rejected candidate must declare {name}=true")
+    values = _declared_values(payload, ("live_execution",))
+    if any(not isinstance(value, bool) or value is not False for value in values):
+        raise ShadowAssessmentError("rejected candidate live_execution must be false")
+
+
+_COST_FEE_ALIAS_NAMES = frozenset({"fee_bps", "fees_bps", "fee_rate"})
+_COST_SLIPPAGE_ALIAS_NAMES = frozenset(
+    {"slippage_bps", "max_slippage_bps", "slippage"}
+)
+
+
+def _strict_cost_number(value: Any, path: str) -> float:
+    if isinstance(value, bool) or value in (None, ""):
+        raise ShadowAssessmentError(f"{path} must be finite and non-negative")
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ShadowAssessmentError(f"{path} must be finite and non-negative") from None
+    if not math.isfinite(number) or number < 0:
+        raise ShadowAssessmentError(f"{path} must be finite and non-negative")
+    return number
+
+def _validate_raw_cost_aliases(value: Any, path: str = "costs", *, depth: int = 0) -> None:
+    if depth > 6:
+        raise ShadowAssessmentError("cost provenance nesting is invalid")
+    if isinstance(value, Mapping):
+        for raw_key, raw_value in value.items():
+            key = _text(raw_key).lower().replace("-", "_")
+            child_path = f"{path}.{key}"
+            if (
+                key in _COST_FEE_ALIAS_NAMES
+                or key in _COST_SLIPPAGE_ALIAS_NAMES
+            ) and not (
+                key == "slippage" and isinstance(raw_value, Mapping)
+            ):
+                candidate = raw_value
+                if isinstance(candidate, Mapping):
+                    candidate = _first(candidate, key, "value", "amount", "bps")
+                _strict_cost_number(candidate, child_path)
+            _validate_raw_cost_aliases(raw_value, child_path, depth=depth + 1)
+    elif isinstance(value, (list, tuple)):
+        for index, child in enumerate(value[:32]):
+            _validate_raw_cost_aliases(child, f"{path}[{index}]", depth=depth + 1)
+
+def _reject_candidate_allocation_aliases(
+    value: Any,
+    path: str = "candidate",
+    *,
+    depth: int = 0,
+) -> None:
+    """Do not let historical candidate sizing influence the shared wallet."""
+    if depth > 6:
+        raise ShadowAssessmentError("candidate allocation provenance is invalid")
+    if isinstance(value, Mapping):
+        for raw_key, raw_value in value.items():
+            key = _text(raw_key).lower().replace("-", "_")
+            child_path = f"{path}.{key}"
+            if key in _ALLOCATION_ALIAS_NAMES:
+                raise ShadowAssessmentError(
+                    f"candidate allocation declaration is not permitted: {child_path}"
+                )
+            _reject_candidate_allocation_aliases(
+                raw_value, child_path, depth=depth + 1
+            )
+    elif isinstance(value, (list, tuple)):
+        for index, child in enumerate(value[:32]):
+            _reject_candidate_allocation_aliases(
+                child, f"{path}[{index}]", depth=depth + 1
+            )
+
+
+def _rejected_costs(
+    payload: Mapping[str, Any],
+    setup: Mapping[str, Any],
+) -> dict[str, Any]:
+    raw = _candidate_fallback_value(
+        payload,
+        ("cost_assumptions", "cost_provenance", "book_assumptions"),
+    )
+    if raw is None:
+        raw = setup.get("book_assumptions")
+    if not isinstance(raw, Mapping):
+        raise ShadowAssessmentError("missing rejected recorded-book cost assumptions")
+    _validate_raw_cost_aliases(raw, "rejected.costs")
+    setup_book = setup.get("book_assumptions")
+    if setup_book is not None:
+        _validate_raw_cost_aliases(setup_book, "rejected.setup.book_assumptions")
+    source = _text(raw.get("source", raw.get("book_source"))).lower()
+    setup_source = (
+        _text(setup_book.get("source", setup_book.get("book_source"))).lower()
+        if isinstance(setup_book, Mapping)
+        else ""
+    )
+    if source and source != "recorded_book":
+        raise ShadowAssessmentError("rejected cost assumptions must use recorded_book")
+    if setup_source and setup_source != "recorded_book":
+        raise ShadowAssessmentError("operational setup book source is invalid")
+    if source != "recorded_book" and setup_source != "recorded_book":
+        raise ShadowAssessmentError("rejected recorded-book cost source is missing")
+    normalized = dict(raw)
+    fees = normalized.get("fees")
+    slippage = normalized.get("slippage")
+
+    def strict_alias(
+        mapping: Mapping[str, Any],
+        aliases: Sequence[str],
+        path: str,
+    ) -> float | None:
+        for name in aliases:
+            if name in mapping:
+                return _strict_cost_number(mapping[name], f"{path}.{name}")
+        return None
+
+    fee_bps = strict_alias(normalized, tuple(_COST_FEE_ALIAS_NAMES), "rejected.costs")
+    if fee_bps is None and isinstance(fees, Mapping):
+        fee_bps = strict_alias(
+            fees, tuple(_COST_FEE_ALIAS_NAMES), "rejected.costs.fees"
+        )
+    if fee_bps is not None:
+        normalized["fee_bps"] = fee_bps
+
+    slippage_bps = strict_alias(
+        normalized, tuple(_COST_SLIPPAGE_ALIAS_NAMES - {"slippage"}), "rejected.costs"
+    )
+    if slippage_bps is None and isinstance(slippage, Mapping):
+        slippage_bps = strict_alias(
+            slippage,
+            tuple(_COST_SLIPPAGE_ALIAS_NAMES - {"slippage"}),
+            "rejected.costs.slippage",
+        )
+    if slippage_bps is not None:
+        normalized["slippage_bps"] = slippage_bps
+    elif not isinstance(slippage, Mapping):
+        if "slippage" in normalized:
+            normalized["slippage_bps"] = _strict_cost_number(
+                normalized["slippage"], "rejected.costs.slippage"
+            )
+    if "fee_bps" not in normalized or "slippage_bps" not in normalized:
+        raise ShadowAssessmentError(
+            "rejected recorded-book costs must include fee_bps and slippage_bps"
+        )
+    costs = _cost_provenance(
+        {},
+        setup,
+        {"paper_assumptions": normalized},
+    )
+    if source or setup_source:
+        costs["source"] = "recorded_book"
+    # Historical rejected candidates did not freeze paper sizing.  Never let a
+    # stale candidate allocation become a shared-wallet budget fence.
+    costs.pop("sizing", None)
+    return costs
+
+
+def _validate_rejected_without_config(
+    candidate_id: str,
+    record: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    settings: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project a terminal rejection into a new shadow registration config."""
+    _reject_candidate_allocation_aliases(payload)
+    for index, value in enumerate(
+        _declared_values(
+            payload,
+            ("cost_provenance", "cost_assumptions", "paper_assumptions", "book_assumptions"),
+        )
+    ):
+        _validate_raw_cost_aliases(value, f"rejected.declared_costs[{index}]")
+    _rejected_flags(payload)
+    setup_value = _one_declared_mapping(payload, ("operational_setup", "setup"), "operational setup")
+    setup = dict(_mapping(setup_value, "operational setup"))
+    setup_hash_values = _declared_values(payload, ("operational_setup_hash", "setup_hash"))
+    if not setup_hash_values:
+        raise ShadowAssessmentError("missing rejected operational setup hash")
+    setup_hash = _text(setup_hash_values[0])
+    if any(_text(value) != setup_hash for value in setup_hash_values):
+        raise ShadowAssessmentError("conflicting rejected operational setup hash")
+    try:
+        if setup_hash != _operational_setup_hash(setup):
+            raise ShadowAssessmentError("rejected operational setup hash mismatch")
+    except ShadowAssessmentError:
+        raise
+    except Exception as exc:
+        raise ShadowAssessmentError("rejected operational setup cannot be hashed") from exc
+    setup_id_values = _declared_values(payload, ("setup_id", "operational_setup_id"))
+    if setup_id_values:
+        if any(not isinstance(value, str) or not value.strip() for value in setup_id_values):
+            raise ShadowAssessmentError("rejected operational setup id must be a non-empty string")
+        setup_id = setup_id_values[0].strip()
+        if any(value.strip() != setup_id for value in setup_id_values[1:]):
+            raise ShadowAssessmentError("missing or conflicting rejected operational setup id")
+    else:
+        setup_id = setup.get("setup_id")
+        if not isinstance(setup_id, str) or not setup_id.strip():
+            raise ShadowAssessmentError("rejected operational setup id must be a non-empty string")
+        setup_id = setup_id.strip()
+
+    family_values = _declared_values(payload, ("family", "strategy_family"))
+    if setup.get("family") not in (None, ""):
+        family_values.append(setup["family"])
+    family = {_text(value).lower() for value in family_values if _text(value)}
+    if family != {"momentum"} and family != {"mean_reversion"}:
+        raise ShadowAssessmentError("rejected candidate family is ambiguous or invalid")
+    family_name = next(iter(family))
+    strategy, strategy_hash = _rejected_strategy(payload, setup, family_name)
+    model, model_hash, model_declared = _rejected_model(payload)
+    declared_strategy_hash = _declared_values(payload, ("strategy_hash",))
+    if declared_strategy_hash and any(_text(value) != strategy_hash for value in declared_strategy_hash):
+        raise ShadowAssessmentError("rejected strategy hash mismatch")
+    declared_model_hash = _declared_values(payload, ("model_hash",))
+    if declared_model_hash and any(_text(value) != model_hash for value in declared_model_hash):
+        raise ShadowAssessmentError("rejected model hash mismatch")
+
+    scope = _candidate_scope(payload, setup, {})
+    setup_policy = setup.get("market_scope_policy")
+    if isinstance(setup_policy, Mapping):
+        try:
+            if normalize_market_scope(setup_policy).scope_hash != normalize_market_scope(scope).scope_hash:
+                raise ShadowAssessmentError("rejected setup and market scope disagree")
+        except ShadowAssessmentError:
+            raise
+        except Exception as exc:
+            raise ShadowAssessmentError("rejected setup market scope is invalid") from exc
+    scope_policy = normalize_market_scope(scope)
+    scope_hash_values = _declared_values(payload, ("market_scope_hash", "scope_hash"))
+    scope_version_values = _declared_values(payload, ("market_scope_version", "scope_version"))
+    if not scope_hash_values or any(_text(value) != scope_policy.scope_hash for value in scope_hash_values):
+        raise ShadowAssessmentError("rejected market scope hash is missing or invalid")
+    if not scope_version_values or any(_text(value) != scope_policy.scope_version for value in scope_version_values):
+        raise ShadowAssessmentError("rejected market scope version is missing or invalid")
+
+    exit_policy = _candidate_exit(payload, setup, {})
+    costs = _rejected_costs(payload, setup)
+    risk_limits = _risk_limits(settings, {})
+    rejection_evidence = _rejection_evidence(candidate_id, payload)
+    if not rejection_evidence.get("has_rejection_provenance"):
+        raise ShadowAssessmentError("missing rejection provenance")
+    rejection_evidence.pop("has_rejection_provenance", None)
+    historical_values = _declared_values(
+        payload,
+        ("historical_evidence", "historical_provenance", "historical_support"),
+    )
+    historical_evidence: Mapping[str, Any] = {}
+    if historical_values:
+        if any(not isinstance(value, Mapping) for value in historical_values):
+            raise ShadowAssessmentError("historical provenance must be a mapping")
+        historical_evidence = _json_copy(historical_values[0])
+        if any(_canonical(value) != _canonical(historical_evidence) for value in historical_values[1:]):
+            raise ShadowAssessmentError("conflicting historical provenance")
+
+    settings_identity = {
+        key: settings.get(key) for key in ("config_id", "generation", "config_hash")
+    }
+    projection_config = {
+        "schema": SHADOW_SCHEMA,
+        "shadow_assessment": True,
+        "observation_intent": True,
+        "paper_only": True,
+        "research_only": True,
+        "live_execution": False,
+        "execution": "paper_only",
+        "market_authority_required": bool(scope_policy.market_ids),
+        "market_scope": scope_policy.as_dict(),
+        "market_scope_hash": scope_policy.scope_hash,
+        "market_scope_version": scope_policy.scope_version,
+        "strategy_document": _json_copy(strategy),
+        "model_document": _json_copy(model),
+        "exit_policy": _json_copy(exit_policy),
+        "paper_assumptions_explicit": True,
+        "paper_assumptions": _json_copy(costs),
+        "risk_limits": _json_copy(risk_limits),
+        "settings_identity": _json_copy(settings_identity),
+    }
+    projection_hash = _content_hash(
+        {"config": projection_config, "risk_limits": risk_limits}
+    )
+    candidate_declared = {
+        "strategy": _json_copy(strategy),
+        "operational_setup": _json_copy(setup),
+        "market_scope": scope_policy.as_dict(),
+        "exit_policy": _json_copy(exit_policy),
+        "recorded_book_cost_assumptions": _json_copy(costs),
+        "paper_only": True,
+        "research_only": True,
+        "rejection_evidence": _json_copy(rejection_evidence),
+    }
+    if model_declared:
+        candidate_declared["model"] = _json_copy(model)
+    projection_provenance = {
+        "kind": _HISTORICAL_REJECTED_PROJECTION,
+        "candidate_declared": candidate_declared,
+        "current_derived": {
+            "risk_limits": _json_copy(risk_limits),
+            "paper_sizing": {
+                "rule": "shared_wallet_half_at_registration",
+                "settings_identity": _json_copy(settings_identity),
+            },
+            "settings_identity": _json_copy(settings_identity),
+        },
+    }
+    return {
+        "candidate_id": candidate_id,
+        "shadow_member_id": _member_id(family_name, candidate_id),
+        "family": family_name,
+        "setup": _json_copy(setup),
+        "setup_id": setup_id,
+        "setup_hash": setup_hash,
+        "strategy": _json_copy(strategy),
+        "strategy_hash": strategy_hash,
+        "model": _json_copy(model),
+        "model_hash": model_hash,
+        "config": projection_config,
+        "config_hash": projection_hash,
+        "scope": scope_policy.as_dict(),
+        "scope_hash": scope_policy.scope_hash,
+        "scope_version": scope_policy.scope_version,
+        "exit_policy": _json_copy(exit_policy),
+        "cost_provenance": _json_copy(costs),
+        "risk_limits": _json_copy(risk_limits),
+        "rejection_evidence": rejection_evidence,
+        "historical_evidence": historical_evidence,
+        "projection_provenance": projection_provenance,
+        "historical_frozen_config": False,
+    }
 def _candidate_scope(
     payload: Mapping[str, Any],
     setup: Mapping[str, Any],
@@ -418,11 +970,14 @@ def _cost_provenance(payload: Mapping[str, Any], setup: Mapping[str, Any], confi
         raise ShadowAssessmentError("frozen cost provenance is invalid")
     if not mappings:
         raise ShadowAssessmentError("frozen cost provenance is required")
+    for index, value in enumerate(values):
+        _validate_raw_cost_aliases(value, f"frozen.costs[{index}]")
     result = _json_copy(mappings[0])
     setup_costs = setup.get("book_assumptions")
     if setup_costs is not None and not isinstance(setup_costs, Mapping):
         raise ShadowAssessmentError("operational setup book assumptions are invalid")
     if isinstance(setup_costs, Mapping):
+        _validate_raw_cost_aliases(setup_costs, "frozen.setup.book_assumptions")
         # Recorded provider assumptions are authoritative.  A candidate may
         # repeat them, but may not replace them with a different value.
         for key in ("fee_bps", "fees_bps", "fee_rate", "slippage_bps", "max_slippage_bps", "slippage"):
@@ -578,7 +1133,221 @@ def _rejection_evidence(candidate_id: str, payload: Mapping[str, Any]) -> dict[s
     return evidence
 
 
-def _validate_candidate_unchecked(candidate_id: str, record: Mapping[str, Any]) -> dict[str, Any]:
+def _event_stage(event: Mapping[str, Any], name: str) -> str:
+    return _text(event.get(name)).upper()
+
+
+def _event_mapping(event: Mapping[str, Any]) -> Mapping[str, Any]:
+    payload = event.get("payload")
+    return payload if isinstance(payload, Mapping) else {}
+
+
+def _authoritative_frozen_forward_proof(
+    store: Any,
+    candidate_id: str,
+    payload: Mapping[str, Any],
+    events: Sequence[Mapping[str, Any]],
+) -> Mapping[str, Any]:
+    """Require a lifecycle freeze event bound to the persisted forward row."""
+    frozen_events = [
+        event
+        for event in events
+        if _event_stage(event, "to_stage") == "FROZEN"
+    ]
+    if not frozen_events:
+        raise ShadowAssessmentError("authoritative frozen lifecycle proof is missing")
+    frozen_event = frozen_events[-1]
+    if _event_stage(frozen_event, "from_stage") != "ROBUSTNESS_CHECKED":
+        raise ShadowAssessmentError("frozen lifecycle chain is invalid")
+    frozen_payload = _event_mapping(frozen_event)
+    if frozen_payload.get("frozen") is not True:
+        raise ShadowAssessmentError("frozen lifecycle evidence is invalid")
+
+    def optional_hash(name: str) -> str | None:
+        values = _declared_values(payload, (name,))
+        if not values:
+            return None
+        if any(not isinstance(value, str) or not value.strip() for value in values):
+            raise ShadowAssessmentError(f"frozen {name} must be a non-empty string")
+        first = values[0].strip()
+        if any(value.strip() != first for value in values[1:]):
+            raise ShadowAssessmentError(f"conflicting frozen {name} provenance")
+        return first
+
+    event_hashes = {
+        name: _declared_hash(frozen_payload, name)
+        for name in ("strategy_hash", "model_hash", "config_hash")
+    }
+    strategy_hash = optional_hash("strategy_hash")
+    model_hash = optional_hash("model_hash")
+    config_hash = optional_hash("config_hash")
+    if (
+        strategy_hash is not None
+        and strategy_hash != event_hashes["strategy_hash"]
+    ) or (
+        model_hash is not None
+        and model_hash != event_hashes["model_hash"]
+    ) or (
+        config_hash is not None
+        and config_hash != event_hashes["config_hash"]
+    ):
+        raise ShadowAssessmentError("frozen lifecycle hashes do not match candidate")
+    strategy_hash = strategy_hash or event_hashes["strategy_hash"]
+    model_hash = model_hash or event_hashes["model_hash"]
+    config_hash = config_hash or event_hashes["config_hash"]
+    expected_frozen_hash = hashlib.sha256(
+        "|".join((strategy_hash, model_hash, config_hash)).encode()
+    ).hexdigest()
+    frozen_hash_values = _declared_values(frozen_payload, ("frozen_hash",))
+    if frozen_hash_values and any(
+        not isinstance(value, str) or value.strip() != expected_frozen_hash
+        for value in frozen_hash_values
+    ):
+        raise ShadowAssessmentError("frozen lifecycle hash is invalid")
+
+    candidate_config_values = _declared_values(payload, ("forward_config", "config"))
+    candidate_config = (
+        _candidate_config(payload) if candidate_config_values else None
+    )
+    candidate_risk_values = _declared_values(
+        payload, ("risk_limits", "risk_snapshot", "candidate_risk_limits")
+    )
+    candidate_risk = (
+        _candidate_risk_limits(payload, candidate_config or {})
+        if candidate_risk_values
+        else None
+    )
+    risk_values = _declared_values(frozen_payload, ("risk_snapshot",))
+    if not risk_values or any(not isinstance(value, Mapping) for value in risk_values):
+        raise ShadowAssessmentError("frozen lifecycle risk snapshot is missing")
+    frozen_risk = risk_values[0]
+    if any(_canonical(value) != _canonical(frozen_risk) for value in risk_values[1:]):
+        raise ShadowAssessmentError("conflicting frozen lifecycle risk snapshot")
+    if candidate_risk is not None and _canonical(candidate_risk) != _canonical(frozen_risk):
+        raise ShadowAssessmentError("frozen lifecycle risk snapshot does not match candidate")
+
+    forward_ids = _declared_values(
+        payload,
+        ("forward_test_id", "forward_id", "experiment_id"),
+    )
+    if any(not isinstance(value, str) or not value.strip() for value in forward_ids):
+        raise ShadowAssessmentError("frozen forward identifier must be a non-empty string")
+    try:
+        loader = getattr(store, "load_forward_tests")
+        records = loader(limit=10_000)
+    except Exception as exc:
+        raise ShadowAssessmentError("authoritative frozen forward proof is unavailable") from exc
+    if not isinstance(records, Sequence) or isinstance(records, (str, bytes)):
+        raise ShadowAssessmentError("authoritative frozen forward proof is unavailable")
+
+    matches: list[Mapping[str, Any]] = []
+    for record in records:
+        if not isinstance(record, Mapping):
+            continue
+        experiment_id = record.get("experiment_id")
+        if not isinstance(experiment_id, str) or not experiment_id.strip():
+            continue
+        if forward_ids and experiment_id.strip() not in {
+            value.strip() for value in forward_ids
+        }:
+            continue
+        record_config = record.get("config")
+        record_risk = record.get("risk_limits")
+        if not isinstance(record_config, Mapping) or not isinstance(record_risk, Mapping):
+            continue
+        record_candidate_id = record_config.get("candidate_id")
+        if (
+            not isinstance(record_candidate_id, str)
+            or record_candidate_id.strip() != candidate_id
+        ):
+            continue
+        if _text(record.get("quality")).upper() != "PAPER_FORWARD":
+            continue
+        record_strategy_hash = record.get("strategy_hash")
+        record_model_hash = record.get("model_hash")
+        if (
+            not isinstance(record_strategy_hash, str)
+            or not isinstance(record_model_hash, str)
+            or record_strategy_hash.strip() != strategy_hash
+            or record_model_hash.strip() != model_hash
+        ):
+            continue
+        if candidate_config is not None and _canonical(record_config) != _canonical(candidate_config):
+            continue
+        if _canonical(record_risk) != _canonical(frozen_risk):
+            continue
+        if _content_hash({"config": record_config, "risk_limits": record_risk}) != config_hash:
+            continue
+        matches.append(record)
+    if len(matches) != 1:
+        raise ShadowAssessmentError("authoritative frozen forward proof is ambiguous")
+    return matches[0]
+
+def _projection_mode(
+    store: Any,
+    candidate_id: str,
+    record: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    events: Sequence[Mapping[str, Any]] | None,
+) -> tuple[str, Mapping[str, Any] | None]:
+    """Classify only from the persisted lifecycle chain, never payload reasons."""
+    if not isinstance(events, Sequence) or isinstance(events, (str, bytes)) or not events:
+        raise ShadowAssessmentError("candidate lifecycle event chain is unavailable")
+    normalized_events = [
+        event for event in events if isinstance(event, Mapping)
+    ]
+    if len(normalized_events) != len(events):
+        raise ShadowAssessmentError("candidate lifecycle event chain is invalid")
+    # Lifecycle rows are authoritative only when they belong to this candidate.
+    for event in normalized_events:
+        event_candidate_id = event.get("candidate_id")
+        if (
+            not isinstance(event_candidate_id, str)
+            or event_candidate_id.strip() != candidate_id
+        ):
+            raise ShadowAssessmentError("candidate lifecycle event identity is invalid")
+    rejected_events = [
+        event
+        for event in normalized_events
+        if _event_stage(event, "to_stage") == "REJECTED"
+    ]
+    if len(rejected_events) != 1:
+        raise ShadowAssessmentError("candidate lifecycle rejection chain is invalid")
+    has_forward_evidence = any(
+        _event_stage(event, "to_stage") in _FORWARD_EVIDENCE_STAGES
+        for event in normalized_events
+    )
+    if any(
+        _event_stage(event, "to_stage") == "FROZEN"
+        for event in normalized_events
+    ):
+        proof = _authoritative_frozen_forward_proof(
+            store, candidate_id, payload, normalized_events
+        )
+        return "frozen", proof
+    if has_forward_evidence:
+        raise ShadowAssessmentError("candidate has incomplete frozen lifecycle evidence")
+    rejection = rejected_events[0]
+    if (
+        _event_stage(rejection, "from_stage") != "BACKTESTED"
+        or _text(rejection.get("reason")).lower() != "negative_validation_expectancy"
+    ):
+        raise ShadowAssessmentError(
+            "candidate rejection is not an authoritative negative validation expectancy"
+        )
+    if _declared_values(payload, ("forward_config", "config")):
+        raise ShadowAssessmentError("frozen candidate config provenance is ambiguous")
+    return "projection", None
+
+
+def _validate_candidate_unchecked(
+    candidate_id: str,
+    record: Mapping[str, Any],
+    settings: Mapping[str, Any] | None = None,
+    *,
+    events: Sequence[Mapping[str, Any]] | None = None,
+    store: Any | None = None,
+) -> dict[str, Any]:
     if not isinstance(candidate_id, str) or not candidate_id.strip():
         raise ShadowAssessmentError("candidate_id must be a non-empty string")
     if not isinstance(record, Mapping):
@@ -597,6 +1366,11 @@ def _validate_candidate_unchecked(candidate_id: str, record: Mapping[str, Any]) 
         if any(value.strip() != candidate_id.strip() for value in declared_ids):
             raise ShadowAssessmentError("candidate payload identity does not match candidate_id")
     candidate_id = candidate_id.strip()
+    mode, frozen_proof = _projection_mode(store, candidate_id, record, payload, events)
+    if mode == "projection":
+        if not isinstance(settings, Mapping):
+            raise ShadowAssessmentError("CURRENT risk settings are required for rejected projection")
+        return _validate_rejected_without_config(candidate_id, record, payload, settings)
 
     def declared_text(names: Sequence[str], label: str) -> str:
         values = _declared_values(payload, names)
@@ -611,6 +1385,30 @@ def _validate_candidate_unchecked(candidate_id: str, record: Mapping[str, Any]) 
         if any(value != first for value in normalized[1:]):
             raise ShadowAssessmentError(f"conflicting frozen {label} provenance")
         return first
+    def frozen_declared_text(names: Sequence[str], label: str) -> str:
+        values = _declared_values(payload, names)
+        if values:
+            return declared_text(names, label)
+        if frozen_proof is None:
+            raise ShadowAssessmentError(f"missing frozen {label}")
+        value = frozen_proof.get(names[0])
+        if not isinstance(value, str) or not value.strip():
+            raise ShadowAssessmentError(f"missing frozen {label}")
+        return value.strip()
+
+    def frozen_declared_hash(name: str) -> str:
+        values = _declared_values(payload, (name,))
+        if values:
+            return _declared_hash(payload, name)
+        if frozen_proof is None:
+            raise ShadowAssessmentError(f"missing frozen {name}")
+        value = frozen_proof.get(name)
+        if not isinstance(value, str) or not value.strip():
+            raise ShadowAssessmentError(f"missing frozen {name}")
+        return value.strip()
+
+    if frozen_proof is None:
+        raise ShadowAssessmentError("authoritative frozen forward proof is missing")
 
     setup_value = _one_declared_mapping(payload, ("operational_setup", "setup"), "operational setup")
     setup = dict(_mapping(setup_value, "operational setup"))
@@ -637,14 +1435,19 @@ def _validate_candidate_unchecked(candidate_id: str, record: Mapping[str, Any]) 
         raise ShadowAssessmentError("operational setup must identify momentum or mean_reversion")
     family = next(iter(families))
 
-    config = _candidate_config(payload)
+    config_values = _declared_values(payload, ("forward_config", "config"))
+    config = (
+        _candidate_config(payload)
+        if config_values
+        else _mapping(frozen_proof.get("config"), "authoritative frozen candidate config")
+    )
     if not isinstance(config, Mapping):
         raise ShadowAssessmentError("frozen candidate config must be a mapping")
     strategy, model = _candidate_documents(payload, config)
     strategy = dict(_mapping(strategy, "frozen strategy document"))
     model = dict(_mapping(model, "frozen model document"))
-    strategy_hash = _declared_hash(payload, "strategy_hash")
-    model_hash = _declared_hash(payload, "model_hash")
+    strategy_hash = frozen_declared_hash("strategy_hash")
+    model_hash = frozen_declared_hash("model_hash")
     if _content_hash(strategy) != strategy_hash:
         from .forward import _normalized_strategy_document
         try:
@@ -674,12 +1477,26 @@ def _validate_candidate_unchecked(candidate_id: str, record: Mapping[str, Any]) 
 
     exit_policy = _candidate_exit(payload, setup, config)
     costs = _cost_provenance(payload, setup, config)
-    risk_limits = _candidate_risk_limits(payload, config)
-    config_hash = _declared_hash(payload, "config_hash")
+    risk_values = _declared_values(
+        payload, ("risk_limits", "risk_snapshot", "candidate_risk_limits")
+    )
+    risk_limits = (
+        _candidate_risk_limits(payload, config)
+        if risk_values
+        else dict(_mapping(frozen_proof.get("risk_limits"), "authoritative frozen risk limits"))
+    )
+    config_hash = frozen_declared_hash("config_hash")
     expected_config_hash = _content_hash({"config": config, "risk_limits": risk_limits})
     if config_hash != expected_config_hash:
         raise ShadowAssessmentError("frozen candidate config hash mismatch")
-    frozen_hash = _declared_hash(payload, "frozen_hash")
+    frozen_hash_values = _declared_values(payload, ("frozen_hash",))
+    frozen_hash = (
+        _declared_hash(payload, "frozen_hash")
+        if frozen_hash_values
+        else hashlib.sha256(
+            "|".join((strategy_hash, model_hash, config_hash)).encode()
+        ).hexdigest()
+    )
     expected_frozen_hash = hashlib.sha256(
         "|".join((strategy_hash, model_hash, config_hash)).encode()
     ).hexdigest()
@@ -748,9 +1565,22 @@ def _validate_candidate_unchecked(candidate_id: str, record: Mapping[str, Any]) 
     }
 
 
-def _validate_candidate(candidate_id: str, record: Mapping[str, Any]) -> dict[str, Any]:
+def _validate_candidate(
+    candidate_id: str,
+    record: Mapping[str, Any],
+    settings: Mapping[str, Any] | None = None,
+    *,
+    events: Sequence[Mapping[str, Any]] | None = None,
+    store: Any | None = None,
+) -> dict[str, Any]:
     try:
-        return _validate_candidate_unchecked(candidate_id, record)
+        return _validate_candidate_unchecked(
+            candidate_id,
+            record,
+            settings,
+            events=events,
+            store=store,
+        )
     except ShadowAssessmentError:
         raise
     except Exception:
@@ -1470,6 +2300,15 @@ _MEMBER_ALLOCATION_NAMES = (
     "max_allocated_capital_usd",
 )
 
+_ALLOCATION_ALIAS_NAMES = frozenset(
+    {
+        *(_name.lower() for _name in _SHARED_CAP_NAMES),
+        "allocation",
+        "allocation_usd",
+        *(_name.lower() for _name in _MEMBER_ALLOCATION_NAMES),
+    }
+)
+
 
 def _named_positive_values(
     source: Mapping[str, Any],
@@ -1654,13 +2493,32 @@ class ShadowAssessmentService:
         self.max_markets = max_markets
         self.max_observations = max_observations
 
-    def _load_candidates(self, candidate_ids: Sequence[str]) -> list[dict[str, Any]]:
+    def _load_candidates(
+        self,
+        candidate_ids: Sequence[str],
+        settings: Mapping[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
         result = []
+        event_loader = getattr(self.store, "list_candidate_lifecycle_events", None)
+        if not callable(event_loader):
+            raise ShadowAssessmentError("candidate lifecycle event chain is unavailable")
         for candidate_id in candidate_ids:
             record = self.store.load_candidate_lifecycle(candidate_id)
             if not isinstance(record, Mapping):
                 raise ShadowAssessmentError(f"candidate does not exist: {candidate_id}")
-            result.append(_validate_candidate(candidate_id, record))
+            try:
+                events = event_loader(candidate_id, limit=256)
+            except Exception as exc:
+                raise ShadowAssessmentError("candidate lifecycle event chain is unavailable") from exc
+            result.append(
+                _validate_candidate(
+                    candidate_id,
+                    record,
+                    settings,
+                    events=events,
+                    store=self.store,
+                )
+            )
         return result
 
     def register(
@@ -1689,7 +2547,10 @@ class ShadowAssessmentService:
         stop_stamp = _safe_stop_value(stop_at, "stop_at")
         if isinstance(stop_stamp, datetime) and ensure_utc(stop_stamp) <= current:
             raise ShadowAssessmentError("stop_at must be in the future")
-        members = self._load_candidates(identifiers)
+        settings = CanarySettingsService(self.store, clock=self.clock, initialize=False).snapshot(now=current)
+        if _text(settings.get("status")).upper() != "CURRENT" or not settings.get("settings_available"):
+            raise ShadowAssessmentError("CURRENT risk settings are unavailable")
+        members = self._load_candidates(identifiers, settings)
         members.sort(key=lambda item: (_MEMBER_ORDER.get(item["family"], 99), item["candidate_id"]))
         _verify_family_semantics(members)
         if _canonical(members[0]["scope"]) != _canonical(members[1]["scope"]):
@@ -1698,10 +2559,6 @@ class ShadowAssessmentService:
             raise ShadowAssessmentError("shadow members must share the exact frozen exit policy")
         if _canonical(members[0]["cost_provenance"]) != _canonical(members[1]["cost_provenance"]):
             raise ShadowAssessmentError("shadow members must share the exact frozen cost provenance")
-
-        settings = CanarySettingsService(self.store, clock=self.clock, initialize=False).snapshot(now=current)
-        if _text(settings.get("status")).upper() != "CURRENT" or not settings.get("settings_available"):
-            raise ShadowAssessmentError("CURRENT risk settings are unavailable")
         settings_identity = {key: settings.get(key) for key in ("config_id", "generation", "config_hash")}
         budget_cap, cap_sources = _shadow_budget_cap(settings, members)
         if bankroll is None:
@@ -1727,13 +2584,29 @@ class ShadowAssessmentService:
         }
         # The job identity excludes wall-clock time but includes the exact
         # immutable budget and CURRENT settings fence.
+        identity_members: list[dict[str, Any]] = []
+        for item in members:
+            member_identity = {
+                key: item[key]
+                for key in (
+                    "family",
+                    "setup_id",
+                    "setup_hash",
+                    "strategy_hash",
+                    "model_hash",
+                    "scope_hash",
+                    "scope_version",
+                    "exit_policy",
+                    "cost_provenance",
+                )
+            }
+            if "projection_provenance" in item:
+                member_identity["projection_provenance"] = item["projection_provenance"]
+            identity_members.append(member_identity)
         identity = {
             "schema": SHADOW_SCHEMA,
             "candidate_ids": [item["candidate_id"] for item in members],
-            "members": [
-                {key: item[key] for key in ("family", "setup_id", "setup_hash", "strategy_hash", "model_hash", "scope_hash", "scope_version", "exit_policy", "cost_provenance")}
-                for item in members
-            ],
+            "members": identity_members,
             "shared_budget": shared_budget,
             "max_cycles": cycle_limit,
             "max_observations": observation_limit,
@@ -1776,7 +2649,7 @@ class ShadowAssessmentService:
                 persisted_settings = _json_copy(candidate_settings)
         member_records = []
         for item in members:
-            member_records.append({
+            member_record = {
                 "shadow_member_id": item["shadow_member_id"],
                 "candidate_id": item["candidate_id"],
                 "family": item["family"],
@@ -1789,7 +2662,6 @@ class ShadowAssessmentService:
                 "model_hash": item["model_hash"],
                 "config": item["config"],
                 "config_hash": item["config_hash"],
-                "frozen_hash": item["frozen_hash"],
                 "scope": item["scope"],
                 "scope_hash": item["scope_hash"],
                 "scope_version": item["scope_version"],
@@ -1798,7 +2670,13 @@ class ShadowAssessmentService:
                 "risk_limits": item["risk_limits"],
                 "rejection_evidence": item["rejection_evidence"],
                 "historical_evidence": item["historical_evidence"],
-            })
+            }
+            if "frozen_hash" in item:
+                member_record["frozen_hash"] = item["frozen_hash"]
+            if "projection_provenance" in item:
+                member_record["projection_provenance"] = item["projection_provenance"]
+                member_record["historical_frozen_config"] = False
+            member_records.append(member_record)
         composite = ShadowCompositeStrategy(member_records)
         composite_model = ShadowCompositeModel(composite.members)
         # Freeze the declarative composite documents once.  The registry hashes
@@ -1848,8 +2726,15 @@ class ShadowAssessmentService:
         # source, and each member can consume no more than half at one entry.
         assumptions = spec_config["paper_assumptions"]
         sizing = assumptions.get("sizing") if isinstance(assumptions, Mapping) else None
+        projection = any("projection_provenance" in item for item in members)
         if not isinstance(sizing, Mapping):
-            raise ShadowAssessmentError("frozen cost provenance sizing is invalid")
+            if not projection:
+                raise ShadowAssessmentError("frozen cost provenance sizing is invalid")
+            sizing = {
+                "model": "fixed_allocated_capital",
+                "source": "CURRENT_SETTINGS",
+                "settings_identity": _json_copy(settings_identity),
+            }
         assumptions = dict(assumptions)
         assumptions["sizing"] = {
             **dict(sizing),
@@ -1891,24 +2776,66 @@ class ShadowAssessmentService:
             "strategy_hash": composite_strategy_hash,
             "model_hash": composite_model_hash,
         }
+        shared_record = {
+            "spec": spec.as_record(),
+            "run_id": spec.experiment_id,
+            "bankroll": bankroll_value,
+            "budget": shared_budget,
+            "shared_budget": shared_budget,
+            "bankroll_source": budget_source,
+            "bankroll_cap": format(budget_cap, "f"),
+            "risk_settings": persisted_settings if persisted_settings is not None else _json_copy(settings),
+            "risk_settings_identity": settings_identity,
+            "operational_policy": operational_policy.as_record(),
+            "scope": canonical_scope,
+            "scope_hash": scope_policy.scope_hash,
+            "scope_version": scope_policy.scope_version,
+            "cost_provenance": _json_copy(spec_config["paper_assumptions"]),
+            "member_allocated_capital": format(bankroll_decimal / Decimal("2"), "f"),
+            "frozen_documents": frozen_documents,
+            "member_documents": member_documents,
+            "member_hashes": member_hashes,
+        }
+        if projection:
+            shared_record["projection_provenance"] = {
+                "kind": _HISTORICAL_REJECTED_PROJECTION,
+                "candidate_declared_fields": [
+                    "strategy",
+                    "model",
+                    "operational_setup",
+                    "market_scope",
+                    "exit_policy",
+                    "recorded_book_cost_assumptions",
+                    "paper_only",
+                    "research_only",
+                    "rejection_evidence",
+                ],
+                "current_derived_fields": [
+                    "risk_limits",
+                    "paper_assumptions.sizing",
+                    "settings_identity",
+                ],
+                "current_derived": {
+                    "risk_limits": _json_copy(spec.risk_limits),
+                    "paper_sizing": _json_copy(
+                        spec.config["paper_assumptions"]["sizing"]
+                    ),
+                    "settings_identity": _json_copy(settings_identity),
+                },
+                "settings_identity": _json_copy(settings_identity),
+            }
         manifest = {
-            "schema": SHADOW_SCHEMA, "job_id": job_id, "paper_only": True, "live_execution": False,
+            "schema": SHADOW_SCHEMA,
+            "job_id": job_id,
+            "paper_only": True,
+            "live_execution": False,
             "members": member_records,
-            "shared": {
-                "spec": spec.as_record(), "run_id": spec.experiment_id, "bankroll": bankroll_value,
-                "budget": shared_budget, "shared_budget": shared_budget,
-                "bankroll_source": budget_source, "bankroll_cap": format(budget_cap, "f"),
-                "risk_settings": persisted_settings if persisted_settings is not None else _json_copy(settings),
-                "risk_settings_identity": settings_identity,
-                "operational_policy": operational_policy.as_record(),
-                "scope": canonical_scope, "scope_hash": scope_policy.scope_hash, "scope_version": scope_policy.scope_version,
-                "cost_provenance": _json_copy(spec_config["paper_assumptions"]),
-                "member_allocated_capital": format(bankroll_decimal / Decimal("2"), "f"),
-                "frozen_documents": frozen_documents,
-                "member_documents": member_documents,
-                "member_hashes": member_hashes,
+            "shared": shared_record,
+            "stop_conditions": {
+                "max_cycles": cycle_limit,
+                "max_observations": observation_limit,
+                "stop_at": stop_stamp.isoformat() if isinstance(stop_stamp, datetime) else None,
             },
-            "stop_conditions": {"max_cycles": cycle_limit, "max_observations": observation_limit, "stop_at": stop_stamp.isoformat() if isinstance(stop_stamp, datetime) else None},
         }
         state = self._initial_state(job_id, spec, member_records, cycle_limit, observation_limit, stop_stamp)
         return self.store.register_shadow_job(job_id, manifest, state, SHADOW_STATUS_REGISTERED, current, current)
