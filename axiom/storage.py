@@ -120,6 +120,23 @@ _SHADOW_JOB_ID_MAX_LENGTH = 256
 _LOGGER = logging.getLogger(__name__)
 
 
+def _recent_rowid_cte(table: str, columns: str, *, alias: str = "recent_rows") -> str:
+    """Build a materialized, bounded insertion-window CTE for a large table.
+
+    The rowid predicate is deliberately inside the materialization fence and
+    timestamp/source predicates are applied by callers afterwards.  This keeps
+    SQLite on the rowid seek instead of allowing a timestamp/index-driven plan
+    to scan the historical tape before applying the operational window.
+    """
+    return (
+        f"{alias} AS MATERIALIZED ("
+        f"SELECT {columns} FROM {table} "
+        f"WHERE rowid > COALESCE((SELECT MAX(rowid)-? FROM {table}),0)"
+        ")"
+    )
+
+
+
 class SQLiteBusyTimeout(sqlite3.OperationalError):
     """Bounded retry exhaustion while another writer owns SQLite."""
 
@@ -9656,16 +9673,27 @@ class AxiomStore:
         snapshot = self._snapshot_read_connection()
         try:
             market_row = snapshot.execute(
-                "WITH market_ids AS ("
-                "SELECT market_id FROM polymarket_markets "
-                "WHERE rowid > COALESCE((SELECT MAX(rowid)-? FROM polymarket_markets),0) AND observed_at <= ? "
-                "UNION SELECT market_id FROM polymarket_snapshots "
-                "WHERE rowid > COALESCE((SELECT MAX(rowid)-? FROM polymarket_snapshots),0) AND observed_at <= ?"
-                ") SELECT COUNT(*) AS market_count FROM market_ids",
-                (_MAX_EVIDENCE_SCAN_ROWS, cutoff, _MAX_EVIDENCE_SCAN_ROWS, cutoff),
+                "WITH "
+                + _recent_rowid_cte("polymarket_markets", "market_id,observed_at", alias="recent_markets")
+                + ", "
+                + _recent_rowid_cte("polymarket_snapshots", "market_id,observed_at", alias="recent_snapshots")
+                + ", market_ids AS ("
+                "SELECT market_id FROM recent_markets WHERE observed_at <= ? "
+                "UNION SELECT market_id FROM recent_snapshots WHERE observed_at <= ?"
+                ") SELECT COUNT(*) AS market_count, "
+                "(SELECT COUNT(*) FROM recent_markets) AS recent_market_rows, "
+                "(SELECT COUNT(*) FROM recent_snapshots) AS recent_snapshot_rows "
+                "FROM market_ids",
+                (_MAX_EVIDENCE_SCAN_ROWS, _MAX_EVIDENCE_SCAN_ROWS, cutoff, cutoff),
             ).fetchone()
             snapshot_row = snapshot.execute(
-                "SELECT COUNT(*) AS snapshot_count, "
+                "WITH "
+                + _recent_rowid_cte(
+                    "polymarket_snapshots",
+                    "market_id,observed_at,payload_json,quality",
+                    alias="recent_snapshots",
+                )
+                + " SELECT COUNT(*) AS snapshot_count, "
                 "COUNT(DISTINCT market_id) AS snapshot_markets, "
                 "SUM(CASE WHEN quality = 'ORDER_BOOK_SIMULATED' THEN 1 ELSE 0 END) AS book_snapshots, "
                 "SUM(CASE WHEN json_valid(payload_json) THEN "
@@ -9678,14 +9706,7 @@ class AxiomStore:
                 "  CASE WHEN lower(CAST(json_extract(payload_json, '$.settlement') AS TEXT)) "
                 "       IN ('resolved_yes', 'resolved_no', 'void') THEN market_id ELSE NULL END "
                 " ELSE NULL END) AS resolved_markets, "
-                "MIN(observed_at) AS first_observed_at, MAX(observed_at) AS latest_observed_at "
-                "FROM polymarket_snapshots "
-                "WHERE rowid > COALESCE((SELECT MAX(rowid)-? FROM polymarket_snapshots),0) AND observed_at <= ?",
-                (_MAX_EVIDENCE_SCAN_ROWS, cutoff),
-            ).fetchone()
-            regime_row = snapshot.execute(
-                "SELECT COUNT(*) AS regime_count FROM ("
-                "SELECT DISTINCT CASE WHEN json_valid(payload_json) THEN "
+                "COUNT(DISTINCT CASE WHEN json_valid(payload_json) THEN "
                 "  CASE "
                 "    WHEN NULLIF(TRIM(CAST(json_extract(payload_json, '$.regime') AS TEXT)), '') IS NOT NULL "
                 "      THEN TRIM(CAST(json_extract(payload_json, '$.regime') AS TEXT)) "
@@ -9693,28 +9714,35 @@ class AxiomStore:
                 "      THEN TRIM(CAST(json_extract(payload_json, '$.snapshot.regime') AS TEXT)) "
                 "    ELSE NULL "
                 "  END "
-                " ELSE NULL END AS regime "
-                "FROM polymarket_snapshots "
-                "WHERE rowid > COALESCE((SELECT MAX(rowid)-? FROM polymarket_snapshots),0) AND observed_at <= ?"
-                ") WHERE regime IS NOT NULL",
+                " ELSE NULL END) AS regime_count, "
+                "MIN(observed_at) AS first_observed_at, MAX(observed_at) AS latest_observed_at, "
+                "(SELECT COUNT(*) FROM recent_snapshots) AS recent_snapshot_rows "
+                "FROM recent_snapshots WHERE observed_at <= ?",
                 (_MAX_EVIDENCE_SCAN_ROWS, cutoff),
             ).fetchone()
-            # Materialize the bounded rowid seek before joining eligible markets.
-            # Without this fence, SQLite can drive the join from
-            # idx_polymarket_trades_market_time and scan the full trade history.
+            # Keep the join driven by bounded recent rowid sets.  Without the
+            # materialization fence SQLite can choose the market/time index
+            # and scan the full historical trade tape.
             trade_row = snapshot.execute(
-                "WITH recent_trades AS MATERIALIZED ("
-                "SELECT market_id FROM polymarket_trades "
-                "WHERE rowid > COALESCE((SELECT MAX(rowid)-? FROM polymarket_trades),0) AND timestamp <= ?"
-                "), market_ids AS ("
-                "SELECT market_id FROM polymarket_markets "
-                "WHERE rowid > COALESCE((SELECT MAX(rowid)-? FROM polymarket_markets),0) AND observed_at <= ? "
-                "UNION SELECT market_id FROM polymarket_snapshots "
-                "WHERE rowid > COALESCE((SELECT MAX(rowid)-? FROM polymarket_snapshots),0) AND observed_at <= ?"
-                ") SELECT COUNT(DISTINCT recent_trades.market_id) AS trade_markets "
+                "WITH "
+                + _recent_rowid_cte(
+                    "polymarket_trades",
+                    "market_id,timestamp",
+                    alias="recent_trades",
+                )
+                + ", "
+                + _recent_rowid_cte("polymarket_markets", "market_id,observed_at", alias="recent_markets")
+                + ", "
+                + _recent_rowid_cte("polymarket_snapshots", "market_id,observed_at", alias="recent_snapshots")
+                + ", market_ids AS ("
+                "SELECT market_id FROM recent_markets WHERE observed_at <= ? "
+                "UNION SELECT market_id FROM recent_snapshots WHERE observed_at <= ?"
+                ") SELECT COUNT(DISTINCT recent_trades.market_id) AS trade_markets, "
+                "(SELECT COUNT(*) FROM recent_trades) AS recent_trade_rows "
                 "FROM recent_trades "
-                "JOIN market_ids ON market_ids.market_id = recent_trades.market_id",
-                (_MAX_EVIDENCE_SCAN_ROWS, cutoff, _MAX_EVIDENCE_SCAN_ROWS, cutoff, _MAX_EVIDENCE_SCAN_ROWS, cutoff),
+                "JOIN market_ids ON market_ids.market_id = recent_trades.market_id "
+                "WHERE recent_trades.timestamp <= ?",
+                (_MAX_EVIDENCE_SCAN_ROWS, _MAX_EVIDENCE_SCAN_ROWS, _MAX_EVIDENCE_SCAN_ROWS, cutoff, cutoff, cutoff),
             ).fetchone()
         finally:
             snapshot.close()
@@ -9726,7 +9754,15 @@ class AxiomStore:
         time_to_resolution = int((snapshot_row["time_to_resolution"] if snapshot_row else 0) or 0)
         resolved_markets = int((snapshot_row["resolved_markets"] if snapshot_row else 0) or 0)
         trade_markets = int((trade_row["trade_markets"] if trade_row else 0) or 0)
-        regime_count = int((regime_row["regime_count"] if regime_row else 0) or 0)
+        regime_count = int((snapshot_row["regime_count"] if snapshot_row else 0) or 0)
+        recent_market_rows = int((market_row["recent_market_rows"] if market_row else 0) or 0)
+        recent_snapshot_rows = int((snapshot_row["recent_snapshot_rows"] if snapshot_row else 0) or 0)
+        recent_trade_rows = int((trade_row["recent_trade_rows"] if trade_row else 0) or 0)
+        truncation = {
+            "markets": recent_market_rows >= _MAX_EVIDENCE_SCAN_ROWS,
+            "snapshots": recent_snapshot_rows >= _MAX_EVIDENCE_SCAN_ROWS,
+            "trades": recent_trade_rows >= _MAX_EVIDENCE_SCAN_ROWS,
+        }
         first_observed = _parse_datetime(snapshot_row["first_observed_at"]) if snapshot_row else None
         latest_observed = _parse_datetime(snapshot_row["latest_observed_at"]) if snapshot_row else None
         duration_seconds = max(0.0, (latest_observed - first_observed).total_seconds()) if first_observed and latest_observed else 0.0
@@ -9775,6 +9811,8 @@ class AxiomStore:
                 "market_rows": _MAX_EVIDENCE_SCAN_ROWS,
                 "snapshot_rows": _MAX_EVIDENCE_SCAN_ROWS,
                 "trade_rows": _MAX_EVIDENCE_SCAN_ROWS,
+                "bounded": True,
+                "truncated": truncation,
             },
             "requirements": requirements,
             "checks": checks,
@@ -9827,6 +9865,7 @@ class AxiomStore:
         latest_window_seconds = max(window, stale_after)
         latest_window_start = current - timedelta(seconds=latest_window_seconds)
         current_iso, window_iso, latest_window_iso = current.isoformat(), window_start.isoformat(), latest_window_start.isoformat()
+        health_row_cap = _MAX_LATEST_SCAN_ROWS
         cycle_limit = int(recent_cycles or 24)
         cycle_rows = self.list_collection_cycles(collector_name="polymarket", limit=cycle_limit)
         cycle_payloads = [
@@ -9871,43 +9910,109 @@ class AxiomStore:
         snapshot = self._snapshot_read_connection()
         try:
             latest_rows = snapshot.execute(
-                "SELECT market_id,observed_at,payload_json FROM ("
+                "WITH "
+                + _recent_rowid_cte(
+                    "polymarket_snapshots",
+                    "market_id,observed_at,source_timestamp,snapshot_id,payload_json,source_type",
+                    alias="recent_snapshots",
+                )
+                + ", latest_candidates AS ("
                 "SELECT market_id,observed_at,payload_json,"
-                "ROW_NUMBER() OVER (PARTITION BY market_id ORDER BY observed_at DESC,source_timestamp DESC,snapshot_id DESC) AS row_number "
-                "FROM polymarket_snapshots WHERE source_type='FORWARD_COLLECTED' AND observed_at>=? AND observed_at<=?) WHERE row_number=1",
-                (latest_window_iso, current_iso),
+                "ROW_NUMBER() OVER (PARTITION BY market_id "
+                "ORDER BY observed_at DESC,source_timestamp DESC,snapshot_id DESC) AS row_number "
+                "FROM recent_snapshots "
+                "WHERE source_type='FORWARD_COLLECTED' AND observed_at>=? AND observed_at<=?"
+                ") SELECT market_id,observed_at,payload_json,"
+                "(SELECT COUNT(*) FROM recent_snapshots) AS recent_snapshot_rows "
+                "FROM latest_candidates WHERE row_number=1",
+                (health_row_cap, latest_window_iso, current_iso),
             ).fetchall()
             recent_rows = snapshot.execute(
-                "SELECT market_id,observed_at FROM polymarket_snapshots "
+                "WITH "
+                + _recent_rowid_cte(
+                    "polymarket_snapshots",
+                    "market_id,observed_at,source_timestamp,snapshot_id,source_type",
+                    alias="recent_snapshots",
+                )
+                + " SELECT market_id,observed_at,"
+                "(SELECT COUNT(*) FROM recent_snapshots) AS recent_snapshot_rows "
+                "FROM recent_snapshots "
                 "WHERE source_type='FORWARD_COLLECTED' AND observed_at>=? AND observed_at<=? "
                 "ORDER BY market_id,observed_at,source_timestamp,snapshot_id",
-                (window_iso, current_iso),
+                (health_row_cap, window_iso, current_iso),
             ).fetchall()
             error_rows = snapshot.execute(
-                "SELECT error_id,market_id,observed_at,kind,detail,payload_json FROM collection_errors "
+                "WITH "
+                + _recent_rowid_cte(
+                    "collection_errors",
+                    "error_id,market_id,observed_at,kind,detail,payload_json,source_type",
+                    alias="recent_errors",
+                )
+                + " SELECT error_id,market_id,observed_at,kind,detail,payload_json,"
+                "(SELECT COUNT(*) FROM recent_errors) AS recent_error_rows "
+                "FROM recent_errors "
                 "WHERE source_type='FORWARD_COLLECTED' AND observed_at>=? AND observed_at<=? "
-                "AND rowid > COALESCE((SELECT MAX(rowid)-? FROM collection_errors WHERE source_type='FORWARD_COLLECTED'),0) "
                 "ORDER BY observed_at,error_id LIMIT 256",
-                (window_iso, current_iso, _MAX_LATEST_SCAN_ROWS),
+                (health_row_cap, window_iso, current_iso),
             ).fetchall()
-            historical_error_count = int(snapshot.execute(
-                "SELECT COUNT(*) AS n FROM collection_errors WHERE source_type='HISTORICAL' "
-                "AND rowid > COALESCE((SELECT MAX(rowid)-? FROM collection_errors WHERE source_type='HISTORICAL'),0) AND observed_at<=?",
-                (_MAX_EVIDENCE_SCAN_ROWS, current_iso),
-            ).fetchone()["n"])
-            trade_count = int(snapshot.execute(
-                "SELECT COUNT(*) AS n FROM ("
-                "SELECT trade_key FROM polymarket_trades "
-                "WHERE timestamp>=? AND timestamp<=? "
-                "ORDER BY timestamp,trade_key LIMIT ?"
-                ")",
-                (window_iso, current_iso, _MAX_LATEST_SCAN_ROWS),
-            ).fetchone()["n"])
-            metadata_count = int(snapshot.execute(
-                "SELECT COUNT(*) AS n FROM polymarket_markets "
+            error_bound_row = snapshot.execute(
+                "WITH "
+                + _recent_rowid_cte(
+                    "collection_errors",
+                    "error_id",
+                    alias="recent_errors",
+                )
+                + " SELECT COUNT(*) AS recent_error_rows FROM recent_errors",
+                (health_row_cap,),
+            ).fetchone()
+            historical_error_row = snapshot.execute(
+                "WITH "
+                + _recent_rowid_cte(
+                    "collection_errors",
+                    "observed_at,source_type",
+                    alias="recent_errors",
+                )
+                + " SELECT COUNT(*) AS n, "
+                "(SELECT COUNT(*) FROM recent_errors) AS recent_error_rows "
+                "FROM recent_errors "
+                "WHERE source_type='HISTORICAL' AND observed_at<=?",
+                (health_row_cap, current_iso),
+            ).fetchone()
+            trade_row = snapshot.execute(
+                "WITH "
+                + _recent_rowid_cte(
+                    "polymarket_trades",
+                    "timestamp",
+                    alias="recent_trades",
+                )
+                + " SELECT COUNT(*) AS n, "
+                "(SELECT COUNT(*) FROM recent_trades) AS recent_trade_rows "
+                "FROM recent_trades WHERE timestamp>=? AND timestamp<=?",
+                (health_row_cap, window_iso, current_iso),
+            ).fetchone()
+            metadata_row = snapshot.execute(
+                "WITH "
+                + _recent_rowid_cte(
+                    "polymarket_markets",
+                    "observed_at,source_type",
+                    alias="recent_markets",
+                )
+                + " SELECT COUNT(*) AS n, "
+                "(SELECT COUNT(*) FROM recent_markets) AS recent_market_rows "
+                "FROM recent_markets "
                 "WHERE source_type='FORWARD_COLLECTED' AND observed_at>=? AND observed_at<=?",
-                (latest_window_iso, current_iso),
-            ).fetchone()["n"])
+                (health_row_cap, latest_window_iso, current_iso),
+            ).fetchone()
+            snapshot_bound_row = snapshot.execute(
+                "WITH "
+                + _recent_rowid_cte(
+                    "polymarket_snapshots",
+                    "snapshot_id",
+                    alias="recent_snapshots",
+                )
+                + " SELECT COUNT(*) AS recent_snapshot_rows FROM recent_snapshots",
+                (health_row_cap,),
+            ).fetchone()
         finally:
             snapshot.close()
         tracked = self.tracked_polymarket_markets(active_only=True, now=current, include_payload=True, limit=1000)
@@ -9920,6 +10025,21 @@ class AxiomStore:
                 if isinstance(item, Mapping) and item.get("market_id")
             }
         )
+        historical_error_count = int((historical_error_row["n"] if historical_error_row else 0) or 0)
+        trade_count = int((trade_row["n"] if trade_row else 0) or 0)
+        metadata_count = int((metadata_row["n"] if metadata_row else 0) or 0)
+        recent_snapshot_rows = int(
+            (snapshot_bound_row["recent_snapshot_rows"] if snapshot_bound_row else 0) or 0
+        )
+        recent_trade_rows = int((trade_row["recent_trade_rows"] if trade_row else 0) or 0)
+        recent_market_rows = int((metadata_row["recent_market_rows"] if metadata_row else 0) or 0)
+        recent_error_rows = int((error_bound_row["recent_error_rows"] if error_bound_row else 0) or 0)
+        truncation = {
+            "snapshots": recent_snapshot_rows >= health_row_cap,
+            "trades": recent_trade_rows >= health_row_cap,
+            "metadata": recent_market_rows >= health_row_cap,
+            "errors": recent_error_rows >= health_row_cap,
+        }
         latest_by_market: dict[str, datetime] = {}
         latest_payload: dict[str, Mapping[str, Any]] = {}
         for row in latest_rows:
@@ -10023,6 +10143,8 @@ class AxiomStore:
             "grade_scope": "collector_health",
             "reason_code": reasons[0]["code"] if reasons else None,
             "reasons": reasons,
+            "bounded": True,
+            "truncated": truncation,
             "markets": len(active_markets),
             "scheduled_market_count": len(scheduled_market_ids),
             "markets_with_snapshots": len(latest_by_market),
@@ -10095,8 +10217,16 @@ class AxiomStore:
             "historical_error_count": historical_error_count,
             "historical_maturity_grade": maturity.get("grade"),
             "evidence_maturity": maturity,
+            "scan_limits": {
+                "latest_window_seconds": latest_window_seconds,
+                "recent_window_seconds": window,
+                "recent_row_cap": health_row_cap,
+                "bounded": True,
+                "truncated": truncation,
+                "recent_cycles": recent_cycles,
+                "gap_sample": 64,
+            },
             "storage_bytes": _storage_bytes(self._conn, self.path),
-            "scan_limits": {"latest_window_seconds": latest_window_seconds, "recent_window_seconds": window, "recent_cycles": recent_cycles, "gap_sample": 64},
         }
     # Rolling portfolio persistence ------------------------------------
     def save_strategy_version(self, record: Any) -> None:
@@ -16726,24 +16856,37 @@ class AxiomStore:
                 snapshot_where += f" AND market_id IN ({placeholders})"
                 snapshot_values.extend(requested_ids)
             metadata_rows = snapshot.execute(
-                "WITH latest_keys AS ("
-                "SELECT rowid AS row_id,market_id,observed_at,metadata_hash,"
+                "WITH "
+                + _recent_rowid_cte(
+                    "polymarket_markets",
+                    "rowid AS row_id,market_id,observed_at,metadata_hash,payload_json,source_type",
+                    alias="recent_markets",
+                )
+                + ", latest_keys AS ("
+                "SELECT row_id,market_id,observed_at,metadata_hash,payload_json,source_type,"
                 "ROW_NUMBER() OVER (PARTITION BY market_id ORDER BY observed_at DESC,metadata_hash DESC) AS row_number "
-                f"FROM polymarket_markets WHERE {metadata_where}) "
-                "SELECT p.market_id,p.observed_at,p.metadata_hash,p.payload_json,p.source_type "
-                "FROM polymarket_markets AS p JOIN latest_keys AS latest ON p.rowid=latest.row_id "
-                "WHERE latest.row_number=1 ORDER BY p.market_id LIMIT ?",
-                [*metadata_values, int(limit)],
+                f"FROM recent_markets WHERE {metadata_where}) "
+                "SELECT market_id,observed_at,metadata_hash,payload_json,source_type "
+                "FROM latest_keys "
+                "WHERE row_number=1 ORDER BY market_id LIMIT ?",
+                [_MAX_EVIDENCE_SCAN_ROWS, *metadata_values, int(limit)],
             ).fetchall()
             snapshot_rows = snapshot.execute(
-                "WITH latest_keys AS ("
-                "SELECT rowid AS row_id,market_id,observed_at,source_timestamp,snapshot_id,"
-                "ROW_NUMBER() OVER (PARTITION BY market_id ORDER BY observed_at DESC,source_timestamp DESC,snapshot_id DESC) AS row_number "
-                f"FROM polymarket_snapshots WHERE {snapshot_where}) "
-                "SELECT p.market_id,p.observed_at,p.source_timestamp,p.snapshot_id,p.payload_json,p.source_type "
-                "FROM polymarket_snapshots AS p JOIN latest_keys AS latest ON p.rowid=latest.row_id "
-                "WHERE latest.row_number=1 ORDER BY p.market_id LIMIT ?",
-                [*snapshot_values, int(limit)],
+                "WITH "
+                + _recent_rowid_cte(
+                    "polymarket_snapshots",
+                    "rowid AS row_id,market_id,observed_at,source_timestamp,snapshot_id,payload_json,source_type",
+                    alias="recent_snapshots",
+                )
+                + ", latest_keys AS ("
+                "SELECT row_id,market_id,observed_at,source_timestamp,snapshot_id,payload_json,source_type,"
+                "ROW_NUMBER() OVER (PARTITION BY market_id "
+                "ORDER BY observed_at DESC,source_timestamp DESC,snapshot_id DESC) AS row_number "
+                f"FROM recent_snapshots WHERE {snapshot_where}) "
+                "SELECT market_id,observed_at,source_timestamp,snapshot_id,payload_json,source_type "
+                "FROM latest_keys "
+                "WHERE row_number=1 ORDER BY market_id LIMIT ?",
+                [_MAX_EVIDENCE_SCAN_ROWS, *snapshot_values, int(limit)],
             ).fetchall()
         finally:
             snapshot.close()

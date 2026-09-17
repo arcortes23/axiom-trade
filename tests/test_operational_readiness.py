@@ -858,7 +858,8 @@ class OperationalHealthTests(unittest.TestCase):
             self.assertEqual(health["snapshots"], 1)
             self.assertEqual(health["historical_maturity_grade"], health["evidence_maturity"]["grade"])
             self.assertNotEqual(health["grade_scope"], health["evidence_maturity"]["grade_scope"])
-    def test_forward_health_source_bound_survives_historical_append(self) -> None:
+
+    def test_forward_health_reports_bounded_coverage_after_historical_append(self) -> None:
         with AxiomStore(":memory:") as store:
             self._tracked_market(store, T0)
             self._snapshot(store, "forward-before-history", T0, source_type="FORWARD_COLLECTED")
@@ -895,17 +896,19 @@ class OperationalHealthTests(unittest.TestCase):
                 recent_window_seconds=300,
             )
 
-            self.assertEqual(health["grade"], "A")
-            self.assertEqual(health["snapshots"], 1)
-            self.assertEqual(health["markets_with_snapshots"], 1)
-            self.assertEqual(health["metadata_records"], 1)
+            self.assertEqual(health["grade"], "D")
+            self.assertEqual(health["reason_code"], "NO_FORWARD_SNAPSHOTS")
+            self.assertEqual(health["snapshots"], 0)
+            self.assertEqual(health["markets_with_snapshots"], 0)
+            self.assertEqual(health["metadata_records"], 0)
             self.assertEqual(health["collection_errors"], 0)
             self.assertEqual(health["historical_error_count"], 1)
+            self.assertTrue(health["scan_limits"]["truncated"]["snapshots"])
             audit = store.list_collection_errors("market-1")
             self.assertEqual(len(audit), 1)
             self.assertEqual(audit[0]["source_type"], "HISTORICAL")
 
-    def test_forward_health_time_window_keeps_early_market_after_large_append(self) -> None:
+    def test_forward_health_reports_bounded_coverage_after_large_append(self) -> None:
         with AxiomStore(":memory:") as store:
             early_market = "early-market"
             late_market = "late-market"
@@ -928,12 +931,13 @@ class OperationalHealthTests(unittest.TestCase):
                 recent_window_seconds=300,
             )
 
-            self.assertEqual(health["grade"], "A")
-            self.assertIsNone(health["reason_code"])
+            self.assertEqual(health["grade"], "C")
+            self.assertEqual(health["reason_code"], "STALE_MARKETS")
             self.assertNotIn("NO_FORWARD_SNAPSHOTS", {item["code"] for item in health["reasons"]})
-            self.assertEqual(health["snapshots"], 10_002)
-            self.assertEqual(health["markets_with_snapshots"], 2)
-            self.assertEqual(health["stale_markets"], [])
+            self.assertEqual(health["snapshots"], 10_000)
+            self.assertEqual(health["markets_with_snapshots"], 1)
+            self.assertEqual(health["stale_markets"], ["early-market"])
+            self.assertTrue(health["scan_limits"]["truncated"]["snapshots"])
 
 
 
@@ -1070,6 +1074,103 @@ class OperationalHealthTests(unittest.TestCase):
                 "SCAN polymarket_trades USING COVERING INDEX idx_polymarket_trades_market_time",
                 details,
             )
+
+    def test_health_large_queries_seek_bounded_rowid_sets(self) -> None:
+        with AxiomStore(":memory:") as store:
+            self._tracked_market(store, T0)
+            self._snapshot(store, "plan-snapshot", T0, source_type="FORWARD_COLLECTED")
+            traces: list[str] = []
+            original_connection = store._snapshot_read_connection
+
+            def traced_connection():
+                connection = original_connection()
+                connection.set_trace_callback(traces.append)
+                return connection
+
+            with patch.object(store, "_snapshot_read_connection", traced_connection):
+                store.polymarket_health(
+                    now=T0,
+                    expected_interval_seconds=60,
+                    stale_after_seconds=180,
+                    recent_window_seconds=300,
+                )
+
+            bounded_queries = [
+                query
+                for query in traces
+                if query.startswith("WITH ")
+                and "rowid > COALESCE" in query
+                and ("polymarket_snapshots" in query or "polymarket_trades" in query)
+            ]
+            self.assertGreaterEqual(len(bounded_queries), 4)
+            for query in bounded_queries:
+                details = " ".join(
+                    str(row[3])
+                    for row in store.connection.execute("EXPLAIN QUERY PLAN " + query).fetchall()
+                )
+                if "polymarket_snapshots" in query:
+                    self.assertIn(
+                        "SEARCH polymarket_snapshots USING INTEGER PRIMARY KEY (rowid>?)",
+                        details,
+                    )
+                    self.assertNotIn(
+                        "SCAN polymarket_snapshots USING COVERING INDEX",
+                        details,
+                    )
+                if "polymarket_trades" in query:
+                    self.assertIn(
+                        "SEARCH polymarket_trades USING INTEGER PRIMARY KEY (rowid>?)",
+                        details,
+                    )
+                    self.assertNotIn(
+                        "SCAN polymarket_trades USING COVERING INDEX",
+                        details,
+                    )
+                order_position = details.find("USE TEMP B-TREE FOR ORDER BY")
+                if order_position >= 0:
+                    self.assertLess(
+                        details.find("MATERIALIZE recent_"),
+                        order_position,
+                    )
+
+    def test_health_exposes_recent_row_truncation_without_claiming_exhaustive_counts(self) -> None:
+        with patch("axiom.storage._MAX_EVIDENCE_SCAN_ROWS", 2), patch(
+            "axiom.storage._MAX_LATEST_SCAN_ROWS", 2
+        ):
+            with AxiomStore(":memory:") as store:
+                self._tracked_market(store, T0)
+                for index in range(3):
+                    observed_at = T0 - timedelta(seconds=2 - index)
+                    self._snapshot(
+                        store,
+                        f"bounded-snapshot-{index}",
+                        observed_at,
+                        source_type="FORWARD_COLLECTED",
+                    )
+                    store.save_polymarket_trade(
+                        "market-1",
+                        {
+                            "timestamp": observed_at.isoformat(),
+                            "trade_id": f"bounded-trade-{index}",
+                        },
+                    )
+
+                health = store.polymarket_health(
+                    now=T0,
+                    expected_interval_seconds=60,
+                    stale_after_seconds=180,
+                    recent_window_seconds=300,
+                )
+
+                self.assertTrue(health["scan_limits"]["bounded"])
+                self.assertEqual(health["scan_limits"]["recent_row_cap"], 2)
+                self.assertTrue(health["scan_limits"]["truncated"]["snapshots"])
+                self.assertTrue(health["scan_limits"]["truncated"]["trades"])
+                self.assertEqual(health["snapshots"], 2)
+                self.assertEqual(health["trades"], 2)
+                maturity_limits = health["evidence_maturity"]["scan_limits"]
+                self.assertTrue(maturity_limits["truncated"]["snapshots"])
+                self.assertTrue(maturity_limits["truncated"]["trades"])
 
 
     def test_stale_tracked_market_and_recent_malformed_error_degrade(self) -> None:
