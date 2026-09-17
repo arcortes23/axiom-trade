@@ -3491,6 +3491,51 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
                 self.assertIn(key, payload)
             self.assertLessEqual(len(payload["active_rows"]), 10)
             self.assertFalse(payload.get("live_execution", True))
+    def test_dashboard_exact_rolling_worker_lookup_survives_worker_pagination(self) -> None:
+        with self._store("rolling-worker-pagination.sqlite3") as store:
+            for index in range(33):
+                store.save_worker_state(
+                    f"a-earlier-worker-{index:02d}",
+                    "IDLE",
+                    {"worker_status": "IDLE"},
+                    heartbeat_at=NOW,
+                )
+            heartbeat = NOW - timedelta(seconds=5)
+            store.save_worker_state(
+                "rolling-portfolio",
+                "IDLE",
+                {
+                    "worker_status": "SCHEDULED",
+                    "scheduled": True,
+                    "configured_interval_seconds": 300.0,
+                    "evidence_interval_seconds": 300.0,
+                    "review_interval_seconds": 86_400.0,
+                    "next_work": "refresh_rolling_evidence",
+                    "last_error": None,
+                    "last_error_code": None,
+                },
+                started_at=NOW - timedelta(minutes=5),
+                heartbeat_at=heartbeat,
+            )
+
+            payload = DashboardData(
+                store=store,
+                clock=lambda: NOW,
+            ).v2_snapshot("rolling-portfolio")
+            controller = payload["controller"]
+
+            self.assertEqual(payload["controller_status"], "SCHEDULED")
+            self.assertNotIn(payload["controller_status"], {"COLD_START", "NOT_INITIALIZED"})
+            self.assertEqual(controller["worker_name"], "rolling-portfolio")
+            self.assertEqual(controller["status"], "SCHEDULED")
+            self.assertTrue(controller["scheduled"])
+            self.assertEqual(controller["interval_seconds"], 300.0)
+            self.assertEqual(controller["cadence_seconds"], 300.0)
+            self.assertEqual(controller["heartbeat_at"], heartbeat.isoformat())
+            self.assertEqual(controller["next_work"], "refresh_rolling_evidence")
+            self.assertEqual(payload["active_policy"], {})
+            self.assertEqual(payload["signal"]["status"], "UNKNOWN")
+
 
     def test_dashboard_projects_persisted_reviewed_values_only_draft_without_active_policy(self) -> None:
         path = self.path / "rolling-dashboard-reviewed-values.sqlite3"

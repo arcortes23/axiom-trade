@@ -2856,19 +2856,9 @@ class DashboardData:
         selection = selection if isinstance(selection, Mapping) else {}
         review_state = load("load_portfolio_review_state")
         review_state = review_state if isinstance(review_state, Mapping) else {}
-        workers = load("list_worker_states", limit=32)
-        workers = (
-            [item for item in workers if isinstance(item, Mapping)]
-            if isinstance(workers, (list, tuple))
-            else []
-        )
-        rolling_worker = next(
-            (
-                item
-                for item in workers
-                if str(item.get("worker_name") or "") == "rolling-portfolio"
-            ),
-            {},
+        rolling_worker = load("get_worker_state", "rolling-portfolio")
+        rolling_worker = (
+            dict(rolling_worker) if isinstance(rolling_worker, Mapping) else {}
         )
         worker_payload = (
             rolling_worker.get("payload")
@@ -2880,6 +2870,14 @@ class DashboardData:
             or rolling_worker.get("status")
             or "NOT_INITIALIZED"
         ).upper()
+        worker_scheduled = worker_payload.get("scheduled")
+        if worker_scheduled is None:
+            worker_scheduled = bool(rolling_worker) and worker_status in {
+                "SCHEDULED",
+                "RUNNING",
+                "IDLE",
+                "DEGRADED",
+            }
 
         def member_value(member: Mapping[str, Any], payload: Mapping[str, Any], key: str) -> Any:
             value = member.get(key)
@@ -4643,6 +4641,8 @@ class DashboardData:
                 "policy_review": policy_review,
                 "allocation_review": allocation_review,
                 "next_jobs": next_jobs,
+                "next_work": worker_payload.get("next_work")
+                or rolling_worker_state.get("next_work"),
                 "cold_start_requirements": cold_start,
                 "policy_identity": {
                     "policy_id": policy_id,
@@ -4654,15 +4654,30 @@ class DashboardData:
                 },
                 "risk": risk_binding,
                 "controller": {
+                    "worker_name": rolling_worker.get("worker_name"),
                     "status": worker_status,
                     "worker_status": worker_status,
-                    "scheduled": bool(worker_payload.get("scheduled", True)),
+                    "scheduled": bool(worker_scheduled),
+                    "started_at": rolling_worker.get("started_at"),
+                    "heartbeat_at": rolling_worker.get("heartbeat_at"),
+                    "worker_heartbeat_at": rolling_worker.get("heartbeat_at"),
+                    "updated_at": rolling_worker.get("updated_at"),
+                    "last_error": worker_payload.get("last_error"),
+                    "last_error_code": worker_payload.get("last_error_code"),
                     "last_review_at": state.get("reviewed_at"),
                     "next_review_at": state.get(
                         "review_due_at",
                         selection.get("review_due_at"),
                     ),
+                    "next_work": worker_payload.get("next_work")
+                    or rolling_worker_state.get("next_work"),
                     "interval_seconds": worker_payload.get(
+                        "configured_interval_seconds"
+                    ),
+                    "cadence_seconds": worker_payload.get(
+                        "configured_interval_seconds"
+                    ),
+                    "configured_interval_seconds": worker_payload.get(
                         "configured_interval_seconds"
                     ),
                     "evidence_interval_seconds": worker_payload.get(

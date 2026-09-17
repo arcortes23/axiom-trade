@@ -9699,16 +9699,21 @@ class AxiomStore:
                 ") WHERE regime IS NOT NULL",
                 (_MAX_EVIDENCE_SCAN_ROWS, cutoff),
             ).fetchone()
+            # Materialize the bounded rowid seek before joining eligible markets.
+            # Without this fence, SQLite can drive the join from
+            # idx_polymarket_trades_market_time and scan the full trade history.
             trade_row = snapshot.execute(
-                "WITH market_ids AS ("
+                "WITH recent_trades AS MATERIALIZED ("
+                "SELECT market_id FROM polymarket_trades "
+                "WHERE rowid > COALESCE((SELECT MAX(rowid)-? FROM polymarket_trades),0) AND timestamp <= ?"
+                "), market_ids AS ("
                 "SELECT market_id FROM polymarket_markets "
                 "WHERE rowid > COALESCE((SELECT MAX(rowid)-? FROM polymarket_markets),0) AND observed_at <= ? "
                 "UNION SELECT market_id FROM polymarket_snapshots "
                 "WHERE rowid > COALESCE((SELECT MAX(rowid)-? FROM polymarket_snapshots),0) AND observed_at <= ?"
-                ") SELECT COUNT(DISTINCT trades.market_id) AS trade_markets "
-                "FROM polymarket_trades AS trades "
-                "JOIN market_ids ON market_ids.market_id = trades.market_id "
-                "WHERE trades.rowid > COALESCE((SELECT MAX(rowid)-? FROM polymarket_trades),0) AND trades.timestamp <= ?",
+                ") SELECT COUNT(DISTINCT recent_trades.market_id) AS trade_markets "
+                "FROM recent_trades "
+                "JOIN market_ids ON market_ids.market_id = recent_trades.market_id",
                 (_MAX_EVIDENCE_SCAN_ROWS, cutoff, _MAX_EVIDENCE_SCAN_ROWS, cutoff, _MAX_EVIDENCE_SCAN_ROWS, cutoff),
             ).fetchone()
         finally:

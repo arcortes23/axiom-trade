@@ -979,6 +979,98 @@ class OperationalHealthTests(unittest.TestCase):
             self.assertEqual(health["collector_health"]["trades"], 1)
             self.assertEqual(health["evidence_maturity"]["trade_markets"], 2)
 
+    def test_evidence_trade_query_seeks_recent_row_window_before_join(self) -> None:
+        window = 100_000
+        cutoff = T0.isoformat()
+        with AxiomStore(":memory:") as store:
+            self._tracked_market(store, T0, market_id="market-a")
+            self._tracked_market(store, T0, market_id="market-b")
+            trade_rows = [
+                (
+                    "outside-window",
+                    "outside-market",
+                    (T0 - timedelta(days=2)).isoformat(),
+                    "{}",
+                    cutoff,
+                )
+            ]
+            trade_rows.extend(
+                (f"bulk-{index:06d}", "market-a", cutoff, "{}", cutoff)
+                for index in range(window - 1)
+            )
+            trade_rows.extend(
+                [
+                    ("eligible-market-b", "market-b", cutoff, "{}", cutoff),
+                    (
+                        "future-market-b",
+                        "market-b",
+                        (T0 + timedelta(seconds=1)).isoformat(),
+                        "{}",
+                        cutoff,
+                    ),
+                ]
+            )
+            with store.transaction():
+                store.connection.executemany(
+                    "INSERT INTO polymarket_trades("
+                    "trade_key,market_id,timestamp,payload_json,created_at"
+                    ") VALUES (?,?,?,?,?)",
+                    trade_rows,
+                )
+
+            legacy_query = (
+                "WITH market_ids AS ("
+                "SELECT market_id FROM polymarket_markets "
+                "WHERE rowid > COALESCE((SELECT MAX(rowid)-? FROM polymarket_markets),0) AND observed_at <= ? "
+                "UNION SELECT market_id FROM polymarket_snapshots "
+                "WHERE rowid > COALESCE((SELECT MAX(rowid)-? FROM polymarket_snapshots),0) AND observed_at <= ?"
+                ") SELECT COUNT(DISTINCT trades.market_id) AS trade_markets "
+                "FROM polymarket_trades AS trades "
+                "JOIN market_ids ON market_ids.market_id = trades.market_id "
+                "WHERE trades.rowid > COALESCE((SELECT MAX(rowid)-? FROM polymarket_trades),0) AND trades.timestamp <= ?"
+            )
+            legacy_count = int(
+                store.connection.execute(
+                    legacy_query,
+                    (window, cutoff, window, cutoff, window, cutoff),
+                ).fetchone()[0]
+            )
+
+            plan_query = (
+                "EXPLAIN QUERY PLAN "
+                "WITH recent_trades AS MATERIALIZED ("
+                "SELECT market_id FROM polymarket_trades "
+                "WHERE rowid > COALESCE((SELECT MAX(rowid)-? FROM polymarket_trades),0) AND timestamp <= ?"
+                "), market_ids AS ("
+                "SELECT market_id FROM polymarket_markets "
+                "WHERE rowid > COALESCE((SELECT MAX(rowid)-? FROM polymarket_markets),0) AND observed_at <= ? "
+                "UNION SELECT market_id FROM polymarket_snapshots "
+                "WHERE rowid > COALESCE((SELECT MAX(rowid)-? FROM polymarket_snapshots),0) AND observed_at <= ?"
+                ") SELECT COUNT(DISTINCT recent_trades.market_id) "
+                "FROM recent_trades "
+                "JOIN market_ids ON market_ids.market_id = recent_trades.market_id"
+            )
+            details = " ".join(
+                str(row[3])
+                for row in store.connection.execute(
+                    plan_query,
+                    (window, cutoff, window, cutoff, window, cutoff),
+                ).fetchall()
+            )
+
+            maturity = store.polymarket_evidence_maturity(now=T0)
+
+            self.assertEqual(legacy_count, 2)
+            self.assertEqual(maturity["trade_markets"], legacy_count)
+            self.assertIn(
+                "SEARCH polymarket_trades USING INTEGER PRIMARY KEY (rowid>?)",
+                details,
+            )
+            self.assertNotIn(
+                "SCAN polymarket_trades USING COVERING INDEX idx_polymarket_trades_market_time",
+                details,
+            )
+
 
     def test_stale_tracked_market_and_recent_malformed_error_degrade(self) -> None:
         with AxiomStore(":memory:") as store:
