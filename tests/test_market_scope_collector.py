@@ -10,6 +10,7 @@ import unittest
 
 from axiom.collector import CollectorConfig, PolymarketCollector
 from axiom.data import InMemoryPredictionProvider
+from axiom.storage import AxiomStore
 from axiom.polymarket_rules import assess_selected_token_depth, parse_polymarket_rules
 from axiom.domain import (
     InstrumentMetadata,
@@ -1670,6 +1671,46 @@ class MarketScopeCollectorTests(unittest.TestCase):
         provider.release.set()
         third = collector.collect_once(now=T0)
         self.assertEqual(provider.keyset_calls, 2)
+
+    def test_provider_stage_telemetry_does_not_rewrite_collector_state(self) -> None:
+        with AxiomStore(":memory:") as store:
+            collector = PolymarketCollector(
+                object(),
+                store,
+                CollectorConfig(
+                    max_attempts=1,
+                    provider_timeout_seconds=0.05,
+                    backoff_initial_seconds=0,
+                    jitter_seconds=0,
+                ),
+                clock=lambda: T0,
+                sleep=lambda _seconds: None,
+            )
+            collector._set_current_stage("cycle_start", None, T0, persist=True)
+            before = int(
+                store.connection.execute(
+                    "SELECT length(state_json) FROM collector_state "
+                    "WHERE collector_name='polymarket'"
+                ).fetchone()[0]
+            )
+            counters = collector._new_counters()
+            started = time.monotonic()
+            for index in range(256):
+                collector._call_provider(
+                    f"market:{index}",
+                    lambda: None,
+                    T0,
+                    counters,
+                )
+            elapsed = time.monotonic() - started
+            row = store.connection.execute(
+                "SELECT length(state_json), state_json FROM collector_state "
+                "WHERE collector_name='polymarket'"
+            ).fetchone()
+
+            self.assertLess(elapsed, 2.0)
+            self.assertEqual(int(row[0]), before)
+            self.assertEqual(json.loads(row[1])["current_stage"], "cycle_start")
 
 if __name__ == "__main__":
 

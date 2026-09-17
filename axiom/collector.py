@@ -4682,7 +4682,11 @@ class PolymarketCollector:
     ) -> Any:
         provider = provider or self.provider
         del market_id
-        self._set_current_stage("provider_call", endpoint, observed_at, persist=True)
+        # Provider-call stage is volatile telemetry.  Persisting it before
+        # every request rewrites the potentially multi-megabyte collector
+        # state and can itself delay a bounded tick.  Timeout and terminal
+        # cycle paths persist the durable evidence instead.
+        self._set_current_stage("provider_call", endpoint, observed_at)
         last_error: Exception | None = None
         timeout = float(self.config.provider_timeout_seconds)
         for attempt in range(self.config.max_attempts):
