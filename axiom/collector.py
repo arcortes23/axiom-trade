@@ -427,6 +427,8 @@ class PolymarketCollector:
         # for this tick so a provider call is issued only once.
         self._scope_refresh_attempted: set[str] = set()
         self._scope_refreshed_snapshots: dict[str, PredictionMarketSnapshot] = {}
+        self._scope_resolution_deferred_candidate_ids: tuple[str, ...] = ()
+        self._observation_materialization_deferred_candidate_ids: tuple[str, ...] = ()
         # Resolutions produced for this cycle are the only authority passed to
         # observation-intent materialization; callers cannot supply market ids
         self._provider_executor_lock = threading.Lock()
@@ -551,6 +553,16 @@ class PolymarketCollector:
         self._scope_suitability_cache = {}
         self._scope_refresh_attempted = set()
         self._scope_refreshed_snapshots = {}
+        self._scope_resolution_deferred_candidate_ids = tuple(
+            str(item).strip()
+            for item in root_state.get("scope_resolution_deferred_candidate_ids", ())
+            if str(item).strip()
+        )[:_MAX_SCOPE_RESOLUTION_CANDIDATES]
+        self._observation_materialization_deferred_candidate_ids = tuple(
+            str(item).strip()
+            for item in root_state.get("observation_materialization_deferred_candidate_ids", ())
+            if str(item).strip()
+        )[:_MAX_SCOPE_RESOLUTION_CANDIDATES]
         configured_values = tuple(dict.fromkeys([*configured, *rolling_scope_ids]))
         primary_candidate_ids = self._active_primary_candidate_ids() or []
         paper_ids = self._active_paper_forward_ids()
@@ -1189,6 +1201,12 @@ class PolymarketCollector:
                 "discovery_complete": discovery_complete,
                 "scope_discovery_carry_cursor": scope_cursor,
                 "scope_inventory_continuation": self._scope_inventory_continuation,
+                "scope_resolution_deferred_candidate_ids": list(
+                    self._scope_resolution_deferred_candidate_ids
+                )[:_MAX_SCOPE_RESOLUTION_CANDIDATES],
+                "observation_materialization_deferred_candidate_ids": list(
+                    self._observation_materialization_deferred_candidate_ids
+                )[:_MAX_SCOPE_RESOLUTION_CANDIDATES],
                 "suitable_market_scheduled": list(discovery_scheduled),
                 "suitable_market_deferred": list(suitable_deferred),
                 "discovery_exclusions": [dict(item) for item in discovery_exclusions],
@@ -1689,6 +1707,7 @@ class PolymarketCollector:
         scope_resolutions: Mapping[str, Any] | None = None,
     ) -> None:
         if not candidate_ids:
+            self._observation_materialization_deferred_candidate_ids = ()
             return
         registry = ForwardTestRegistry(self.store)
         by_candidate = {
@@ -1697,7 +1716,15 @@ class PolymarketCollector:
             if isinstance(spec.config, Mapping)
             and str(spec.config.get("candidate_id", "")).strip()
         }
-        for candidate_id in candidate_ids:
+        ordered_ids = list(dict.fromkeys([
+            *self._observation_materialization_deferred_candidate_ids,
+            *(str(item).strip() for item in candidate_ids if str(item).strip()),
+        ]))
+        deferred_ids: list[str] = []
+        for index, candidate_id in enumerate(ordered_ids):
+            if not self._scope_pipeline_budget_available():
+                deferred_ids = ordered_ids[index:][:_MAX_SCOPE_RESOLUTION_CANDIDATES]
+                break
             markets = tuple(
                 str(item).strip()
                 for item in candidate_markets.get(candidate_id, ())
@@ -1724,6 +1751,7 @@ class PolymarketCollector:
             except (TypeError, ValueError):
                 counters["errors"] += 1
 
+        self._observation_materialization_deferred_candidate_ids = tuple(deferred_ids)
     def _isolated_worker_providers(self) -> list[Any]:
         if self.config.max_concurrency <= 1:
             return []
@@ -1769,7 +1797,20 @@ class PolymarketCollector:
 
         documents: list[tuple[str, Mapping[str, Any]]] = []
         scope_candidate_ids: list[str] = []
-        for candidate_id in dict.fromkeys(str(item).strip() for item in candidate_ids if str(item).strip()):
+        deferred_candidates = [
+            str(item).strip()
+            for item in root_state.get("scope_resolution_deferred_candidate_ids", ())
+            if str(item).strip()
+        ]
+        candidate_order = list(dict.fromkeys([
+            *deferred_candidates,
+            *(
+                str(item).strip()
+                for item in candidate_ids
+                if str(item).strip()
+            ),
+        ]))
+        for candidate_id in candidate_order:
             try:
                 record = loader(candidate_id)
             except (AttributeError, KeyError, TypeError, ValueError):
@@ -1832,7 +1873,21 @@ class PolymarketCollector:
             max(0, len(current_records)),
         )
         candidate_markets: dict[str, list[str]] = {}
-        for candidate_id, document in documents:
+        deferred_resolution_ids: list[str] = []
+        for document_index, (candidate_id, document) in enumerate(documents):
+            if (
+                not self._scope_pipeline_budget_available()
+                and not self._scope_candidate_has_cached_evidence(
+                    document,
+                    current_records,
+                    snapshots,
+                )
+            ):
+                deferred_resolution_ids = [
+                    deferred_id
+                    for deferred_id, _ in documents[document_index:]
+                ][: _MAX_SCOPE_RESOLUTION_CANDIDATES]
+                break
             candidate_records = list(current_records)
             candidate_snapshots = dict(self._scope_refreshed_snapshots)
             candidate_snapshots.update(snapshots)
@@ -1991,6 +2046,7 @@ class PolymarketCollector:
             proof = result.as_dict() if hasattr(result, "as_dict") and callable(result.as_dict) else result
             if isinstance(proof, Mapping):
                 self._scope_resolutions[candidate_id] = proof
+        self._scope_resolution_deferred_candidate_ids = tuple(deferred_resolution_ids)
         return scope_candidates, candidate_markets, snapshots, next_cursor
 
     @staticmethod
@@ -2392,6 +2448,17 @@ class PolymarketCollector:
         provider_window = max(0.001, float(self.config.provider_timeout_seconds))
         return min(provider_window, cycle_budget * 0.5)
 
+    def _scope_resolution_reserve_seconds(self) -> float:
+        """Reserve bounded storage time for one scope proof before collection."""
+        cycle_budget = max(0.001, float(self.config.cycle_budget_seconds))
+        return max(0.001, min(float(self.config.provider_timeout_seconds) * 0.1, cycle_budget * 0.1))
+
+    def _scope_phase_reserve_seconds(self) -> float:
+        return (
+            self._downstream_collection_reserve_seconds()
+            + self._scope_resolution_reserve_seconds()
+        )
+
     def _downstream_collection_budget_available(self) -> bool:
         """Whether scope work may consume time without starving collection."""
         remaining = self._cycle_remaining_seconds()
@@ -2400,13 +2467,11 @@ class PolymarketCollector:
         return remaining > self._downstream_collection_reserve_seconds() + 1e-6
 
     def _scope_pipeline_budget_available(self) -> bool:
-        """Keep the downstream collection window behind scope probes.
-
-        A carried metadata refresh must still leave enough monotonic budget
-        for its selected-token book/rules probe.  The same window is the
-        minimum reserved for the first scheduled market collection.
-        """
-        return self._downstream_collection_budget_available()
+        """Keep proof persistence and downstream collection behind scope probes."""
+        remaining = self._cycle_remaining_seconds()
+        if remaining is None:
+            return True
+        return remaining > self._scope_phase_reserve_seconds() + 1e-6
 
     @staticmethod
     def _scope_exact_market_ids(
@@ -2434,6 +2499,34 @@ class PolymarketCollector:
                 if str(item).strip()
             )
         return tuple(dict.fromkeys(result))
+    def _scope_candidate_has_cached_evidence(
+        self,
+        document: Mapping[str, Any],
+        records: Sequence[Mapping[str, Any]],
+        snapshots: Mapping[str, PredictionMarketSnapshot],
+    ) -> bool:
+        """Allow pure resolution from this tick's snapshots after the reserve."""
+        if not self._suitability_is_configured(document):
+            return True
+        kwargs = self._suitability_kwargs(document)
+        policy = self._scope_policy(document)
+        required_ids: set[str] = set()
+        if policy is not None and str(getattr(policy, "mode", "")).upper() == "EXACT_MARKETS":
+            required_ids.update(self._scope_exact_market_ids((document,)))
+        if not required_ids:
+            required_ids.update(
+                str(record.get("market_id", "")).strip()
+                for record in records
+                if isinstance(record, Mapping) and str(record.get("market_id", "")).strip()
+            )
+        available_snapshots = dict(self._scope_refreshed_snapshots)
+        available_snapshots.update(snapshots)
+        cache_key = _stable_payload(kwargs)
+        return all(
+            market_id in available_snapshots
+            and (market_id, cache_key) in self._scope_suitability_cache
+            for market_id in required_ids
+        )
 
     def _refresh_scope_snapshot(
         self,
@@ -3282,7 +3375,7 @@ class PolymarketCollector:
                 if self._cycle_remaining_seconds() is not None and self._cycle_remaining_seconds() <= 0:
                     self._mark_cycle_exhaustion("scope_suitability")
                     break
-                if suitability_enabled and not self._downstream_collection_budget_available():
+                if suitability_enabled and not self._scope_pipeline_budget_available():
                     # Keep an explicit collection window after scope
                     # authorization; page rows can continue on the next tick.
                     break
@@ -5322,7 +5415,7 @@ class PolymarketCollector:
                         timeout,
                         max(
                             0.000001,
-                            remaining - self._downstream_collection_reserve_seconds(),
+                            remaining - self._scope_phase_reserve_seconds(),
                         ),
                     )
                 wait_timeout = (
