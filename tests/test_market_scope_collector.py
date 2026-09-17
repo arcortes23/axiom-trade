@@ -1919,6 +1919,54 @@ class MarketScopeCollectorTests(unittest.TestCase):
         self.assertEqual(candidate_markets, {"candidate": ["queue-suitable"]})
 
 
+    def test_invalid_observation_assumptions_do_not_poison_valid_exact_scope(self) -> None:
+        valid = market("valid-exact")
+        invalid = market("invalid-observation")
+        valid_document = {
+            "experiment_plan": {
+                "market_scope": scope("EXACT_MARKETS", market_ids=("valid-exact",)),
+                "suitability": {"required_capital": 1.0},
+            }
+        }
+        invalid_document = {
+            "paper_observation_intent_id": "observation-invalid",
+            "experiment_plan": {
+                "market_scope": scope("EXACT_MARKETS", market_ids=("invalid-observation",)),
+                "required_capital": 2.0,
+                "suitability": {"required_capital": 1.0},
+            },
+        }
+        store = _ScopeStore(
+            {
+                "valid-candidate": {"experiment_plan": valid_document["experiment_plan"]},
+                "invalid-observation": invalid_document,
+            }
+        )
+        provider = _PagedProvider(
+            (valid, invalid),
+            ({"snapshots": (valid, invalid), "next_cursor": None},),
+        )
+        cycle = self._collector(
+            provider,
+            store,
+            ("valid-candidate", "invalid-observation"),
+            max_markets=2,
+        ).collect_once(now=T0)
+
+        self.assertIn("valid-exact", cycle.candidate_bound_scheduled)
+        self.assertNotIn("invalid-observation", cycle.candidate_bound_scheduled)
+        self.assertEqual(
+            cycle.market_authorization["verified_market_ids"],  # type: ignore[index]
+            ["valid-exact"],
+        )
+        invalid_evidence = [
+            item
+            for item in cycle.discovery_exclusions
+            if item["market_id"] == "invalid-observation"
+        ]
+        self.assertTrue(invalid_evidence)
+        self.assertEqual(invalid_evidence[-1]["reason"], "SUITABILITY_ASSUMPTIONS_UNKNOWN")
+
     def test_selected_token_book_never_uses_wrong_singleton(self) -> None:
         base = market("exact-book")
         wrong = replace(base.order_book, token_id="no-other-market")

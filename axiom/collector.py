@@ -2523,25 +2523,47 @@ class PolymarketCollector:
     ) -> tuple[list[Mapping[str, Any]], dict[str, PredictionMarketSnapshot], Any]:
         """Fetch exactly one bounded scope page, preserving opaque continuation."""
         provider = provider or self.provider
-        suitability_enabled = any(
-            self._suitability_is_configured(document)
-            for document in documents
-            if isinstance(document, Mapping)
+        suitability_specs: list[
+            tuple[int, int, Mapping[str, Any], dict[str, Any], bool]
+        ] = []
+        for index, document in enumerate(documents):
+            if not isinstance(document, Mapping):
+                continue
+            parameters = self._suitability_parameters(document)
+            if not parameters:
+                continue
+            kwargs = self._suitability_kwargs(document)
+            assumption_error = bool(parameters.get("_assumption_error"))
+            is_observation = bool(
+                str(document.get("paper_observation_intent_id", "")).strip()
+                or document.get("observation_intent") is True
+                or str(document.get("quality", "")).strip().upper() == "PAPER_OBSERVATION"
+            )
+            suitability_specs.append((
+                1 if is_observation else 0,
+                index,
+                document,
+                kwargs,
+                assumption_error,
+            ))
+        suitability_specs.sort(
+            key=lambda item: (item[4], item[0], item[1])
         )
-        suitability_documents = [
-            document
-            for document in documents
-            if isinstance(document, Mapping) and self._suitability_is_configured(document)
-        ]
-        suitability_kwargs: dict[str, Any] = {}
-        if suitability_documents:
-            candidate_kwargs = [self._suitability_kwargs(document) for document in suitability_documents]
-            suitability_kwargs = candidate_kwargs[0]
-            if any(
-                _stable_payload(item) != _stable_payload(suitability_kwargs)
-                for item in candidate_kwargs[1:]
-            ):
-                suitability_kwargs = {"intended_token": "__unknown__"}
+        suitability_enabled = bool(suitability_specs)
+        suitability_kwargs: dict[str, Any] = (
+            dict(suitability_specs[0][3]) if suitability_specs else {}
+        )
+        suitability_kwargs_by_market: dict[str, dict[str, Any]] = {}
+        suitability_kwargs_validity: dict[str, bool] = {}
+        for _, _, document, kwargs, assumption_error in suitability_specs:
+            for market_id in self._scope_exact_market_ids((document,)):
+                previous_valid = suitability_kwargs_validity.get(market_id)
+                if previous_valid is False and not assumption_error:
+                    suitability_kwargs_by_market[market_id] = dict(kwargs)
+                    suitability_kwargs_validity[market_id] = True
+                elif market_id not in suitability_kwargs_by_market:
+                    suitability_kwargs_by_market[market_id] = dict(kwargs)
+                    suitability_kwargs_validity[market_id] = not assumption_error
         method_page = getattr(provider, "market_page", None)
         if callable(method_page) and self.config.discovery_budget_per_cycle > 0:
             limit = min(100, max(1, int(self.config.discovery_budget_per_cycle)))
@@ -3202,12 +3224,16 @@ class PolymarketCollector:
                         failed_refresh = True
                         failed_market_id = failed_market_id or market_id
                         break
+                    probe_kwargs = suitability_kwargs_by_market.get(
+                        market_id,
+                        suitability_kwargs,
+                    )
                     assessment = self._cached_scope_suitability_assessment(
                         snapshot,
                         observed_at,
                         provider,
                         counters=counters,
-                        **suitability_kwargs,
+                        **probe_kwargs,
                     )
                     self._suitable_market_evidence.append(dict(assessment))
                     suitability_evidence.append(dict(assessment))
@@ -3253,12 +3279,16 @@ class PolymarketCollector:
                 refreshed_snapshots[market_id] = item
                 self._scope_refreshed_snapshots[market_id] = item
                 if suitability_enabled:
+                    probe_kwargs = suitability_kwargs_by_market.get(
+                        market_id,
+                        suitability_kwargs,
+                    )
                     assessment = self._cached_scope_suitability_assessment(
                         item,
                         observed_at,
                         provider,
                         counters=counters,
-                        **suitability_kwargs,
+                        **probe_kwargs,
                     )
                     self._suitable_market_evidence.append(dict(assessment))
                     suitability_evidence.append(dict(assessment))
@@ -3465,12 +3495,16 @@ class PolymarketCollector:
         for item in page:
             record = dict(self._scope_market_record(item, observed_at, provider))
             if suitability_enabled:
+                probe_kwargs = suitability_kwargs_by_market.get(
+                    str(item.market_id).strip(),
+                    suitability_kwargs,
+                )
                 assessment = self._cached_scope_suitability_assessment(
                     item,
                     observed_at,
                     provider,
                     counters=counters,
-                    **suitability_kwargs,
+                    **probe_kwargs,
                 )
                 suitability_evidence.append(dict(assessment))
                 record["suitability_evidence"] = dict(assessment)
