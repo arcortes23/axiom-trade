@@ -1627,6 +1627,280 @@ class Phase3PaperAndRiskTests(unittest.TestCase):
                 second_materialized.as_record(),
             )
 
+    def test_model_free_directional_intent_materializes_and_model_dependent_blocks(self) -> None:
+        directional = {
+            "version": 1,
+            "market_type": "prediction",
+            "family": "momentum",
+            "parameters": {"lookback": 1, "threshold": 0.05},
+            "probability_model": "market-history",
+            "resolution_aware": True,
+            "resolution_inputs": ["settlement"],
+        }
+        dependent = {
+            **directional,
+            "family": "probability_mispricing",
+            "probability_model": "immutable-model",
+        }
+        with AxiomStore(":memory:") as store:
+            registry = ForwardTestRegistry(store)
+            intent = registry.register_observation_intent(
+                strategy=directional,
+                model=None,
+                config={"strategy_document": directional},
+                registration_timestamp=T0,
+                candidate_id="candidate-model-free-directional",
+            )
+            self.assertEqual(intent.config["model_document"], {"model_required": False})
+            materialized = registry.materialize_observation_intent(
+                intent,
+                allowed_markets=("market-directional",),
+                registration_timestamp=T0,
+                now=T0,
+            )
+            self.assertEqual(
+                materialized.config["model_document"],
+                {"model_required": False},
+            )
+            dependent_intent = registry.register_observation_intent(
+                strategy=dependent,
+                model=None,
+                config={"strategy_document": dependent},
+                registration_timestamp=T0,
+                candidate_id="candidate-model-dependent",
+            )
+            with self.assertRaisesRegex(ValueError, "MODEL_INPUT_MISSING"):
+                registry.materialize_observation_intent(
+                    dependent_intent,
+                    allowed_markets=("market-dependent",),
+                    registration_timestamp=T0,
+                    now=T0,
+                )
+
+    def test_model_free_directional_discards_supplied_model_document(self) -> None:
+        strategy = {
+            "version": 1,
+            "market_type": "prediction",
+            "family": "mean_reversion",
+            "parameters": {"lookback": 1, "threshold": 0.05},
+            "probability_model": "market-history",
+            "resolution_aware": True,
+            "resolution_inputs": ["settlement"],
+        }
+        supplied_model = {"probability": 0.99}
+        marker = {"model_required": False}
+        with AxiomStore(":memory:") as store:
+            registry = ForwardTestRegistry(store)
+            intent = registry.register_observation_intent(
+                strategy=strategy,
+                model=supplied_model,
+                config={
+                    "strategy_document": strategy,
+                    "model_document": supplied_model,
+                },
+                registration_timestamp=T0,
+                candidate_id="candidate-discarded-model",
+            )
+            self.assertEqual(intent.config["model_document"], marker)
+            self.assertEqual(intent.model_hash, _content_hash(marker))
+            materialized = registry.materialize_observation_intent(
+                intent,
+                allowed_markets=("market-discarded-model",),
+                registration_timestamp=T0,
+                now=T0,
+            )
+            self.assertEqual(materialized.config["model_document"], marker)
+            self.assertNotIn("probability", materialized.config["model_document"])
+
+    def test_frozen_model_marker_requires_recognized_model_free_strategy(self) -> None:
+        marker = {"model_required": False}
+        base = {
+            "version": 1,
+            "market_type": "prediction",
+            "parameters": {"lookback": 1, "threshold": 0.05},
+            "operations": [],
+            "probability_model": "market-history",
+            "resolution_aware": True,
+            "resolution_inputs": ["settlement"],
+        }
+        directional = load_strategy({**base, "family": "momentum"})
+        dependent = load_strategy({**base, "family": "probability_mispricing"})
+        with AxiomStore(":memory:") as store:
+            registry = ForwardTestRegistry(store)
+            spec = registry.freeze(
+                strategy=directional,
+                model=marker,
+                config={"model_document": marker},
+                start_timestamp=T0,
+                allowed_markets=("market-typed-directional",),
+            )
+            self.assertEqual(spec.model_hash, _content_hash(marker))
+            engine = ForwardPaperEngine(
+                spec,
+                store=store,
+                strategy=directional,
+                model=marker,
+            )
+            self.assertTrue(engine._model_free)
+            with self.assertRaisesRegex(ValueError, "MODEL_INPUT_MISSING"):
+                registry.freeze(
+                    strategy=dependent,
+                    model=marker,
+                    config={"model_document": marker},
+                    start_timestamp=T0,
+                    allowed_markets=("market-typed-dependent",),
+                )
+
+    def test_historical_replay_requires_isolated_storage_namespace(self) -> None:
+        with AxiomStore(":memory:") as store:
+            spec = ForwardTestRegistry(store).freeze(
+                strategy=_BuyStrategy(),
+                model={"id": "model"},
+                config={"historical_replay": True},
+                start_timestamp=T0,
+                allowed_markets=("m",),
+            )
+            with self.assertRaisesRegex(
+                ValueError,
+                "historical replay specs require run_historical_replay",
+            ):
+                ForwardPaperEngine(
+                    spec,
+                    store=store,
+                    strategy=_BuyStrategy(),
+                    model={"id": "model"},
+                )
+
+    def test_model_free_marker_strips_forged_probability_aliases_from_evidence(self) -> None:
+        strategy = {
+            "version": 1,
+            "market_type": "prediction",
+            "family": "momentum",
+            "parameters": {"lookback": 1, "threshold": 0.05},
+            "operations": [],
+            "probability_model": "market-history",
+            "resolution_aware": True,
+            "resolution_inputs": ["settlement"],
+        }
+        marker = {"model_required": False}
+        observation = {
+            "market_id": "marker-alias-market",
+            "timestamp": T0 + timedelta(minutes=1),
+            "yes_mid": 0.4,
+            "yes_bid": 0.39,
+            "yes_ask": 0.41,
+            "no_mid": 0.6,
+            "no_bid": 0.59,
+            "no_ask": 0.61,
+            "settlement": "OPEN",
+            "model_probability": 0.99,
+            "probability": 0.99,
+            "predicted_probability": 0.99,
+            "p": 0.99,
+            "model_evaluation": {"probability": 0.99},
+        }
+        with AxiomStore(":memory:") as store:
+            spec = ForwardTestRegistry(store).freeze(
+                strategy=strategy,
+                model=marker,
+                config={
+                    "strategy_document": strategy,
+                    "model_document": marker,
+                },
+                start_timestamp=T0,
+                allowed_markets=("marker-alias-market",),
+            )
+            cycle = ForwardPaperEngine(
+                spec,
+                store=store,
+                strategy=strategy,
+                model=marker,
+            ).run([observation], now=observation["timestamp"])
+            self.assertEqual(cycle.observations_processed, 1)
+            saved = store.list_paper_observations(spec.experiment_id)
+            self.assertEqual(len(saved), 1)
+            saved_payload = saved[0]["payload"]
+            for key in (
+                "model_probability",
+                "probability",
+                "predicted_probability",
+                "p",
+                "model_evaluation",
+            ):
+                self.assertNotIn(key, saved_payload)
+            events = store.list_paper_execution_events(spec.experiment_id)
+            self.assertEqual(len(events), 1)
+            event_payload = events[0]["payload"]
+            evaluation_evidence = event_payload.get("evaluation_evidence", {})
+            self.assertIsInstance(evaluation_evidence, dict)
+            for key in (
+                "model_probability",
+                "probability",
+                "predicted_probability",
+                "p",
+                "model_evaluation",
+            ):
+                self.assertNotIn(key, evaluation_evidence)
+
+    def test_model_free_marker_sanitizes_persisted_history_when_warm_query_fails(self) -> None:
+        strategy = {
+            "version": 1,
+            "market_type": "prediction",
+            "family": "mean_reversion",
+            "parameters": {"lookback": 1, "threshold": 0.05},
+            "operations": [],
+            "probability_model": "market-history",
+            "resolution_aware": True,
+            "resolution_inputs": ["settlement"],
+        }
+        marker = {"model_required": False}
+        forged = {
+            "market_id": "persisted-alias-market",
+            "timestamp": T0.isoformat(),
+            "yes_mid": 0.4,
+            "model_probability": 0.99,
+            "probability": 0.99,
+            "predicted_probability": 0.99,
+            "p": 0.99,
+            "model_evaluation": {"probability": 0.99},
+        }
+        with AxiomStore(":memory:") as store:
+            spec = ForwardTestRegistry(store).freeze(
+                strategy=strategy,
+                model=marker,
+                config={
+                    "strategy_document": strategy,
+                    "model_document": marker,
+                },
+                start_timestamp=T0,
+                allowed_markets=("persisted-alias-market",),
+            )
+            store.save_paper_state(
+                spec.experiment_id,
+                {
+                    "experiment_id": spec.experiment_id,
+                    "signal_history_by_market": {
+                        "persisted-alias-market": [forged],
+                    },
+                },
+                timestamp=T0,
+            )
+            with patch.object(
+                store,
+                "list_latest_paper_observations",
+                side_effect=RuntimeError("warm query unavailable"),
+            ):
+                engine = ForwardPaperEngine(
+                    spec,
+                    store=store,
+                    strategy=strategy,
+                    model=marker,
+                )
+            self.assertEqual(
+                engine._signal_history["persisted-alias-market"],
+                [{"market_id": "persisted-alias-market", "timestamp": T0.isoformat(), "yes_mid": 0.4}],
+            )
+
     def test_rule_scope_materialization_requires_matching_resolution_proof(self) -> None:
         scope = normalize_market_scope(
             {

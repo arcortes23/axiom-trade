@@ -40,7 +40,10 @@ from .polymarket_rules import (
     parse_polymarket_rules,
 )
 _LOGGER = logging.getLogger(__name__)
-from .strategy.signals import evaluate_model_document_probability
+from .strategy.signals import (
+    _prediction_requires_model,
+    evaluate_model_document_probability,
+)
 
 SUPPORTED_POLYMARKET_SDK = "0.9.0"
 POLYMARKET_CHAIN_ID = 137
@@ -100,6 +103,23 @@ _ROLLING_AUTHORIZATION_FIELDS = (
 )
 _ROLLING_NON_ACTIVE_STATUSES = frozenset({"OBSERVE", "PAPER", "REJECTED"})
 _ROLLING_EXPLICIT_ADVERSE_ACK_REQUIRED = frozenset({"REJECTED"})
+_CANARY_MODEL_FREE_DOCUMENT = {"model_required": False}
+
+
+def _canary_model_free_document(value: Any) -> bool:
+    return isinstance(value, Mapping) and dict(value) == _CANARY_MODEL_FREE_DOCUMENT
+
+
+def _canary_strategy_requires_model(strategy: Any) -> bool:
+    """Return whether a prediction strategy needs persisted model evidence."""
+    market_type = getattr(strategy, "market_type", None)
+    market_type = getattr(market_type, "value", market_type)
+    if str(market_type or "").strip().lower() != "prediction":
+        return True
+    family = str(getattr(strategy, "family", "") or "").strip().lower()
+    return _prediction_requires_model(family)
+
+
 
 
 def _canary_adverse_acknowledged(value: Any, *, require_required: bool = False) -> bool:
@@ -8642,9 +8662,9 @@ class CanaryService:
             model_document = forward_config.get("model_document")
         if not isinstance(model_document, Mapping):
             model_document = plan.get("model_document")
-        if not isinstance(strategy_document, Mapping) or not isinstance(model_document, Mapping):
-            raise CanaryBlocked("CANDIDATE_EXECUTABLE_DOCUMENTS_UNAVAILABLE")
 
+        if not isinstance(strategy_document, Mapping):
+            raise CanaryBlocked("CANDIDATE_EXECUTABLE_DOCUMENTS_UNAVAILABLE")
         try:
             from .strategy import load_strategy
 
@@ -8653,19 +8673,44 @@ class CanaryService:
             raise CanaryBlocked("CANDIDATE_EXECUTABLE_DOCUMENTS_INVALID") from exc
         if strategy.market_type.value != "prediction":
             raise CanaryBlocked("CANARY_MARKET_TYPE_UNSUPPORTED")
+        model_required = _canary_strategy_requires_model(strategy)
+        if model_required and not isinstance(model_document, Mapping):
+            raise CanaryBlocked("CANDIDATE_EXECUTABLE_DOCUMENTS_UNAVAILABLE")
         expected_strategy_hash = str(payload.get("strategy_hash", "")).strip()
         expected_model_hash = str(payload.get("model_hash", "")).strip()
         expected_config_hash = str(payload.get("config_hash", "")).strip()
+        if not model_required:
+            marker_hash = self._document_hash(_CANARY_MODEL_FREE_DOCUMENT)
+            if not isinstance(model_document, Mapping) or _canary_model_free_document(
+                model_document
+            ):
+                if not expected_model_hash or expected_model_hash != marker_hash:
+                    raise CanaryBlocked("CANDIDATE_FROZEN_BINDING_INVALID")
+                model_document = dict(_CANARY_MODEL_FREE_DOCUMENT)
+            else:
+                raise CanaryBlocked("CANDIDATE_FROZEN_BINDING_INVALID")
         strategy_hash_matches = (
             self._document_hash(strategy_document) == expected_strategy_hash
             or self._document_hash(strategy.to_dict()) == expected_strategy_hash
         )
         if (
             not expected_strategy_hash
-            or not expected_model_hash
             or not expected_config_hash
             or not strategy_hash_matches
-            or self._document_hash(model_document) != expected_model_hash
+            or (
+                model_required
+                and (
+                    not expected_model_hash
+                    or not isinstance(model_document, Mapping)
+                    or self._document_hash(model_document) != expected_model_hash
+                )
+            )
+            or (
+                not model_required
+                and isinstance(model_document, Mapping)
+                and expected_model_hash
+                and self._document_hash(model_document) != expected_model_hash
+            )
         ):
             raise CanaryBlocked("CANDIDATE_FROZEN_BINDING_INVALID")
         scope_binding = _canary_scope_binding(payload)
@@ -8680,7 +8725,7 @@ class CanaryService:
             "model_hash": expected_model_hash,
             "config_hash": expected_config_hash,
             "strategy": strategy,
-            "model_document": dict(model_document),
+            "model_document": dict(model_document) if isinstance(model_document, Mapping) else None,
             "forward_test": forward_test,
             "forward_config": forward_config,
             "data_quality": quality,
@@ -8990,6 +9035,7 @@ class CanaryService:
         source_snapshot_id = str(current_row.get("snapshot_id") or "").strip()
         source_timestamp = parse_timestamp(current_row.get("source_timestamp"))
         lineage = _normalize_lineage(lineage)
+        model_required = _canary_strategy_requires_model(binding["strategy"])
         if not source_snapshot_id or source_timestamp is None:
             return None
         side = "BUY"
@@ -9123,7 +9169,6 @@ class CanaryService:
                     )
                     evidence = {
                         "score": score,
-                        "model_probability": current_observation.get("model_probability"),
                         "market_price": str(expected_price),
                         "research_quality": current_observation.get("research_quality"),
                         "current_execution_evidence": CURRENT_ORDER_BOOK,
@@ -9140,6 +9185,8 @@ class CanaryService:
                             scope_resolution_row, "resolution_id"
                         ),
                     }
+                    if model_required and "model_probability" in current_observation:
+                        evidence["model_probability"] = current_observation["model_probability"]
                     if lineage["lineage_type"] == _ROLLING_LINEAGE_TYPE:
                         evidence.update(
                             {
@@ -9837,16 +9884,28 @@ class CanaryService:
                     details={"signal_blocker": "INSUFFICIENT_FORWARD_INPUT"},
                 )
                 continue
-            if not self._apply_signal_model(observations, binding["model_document"]):
-                record_failure(
-                    "MODEL_INPUT_MISSING",
-                    market_id,
-                    details={"signal_blocker": "MODEL_INPUT_MISSING"},
+            model_required = _canary_strategy_requires_model(binding["strategy"])
+            if model_required:
+                if not self._apply_signal_model(observations, binding["model_document"]):
+                    record_failure(
+                        "MODEL_INPUT_MISSING",
+                        market_id,
+                        details={"signal_blocker": "MODEL_INPUT_MISSING"},
+                    )
+                    continue
+                current_observation["model_probability"] = observations[-1].get(
+                    "model_probability"
                 )
-                continue
-            current_observation["model_probability"] = observations[-1].get(
-                "model_probability"
-            )
+            else:
+                for item in (*observations, current_observation):
+                    for key in (
+                        "model_probability",
+                        "probability",
+                        "predicted_probability",
+                        "p",
+                        "model_evaluation",
+                    ):
+                        item.pop(key, None)
             try:
                 from .strategy import evaluate_signal_record
 

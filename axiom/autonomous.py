@@ -30,6 +30,7 @@ from .forward import (
     _normalized_strategy_document,
     _operational_setup_for_strategy,
     _operational_setup_hash,
+    _prediction_strategy_model_required,
 )
 from .director import compact_report, validate_hermes_proposal
 from .domain import Fill, MarketType, ResearchQuality, SettlementState, ensure_utc, parse_timestamp, utc_now
@@ -238,6 +239,44 @@ _ROLLING_MODEL_DOCUMENT_FIELDS = frozenset(
 _ROLLING_MODEL_OVERRIDE_FIELDS = frozenset(
     {"model_probability", "probability", "predicted_probability", "p"}
 )
+
+_ROLLING_MODEL_FREE_DOCUMENT = {"model_required": False}
+
+
+def _rolling_model_free_marker(value: Any) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and value.get("model_required") is False
+        and set(value) == {"model_required"}
+    )
+
+
+def _rolling_strategy_document(strategy: Any) -> Mapping[str, Any] | None:
+    """Return the persisted strategy document when one is available."""
+    if not isinstance(strategy, Mapping):
+        return None
+    document = strategy.get("strategy_document", strategy.get("canonical_strategy"))
+    if isinstance(document, Mapping):
+        return document
+    return strategy if "family" in strategy else None
+
+
+def _rolling_prediction_model_required(strategy: Any) -> bool | None:
+    """Use the shared prediction-family model contract for rolling work."""
+    document = _rolling_strategy_document(strategy)
+    if not isinstance(document, Mapping):
+        return None
+    return _prediction_strategy_model_required(document)
+
+
+def _rolling_model_free_resolution() -> dict[str, Any]:
+    """Return bounded provenance for a strategy with no model dependency."""
+    return {
+        "source_type": "strategy_contract",
+        "plan_id": None,
+        "model_hash": _content_hash(_ROLLING_MODEL_FREE_DOCUMENT),
+        "model_required": False,
+    }
 
 
 def _rolling_reason_is_immutable(reason: Any) -> bool:
@@ -6755,6 +6794,13 @@ class AutonomousResearchProcessor:
         """
         if not isinstance(strategy, Mapping):
             raise ValueError("MODEL_INPUT_MISSING")
+        model_required = _rolling_prediction_model_required(strategy)
+        if model_required is False:
+            # Directional prediction families (and other built-in
+            # model-independent families) deliberately evaluate from their
+            # observed input path.  A marker is persisted so forward workers
+            # have one canonical representation for "no model".
+            return dict(_ROLLING_MODEL_FREE_DOCUMENT), _rolling_model_free_resolution()
 
         def identity_values(
             value: Any,
@@ -7023,7 +7069,7 @@ class AutonomousResearchProcessor:
             result: list[tuple[Mapping[str, Any], str]] = []
             if "model_document" in value:
                 raw_model = value.get("model_document")
-                if raw_model is not None:
+                if raw_model is not None and not _rolling_model_free_marker(raw_model):
                     if not isinstance(raw_model, Mapping):
                         raise ValueError("MODEL_PLAN_NOT_EXECUTABLE")
                     result.append((dict(raw_model), origin))
@@ -7161,6 +7207,8 @@ class AutonomousResearchProcessor:
         if frozen_plan_hashes and frozen_plan_hashes != {canonical_plan_hash}:
             raise ValueError("MODEL_LINEAGE_MISMATCH")
         raw_model = raw_plan.get("model_document")
+        if _rolling_model_free_marker(raw_model):
+            raw_model = None
         if raw_model is None and any(
             key in raw_plan for key in _ROLLING_MODEL_DOCUMENT_FIELDS
         ):
@@ -8198,10 +8246,17 @@ class AutonomousResearchProcessor:
                 "accounting_partial": True,
             }
         model_error: str | None = None
-        try:
-            model_document, model_resolution = self._resolve_rolling_model(strategy)
-        except (TypeError, ValueError, RuntimeError) as exc:
-            model_error = str(exc).split(":", 1)[0].strip() or "MODEL_INPUT_MISSING"
+        model_required = _rolling_prediction_model_required(strategy)
+        if model_required is False:
+            # Directional families consume the market probability path only;
+            # no caller/model probability is admitted into this evaluator.
+            model_document = None
+            model_resolution = _rolling_model_free_resolution()
+        else:
+            try:
+                model_document, model_resolution = self._resolve_rolling_model(strategy)
+            except (TypeError, ValueError, RuntimeError) as exc:
+                model_error = str(exc).split(":", 1)[0].strip() or "MODEL_INPUT_MISSING"
         verified_field: str | None = None
         if (
             isinstance(model_document, Mapping)
@@ -8328,6 +8383,20 @@ class AutonomousResearchProcessor:
         evaluation.setdefault("evaluation_kind", "CANONICAL_SIMULATION")
         if model_resolution is not None:
             evaluation["model_resolution"] = dict(model_resolution)
+        path_manifest = metrics.get("path_manifest")
+        if (
+            isinstance(path_manifest, Mapping)
+            and isinstance(raw_evaluation, Mapping)
+            and raw_evaluation.get("evaluator_invoked") is False
+            and raw_evaluation.get("evaluator_completed") is False
+        ):
+            exclusions = path_manifest.get("exclusion_reasons")
+            if isinstance(exclusions, Mapping) and exclusions.get("INSUFFICIENT_OBSERVATIONS"):
+                # Structural path selection happens before signal evaluation.
+                # Preserve that fact as the strategy-level lookback blocker
+                # instead of reporting an opaque unavailable evaluator.
+                evaluation["evaluator_error"] = "INSUFFICIENT_LOOKBACK"
+                evaluation["evaluator_prerequisite"] = "INSUFFICIENT_LOOKBACK"
 
         # V2 status is authoritative only when the evaluator emitted both
         # nested boolean fields.  A result curve is not an evaluator
@@ -15480,8 +15549,6 @@ class AutonomousResearchProcessor:
                 return None
         candidate_strategy = payload.get("strategy")
         forward_strategy = config.get("strategy_document")
-        candidate_model = plan.model_for() or {"type": "deterministic"}
-        forward_model = config.get("model_document")
         if not isinstance(candidate_strategy, Mapping) or not isinstance(forward_strategy, Mapping):
             return None
         candidate_strategy = dict(candidate_strategy)
@@ -15489,6 +15556,15 @@ class AutonomousResearchProcessor:
         candidate_strategy.pop("strategy_id", None)
         forward_strategy.pop("strategy_id", None)
         if _canonical_binding(candidate_strategy) != _canonical_binding(forward_strategy):
+            return None
+        model_required = _rolling_prediction_model_required(candidate_strategy)
+        candidate_model = (
+            dict(_ROLLING_MODEL_FREE_DOCUMENT)
+            if model_required is False
+            else plan.model_for() or {"type": "deterministic"}
+        )
+        forward_model = config.get("model_document")
+        if not isinstance(forward_model, Mapping):
             return None
         intent_strategy = intent_config.get("strategy_document")
         intent_model = intent_config.get("model_document")
@@ -15498,7 +15574,7 @@ class AutonomousResearchProcessor:
         intent_strategy.pop("strategy_id", None)
         if _canonical_binding(candidate_strategy) != _canonical_binding(intent_strategy):
             return None
-        if not isinstance(forward_model, Mapping) or _canonical_binding(candidate_model) != _canonical_binding(forward_model):
+        if _canonical_binding(candidate_model) != _canonical_binding(forward_model):
             return None
         if _canonical_binding(candidate_model) != _canonical_binding(intent_model):
             return None

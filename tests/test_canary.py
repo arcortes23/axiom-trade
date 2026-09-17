@@ -4827,6 +4827,7 @@ class CanarySignalTests(unittest.TestCase):
         frozen_filters=None,
         strategy=None,
         model=None,
+        omit_model=False,
         dataset_market_ids=(),
         experiment_plan=None,
         scope_records=None,
@@ -4835,6 +4836,11 @@ class CanarySignalTests(unittest.TestCase):
         model = dict(model or self.model)
         strategy_hash = self.service._document_hash(strategy)
         model_hash = self.service._document_hash(model)
+        if omit_model and str(strategy.get("family") or "").strip().lower() in {
+            "momentum",
+            "mean_reversion",
+        }:
+            model_hash = self.service._document_hash({"model_required": False})
         config_hash = "config-hash"
         payload = {
             "market_type": "prediction",
@@ -4879,9 +4885,10 @@ class CanarySignalTests(unittest.TestCase):
                 "|".join((strategy_hash, model_hash, config_hash)).encode()
             ).hexdigest(),
             "strategy_document": strategy,
-            "model_document": model,
             "market_ids": list(market_ids),
         }
+        if not omit_model:
+            payload["model_document"] = model
         if frozen_filters:
             payload["frozen_filters"] = dict(frozen_filters)
         if experiment_plan is not None:
@@ -4919,6 +4926,7 @@ class CanarySignalTests(unittest.TestCase):
         observed_at=None,
         category=None,
         feature_probability=None,
+        model_probability=None,
     ):
         source_timestamp = source_timestamp or T0
         observed_at = observed_at or self.now
@@ -4947,6 +4955,8 @@ class CanarySignalTests(unittest.TestCase):
         }
         if feature_probability is not None:
             nested["feature_probability"] = feature_probability
+        if model_probability is not None:
+            nested["model_probability"] = model_probability
         payload = {
             "source_type": "FORWARD_COLLECTED",
             "snapshot": nested,
@@ -5082,6 +5092,7 @@ class CanarySignalTests(unittest.TestCase):
             candidate_id,
             market_ids=(market_id,),
             strategy=strategy,
+            omit_model=True,
         )
         self._save_snapshot(
             "qualified-warming-snapshot",
@@ -5125,7 +5136,7 @@ class CanarySignalTests(unittest.TestCase):
             candidate_id,
             market_ids=(market_id,),
             strategy=strategy,
-            model={"probability": 0.80},
+            omit_model=True,
         )
         prior = T0 - timedelta(seconds=1)
         self._save_snapshot(
@@ -5178,6 +5189,186 @@ class CanarySignalTests(unittest.TestCase):
             [item["observed_at"] for item in evaluated_snapshots],
             [prior, T0],
         )
+
+    def test_directional_model_free_candidate_uses_market_history_without_model_document(self):
+        candidate_id = "model-free-momentum"
+        market_id = "model-free-market"
+        strategy = {
+            **self.strategy,
+            "family": "momentum",
+            "parameters": {"lookback": 1, "threshold": 0.05},
+        }
+        self._add_candidate(
+            candidate_id,
+            market_ids=(market_id,),
+            strategy=strategy,
+            omit_model=True,
+        )
+        prior = T0 - timedelta(seconds=1)
+        self._save_snapshot(
+            "model-free-prior-snapshot",
+            market_id=market_id,
+            price="0.40",
+            model_probability="0.99",
+            source_timestamp=prior,
+            observed_at=prior,
+        )
+        self._save_snapshot(
+            "model-free-current-snapshot",
+            market_id=market_id,
+            price="0.50",
+            model_probability="0.99",
+            source_timestamp=T0,
+            observed_at=T0,
+        )
+
+        result = self._assert_evaluation(
+            candidate_id,
+            "READY_SIGNAL",
+            market_id=market_id,
+            cycle_id="model-free-cycle",
+            expect_signal=True,
+            assert_market_id=True,
+        )
+        self.assertNotIn("model_document", self.store.load_candidate_lifecycle(candidate_id)["payload"])
+        self.assertNotIn("model_probability", result["signal"]["evidence"])
+
+
+
+    def test_directional_model_free_decline_omits_forged_model_probability(self):
+        candidate_id = "model-free-decline"
+        market_id = "model-free-decline-market"
+        strategy = {
+            **self.strategy,
+            "family": "momentum",
+            "parameters": {"lookback": 1, "threshold": 0.05},
+        }
+        self._add_candidate(
+            candidate_id,
+            market_ids=(market_id,),
+            strategy=strategy,
+            omit_model=True,
+        )
+        prior = T0 - timedelta(seconds=1)
+        self._save_snapshot(
+            "model-free-decline-prior-snapshot",
+            market_id=market_id,
+            price="0.50",
+            model_probability="0.99",
+            source_timestamp=prior,
+            observed_at=prior,
+        )
+        self._save_snapshot(
+            "model-free-decline-current-snapshot",
+            market_id=market_id,
+            price="0.50",
+            model_probability="0.99",
+            source_timestamp=T0,
+            observed_at=T0,
+        )
+
+        result = self._assert_evaluation(
+            candidate_id,
+            "STRATEGY_EVALUATED_DECLINED",
+            market_id=market_id,
+            cycle_id="model-free-decline-cycle",
+            assert_market_id=True,
+        )
+        self.assertNotIn("model_probability", result["evidence"])
+
+    def test_directional_model_free_rejects_supplied_executable_model_document(self):
+        candidate_id = "model-free-supplied-model"
+        market_id = "model-free-supplied-market"
+        strategy = {
+            **self.strategy,
+            "family": "momentum",
+            "parameters": {"lookback": 1, "threshold": 0.05},
+        }
+        self._add_candidate(
+            candidate_id,
+            market_ids=(market_id,),
+            strategy=strategy,
+            model={"probability": 0.80},
+        )
+
+        result = self._assert_evaluation(
+            candidate_id,
+            "COLLECTOR_CANDIDATE_HEALTH_BLOCKED",
+            cycle_id="model-free-supplied-cycle",
+        )
+        self.assertEqual(
+            result["evidence"]["binding_reason"],
+            "CANDIDATE_FROZEN_BINDING_INVALID",
+        )
+
+    def test_directional_model_free_rejects_unrelated_model_hash_without_document(self):
+        candidate_id = "model-free-unrelated-hash"
+        market_id = "model-free-unrelated-market"
+        strategy = {
+            **self.strategy,
+            "family": "momentum",
+            "parameters": {"lookback": 1, "threshold": 0.05},
+        }
+        self._add_candidate(
+            candidate_id,
+            market_ids=(market_id,),
+            strategy=strategy,
+            omit_model=True,
+        )
+        payload = dict(self.store.load_candidate_lifecycle(candidate_id)["payload"])
+        payload["model_hash"] = "unrelated-model-hash"
+        payload["frozen_hash"] = hashlib.sha256(
+            "|".join(
+                (payload["strategy_hash"], payload["model_hash"], payload["config_hash"])
+            ).encode()
+        ).hexdigest()
+        self.store.save_candidate_lifecycle(
+            candidate_id,
+            "FROZEN",
+            payload,
+            timestamp=T0,
+        )
+        self.service.mark_eligible(candidate_id)
+
+        result = self._assert_evaluation(
+            candidate_id,
+            "COLLECTOR_CANDIDATE_HEALTH_BLOCKED",
+            market_id=market_id,
+            cycle_id="model-free-unrelated-hash-cycle",
+            assert_market_id=True,
+        )
+        self.assertEqual(
+            result["evidence"]["binding_reason"],
+            "CANDIDATE_FROZEN_BINDING_INVALID",
+        )
+
+
+    def test_model_dependent_candidate_without_model_document_is_blocked(self):
+        candidate_id = "model-dependent-missing-document"
+        market_id = "model-dependent-market"
+        self._add_candidate(
+            candidate_id,
+            market_ids=(market_id,),
+            omit_model=True,
+        )
+        self._save_snapshot(
+            "model-dependent-snapshot",
+            market_id=market_id,
+            price="0.50",
+        )
+
+        result = self._assert_evaluation(
+            candidate_id,
+            "COLLECTOR_CANDIDATE_HEALTH_BLOCKED",
+            market_id=market_id,
+            cycle_id="model-dependent-missing-document-cycle",
+            assert_market_id=True,
+        )
+        self.assertEqual(
+            result["evidence"]["binding_reason"],
+            "CANDIDATE_EXECUTABLE_DOCUMENTS_UNAVAILABLE",
+        )
+
 
     def test_missing_model_input_is_not_recorded_as_strategy_decline(self):
         candidate_id = "missing-model-input"

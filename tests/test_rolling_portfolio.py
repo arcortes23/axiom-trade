@@ -4686,6 +4686,150 @@ class TestRollingPortfolio(unittest.TestCase):
             assert evaluation is not None
             self.assertTrue(evaluation["evaluator_completed"])
             self.assertEqual(evaluation["signal_count"], 1)
+    def test_directional_families_evaluate_without_model_when_path_is_complete(self) -> None:
+        rows = [
+            {
+                "timestamp": (NOW + timedelta(minutes=index)).isoformat(),
+                "market_id": "market-directional-model-free",
+                "yes_mid": probability,
+                "yes_ask": probability + 0.01,
+                "yes_bid": probability - 0.01,
+                "no_mid": 1.0 - probability,
+                "no_ask": 1.0 - probability + 0.01,
+                "no_bid": 1.0 - probability - 0.01,
+            }
+            for index, probability in enumerate((0.40, 0.60, 0.70))
+        ]
+        with _store(self.tmp_path) as store:
+            processor = AutonomousResearchProcessor(store, clock=lambda: NOW)
+            for family in ("momentum", "mean_reversion"):
+                with self.subTest(family=family):
+                    strategy_document = {
+                        "version": 1,
+                        "market_type": "prediction",
+                        "family": family,
+                        "parameters": {
+                            "lookback": 1,
+                            "threshold": 0.05,
+                            "entry_predicate": {
+                                "version": "absolute-move-v1",
+                                "minimum_move": 0.05,
+                                "units": "probability",
+                                "boundary": "inclusive",
+                            },
+                        },
+                        "probability_model": "market-history",
+                        "resolution_aware": True,
+                        "resolution_inputs": ["settlement"],
+                    }
+                    strategy = _strategy(
+                        f"sv-directional-model-free-{family}",
+                        strategy_document=strategy_document,
+                        model_document=None,
+                    )
+                    evaluation = processor._rolling_canonical_evaluation(
+                        strategy,
+                        rows,
+                        "HISTORICAL",
+                    )
+                    self.assertIsNotNone(evaluation)
+                    assert evaluation is not None
+                    self.assertTrue(evaluation["evaluator_invoked"])
+                    self.assertTrue(evaluation["evaluator_completed"])
+                    self.assertIsNone(evaluation["evaluator_error"])
+                    self.assertEqual(
+                        evaluation["evaluation"]["model_resolution"]["model_required"],
+                        False,
+                    )
+
+    def test_directional_short_path_surfaces_insufficient_lookback(self) -> None:
+        strategy_document = {
+            "version": 1,
+            "market_type": "prediction",
+            "family": "momentum",
+            "parameters": {
+                "lookback": 1,
+                "threshold": 0.05,
+                "entry_predicate": {
+                    "version": "absolute-move-v1",
+                    "minimum_move": 0.05,
+                    "units": "probability",
+                    "boundary": "inclusive",
+                },
+            },
+            "probability_model": "market-history",
+            "resolution_aware": True,
+            "resolution_inputs": ["settlement"],
+        }
+        rows = [
+            {
+                "timestamp": (NOW + timedelta(minutes=index)).isoformat(),
+                "market_id": "market-directional-short",
+                "yes_mid": probability,
+            }
+            for index, probability in enumerate((0.40, 0.60))
+        ]
+        with _store(self.tmp_path) as store:
+            evaluation = AutonomousResearchProcessor(
+                store,
+                clock=lambda: NOW,
+            )._rolling_canonical_evaluation(
+                _strategy(
+                    "sv-directional-short",
+                    strategy_document=strategy_document,
+                    model_document={"model_required": False},
+                ),
+                rows,
+                "HISTORICAL",
+            )
+            self.assertIsNotNone(evaluation)
+            assert evaluation is not None
+            self.assertFalse(evaluation["evaluator_invoked"])
+            self.assertFalse(evaluation["evaluator_completed"])
+            self.assertEqual(evaluation["evaluator_prerequisite"], "INSUFFICIENT_LOOKBACK")
+
+    def test_model_dependent_family_without_model_remains_blocked(self) -> None:
+        strategy_document = {
+            "version": 1,
+            "market_type": "prediction",
+            "family": "probability_mispricing",
+            "parameters": {"threshold": 0.05},
+            "probability_model": "immutable-model",
+            "resolution_aware": True,
+            "resolution_inputs": ["settlement"],
+        }
+        rows = [
+            {
+                "timestamp": (NOW + timedelta(minutes=index)).isoformat(),
+                "market_id": "market-model-dependent",
+                "yes_mid": probability,
+                "model_probability": 0.90,
+                "settlement": "YES",
+            }
+            for index, probability in enumerate((0.40, 0.60, 0.70))
+        ]
+        with _store(self.tmp_path) as store:
+            processor = AutonomousResearchProcessor(store, clock=lambda: NOW)
+            for model_document in (None, {"model_required": False}):
+                with self.subTest(model_document=model_document):
+                    evaluation = processor._rolling_canonical_evaluation(
+                        _strategy(
+                            "sv-model-dependent-missing",
+                            strategy_document=strategy_document,
+                            model_document=model_document,
+                        ),
+                        rows,
+                        "HISTORICAL",
+                    )
+                    self.assertIsNotNone(evaluation)
+                    assert evaluation is not None
+                    self.assertFalse(evaluation["evaluator_invoked"])
+                    self.assertFalse(evaluation["evaluator_completed"])
+                    self.assertEqual(
+                        evaluation["evaluator_prerequisite"],
+                        "MODEL_INPUT_MISSING",
+                    )
+
     def test_row_model_probability_cannot_bypass_missing_immutable_model(self) -> None:
         with _store(self.tmp_path) as store:
             strategy = _strategy(

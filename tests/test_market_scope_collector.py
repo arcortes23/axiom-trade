@@ -6,6 +6,8 @@ from decimal import Decimal
 import json
 import threading
 import time
+import sqlite3
+
 import unittest
 
 from axiom.collector import (
@@ -366,6 +368,41 @@ class _ScopeStore:
     def save_dataset_catalog(self, *args, **kwargs):
         return None
 
+
+class _SelectedRollingScopeStore(_ScopeStore):
+    def __init__(
+        self,
+        candidate_id: str,
+        strategy_version_id: str,
+        payload: dict[str, object],
+        *,
+        status: str = "OBSERVE",
+    ) -> None:
+        super().__init__({candidate_id: payload})
+        self._selection = {
+            "portfolio_selection_id": "selection-current",
+            "members": [
+                {
+                    "strategy_version_id": strategy_version_id,
+                    "candidate_id": candidate_id,
+                    "status": status,
+                }
+            ],
+        }
+        self.connection = sqlite3.connect(":memory:")
+        self.connection.execute(
+            "CREATE TABLE strategy_versions("
+            "strategy_version_id TEXT PRIMARY KEY,payload_json TEXT NOT NULL)"
+        )
+        self.connection.execute(
+            "INSERT INTO strategy_versions(strategy_version_id,payload_json) VALUES (?,?)",
+            (strategy_version_id, json.dumps(payload, sort_keys=True)),
+        )
+        self.connection.commit()
+
+    def load_current_portfolio_selection(self):
+        return dict(self._selection)
+
 class _ImmutableTradeStore(_ScopeStore):
     def __init__(self, documents: dict[str, dict[str, object]]) -> None:
         super().__init__(documents)
@@ -430,6 +467,244 @@ class MarketScopeCollectorTests(unittest.TestCase):
             clock=lambda: T0,
             sleep=lambda _seconds: None,
         )
+
+    def test_selected_rolling_exact_scope_direct_lookup_bypasses_empty_legacy_authority(self) -> None:
+        selected = market("rolling-direct-open")
+        store = _SelectedRollingScopeStore(
+            "rolling-candidate",
+            "rolling-strategy",
+            {
+                "candidate_id": "rolling-candidate",
+                "experiment_plan": {
+                    "market_scope": scope(
+                        "EXACT_MARKETS",
+                        market_ids=("rolling-direct-open",),
+                    )
+                },
+            },
+        )
+        provider = _PagedProvider(
+            (selected,),
+            ({"markets": (), "next_cursor": None},),
+        )
+
+        cycle = self._collector(provider, store, ()).collect_once(now=T0)
+
+        self.assertIn("rolling-direct-open", provider.market_calls)
+        self.assertEqual(list(cycle.candidate_bound_scheduled), ["rolling-direct-open"])
+        self.assertEqual(list(cycle.discovery_scheduled), [])
+        self.assertTrue(store.requirement_calls)
+        self.assertTrue(all(not call for call in store.requirement_calls))
+        self.assertEqual(len(store.resolutions), 1)
+        self.assertEqual(store.resolutions[0].status, MATCHED)
+
+    def test_selected_rolling_exact_scope_direct_lookup_persists_closed_and_no_orders_exclusions(self) -> None:
+        closed = replace(
+            market(
+                "rolling-direct-closed",
+                settlement=SettlementState.RESOLVED_YES,
+                closed=True,
+            ),
+            active=True,
+        )
+        no_orders = replace(
+            market("rolling-direct-no-orders"),
+            accepting_orders=False,
+        )
+        payload = {
+            "candidate_id": "rolling-candidate",
+            "experiment_plan": {
+                "market_scope": scope(
+                    "EXACT_MARKETS",
+                    market_ids=(
+                        "rolling-direct-closed",
+                        "rolling-direct-no-orders",
+                        "rolling-direct-missing",
+                    ),
+                )
+            },
+
+        }
+        store = _SelectedRollingScopeStore(
+            "rolling-candidate",
+            "rolling-strategy",
+            payload,
+            status="FROZEN",
+        )
+        provider = _PagedProvider(
+            (closed, no_orders),
+            ({"markets": (), "next_cursor": None},),
+        )
+
+        cycle = self._collector(provider, store, ()).collect_once(now=T0)
+
+        self.assertEqual(list(cycle.candidate_bound_scheduled), [])
+        self.assertEqual(len(store.resolutions), 1)
+        resolution = store.resolutions[0]
+        self.assertEqual(resolution.status, "DEFERRED")
+
+        self.assertEqual(
+            {item.reason for item in resolution.excluded_markets},
+            {"MARKET_CLOSED", "ACCEPTING_ORDERS_FALSE"},
+        )
+        self.assertEqual(
+            {item.reason for item in resolution.deferred_markets},
+            {"NOT_OBSERVED"},
+        )
+
+
+    def test_direct_exact_snapshot_overrides_stale_carried_inventory_before_resolver_cap(self) -> None:
+        fresh = market("carried-duplicate")
+        stale = replace(
+            fresh,
+            active=True,
+            closed=True,
+            settlement=SettlementState.RESOLVED_YES,
+        )
+        store = _ScopeStore(
+            {
+                "candidate": {
+                    "experiment_plan": {
+                        "market_scope": scope(
+                            "EXACT_MARKETS",
+                            market_ids=("carried-duplicate",),
+                        )
+                    }
+                }
+            }
+        )
+        provider = _PagedProvider(
+            (fresh,),
+            ({"markets": (), "next_cursor": None},),
+        )
+        carried = [
+            dict(PolymarketCollector._scope_market_record(stale, T0, provider)),
+            *({"market_id": f"carried-{index:04d}"} for index in range(999)),
+        ]
+        store.states["polymarket"] = {
+            "scope_inventory_continuation": {
+                "coverage_status": "PARTIAL",
+                "after_cursor": "opaque-carried",
+                "inventory_records": carried,
+            }
+        }
+
+        cycle = self._collector(provider, store, ("candidate",)).collect_once(now=T0)
+
+        self.assertEqual(list(cycle.candidate_bound_scheduled), ["carried-duplicate"])
+        self.assertEqual(len(store.resolutions), 1)
+        self.assertEqual(
+            [item.market_id for item in store.resolutions[0].matched_markets],
+            ["carried-duplicate"],
+        )
+
+    def test_failed_direct_exact_lookup_does_not_fall_back_to_stale_carried_record(self) -> None:
+        class FailingDirectProvider(_PagedProvider):
+            def market(self, market_id: str):
+                self.market_calls.append(str(market_id))
+                raise RuntimeError("direct lookup unavailable")
+
+        stale = market("failed-carried")
+        store = _ScopeStore(
+            {
+                "candidate": {
+                    "experiment_plan": {
+                        "market_scope": scope(
+                            "EXACT_MARKETS",
+                            market_ids=("failed-carried",),
+                        )
+                    }
+                }
+            }
+        )
+        provider = FailingDirectProvider(
+            (stale,),
+            ({"markets": (), "next_cursor": None},),
+        )
+        store.states["polymarket"] = {
+            "scope_inventory_continuation": {
+                "coverage_status": "PARTIAL",
+                "after_cursor": "opaque-failed",
+                "inventory_records": [
+                    dict(PolymarketCollector._scope_market_record(stale, T0, provider))
+                ],
+            }
+        }
+
+        cycle = self._collector(provider, store, ("candidate",)).collect_once(now=T0)
+
+        self.assertEqual(list(cycle.candidate_bound_scheduled), [])
+        self.assertEqual(len(store.resolutions), 1)
+        resolution = store.resolutions[0]
+        self.assertEqual(resolution.status, "DEFERRED")
+        self.assertEqual(
+            [(item.market_id, item.reason) for item in resolution.deferred_markets],
+            [("failed-carried", "NOT_OBSERVED")],
+        )
+
+    def test_scope_persistence_unavailable_fails_closed_without_legacy_authority(self) -> None:
+        provider = _RecordingProvider((market("scope-store-unavailable"),))
+        store = _ScopeStore(
+            {
+                "candidate": {
+                    "experiment_plan": {
+                        "market_scope": scope(
+                            "EXACT_MARKETS",
+                            market_ids=("scope-store-unavailable",),
+                        )
+                    }
+                }
+            }
+        )
+        store.save_market_scope_resolution = None  # type: ignore[method-assign]
+
+        cycle = self._collector(provider, store, ("candidate",)).collect_once(now=T0)
+
+        self.assertEqual(list(cycle.candidate_bound_markets), [])
+        self.assertEqual(list(cycle.candidate_bound_scheduled), [])
+        self.assertEqual(store.resolutions, [])
+        self.assertNotIn("scope-store-unavailable", provider.market_calls)
+    def test_closed_current_scope_drops_deadline_resume_id(self) -> None:
+        open_market = market("resume-exact")
+        store = _ScopeStore(
+            {
+                "candidate": {
+                    "experiment_plan": {
+                        "market_scope": scope(
+                            "EXACT_MARKETS",
+                            market_ids=("resume-exact",),
+                        )
+                    }
+                }
+            }
+        )
+        provider = _RecordingProvider((open_market,))
+
+        collector = self._collector(provider, store, ("candidate",))
+        collector.collect_once(now=T0)
+        first_market_call_count = provider.market_calls.count("resume-exact")
+        provider._markets["resume-exact"] = replace(
+            open_market,
+            active=False,
+            closed=True,
+            settlement=SettlementState.RESOLVED_YES,
+        )
+        store.states["polymarket"]["cycle_continuation"] = {
+            "remaining_market_ids": ["resume-exact"],
+        }
+
+        second = collector.collect_once(now=T0 + timedelta(seconds=61))
+
+        self.assertEqual(list(second.candidate_bound_scheduled), [])
+        self.assertEqual(
+            provider.market_calls.count("resume-exact") - first_market_call_count,
+            1,
+        )
+        self.assertEqual(
+            [item.reason for item in store.resolutions[-1].excluded_markets],
+            ["INACTIVE_MARKET"],
+        )
+
 
     def test_shared_bounded_discovery_and_only_resolved_markets_are_scheduled(self) -> None:
         fixtures = (

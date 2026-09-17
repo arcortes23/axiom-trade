@@ -14,7 +14,8 @@ from .domain import ResearchQuality, ensure_utc, parse_timestamp, utc_now
 from .research_bus import ResearchBusPermissionError, _validate_payload
 from .storage import AxiomStore
 from .risk import RiskLimits
-
+from .strategy.dsl import PREDICTION_FAMILIES
+from .strategy.signals import _prediction_requires_model
 
 _PRIVATE_FORWARD_TOKENS = frozenset(
     {
@@ -252,6 +253,61 @@ def _canonical_forward_config(config: Mapping[str, Any] | None = None) -> dict[s
     return _plain_json(_canonical_scope_config(result))
 
 
+
+_MODEL_FREE_DOCUMENT = {"model_required": False}
+
+
+def _model_free_marker(value: Any) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and value.get("model_required") is False
+        and set(value) == {"model_required"}
+    )
+
+
+def _prediction_strategy_model_required(strategy: Any) -> bool | None:
+    """Return the existing built-in model requirement for prediction families."""
+    document = strategy
+    if not isinstance(document, Mapping):
+        to_dict = getattr(document, "to_dict", None)
+        if callable(to_dict):
+            try:
+                document = to_dict()
+            except Exception:
+                return None
+        elif isinstance(getattr(document, "definition", None), Mapping):
+            document = getattr(document, "definition")
+    if isinstance(document, Mapping):
+        nested = document.get("strategy_document", document.get("canonical_strategy"))
+        if isinstance(nested, Mapping):
+            document = nested
+    if not isinstance(document, Mapping):
+        return None
+    market_type = str(document.get("market_type", "")).strip().lower()
+    if market_type not in {"prediction", "prediction_market"}:
+        return None
+    family = str(document.get("family", document.get("template", ""))).strip().lower()
+    if not family or family not in PREDICTION_FAMILIES:
+        return None
+    if not _prediction_requires_model(family):
+        return False
+    if str(document.get("probability_model", "")).strip().lower() == "market":
+        return False
+    return True
+
+
+def _normalize_model_document(
+    strategy: Any,
+    model: Any,
+    configured: Any = None,
+) -> tuple[Any, Any]:
+    """Canonicalize model input for model-independent prediction work."""
+    required = _prediction_strategy_model_required(strategy)
+    model_source = getattr(model, "document", model)
+    if required is False:
+        marker = dict(_MODEL_FREE_DOCUMENT)
+        return marker, marker
+    return model_source, configured
 def _merge_exact_observation_bindings(
     config: Mapping[str, Any] | None,
     *,
@@ -672,11 +728,17 @@ class ForwardTestRegistry:
         intent_config.setdefault(
             "strategy_document", _normalized_strategy_document(strategy)
         )
+        strategy_for_model = intent_config.get("strategy_document", strategy)
         source_model_document = getattr(model, "document", model)
-        if "model_document" not in intent_config and isinstance(
-            source_model_document, Mapping
-        ):
-            intent_config["model_document"] = dict(source_model_document)
+        normalized_model, configured_model = _normalize_model_document(
+            strategy_for_model,
+            source_model_document,
+            intent_config.get("model_document"),
+        )
+        if isinstance(configured_model, Mapping):
+            intent_config["model_document"] = dict(configured_model)
+        elif isinstance(normalized_model, Mapping):
+            intent_config["model_document"] = dict(normalized_model)
         _frozen_runtime_documents(strategy, model, intent_config)
         if scope_resolution is not None:
             proof = _scope_resolution_mapping(scope_resolution)
@@ -694,7 +756,7 @@ class ForwardTestRegistry:
             strategy,
             _canonical_forward_config(intent_config),
         )
-        computed_model_hash = _content_hash(getattr(model, "document", model))
+        computed_model_hash = _content_hash(normalized_model)
         normalized_risk_limits = dict(risk_limits or {})
         identity_material = {
             "candidate_id": identifier,
@@ -783,13 +845,23 @@ class ForwardTestRegistry:
         strategy_document = source_config.get("strategy_document")
         if not isinstance(strategy_document, Mapping):
             strategy_document = source_config.get("strategy", source_config.get("canonical_strategy"))
+        if not isinstance(strategy_document, Mapping):
+            raise ValueError("observation intent strategy document is missing")
         model_document = source_config.get("model_document")
         if not isinstance(model_document, Mapping):
             model_document = source_config.get("model")
-        if not isinstance(strategy_document, Mapping):
-            raise ValueError("observation intent strategy document is missing")
-        if not isinstance(model_document, Mapping):
+        model_required = _prediction_strategy_model_required(strategy_document)
+        if model_required is False:
+            # Materialized specs never carry an executable model for a
+            # model-independent family, even when a caller supplied one.
+            model_document = dict(_MODEL_FREE_DOCUMENT)
+            source_config["model_document"] = dict(model_document)
+        elif not isinstance(model_document, Mapping):
+            if model_required is True:
+                raise ValueError("MODEL_INPUT_MISSING")
             raise ValueError("observation intent model document is missing")
+        elif _model_free_marker(model_document):
+            raise ValueError("MODEL_INPUT_MISSING")
         source_candidate = str(source_config.get("candidate_id", "")).strip()
         if not source_candidate:
             source_candidate = source.experiment_id.removeprefix("observation-intent-").strip()
@@ -959,14 +1031,20 @@ def _frozen_runtime_documents(
     ):
         raise ValueError("config strategy_document does not match frozen strategy")
     model_source = getattr(model, "document", model)
+    configured_model = config_model_document
+    if _model_free_marker(configured_model):
+        if _prediction_strategy_model_required(strategy) is not False:
+            raise ValueError("MODEL_INPUT_MISSING")
+        model_source = dict(_MODEL_FREE_DOCUMENT)
+        configured_model = dict(_MODEL_FREE_DOCUMENT)
     if (
-        isinstance(config_model_document, Mapping)
-        and _content_hash(config_model_document) != _content_hash(model_source)
+        isinstance(configured_model, Mapping)
+        and _canonical(configured_model) != _canonical(model_source)
     ):
         raise ValueError("config model_document does not match frozen model")
     return (
         config_document if isinstance(config_document, Mapping) else strategy,
-        config_model_document if isinstance(config_model_document, Mapping) else model_source,
+        configured_model if isinstance(configured_model, Mapping) else model_source,
     )
 
 

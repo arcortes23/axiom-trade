@@ -30,10 +30,13 @@ from .domain import (
 )
 from .forward import (
     ForwardTestSpec,
+    _MODEL_FREE_DOCUMENT,
     _content_hash,
+    _model_free_marker,
     _normalized_strategy_document,
     _paper_assumption_costs,
     _paper_assumptions_explicit,
+    _prediction_strategy_model_required,
     _SUPPORTED_PAPER_SIZING_MODELS,
 )
 from .paper import PaperTrader, PaperTradingConfig, SHADOW_METADATA_KEYS, _shadow_metadata
@@ -53,6 +56,22 @@ PAPER_STATE_EXECUTION_BINDING_MISMATCH = "PAPER_STATE_EXECUTION_BINDING_MISMATCH
 PAPER_STATE_OPERATIONAL_COUNTERS_INVALID = "PAPER_STATE_OPERATIONAL_COUNTERS_INVALID"
 PAPER_STATE_FILL_RESTORE_OVERFLOW = "PAPER_STATE_FILL_RESTORE_OVERFLOW"
 PAPER_STATE_FILL_RESTORE_COUNT_MISMATCH = "PAPER_STATE_FILL_RESTORE_COUNT_MISMATCH"
+_MODEL_OBSERVATION_ALIASES = (
+    "model_probability",
+    "probability",
+    "predicted_probability",
+    "p",
+    "model_evaluation",
+)
+
+
+def _strip_model_observation_aliases(value: Any) -> Any:
+    if not isinstance(value, Mapping):
+        return value
+    result = dict(value)
+    for key in _MODEL_OBSERVATION_ALIASES:
+        result.pop(key, None)
+    return result
 
 _UNRESOLVED_OPERATIONAL_STATUSES = frozenset(
     {
@@ -569,13 +588,31 @@ class ForwardPaperEngine:
         if not isinstance(spec, ForwardTestSpec):
             raise TypeError("spec must be a ForwardTestSpec")
         self._provider_errors: list[str] = []
-        if isinstance(spec.config, Mapping) and bool(spec.config.get("historical_replay")) and storage_namespace is None:
+        if (
+            isinstance(spec.config, Mapping)
+            and bool(spec.config.get("historical_replay"))
+            and storage_namespace is None
+        ):
             raise ValueError("historical replay specs require run_historical_replay")
         self.spec = spec
         self.store = store
         self.provider = provider
-        self.model = model
         self.strategy = strategy
+        config_view = spec.config if isinstance(spec.config, Mapping) else {}
+        configured_strategy = config_view.get("strategy_document")
+        if not isinstance(configured_strategy, Mapping):
+            configured_strategy = getattr(strategy, "definition", strategy)
+        frozen_model_document = config_view.get("model_document")
+        marker_hash = _content_hash(_MODEL_FREE_DOCUMENT)
+        marker_document = _model_free_marker(frozen_model_document)
+        if marker_document and _prediction_strategy_model_required(configured_strategy) is not False:
+            raise ValueError("MODEL_INPUT_MISSING")
+        self._model_free = (
+            marker_document
+            and _content_hash(frozen_model_document) == marker_hash
+            and str(spec.model_hash).strip() == marker_hash
+        )
+        self.model = dict(_MODEL_FREE_DOCUMENT) if self._model_free else model
         self.config, self._allocated_capital = _paper_config_from_spec(spec, config)
         self._run_id = str(storage_namespace or spec.experiment_id).strip()
         if not self._run_id:
@@ -844,7 +881,10 @@ class ForwardPaperEngine:
         }
         stored_history = self._state.get("signal_history_by_market", {})
         self._signal_history: dict[str, list[Any]] = {
-            str(key): list(value[-512:])
+            str(key): [
+                _strip_model_observation_aliases(item) if self._model_free else item
+                for item in value[-512:]
+            ]
             for key, value in stored_history.items()
             if isinstance(value, (list, tuple))
         } if isinstance(stored_history, Mapping) else {}
@@ -866,7 +906,7 @@ class ForwardPaperEngine:
         self._restore_risk_status()
         strategy_document = _normalized_strategy_document(getattr(strategy, "definition", strategy))
         self._strategy_document = strategy_document
-        model_document = getattr(model, "document", model)
+        model_document = getattr(self.model, "document", self.model)
         if _content_hash(strategy_document) != spec.strategy_hash:
             raise ValueError("strategy does not match the frozen forward-test hash")
         if _content_hash(model_document) != spec.model_hash:
@@ -1705,7 +1745,13 @@ class ForwardPaperEngine:
             if not market_id:
                 continue
             observation = dict(payload)
-            if not self._model_state_restored and not _is_terminal(observation.get("settlement")):
+            if self._model_free:
+                observation = _strip_model_observation_aliases(observation)
+            if (
+                not self._model_free
+                and not self._model_state_restored
+                and not _is_terminal(observation.get("settlement"))
+            ):
                 model_evaluation = _model_probability_evaluation(self.model, observation)
                 if model_evaluation.probability is not None and "model_probability" not in observation:
                     observation["model_probability"] = model_evaluation.probability
@@ -1825,6 +1871,8 @@ class ForwardPaperEngine:
                 errors.append("malformed prediction observation")
                 continue
             market_id, observation, yes_book, no_book = normalized
+            if self._model_free:
+                observation = _strip_model_observation_aliases(observation)
             market_scope_key = self._observation_scope_key(market_id, observation)
             terminal = _is_terminal(observation.get("settlement"))
 
@@ -1922,7 +1970,7 @@ class ForwardPaperEngine:
                 continue
             model_state_before = _snapshot_object_state(self.model)
             model_evaluation = None
-            if not terminal:
+            if not terminal and not self._model_free:
                 try:
                     model_evaluation = _model_probability_evaluation(self.model, observation)
                 except Exception as exc:
@@ -1956,9 +2004,10 @@ class ForwardPaperEngine:
                     "history": signal_inputs,
                     "market_id": market_id,
                 }
-                model_document = getattr(self.model, "document", self.model)
-                if model_document is not None:
-                    evaluation_data["model_document"] = model_document
+                if not self._model_free:
+                    model_document = getattr(self.model, "document", self.model)
+                    if model_document is not None:
+                        evaluation_data["model_document"] = model_document
                 try:
                     strategy_evaluation = evaluate_signal_evaluation(self._strategy_document, evaluation_data)
                 except (TypeError, ValueError):

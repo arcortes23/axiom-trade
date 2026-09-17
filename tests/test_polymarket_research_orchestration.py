@@ -14,6 +14,7 @@ from axiom.autonomous import (
     _proposal_identity,
 )
 from axiom.experiment_plan import ExperimentPlan
+from axiom.market_scope import resolve_market_scope
 from axiom.legacy_scope import LegacyScopeError, create_legacy_successor
 from axiom.lifecycle import CandidateLifecycleManager, CandidateStage
 from axiom.storage import AxiomStore
@@ -527,6 +528,78 @@ class PolymarketResearchOrchestrationTests(unittest.TestCase):
                 state["trials"][0]["operational_setup_hash"],
                 queued[0].payload["operational_setup_hash"],
             )
+
+    def test_materialized_directional_binding_uses_model_free_marker(self) -> None:
+        with AxiomStore(":memory:") as store:
+            _save_attested_campaign_dataset(store)
+            processor = AutonomousResearchProcessor(store, clock=lambda: T0)
+            processor.start_polymarket_campaign(
+                "directional-materialized-binding",
+                dataset_id="campaign-history",
+                dataset_version="v1",
+                now=T0,
+            )
+            cycle = processor.process_pending(now=T0)
+            self.assertEqual(cycle.failed, 0, repr(cycle))
+            candidate = store.load_candidate_lifecycle(limit=None)[0]
+            candidate_id = str(candidate["candidate_id"])
+            payload = candidate["payload"]
+            plan_record = store.load_experiment_plan(payload["plan_id"])
+            self.assertIsNotNone(plan_record)
+            assert plan_record is not None
+            plan = ExperimentPlan.from_mapping(
+                plan_record["plan"],
+                hypothesis_id=payload["hypothesis_id"],
+            )
+            registry = ForwardTestRegistry(store)
+            intent = registry.get(payload["paper_observation_intent_id"])
+            self.assertIsNotNone(intent)
+            assert intent is not None
+            scope_market = {
+                "market_id": "campaign-market",
+                "condition_id": "condition-campaign-market",
+                "yes_token_id": "yes-campaign-market",
+                "no_token_id": "no-campaign-market",
+                "instrument": "POLYMARKET",
+                "instrument_type": "POLYMARKET",
+                "market_type": "prediction",
+                "venue": "POLYMARKET",
+                "provider": "campaign-test",
+                "source": "campaign-test",
+                "source_type": "CURRENT",
+                "active": True,
+                "open": True,
+                "closed": False,
+                "accepting_orders": True,
+                "order_book_available": True,
+                "settlement": "open",
+                "expiry": None,
+                "metadata_provenance": {
+                    "source_type": "CURRENT",
+                    "provider": "campaign-test",
+                    "instrument": "POLYMARKET",
+                    "venue": "POLYMARKET",
+                    "observed_at": T0.isoformat(),
+                },
+            }
+            resolution = resolve_market_scope(
+                candidate_id,
+                {"market_scope": plan.market_scope.as_dict()},
+                [scope_market],
+                resolved_at=T0,
+            )
+            store.save_market_scope_resolution(resolution)
+            registry.materialize_observation_intent(
+                intent,
+                allowed_markets=("campaign-market",),
+                registration_timestamp=T0,
+                now=T0,
+                scope_resolution=resolution,
+            )
+            binding = processor._materialized_observation_binding(candidate_id, payload)
+            self.assertIsNotNone(binding)
+            assert binding is not None
+            self.assertEqual(binding[0].config["model_document"], {"model_required": False})
 
     def test_attestation_rotation_changes_forward_setup_identity(self) -> None:
         strategy_document = {

@@ -88,6 +88,32 @@ class MarketScopeStrategyInputTests(unittest.TestCase):
         self.assertTrue(all(record["market_id"] in {"a", "b"} for record in backtest.equity_curve))
         self.assertTrue(all(record["reason_code"] for record in backtest.equity_curve))
 
+    def test_directional_families_produce_or_decline_without_model_input(self) -> None:
+        produced = evaluate_signal_evaluation(
+            prediction_strategy("momentum", lookback=1, threshold=0.05),
+            {
+                "market_id": "a",
+                "observations": [snapshot("a", T0, 0.40), snapshot("a", T0 + timedelta(minutes=1), 0.50)],
+            },
+        )
+        self.assertEqual(produced.reason_code, SIGNAL_PRODUCED)
+        self.assertGreater(produced.score, 0.0)
+        self.assertEqual(produced.evidence["assessment_type"], DIRECTIONAL_OOS_TRADING)
+        self.assertIsNone(produced.evidence["model"]["probability"])
+
+        declined = evaluate_signal_evaluation(
+            prediction_strategy("mean_reversion", lookback=1, threshold=0.05),
+            {
+                "market_id": "a",
+                "observations": [snapshot("a", T0, 0.50), snapshot("a", T0 + timedelta(minutes=1), 0.50)],
+            },
+        )
+        self.assertEqual(declined.reason_code, STRATEGY_EVALUATED_DECLINED)
+        self.assertEqual(declined.score, 0.0)
+        self.assertEqual(declined.side, "flat")
+        self.assertIsNone(declined.evidence["model"]["probability"])
+
+
     def test_absolute_move_boundary_is_inclusive_for_momentum_and_mean_reversion(self) -> None:
         cases = {
             "momentum": (

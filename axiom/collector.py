@@ -151,6 +151,10 @@ _MAX_SCOPE_INVENTORY = 10_000
 # existing ranking/lifecycle query caps.
 _MAX_SCOPE_RESOLUTION_MARKETS = 1_000
 _MAX_SCOPE_RESOLUTION_CANDIDATES = 1_000
+_MAX_CANDIDATE_BOUND_MARKETS = 100
+
+_MAX_SCOPE_DIRECT_LOOKUPS = 256
+
 # Discovery may assess one shared set of assumptions across the complete
 # durable inventory before candidate-specific resolution begins.  The product
 # therefore adds one inventory-sized discovery set to the resolver matrix.
@@ -419,6 +423,12 @@ class PolymarketCollector:
         # selected member has no exact scope resolution, discovery must not
         # widen the cycle back to the public catalog.
         self._rolling_scope_blocked = False
+        self._rolling_scope_candidate_ids: tuple[str, ...] = ()
+        self._rolling_scope_documents: dict[str, Mapping[str, Any]] = {}
+        self._scope_authority_market_ids: set[str] = set()
+
+        self._scope_direct_lookup_cursor = 0
+
         # The nested continuation is assembled during scope discovery and
         # persisted with the root collector state at the end of the cycle.
         self._scope_inventory_continuation: Mapping[str, Any] | None = None
@@ -545,6 +555,8 @@ class PolymarketCollector:
             if isinstance(persisted_scope_continuation, Mapping)
             else None
         )
+        self._scope_direct_lookup_cursor = self._scope_direct_cursor(root_state)
+
         self._discovery_continuation = (
             root_state.get("discovery_continuation")
             if isinstance(root_state.get("discovery_continuation"), Mapping)
@@ -552,6 +564,16 @@ class PolymarketCollector:
         )
         requested = tuple(dict.fromkeys(str(item).strip() for item in (market_ids or ()) if str(item).strip()))
         rolling_scope_ids = self._rolling_scope_market_ids()
+        rolling_exact_scope_ids = {
+            market_id
+            for document in getattr(self, "_rolling_scope_documents", {}).values()
+            if isinstance(document, Mapping)
+            for market_id in self._scope_exact_market_ids((document,))
+        }
+        rolling_non_exact_ids = tuple(
+            item for item in rolling_scope_ids if item not in rolling_exact_scope_ids
+        )
+
         configured = requested or self.config.market_ids
         self._scope_suitability_cache = {}
         self._scope_refresh_attempted = set()
@@ -566,10 +588,15 @@ class PolymarketCollector:
             for item in root_state.get("observation_materialization_deferred_candidate_ids", ())
             if str(item).strip()
         )[:_MAX_SCOPE_RESOLUTION_CANDIDATES]
-        configured_values = tuple(dict.fromkeys([*configured, *rolling_scope_ids]))
-        primary_candidate_ids = self._active_primary_candidate_ids() or []
+        configured_values = tuple(dict.fromkeys([*configured, *rolling_non_exact_ids]))
+
+        primary_candidate_ids = list(dict.fromkeys([
+            *(self._active_primary_candidate_ids() or ()),
+            *getattr(self, "_rolling_scope_candidate_ids", ()),
+        ]))
         paper_ids = self._active_paper_forward_ids()
         observation_intent_ids = self._active_observation_intent_ids()
+
         primary_candidate_set = set(primary_candidate_ids)
         paper_set = set(paper_ids)
         observation_set = set(observation_intent_ids)
@@ -593,6 +620,21 @@ class PolymarketCollector:
                     counters,
                 )
             )
+            scope_authorized_market_ids = {
+                market_id
+                for values in scope_candidate_markets.values()
+                for market_id in values
+            }
+            resume_ids = [
+                market_id
+                for market_id in resume_ids
+                if (
+                    market_id not in self._scope_authority_market_ids
+                    or market_id in scope_authorized_market_ids
+                )
+            ]
+
+
         finally:
             self._scope_phase_active = False
         if isinstance(self._scope_inventory_continuation, Mapping):
@@ -663,13 +705,28 @@ class PolymarketCollector:
                 for item in configured
                 if item in allowed_scope_ids and item not in configured_values
             )
-            # Rolling members are an independent market authority; retain their
-            # union even when legacy candidate scope resolution is populated.
-            configured_values = tuple(dict.fromkeys([*configured_values, *rolling_scope_ids]))
+            # Rolling rule-scope members remain an independent market
+            # authority; exact ids are scheduled only from their resolver
+            # matches above.
+            configured_values = tuple(dict.fromkeys([
+                *configured_values,
+                *rolling_non_exact_ids,
+            ]))
         if configured_values:
             candidate_bound = list(dict.fromkeys([*configured_values, *candidate_bound]))
             for identifier in configured_values:
                 candidate_references.setdefault(identifier, [])
+        candidate_bound = list(dict.fromkeys(candidate_bound))[:_MAX_CANDIDATE_BOUND_MARKETS]
+        candidate_bound_set = set(candidate_bound)
+        candidate_references = {
+            market_id: references
+            for market_id, references in candidate_references.items()
+            if market_id in candidate_bound_set
+        }
+        configured_values = tuple(
+            market_id for market_id in configured_values if market_id in candidate_bound_set
+        )
+
 
         # The storage health projection consumes the legacy authority shape.
         # Project resolved scope ids into that shape without asking storage to
@@ -857,6 +914,7 @@ class PolymarketCollector:
         ]))[:capacity]
         for market_id in resume_ids:
             tier_by_market.setdefault(market_id, "discovery")
+
         workers = self._isolated_worker_providers()
 
         def run_one(identifier: str, worker_provider: Any | None = None) -> tuple[str, dict[str, Any]]:
@@ -1204,6 +1262,11 @@ class PolymarketCollector:
                 "discovery_complete": discovery_complete,
                 "scope_discovery_carry_cursor": scope_cursor,
                 "scope_inventory_continuation": self._scope_inventory_continuation,
+                "scope_direct_lookup_cursor": max(0, min(
+                    _MAX_SCOPE_INVENTORY,
+                    int(self._scope_direct_lookup_cursor),
+                )),
+
                 "scope_resolution_deferred_candidate_ids": list(
                     self._scope_resolution_deferred_candidate_ids
                 )[:_MAX_SCOPE_RESOLUTION_CANDIDATES],
@@ -1342,7 +1405,10 @@ class PolymarketCollector:
         blocks rolling discovery rather than widening into the public catalog.
         """
         self._rolling_scope_blocked = False
+        self._rolling_scope_candidate_ids = ()
+        self._rolling_scope_documents = {}
         selection_loader = getattr(self.store, "load_current_portfolio_selection", None)
+
         if not callable(selection_loader):
             return []
         try:
@@ -1355,7 +1421,7 @@ class PolymarketCollector:
         if not isinstance(selection, Mapping):
             self._rolling_scope_blocked = True
             return []
-        members = selection.get("members", ())
+        members = selection.get("members", selection.get("selected_members", ()))
         if not isinstance(members, (list, tuple)):
             self._rolling_scope_blocked = True
             return []
@@ -1439,7 +1505,6 @@ class PolymarketCollector:
         execute = getattr(connection, "execute", None)
         if not callable(execute):
             self._rolling_scope_blocked = True
-            return []
 
         for member in members:
             if not isinstance(member, Mapping):
@@ -1449,23 +1514,38 @@ class PolymarketCollector:
             if not strategy_version_id:
                 self._rolling_scope_blocked = True
                 continue
-            try:
-                row = execute(
-                    "SELECT payload_json FROM strategy_versions WHERE strategy_version_id=?",
-                    (strategy_version_id,),
-                ).fetchone()
-            except Exception:
-                row = None
-            if row is None:
-                self._rolling_scope_blocked = True
-                continue
-            try:
-                payload = json.loads(row[0]) if isinstance(row[0], str) else row[0]
-            except Exception:
-                payload = None
+            payload: Any = None
+            if callable(execute):
+                try:
+                    row = execute(
+                        "SELECT payload_json FROM strategy_versions WHERE strategy_version_id=?",
+                        (strategy_version_id,),
+                    ).fetchone()
+                except Exception:
+                    row = None
+                if row is not None:
+                    try:
+                        payload = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+                    except Exception:
+                        payload = None
+            else:
+                for name in (
+                    "payload",
+                    "frozen_document",
+                    "strategy_document",
+                    "experiment_plan",
+                    "market_scope",
+                ):
+                    value = member.get(name)
+                    if isinstance(value, Mapping):
+                        payload = member if name in {"experiment_plan", "market_scope"} else value
+                        break
+                if payload is None and self._has_scope_material(member):
+                    payload = member
             if not isinstance(payload, Mapping):
                 self._rolling_scope_blocked = True
                 continue
+
 
             documents: list[Mapping[str, Any]] = [payload]
             for name in (
@@ -1574,8 +1654,19 @@ class PolymarketCollector:
                 continue
             if not canonical_scope_seen:
                 member_ids.extend(legacy_ids)
+            exact_scope_seen = any(
+                str(scope.get("mode", "")).strip().upper() == "EXACT_MARKETS"
+                for scope in scope_documents
+            )
+            if exact_scope_seen and candidate_id:
+                self._rolling_scope_candidate_ids = tuple(dict.fromkeys([
+                    *self._rolling_scope_candidate_ids,
+                    candidate_id,
+                ]))
+                self._rolling_scope_documents[candidate_id] = self._scope_document(payload)
             result.extend(member_ids)
         return list(dict.fromkeys(result))[: self.config.max_markets]
+
 
     def _active_primary_candidate_ids(self) -> list[str] | None:
         """Return the currently selected/eligible ranking universe.
@@ -1789,14 +1880,21 @@ class PolymarketCollector:
         method only supplies bounded current records and projects matched
         market ids into the existing fair scheduler.
         """
+        self._scope_authority_market_ids = set()
+
         try:
             from .market_scope import resolve_market_scope
         except (ImportError, AttributeError):
             resolve_market_scope = None
         saver = getattr(self.store, "save_market_scope_resolution", None)
         loader = getattr(self.store, "load_candidate_lifecycle", None)
-        if not callable(resolve_market_scope) or not callable(loader):
+        rolling_documents = getattr(self, "_rolling_scope_documents", {})
+        if (
+            not callable(resolve_market_scope)
+            or (not callable(loader) and not rolling_documents)
+        ):
             return [], {}, {}, self._scope_cursor(root_state)
+
 
         documents: list[tuple[str, Mapping[str, Any]]] = []
         scope_candidate_ids: list[str] = []
@@ -1815,11 +1913,24 @@ class PolymarketCollector:
         ]))
         for candidate_id in candidate_order:
             try:
-                record = loader(candidate_id)
+                record = loader(candidate_id) if callable(loader) else None
             except (AttributeError, KeyError, TypeError, ValueError):
-                continue
+                record = None
+            if not isinstance(record, Mapping):
+                rolling_document = (
+                    rolling_documents.get(candidate_id)
+                    if isinstance(rolling_documents, Mapping)
+                    else None
+                )
+                if isinstance(rolling_document, Mapping):
+                    record = {
+                        "candidate_id": candidate_id,
+                        "stage": "FROZEN",
+                        "payload": dict(rolling_document),
+                    }
             if not isinstance(record, Mapping):
                 continue
+
             stage = str(record.get("stage", "")).strip().upper()
             payload = record.get("payload")
             if not isinstance(payload, Mapping):
@@ -1834,8 +1945,21 @@ class PolymarketCollector:
                 scope_candidate_ids.append(candidate_id)
                 if len(documents) < _MAX_SCOPE_RESOLUTION_CANDIDATES:
                     documents.append((candidate_id, self._scope_document(payload)))
+        self._scope_authority_market_ids = set(
+            list(dict.fromkeys(
+                market_id
+                for _, document in documents
+                for market_id in self._scope_exact_market_ids((document,))
+            ))[:_MAX_SCOPE_INVENTORY]
+        )
+
         if not documents:
             return scope_candidate_ids, {}, {}, self._scope_cursor(root_state)
+        if not callable(saver):
+            # A canonical scope without a persistence path cannot become
+            # legacy collection authority or silently schedule its ids.
+            return scope_candidate_ids, {}, {}, self._scope_cursor(root_state)
+
         carry_cursor = self._scope_cursor(root_state)
         needs_inventory = any(
             self._scope_document_needs_inventory(document)
@@ -1859,6 +1983,101 @@ class PolymarketCollector:
                 return scope_candidates, {}, {}, next_cursor
         else:
             current_records, snapshots, next_cursor = [], {}, carry_cursor
+
+        exact_ids = list(dict.fromkeys(
+            market_id
+            for _, document in documents
+            for market_id in self._scope_exact_market_ids((document,))
+        ))[:_MAX_SCOPE_INVENTORY]
+        direct_attempted_ids: set[str] = set()
+        direct_snapshots: dict[str, PredictionMarketSnapshot] = {}
+
+
+
+        known_inventory_ids = {
+            str(market_id).strip()
+            for market_id in snapshots
+            if str(market_id).strip()
+        }
+        missing_exact_ids = [
+            market_id for market_id in exact_ids if market_id not in known_inventory_ids
+        ]
+        direct_fetcher = getattr(self.provider, "market", None)
+        if missing_exact_ids and callable(direct_fetcher):
+            try:
+                direct_cursor = int(self._scope_direct_lookup_cursor)
+            except (TypeError, ValueError):
+                direct_cursor = 0
+            direct_cursor %= len(missing_exact_ids)
+            direct_ids = [
+                missing_exact_ids[(direct_cursor + offset) % len(missing_exact_ids)]
+                for offset in range(min(_MAX_SCOPE_DIRECT_LOOKUPS, len(missing_exact_ids)))
+            ]
+            attempted_direct = 0
+            for market_id in direct_ids:
+                if (
+                    self._cycle_remaining_seconds() is not None
+                    and self._cycle_remaining_seconds() <= 0
+                ):
+                    self._mark_cycle_exhaustion("scope_exact_lookup")
+                    break
+                direct_attempted_ids.add(market_id)
+                attempted_direct += 1
+
+                try:
+                    direct_snapshot = self._call_provider(
+                        f"scope_exact:/markets/{market_id}",
+                        lambda identifier=market_id: direct_fetcher(identifier),
+                        observed_at,
+                        counters,
+                        provider=self.provider,
+                        market_id=market_id,
+                    )
+                except _ProviderDeadlineExceeded:
+                    self._mark_cycle_exhaustion("scope_exact_lookup")
+                    break
+                except Exception as exc:
+                    counters["errors"] += 1
+                    try:
+                        self.store.save_collection_error(
+                            market_id,
+                            observed_at,
+                            "scope_exact_lookup",
+                            str(exc),
+                        )
+                    except Exception:
+                        pass
+                    continue
+                if not isinstance(direct_snapshot, PredictionMarketSnapshot):
+                    continue
+                if str(direct_snapshot.market_id).strip() != market_id:
+                    continue
+                direct_snapshots[market_id] = direct_snapshot
+                snapshots[market_id] = direct_snapshot
+
+        if direct_attempted_ids:
+            carried_records = [
+                record
+                for record in current_records
+                if not (
+                    isinstance(record, Mapping)
+                    and str(record.get("market_id", "")).strip()
+                    in direct_attempted_ids
+                )
+            ]
+            direct_records = [
+                self._scope_market_record(snapshot, observed_at, self.provider)
+                for snapshot in direct_snapshots.values()
+            ]
+            current_records = [*direct_records, *carried_records]
+
+
+            self._scope_direct_lookup_cursor = (
+                direct_cursor + attempted_direct
+            ) % len(missing_exact_ids)
+        elif not missing_exact_ids:
+            self._scope_direct_lookup_cursor = 0
+
         coverage = (
             str(self._scope_inventory_continuation.get("coverage_status", "")).upper()
             if isinstance(self._scope_inventory_continuation, Mapping)
@@ -1868,13 +2087,11 @@ class PolymarketCollector:
             # The legacy markets(active=True) endpoint returns a complete
             # bounded inventory and has no continuation metadata.
             coverage = "COMPLETE"
-        # Resolver limits are independently bounded from the scheduler's
-        # global market cap.  A candidate may have up to the canonical 100
-        # matches, while this cycle still schedules at most max_markets.
         max_scope_markets = min(
             _MAX_SCOPE_RESOLUTION_MARKETS,
             max(0, len(current_records)),
         )
+
         candidate_markets: dict[str, list[str]] = {}
         deferred_resolution_ids: list[str] = []
         for document_index, (candidate_id, document) in enumerate(documents):
@@ -1894,9 +2111,31 @@ class PolymarketCollector:
             candidate_records = list(current_records)
             candidate_snapshots = dict(self._scope_refreshed_snapshots)
             candidate_snapshots.update(snapshots)
+            policy = self._scope_policy(document)
+            exact_scope = (
+                policy is not None
+                and str(getattr(policy, "mode", "")).upper() == "EXACT_MARKETS"
+            )
             suitability_configured = self._suitability_is_configured(document)
             kwargs = self._suitability_kwargs(document) if suitability_configured else {}
-            # Cached suitable records are safe to reuse immediately.  Cached
+
+            direct_exact_scope = exact_scope and bool(
+                direct_attempted_ids.intersection(
+                    self._scope_exact_market_ids((document,))
+                )
+            )
+            if (
+                coverage != "COMPLETE"
+                and not suitability_configured
+                and not direct_exact_scope
+            ):
+                # A page-local match is not authority without a current
+                # selected-token suitability proof.  Exact ids are resolved
+                # early only after their bounded direct lookup has run.
+                continue
+
+
+
             # unsuitable records wait behind unresolved records so they cannot
             # consume the resolver cap before a later market is assessed.
             if suitability_configured and candidate_snapshots:
@@ -1918,11 +2157,31 @@ class PolymarketCollector:
                     if isinstance(record, Mapping)
                     else 1
                 )
+            fresh_direct_records = [
+                record
+                for record in candidate_records
+                if isinstance(record, Mapping)
+                and str(record.get("market_id", "")).strip() in direct_snapshots
+            ]
+            if fresh_direct_records:
+                fresh_ids = {
+                    str(record.get("market_id", "")).strip()
+                    for record in fresh_direct_records
+                }
+                candidate_records = [
+                    *fresh_direct_records,
+                    *(
+                        record
+                        for record in candidate_records
+                        if (
+                            not isinstance(record, Mapping)
+                            or str(record.get("market_id", "")).strip() not in fresh_ids
+                        )
+                    ),
+                ]
             candidate_records = candidate_records[:max_scope_markets]
-            if coverage != "COMPLETE" and not suitability_configured:
-                # A page-local match is not authority without a current
-                # selected-token suitability proof.
-                continue
+
+
             if suitability_configured:
                 parameters = self._suitability_parameters(document)
                 refreshed_records: list[Mapping[str, Any]] = []
@@ -1997,14 +2256,26 @@ class PolymarketCollector:
                 candidate_records = refreshed_records
                 candidate_snapshots = refreshed_snapshots
                 if coverage != "COMPLETE":
+                    exact_ids_for_candidate = set(
+                        self._scope_exact_market_ids((document,))
+                    ) if exact_scope else set()
                     candidate_records = [
                         record
                         for record in candidate_records
-                        if isinstance(record.get("suitability_evidence"), Mapping)
-                        and str(record["suitability_evidence"].get("action", "")).upper() == "SUITABLE"
+                        if (
+                            exact_scope
+                            and str(record.get("market_id", "")).strip()
+                            in exact_ids_for_candidate
+                        )
+                        or (
+                            isinstance(record.get("suitability_evidence"), Mapping)
+                            and str(record["suitability_evidence"].get("action", "")).upper()
+                            == "SUITABLE"
+                        )
                     ]
                     if not candidate_records:
                         continue
+
             candidate_limit = min(
                 _MAX_SCOPE_RESOLUTION_MARKETS,
                 max(0, len(candidate_records)),
@@ -2068,6 +2339,16 @@ class PolymarketCollector:
             return max(0, int(value))
         except (TypeError, ValueError):
             return 0
+    @staticmethod
+    def _scope_direct_cursor(root_state: Mapping[str, Any]) -> int:
+        value = root_state.get("scope_direct_lookup_cursor", 0)
+        try:
+            cursor = int(value)
+        except (TypeError, ValueError, OverflowError):
+            return 0
+        return max(0, min(_MAX_SCOPE_INVENTORY, cursor))
+
+
     @staticmethod
     def _scope_inventory_records(value: Any) -> list[dict[str, Any]]:
         """Normalize persisted inventory records to the durable inventory cap."""
