@@ -433,7 +433,10 @@ class PolymarketCollector:
         # observation-intent materialization; callers cannot supply market ids
         self._provider_executor_lock = threading.Lock()
         self._provider_executor: _BoundedProviderExecutor | None = None
+        self._scope_provider_executor: _BoundedProviderExecutor | None = None
+        self._collection_provider_executor: _BoundedProviderExecutor | None = None
         self._active_provider_calls: set[tuple[int, str]] = set()
+        self._provider_call_pools: dict[tuple[int, str], str] = {}
         self._provider_timeout_evidence: list[dict[str, Any]] = []
         self._current_stage = "idle"
         self._provider_futures: dict[tuple[int, str], Future[Any]] = {}
@@ -5231,6 +5234,7 @@ class PolymarketCollector:
         operation: Callable[[], Any],
     ) -> tuple[Future[Any], tuple[int, str]]:
         key = (id(provider), str(endpoint))
+        pool_name = "scope" if self._scope_phase_active else "collection"
         with self._provider_executor_lock:
             if key in self._active_provider_calls:
                 existing = self._provider_futures.get(key)
@@ -5250,6 +5254,7 @@ class PolymarketCollector:
                 if existing is not None and existing.done():
                     self._active_provider_calls.discard(key)
                     self._provider_futures.pop(key, None)
+                    self._provider_call_pools.pop(key, None)
                 else:
                     # Never wait beyond this tick on an operation owned by an
                     # earlier tick; its provider thread is daemonized and the
@@ -5264,10 +5269,16 @@ class PolymarketCollector:
                 if existing is not None and existing.done():
                     self._active_provider_calls.discard(active_key)
                     self._provider_futures.pop(active_key, None)
+                    self._provider_call_pools.pop(active_key, None)
             active_for_provider = [
                 active_endpoint
                 for active_provider_id, active_endpoint in self._active_provider_calls
-                if active_provider_id == id(provider)
+                if (
+                    active_provider_id == id(provider)
+                    and self._provider_call_pools.get(
+                        (active_provider_id, active_endpoint)
+                    ) == pool_name
+                )
             ]
             if len(active_for_provider) >= self.config.max_concurrency:
                 active_endpoint = active_for_provider[0]
@@ -5288,22 +5299,31 @@ class PolymarketCollector:
                 if existing is not None and existing.done():
                     self._active_provider_calls.discard((id(provider), active_endpoint))
                     self._provider_futures.pop((id(provider), active_endpoint), None)
+                    self._provider_call_pools.pop((id(provider), active_endpoint), None)
                 else:
                     raise _ProviderDeadlineExceeded(
                         active_endpoint,
                         float(self.config.provider_timeout_seconds),
                         in_flight=True,
                     )
-            executor = self._provider_executor
-            if executor is None:
-                executor = _BoundedProviderExecutor(self.config.max_concurrency)
-                self._provider_executor = executor
+            if pool_name == "scope":
+                executor = self._scope_provider_executor
+                if executor is None:
+                    executor = _BoundedProviderExecutor(self.config.max_concurrency)
+                    self._scope_provider_executor = executor
+            else:
+                executor = self._collection_provider_executor
+                if executor is None:
+                    executor = _BoundedProviderExecutor(self.config.max_concurrency)
+                    self._collection_provider_executor = executor
             self._active_provider_calls.add(key)
+            self._provider_call_pools[key] = pool_name
             try:
                 future = executor.submit(operation)
             except BaseException:
                 self._active_provider_calls.discard(key)
                 self._provider_futures.pop(key, None)
+                self._provider_call_pools.pop(key, None)
                 raise
             self._provider_futures[key] = future
         future.add_done_callback(lambda _future: self._release_provider_call(key))
@@ -5311,6 +5331,7 @@ class PolymarketCollector:
 
     def _release_provider_call(self, key: tuple[int, str]) -> None:
         with self._provider_executor_lock:
+            self._provider_call_pools.pop(key, None)
             self._provider_futures.pop(key, None)
             self._active_provider_calls.discard(key)
 
