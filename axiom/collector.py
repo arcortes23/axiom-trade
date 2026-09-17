@@ -11,7 +11,7 @@ from __future__ import annotations
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed, TimeoutError as FutureTimeout
+from concurrent.futures import FIRST_COMPLETED, Future, TimeoutError as FutureTimeout, wait
 import hashlib
 import inspect
 import json
@@ -285,6 +285,8 @@ class CollectionCycle:
     discovery_coverage_status: str | None = None
     discovery_cursor: str | None = None
     discovery_complete: bool | None = None
+    current_stage: str | None = None
+    current_endpoint: str | None = None
 
     @property
     def duration_seconds(self) -> float:
@@ -337,12 +339,14 @@ class CollectionCycle:
             },
             "tier_attempts": dict(self.tier_attempts or {}),
             "tier_successes": dict(self.tier_successes or {}),
-            "tier_failures": dict(self.tier_failures or {}),
             "request_latency_summary": dict(self.request_latency_summary or {}),
+            "tier_failures": dict(self.tier_failures or {}),
             "capacity_reason": self.capacity_reason,
             "discovery_coverage_status": self.discovery_coverage_status,
             "discovery_cursor": self.discovery_cursor,
             "discovery_complete": self.discovery_complete,
+            "current_stage": self.current_stage,
+            "current_endpoint": self.current_endpoint,
             "provider_timeout_evidence": [dict(item) for item in self.provider_timeout_evidence],
         }
 
@@ -379,12 +383,50 @@ class PolymarketCollector:
         self._scope_inventory_continuation: Mapping[str, Any] | None = None
         # Resolutions produced for this cycle are the only authority passed to
         # observation-intent materialization; callers cannot supply market ids
-        # independently of the resolver proof.
-        self._scope_resolutions: dict[str, Mapping[str, Any]] = {}
         self._provider_executor_lock = threading.Lock()
         self._provider_executor: _BoundedProviderExecutor | None = None
         self._active_provider_calls: set[tuple[int, str]] = set()
         self._provider_timeout_evidence: list[dict[str, Any]] = []
+        self._current_stage = "idle"
+        self._provider_futures: dict[tuple[int, str], Future[Any]] = {}
+        self._current_endpoint: str | None = None
+        self._collection_executor: _BoundedProviderExecutor | None = None
+    def _set_current_stage(
+        self,
+        stage: str,
+        endpoint: str | None,
+        observed_at: datetime | None = None,
+        *,
+        persist: bool = False,
+    ) -> None:
+        """Publish the operation currently owning the collector tick.
+
+        This intentionally uses the collector root state, rather than only
+        cycle output: a provider call can be blocked before a cycle exists.
+        The endpoint is bounded plain text so a malformed provider label
+        cannot make durable state unbounded.
+        """
+        self._current_stage = str(stage).strip()[:128] or "unknown"
+        endpoint_text = str(endpoint).strip()[:512] if endpoint is not None else ""
+        self._current_endpoint = endpoint_text or None
+        if not persist:
+            return
+        try:
+            state = self.store.get_collector_state(self.config.collector_name) or {}
+            state = dict(state) if isinstance(state, Mapping) else {}
+            state.update(
+                {
+                    "current_stage": self._current_stage,
+                    "current_endpoint": self._current_endpoint,
+                    "current_stage_at": ensure_utc(observed_at or self.clock()).isoformat(),
+                }
+            )
+            self.store.set_collector_state(self.config.collector_name, state)
+        except Exception:
+            # Stage evidence must never turn a provider timeout into a second
+            # collector failure.
+            pass
+
 
     def collect_once(
         self,
@@ -417,6 +459,8 @@ class PolymarketCollector:
         paper_set = set(paper_ids)
         observation_set = set(observation_intent_ids)
         self._provider_timeout_evidence = []
+        self._current_stage = "collection_start"
+        self._current_endpoint = None
         counters = self._new_counters()
         discovery_exclusions: list[Mapping[str, Any]] = []
         self._scope_resolutions = {}
@@ -715,33 +759,41 @@ class PolymarketCollector:
 
         results: list[tuple[str, dict[str, Any]]] = []
         if workers and len(planned_ids) > 1:
-            # Keep each isolated provider assigned to only one future at a
-            # time.  Completed providers are recycled for the next task,
-            # rather than assigned by modulo to overlapping futures.
+            # Use the collector's fixed daemon pool instead of
+            # ``ThreadPoolExecutor``'s context manager.  That context manager
+            # unconditionally joins workers during cleanup, which would make a
+            # missed provider bypass turn a bounded tick into a permanent hang.
             worker_count = min(self.config.max_concurrency, len(workers), len(planned_ids))
-            with ThreadPoolExecutor(max_workers=worker_count) as executor:
-                future_tasks: dict[Any, tuple[str, Any]] = {}
-                planned = iter(planned_ids)
-                for worker_provider in workers[:worker_count]:
+            with self._provider_executor_lock:
+                executor = self._collection_executor
+                if executor is None:
+                    executor = _BoundedProviderExecutor(worker_count)
+                    self._collection_executor = executor
+            future_tasks: dict[Future[Any], tuple[str, Any]] = {}
+            planned = iter(planned_ids)
+            for worker_provider in workers[:worker_count]:
+                try:
+                    identifier = next(planned)
+                except StopIteration:
+                    break
+                future = executor.submit(lambda i=identifier, p=worker_provider: run_one(i, p))
+                future_tasks[future] = (identifier, worker_provider)
+            while future_tasks:
+                done, _ = wait(tuple(future_tasks), return_when=FIRST_COMPLETED)
+                for future in done:
+                    identifier, worker_provider = future_tasks.pop(future)
                     try:
-                        identifier = next(planned)
+                        results.append(future.result())
+                    except Exception as exc:
+                        results.append(failed_task(identifier, exc))
+                    try:
+                        next_identifier = next(planned)
                     except StopIteration:
-                        break
-                    future = executor.submit(run_one, identifier, worker_provider)
-                    future_tasks[future] = (identifier, worker_provider)
-                while future_tasks:
-                    for future in as_completed(tuple(future_tasks)):
-                        identifier, worker_provider = future_tasks.pop(future)
-                        try:
-                            results.append(future.result())
-                        except Exception as exc:
-                            results.append(failed_task(identifier, exc))
-                        try:
-                            next_identifier = next(planned)
-                        except StopIteration:
-                            continue
-                        next_future = executor.submit(run_one, next_identifier, worker_provider)
-                        future_tasks[next_future] = (next_identifier, worker_provider)
+                        continue
+                    next_future = executor.submit(
+                        lambda i=next_identifier, p=worker_provider: run_one(i, p)
+                    )
+                    future_tasks[next_future] = (next_identifier, worker_provider)
         else:
             for identifier in planned_ids:
                 try:
@@ -829,6 +881,8 @@ class PolymarketCollector:
             item for item in discovery_deferred
             if item not in discovery_scheduled
         )
+        final_stage = "degraded" if self._provider_timeout_evidence else "cycle_complete"
+        self._set_current_stage(final_stage, self._current_endpoint, ended)
         cycle = CollectionCycle(
             started,
             ended,
@@ -861,6 +915,8 @@ class PolymarketCollector:
                 else None
             ),
             discovery_complete=discovery_complete,
+            current_stage=self._current_stage,
+            current_endpoint=self._current_endpoint,
             provider_timeout_evidence=tuple(
                 counters.pop("_provider_timeout_evidence", ())
             ),
@@ -963,6 +1019,9 @@ class PolymarketCollector:
                 "discovery_scheduled": list(discovery_scheduled),
                 "discovery_deferred": list(discovery_deferred),
                 "candidate_references": candidate_references,
+                "current_stage": cycle.current_stage,
+                "current_endpoint": cycle.current_endpoint,
+                "current_stage_at": ended.isoformat(),
                 "tier_attempts": tier_attempts,
                 "tier_successes": tier_successes,
                 "tier_failures": tier_failures,
@@ -1839,7 +1898,7 @@ class PolymarketCollector:
                 lookup_failed = False
                 try:
                     resolved = self._call_provider(
-                        "scope_taxonomy",
+                        "scope_taxonomy:/tags/slug",
                         lambda: resolver(category_values[0]),
                         observed_at,
                         counters,
@@ -1866,7 +1925,7 @@ class PolymarketCollector:
                     # validation failures for the next provider operation.
                     # Drain only after this failed advisory call so a
                     # successful broader discovery page is not misclassified.
-                    self._consume_advisory_provider_errors(provider)
+                    self._consume_advisory_provider_errors(provider, observed_at, counters)
 
 
         def scalar_bound(policy: Any, name: str) -> float | None:
@@ -1904,14 +1963,24 @@ class PolymarketCollector:
             query["end_date_max"] = upper.isoformat()
         return query
 
-    @staticmethod
-    def _consume_advisory_provider_errors(provider: Any) -> None:
+    def _consume_advisory_provider_errors(
+        self,
+        provider: Any,
+        observed_at: datetime,
+        counters: dict[str, Any],
+    ) -> None:
         for name in ("consume_transport_errors", "consume_validation_errors"):
             consumer = getattr(provider, name, None)
             if not callable(consumer):
                 continue
             try:
-                consumer()
+                self._call_provider(
+                    f"scope_error_drain:{name}",
+                    consumer,
+                    observed_at,
+                    counters,
+                    provider=provider,
+                )
             except Exception:
                 # A best-effort advisory drain must never become a discovery
                 # failure or mask the broader page request.
@@ -2028,7 +2097,7 @@ class PolymarketCollector:
             return None
         try:
             current = self._call_provider(
-                f"scope_market:{snapshot.market_id}",
+                f"scope_refresh:/markets/{snapshot.market_id}",
                 lambda: fetcher(snapshot.market_id),
                 observed_at,
                 counters,
@@ -2149,6 +2218,8 @@ class PolymarketCollector:
                 timeout_fields = (
                     {
                         "timeout_reason": str(exc).split(":", 1)[0],
+                        "timeout_endpoint": getattr(exc, "endpoint", self._current_endpoint),
+                        "timeout_seconds": float(self.config.provider_timeout_seconds),
                         "resolver": "retry_provider_call",
                         "next_action": "retry_next_collection_tick",
                     }
@@ -2336,7 +2407,6 @@ class PolymarketCollector:
                     "cumulative": dict(zero_counts),
                     "cumulative_raw_count": 0,
                     "cumulative_unique_count": 0,
-                    "cumulative_duplicate_count": 0,
                     "cumulative_malformed_count": 0,
                     "query_reset": True,
                     "rebase_required": True,
@@ -2402,7 +2472,7 @@ class PolymarketCollector:
 
             try:
                 page = self._call_provider(
-                    "scope_discovery",
+                    "scope_keyset:/markets/keyset",
                     lambda: method_page(**call_kwargs),
                     observed_at,
                     counters,
@@ -2417,6 +2487,8 @@ class PolymarketCollector:
                 timeout_fields = (
                     {
                         "timeout_reason": str(exc).split(":", 1)[0],
+                        "timeout_endpoint": getattr(exc, "endpoint", self._current_endpoint),
+                        "timeout_seconds": float(self.config.provider_timeout_seconds),
                         "resolver": "retry_provider_call",
                         "next_action": "retry_next_collection_tick",
                     }
@@ -2835,7 +2907,7 @@ class PolymarketCollector:
             kwargs["limit"] = scan_budget
         try:
             values = self._call_provider(
-                "scope_discovery",
+                "scope_markets:/markets",
                 lambda: method(**kwargs),
                 observed_at,
                 counters,
@@ -2846,6 +2918,8 @@ class PolymarketCollector:
             timeout_fields = (
                 {
                     "timeout_reason": str(exc).split(":", 1)[0],
+                    "timeout_endpoint": getattr(exc, "endpoint", self._current_endpoint),
+                    "timeout_seconds": float(self.config.provider_timeout_seconds),
                     "resolver": "retry_provider_call",
                     "next_action": "retry_next_collection_tick",
                 }
@@ -3611,12 +3685,20 @@ class PolymarketCollector:
             if parameters and not any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
                 kwargs = {key: value for key, value in kwargs.items() if key in parameters}
             try:
-                page = self._call_provider("discovery", lambda: method_page(**kwargs), observed_at, counters, provider=provider)
+                page = self._call_provider(
+                    "discovery_keyset:/markets/keyset",
+                    lambda: method_page(**kwargs),
+                    observed_at,
+                    counters,
+                    provider=provider,
+                )
             except Exception as exc:
                 counters["errors"] += 1
                 timeout_fields = (
                     {
                         "timeout_reason": str(exc).split(":", 1)[0],
+                        "timeout_endpoint": getattr(exc, "endpoint", self._current_endpoint),
+                        "timeout_seconds": float(self.config.provider_timeout_seconds),
                         "resolver": "retry_provider_call",
                         "next_action": "retry_next_collection_tick",
                     }
@@ -4480,11 +4562,54 @@ class PolymarketCollector:
         key = (id(provider), str(endpoint))
         with self._provider_executor_lock:
             if key in self._active_provider_calls:
-                raise _ProviderDeadlineExceeded(
-                    endpoint,
-                    float(self.config.provider_timeout_seconds),
-                    in_flight=True,
-                )
+                existing = self._provider_futures.get(key)
+                if existing is not None and not existing.done():
+                    try:
+                        existing.result(
+                            timeout=float(self.config.provider_timeout_seconds)
+                        )
+                    except FutureTimeout:
+                        pass
+                    except BaseException:
+                        pass
+                if existing is not None and existing.done():
+                    self._active_provider_calls.discard(key)
+                    self._provider_futures.pop(key, None)
+                else:
+                    raise _ProviderDeadlineExceeded(
+                        endpoint,
+                        float(self.config.provider_timeout_seconds),
+                        in_flight=True,
+                    )
+            for active_key in tuple(self._active_provider_calls):
+                existing = self._provider_futures.get(active_key)
+                if existing is not None and existing.done():
+                    self._active_provider_calls.discard(active_key)
+                    self._provider_futures.pop(active_key, None)
+            active_for_provider = [
+                active_endpoint
+                for active_provider_id, active_endpoint in self._active_provider_calls
+                if active_provider_id == id(provider)
+            ]
+            if len(active_for_provider) >= self.config.max_concurrency:
+                active_endpoint = active_for_provider[0]
+                existing = self._provider_futures.get((id(provider), active_endpoint))
+                if existing is not None and not existing.done():
+                    try:
+                        existing.result(timeout=float(self.config.provider_timeout_seconds))
+                    except FutureTimeout:
+                        pass
+                    except BaseException:
+                        pass
+                if existing is not None and existing.done():
+                    self._active_provider_calls.discard((id(provider), active_endpoint))
+                    self._provider_futures.pop((id(provider), active_endpoint), None)
+                else:
+                    raise _ProviderDeadlineExceeded(
+                        active_endpoint,
+                        float(self.config.provider_timeout_seconds),
+                        in_flight=True,
+                    )
             executor = self._provider_executor
             if executor is None:
                 executor = _BoundedProviderExecutor(self.config.max_concurrency)
@@ -4494,12 +4619,15 @@ class PolymarketCollector:
                 future = executor.submit(operation)
             except BaseException:
                 self._active_provider_calls.discard(key)
+                self._provider_futures.pop(key, None)
                 raise
+            self._provider_futures[key] = future
         future.add_done_callback(lambda _future: self._release_provider_call(key))
         return future, key
 
     def _release_provider_call(self, key: tuple[int, str]) -> None:
         with self._provider_executor_lock:
+            self._provider_futures.pop(key, None)
             self._active_provider_calls.discard(key)
 
     def _record_provider_timeout(
@@ -4513,6 +4641,7 @@ class PolymarketCollector:
         timeout = float(self.config.provider_timeout_seconds)
         error = _ProviderDeadlineExceeded(endpoint, timeout, in_flight=in_flight)
         reason = "PROVIDER_CALL_IN_FLIGHT" if in_flight else "PROVIDER_CALL_TIMEOUT"
+        self._set_current_stage("provider_timeout", endpoint, observed_at, persist=True)
         evidence = {
             "endpoint": str(endpoint),
             "reason": reason,
@@ -4522,6 +4651,8 @@ class PolymarketCollector:
             "timeout_seconds": timeout,
             "observed_at": ensure_utc(observed_at).isoformat(),
         }
+        evidence["current_stage"] = self._current_stage
+        evidence["current_endpoint"] = self._current_endpoint
         counters["provider_timeouts"] = int(counters.get("provider_timeouts", 0)) + 1
         counters.setdefault("_provider_timeout_evidence", []).append(evidence)
         self._provider_timeout_evidence.append(dict(evidence))
@@ -4539,7 +4670,6 @@ class PolymarketCollector:
         except Exception:
             pass
         return error
-
     def _call_provider(
         self,
         endpoint: str,
@@ -4552,6 +4682,7 @@ class PolymarketCollector:
     ) -> Any:
         provider = provider or self.provider
         del market_id
+        self._set_current_stage("provider_call", endpoint, observed_at, persist=True)
         last_error: Exception | None = None
         timeout = float(self.config.provider_timeout_seconds)
         for attempt in range(self.config.max_attempts):
@@ -4566,7 +4697,7 @@ class PolymarketCollector:
                     )
                 except _ProviderDeadlineExceeded as exc:
                     deadline_error = self._record_provider_timeout(
-                        endpoint,
+                        exc.endpoint,
                         observed_at,
                         counters,
                         in_flight=exc.in_flight,
@@ -4580,6 +4711,7 @@ class PolymarketCollector:
                     # Python versions.  A completed future carrying a
                     # provider TimeoutError must retain normal retry behavior.
                     if future.done():
+                        self._release_provider_call(_key)
                         raise future.result()
                     future.cancel()
                     deadline_error = self._record_provider_timeout(
@@ -4589,6 +4721,10 @@ class PolymarketCollector:
                     )
                     counters["provider_failures"] += 1
                     raise deadline_error
+                except BaseException:
+                    self._release_provider_call(_key)
+                    raise
+                self._release_provider_call(_key)
                 transport_errors = self._consume_transport_errors(provider)
                 retryable_error = next(
                     (error for error in reversed(transport_errors) if getattr(error, "retryable", False)),
