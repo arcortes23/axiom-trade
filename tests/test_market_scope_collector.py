@@ -4,6 +4,8 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import json
+import threading
+import time
 import unittest
 
 from axiom.collector import CollectorConfig, PolymarketCollector
@@ -188,6 +190,25 @@ class _PagedProvider(_RecordingProvider):
     def order_books(self, market_id: str, depth: int = 20):
         self.book_calls.append(str(market_id))
         return super().order_books(market_id, depth=depth)
+
+
+class _HangingScopeProvider(_PagedProvider):
+    def __init__(
+        self,
+        markets: tuple[PredictionMarketSnapshot, ...],
+        pages: tuple[dict[str, object], ...],
+    ) -> None:
+        super().__init__(markets, pages)
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.keyset_calls = 0
+
+    def market_page(self, **kwargs):
+        self.keyset_calls += 1
+        self.entered.set()
+        if self.keyset_calls == 1:
+            self.release.wait(timeout=2.0)
+        return super().market_page(**kwargs)
 
 
 class _AdvisoryLookupFailureProvider(_PagedProvider):
@@ -1582,6 +1603,73 @@ class MarketScopeCollectorTests(unittest.TestCase):
         self.assertTrue(first_continuation["query_reset"])
         self.assertTrue(first_continuation["rebase_required"])
 
+    def test_hanging_scope_inventory_times_out_once_and_retries_after_release(self) -> None:
+        provider = _HangingScopeProvider(
+            (),
+            ({"markets": (), "next_cursor": None},),
+        )
+        store = _ScopeStore(
+            {
+                "scoped": {
+                    "experiment_plan": {
+                        "market_scope": scope("RULE_BASED_MARKETS", category="politics")
+                    }
+                }
+            }
+        )
+        store.states["polymarket"] = {
+            "scope_inventory_continuation": {
+                "after_cursor": "opaque-cursor",
+                "coverage_status": "BUDGET_EXHAUSTED",
+                "request_query": {
+                    "limit": 1,
+                    "after_cursor": "opaque-cursor",
+                    "closed": False,
+                    "tag_ids": (),
+                    "include_tag": True,
+                    "liquidity_num_min": None,
+                    "end_date_min": None,
+                    "end_date_max": None,
+                },
+            }
+        }
+        collector = _ScopeCollector(
+            provider,
+            store,
+            CollectorConfig(
+                max_markets=1,
+                discovery_budget_per_cycle=1,
+                max_attempts=1,
+                provider_timeout_seconds=0.05,
+                backoff_initial_seconds=0,
+                jitter_seconds=0,
+            ),
+            candidate_ids=("scoped",),
+            clock=lambda: T0,
+            sleep=lambda _seconds: None,
+        )
+
+        started = time.monotonic()
+        first = collector.collect_once(now=T0)
+        elapsed = time.monotonic() - started
+        continuation = store.states["polymarket"]["scope_inventory_continuation"]
+
+        self.assertLess(elapsed, 0.5)
+        self.assertEqual(provider.keyset_calls, 1)
+        self.assertEqual(first.provider_timeouts, 1)
+        self.assertEqual(first.provider_timeout_evidence[0]["reason"], "PROVIDER_CALL_TIMEOUT")
+        self.assertEqual(continuation["after_cursor"], "opaque-cursor")
+        self.assertEqual(continuation["timeout_reason"], "PROVIDER_CALL_TIMEOUT")
+        self.assertEqual(continuation["resolver"], "retry_provider_call")
+        self.assertEqual(continuation["next_action"], "retry_next_collection_tick")
+
+        second = collector.collect_once(now=T0)
+        self.assertLess(second.duration_seconds, 0.5)
+        self.assertEqual(provider.keyset_calls, 1)
+
+        provider.release.set()
+        third = collector.collect_once(now=T0)
+        self.assertEqual(provider.keyset_calls, 2)
 
 if __name__ == "__main__":
 

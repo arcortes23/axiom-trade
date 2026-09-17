@@ -378,6 +378,7 @@ class NodeConfig:
     max_attempts: int = 3
     max_provider_clock_skew_seconds: float = 5.0
     failure_cooldown_seconds: float = 30.0
+    provider_timeout_seconds: float = 10.0
     retain_cycles: int = 5
     research_enabled: bool = True
     research_max_items_per_cycle: int = 1
@@ -450,6 +451,7 @@ class NodeConfig:
             raise ValueError("crypto_symbol is required")
         interval = float(self.interval_seconds)
         cooldown = float(self.failure_cooldown_seconds)
+        provider_timeout = float(self.provider_timeout_seconds)
         auto_interval = float(self.auto_canary_interval_seconds)
         shadow_interval = float(self.shadow_interval)
         rolling_evidence_interval = float(self.rolling_evidence_interval_seconds)
@@ -488,6 +490,8 @@ class NodeConfig:
             raise ValueError("depth must be a positive integer")
         if not math.isfinite(cooldown) or cooldown < 0:
             raise ValueError("failure_cooldown_seconds must be finite and non-negative")
+        if not math.isfinite(provider_timeout) or provider_timeout <= 0:
+            raise ValueError("provider_timeout_seconds must be finite and positive")
         if isinstance(self.max_markets, bool) or not isinstance(self.max_markets, int) or self.max_markets <= 0:
             raise ValueError("max_markets must be a positive integer")
         if isinstance(self.discovery_budget_per_cycle, bool) or not isinstance(self.discovery_budget_per_cycle, int) or self.discovery_budget_per_cycle < 0:
@@ -877,6 +881,7 @@ class ResearchNode:
                 freshness_sla_seconds=config.freshness_sla_seconds,
                 max_attempts=config.max_attempts,
                 failure_cooldown_seconds=config.failure_cooldown_seconds,
+                provider_timeout_seconds=config.provider_timeout_seconds,
                 max_provider_clock_skew_seconds=config.max_provider_clock_skew_seconds,
                 retain_cycles=config.retain_cycles,
             ),
