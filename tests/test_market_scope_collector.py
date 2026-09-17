@@ -10,7 +10,7 @@ import unittest
 
 from axiom.collector import CollectorConfig, PolymarketCollector
 from axiom.data import InMemoryPredictionProvider
-from axiom.storage import AxiomStore
+from axiom.storage import AxiomStore, _COLLECTOR_STATE_MAX_BYTES
 from axiom.polymarket_rules import assess_selected_token_depth, parse_polymarket_rules
 from axiom.domain import (
     InstrumentMetadata,
@@ -1711,6 +1711,130 @@ class MarketScopeCollectorTests(unittest.TestCase):
             self.assertLess(elapsed, 2.0)
             self.assertEqual(int(row[0]), before)
             self.assertEqual(json.loads(row[1])["current_stage"], "cycle_start")
+
+    def test_cycle_deadline_bounds_many_markets_and_resumes_work(self) -> None:
+        class NearTimeoutProvider(_RecordingProvider):
+            def __init__(self, markets):
+                super().__init__(markets)
+                self.active: set[str] = set()
+                self.duplicate_in_flight = False
+                self._active_lock = threading.Lock()
+
+            def market(self, market_id: str):
+                identifier = str(market_id)
+                with self._active_lock:
+                    if identifier in self.active:
+                        self.duplicate_in_flight = True
+                    self.active.add(identifier)
+                try:
+                    time.sleep(0.018)
+                    return super().market(identifier)
+                finally:
+                    with self._active_lock:
+                        self.active.discard(identifier)
+
+            def metadata(self, market_id: str):
+                snapshot = self._markets.get(str(market_id))
+                if snapshot is None:
+                    return None
+                return InstrumentMetadata(
+                    symbol=str(market_id),
+                    market_type=MarketType.PREDICTION,
+                    provider=self.provider_name,
+                    market_id=str(market_id),
+                    question=snapshot.question,
+                    category=snapshot.category,
+                    tags=snapshot.tags,
+                    expiry=snapshot.expiry,
+                )
+
+        identifiers = tuple(str(index) for index in range(100))
+        provider = NearTimeoutProvider(tuple(market(identifier) for identifier in identifiers))
+        with AxiomStore(":memory:") as store:
+            config = CollectorConfig(
+                market_ids=identifiers,
+                max_markets=100,
+                max_attempts=1,
+                provider_timeout_seconds=0.025,
+                failure_cooldown_seconds=0,
+                backoff_initial_seconds=0,
+                jitter_seconds=0,
+            )
+            collector = PolymarketCollector(
+                provider,
+                store,
+                config,
+                clock=lambda: T0,
+                sleep=lambda _seconds: None,
+            )
+            started = time.monotonic()
+            first = collector.collect_once(now=T0)
+            elapsed = time.monotonic() - started
+            state = store.get_collector_state("polymarket") or {}
+
+            self.assertLessEqual(elapsed, config.cycle_budget_seconds + 0.15)
+            self.assertEqual(first.current_stage, "degraded")
+            continuation = state["cycle_continuation"]
+            self.assertTrue(continuation["retryable"])
+            self.assertEqual(continuation["resolver"], "retry_provider_call")
+            self.assertTrue(continuation["endpoint"])
+            self.assertLessEqual(len(continuation["remaining_market_ids"]), 256)
+            first_call_count = len(provider.market_calls)
+
+            collector.collect_once(now=T0 + timedelta(seconds=61))
+            self.assertGreater(len(provider.market_calls), first_call_count)
+            self.assertFalse(provider.duplicate_in_flight)
+
+    def test_oversized_scope_state_is_compacted_on_load_and_save(self) -> None:
+        records = [
+            {
+                "market_id": str(index),
+                "condition_id": f"condition-{index}",
+                "yes_token_id": f"yes-{index}",
+                "no_token_id": f"no-{index}",
+                "question": "question-" + ("x" * 5000),
+                "active": True,
+                "closed": False,
+                "accepting_orders": True,
+                "order_book_available": True,
+                "source_type": "CURRENT",
+            }
+            for index in range(3_000)
+        ]
+        state = {
+            "last_trade_cursor": "trade-cursor",
+            "scope_inventory_continuation": {
+                "after_cursor": "opaque-cursor",
+                "coverage_status": "ERROR",
+                "timeout_reason": "PROVIDER_CALL_TIMEOUT",
+                "timeout_endpoint": "scope_keyset:/markets/keyset",
+                "resolver": "retry_provider_call",
+                "next_action": "retry_next_collection_tick",
+                "inventory_records": records,
+                "seen_market_ids": [str(index) for index in range(3_000)],
+                "seen_cursor_history": [f"cursor-{index}-" + ("y" * 200) for index in range(200)],
+                "suitability_exclusions": [
+                    {"market_id": str(index), "reason": "NO_DEPTH", "detail": "z" * 5000}
+                    for index in range(300)
+                ],
+            },
+        }
+        with AxiomStore(":memory:") as store:
+            store.set_collector_state("polymarket", state)
+            row = store.connection.execute(
+                "SELECT length(state_json) FROM collector_state WHERE collector_name='polymarket'"
+            ).fetchone()
+            self.assertLessEqual(int(row[0]), _COLLECTOR_STATE_MAX_BYTES)
+            loaded = store.get_collector_state("polymarket") or {}
+            continuation = loaded["scope_inventory_continuation"]
+            self.assertEqual(continuation["after_cursor"], "opaque-cursor")
+            self.assertEqual(continuation["timeout_endpoint"], "scope_keyset:/markets/keyset")
+            self.assertEqual(continuation["resolver"], "retry_provider_call")
+            self.assertEqual(loaded["last_trade_cursor"], "trade-cursor")
+            self.assertLessEqual(
+                len(json.dumps(loaded, separators=(",", ":")).encode("utf-8")),
+                _COLLECTOR_STATE_MAX_BYTES,
+            )
 
 if __name__ == "__main__":
 

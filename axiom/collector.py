@@ -42,6 +42,7 @@ _MAX_SCOPE_REQUEST_PATH_LENGTH = 512
 _MAX_SCOPE_QUERY_DEPTH = 8
 _MAX_SCOPE_QUERY_ITEMS = 128
 _MAX_SCOPE_QUERY_STRING_LENGTH = 1024
+_MAX_CYCLE_CONTINUATION_IDS = 256
 
 
 class _ScopePersistenceValueError(ValueError):
@@ -53,11 +54,23 @@ class _ProviderDeadlineExceeded(TimeoutError):
 
     deadline_expired = True
 
-    def __init__(self, endpoint: str, timeout_seconds: float, *, in_flight: bool = False) -> None:
+    def __init__(
+        self,
+        endpoint: str,
+        timeout_seconds: float,
+        *,
+        in_flight: bool = False,
+        cycle_expired: bool = False,
+    ) -> None:
         self.endpoint = str(endpoint)
         self.timeout_seconds = float(timeout_seconds)
         self.in_flight = bool(in_flight)
-        reason = "PROVIDER_CALL_IN_FLIGHT" if self.in_flight else "PROVIDER_CALL_TIMEOUT"
+        self.cycle_expired = bool(cycle_expired)
+        reason = (
+            "COLLECTOR_CYCLE_DEADLINE_EXCEEDED"
+            if self.cycle_expired
+            else ("PROVIDER_CALL_IN_FLIGHT" if self.in_flight else "PROVIDER_CALL_TIMEOUT")
+        )
         super().__init__(
             f"{reason}: {self.endpoint} exceeded {self.timeout_seconds:g}s deadline"
         )
@@ -234,6 +247,11 @@ class CollectorConfig:
             raise ValueError("retain_cycles must be a positive integer")
         normalized = tuple(dict.fromkeys(str(item).strip() for item in self.market_ids if str(item).strip()))
         object.__setattr__(self, "market_ids", normalized)
+    @property
+    def cycle_budget_seconds(self) -> float:
+        """Maximum provider-work window for one collection tick."""
+        return 2.0 * float(self.provider_timeout_seconds)
+
 
 
 @dataclass(frozen=True, slots=True)
@@ -374,6 +392,11 @@ class PolymarketCollector:
         self.clock = clock
         self.sleep = sleep
         self._discovery_continuation: Mapping[str, Any] | None = None
+        # Set for the duration of a tick and intentionally left in place for
+        # daemon workers that finish after the caller has returned.
+        self._cycle_deadline_monotonic: float | None = None
+        self._cycle_deadline_exhausted = False
+        self._cycle_last_remaining_market_ids: tuple[str, ...] = ()
         # A present rolling selection is a closed collection authority.  If a
         # selected member has no exact scope resolution, discovery must not
         # widen the cycle back to the public catalog.
@@ -426,7 +449,45 @@ class PolymarketCollector:
             # Stage evidence must never turn a provider timeout into a second
             # collector failure.
             pass
+    def _cycle_remaining_seconds(self) -> float | None:
+        deadline = self._cycle_deadline_monotonic
+        if deadline is None:
+            return None
+        return deadline - time.monotonic()
 
+    def _cycle_budget_error(
+        self,
+        endpoint: str,
+        observed_at: datetime,
+        counters: dict[str, Any],
+    ) -> _ProviderDeadlineExceeded:
+        self._cycle_deadline_exhausted = True
+        return self._record_provider_timeout(
+            endpoint,
+            observed_at,
+            counters,
+            cycle_expired=True,
+        )
+
+    def _cycle_budget_available(
+        self,
+        endpoint: str,
+        observed_at: datetime,
+        counters: dict[str, Any],
+    ) -> bool:
+        remaining = self._cycle_remaining_seconds()
+        if remaining is None or remaining > 0:
+            return True
+        raise self._cycle_budget_error(endpoint, observed_at, counters)
+
+
+
+    def _mark_cycle_exhaustion(self, endpoint: str | None = None) -> None:
+        """Record a local deadline boundary without waiting on provider work."""
+        self._cycle_deadline_exhausted = True
+        if endpoint:
+            self._current_endpoint = str(endpoint).strip()[:512] or self._current_endpoint
+        self._current_stage = "cycle_deadline"
 
     def collect_once(
         self,
@@ -436,7 +497,20 @@ class PolymarketCollector:
     ) -> CollectionCycle:
         started = ensure_utc(now or self.clock())
         monotonic_started = time.monotonic()
+        self._cycle_deadline_monotonic = monotonic_started + self.config.cycle_budget_seconds
+        self._cycle_deadline_exhausted = False
+        self._cycle_last_remaining_market_ids = ()
         root_state = self.store.get_collector_state(self.config.collector_name) or {}
+        previous_cycle_continuation = (
+            root_state.get("cycle_continuation")
+            if isinstance(root_state.get("cycle_continuation"), Mapping)
+            else {}
+        )
+        resume_ids = [
+            str(item).strip()
+            for item in previous_cycle_continuation.get("remaining_market_ids", ())
+            if str(item).strip()
+        ][:_MAX_CYCLE_CONTINUATION_IDS]
         self._scope_inventory_continuation = (
             root_state.get("scope_inventory_continuation")
             if isinstance(root_state.get("scope_inventory_continuation"), Mapping)
@@ -730,7 +804,14 @@ class PolymarketCollector:
         }
         tier_by_market.update({market_id: "paper_forward" for market_id in paper_scheduled})
         tier_by_market.update({market_id: "discovery" for market_id in discovery_scheduled})
-        planned_ids = list(dict.fromkeys([*candidate_scheduled, *paper_scheduled, *discovery_scheduled]))
+        planned_ids = list(dict.fromkeys([
+            *resume_ids,
+            *candidate_scheduled,
+            *paper_scheduled,
+            *discovery_scheduled,
+        ]))[:capacity]
+        for market_id in resume_ids:
+            tier_by_market.setdefault(market_id, "discovery")
         workers = self._isolated_worker_providers()
 
         def run_one(identifier: str, worker_provider: Any | None = None) -> tuple[str, dict[str, Any]]:
@@ -758,11 +839,14 @@ class PolymarketCollector:
             return identifier, {"counters": local_counters, "attempted": 1}
 
         results: list[tuple[str, dict[str, Any]]] = []
+        completed_identifiers: set[str] = set()
+        remaining_after_deadline: list[str] = []
         if workers and len(planned_ids) > 1:
             # Use the collector's fixed daemon pool instead of
             # ``ThreadPoolExecutor``'s context manager.  That context manager
-            # unconditionally joins workers during cleanup, which would make a
-            # missed provider bypass turn a bounded tick into a permanent hang.
+            # unconditionally joins workers during cleanup, which would make
+            # a missed provider bypass turn a bounded tick into a permanent
+            # hang.
             worker_count = min(self.config.max_concurrency, len(workers), len(planned_ids))
             with self._provider_executor_lock:
                 executor = self._collection_executor
@@ -770,36 +854,78 @@ class PolymarketCollector:
                     executor = _BoundedProviderExecutor(worker_count)
                     self._collection_executor = executor
             future_tasks: dict[Future[Any], tuple[str, Any]] = {}
-            planned = iter(planned_ids)
-            for worker_provider in workers[:worker_count]:
-                try:
-                    identifier = next(planned)
-                except StopIteration:
+            next_index = 0
+
+            def cancel_and_record_remaining() -> None:
+                nonlocal remaining_after_deadline
+                for future in tuple(future_tasks):
+                    future.cancel()
+                queued = [
+                    identifier
+                    for _, (identifier, _provider) in future_tasks.items()
+                ]
+                remaining_after_deadline = list(dict.fromkeys([
+                    *queued,
+                    *planned_ids[next_index:],
+                ]))
+
+            while next_index < len(planned_ids) or future_tasks:
+                remaining = self._cycle_remaining_seconds()
+                if remaining is not None and remaining <= 0:
+                    self._mark_cycle_exhaustion(self._current_endpoint)
+                    cancel_and_record_remaining()
                     break
-                future = executor.submit(lambda i=identifier, p=worker_provider: run_one(i, p))
-                future_tasks[future] = (identifier, worker_provider)
-            while future_tasks:
-                done, _ = wait(tuple(future_tasks), return_when=FIRST_COMPLETED)
+                while next_index < len(planned_ids) and len(future_tasks) < worker_count:
+                    remaining = self._cycle_remaining_seconds()
+                    if remaining is not None and remaining <= 0:
+                        self._mark_cycle_exhaustion(self._current_endpoint)
+                        cancel_and_record_remaining()
+                        break
+                    identifier = planned_ids[next_index]
+                    next_index += 1
+                    worker_provider = workers[len(future_tasks) % worker_count]
+                    future = executor.submit(
+                        lambda i=identifier, p=worker_provider: run_one(i, p)
+                    )
+                    future_tasks[future] = (identifier, worker_provider)
+                if not future_tasks:
+                    break
+                remaining = self._cycle_remaining_seconds()
+                wait_timeout = None if remaining is None else max(0.000001, remaining)
+                done, _ = wait(
+                    tuple(future_tasks),
+                    timeout=wait_timeout,
+                    return_when=FIRST_COMPLETED,
+                )
+                if not done:
+                    self._mark_cycle_exhaustion(self._current_endpoint)
+                    cancel_and_record_remaining()
+                    break
                 for future in done:
-                    identifier, worker_provider = future_tasks.pop(future)
+                    identifier, _worker_provider = future_tasks.pop(future)
+                    completed_identifiers.add(identifier)
                     try:
                         results.append(future.result())
                     except Exception as exc:
                         results.append(failed_task(identifier, exc))
-                    try:
-                        next_identifier = next(planned)
-                    except StopIteration:
-                        continue
-                    next_future = executor.submit(
-                        lambda i=next_identifier, p=worker_provider: run_one(i, p)
-                    )
-                    future_tasks[next_future] = (next_identifier, worker_provider)
+                if self._cycle_deadline_exhausted:
+                    cancel_and_record_remaining()
+                    break
         else:
-            for identifier in planned_ids:
+            for index, identifier in enumerate(planned_ids):
+                remaining = self._cycle_remaining_seconds()
+                if remaining is not None and remaining <= 0:
+                    self._mark_cycle_exhaustion(self._current_endpoint)
+                    remaining_after_deadline = list(planned_ids[index:])
+                    break
                 try:
                     results.append(run_one(identifier))
+                    completed_identifiers.add(identifier)
                 except Exception as exc:
                     results.append(failed_task(identifier, exc))
+                if self._cycle_deadline_exhausted:
+                    remaining_after_deadline = list(planned_ids[index + 1:])
+                    break
 
         tier_attempts = {"candidate": 0, "paper_forward": 0, "discovery": 0}
         tier_successes = {"candidate": 0, "paper_forward": 0, "discovery": 0}
@@ -881,7 +1007,37 @@ class PolymarketCollector:
             item for item in discovery_deferred
             if item not in discovery_scheduled
         )
-        final_stage = "degraded" if self._provider_timeout_evidence else "cycle_complete"
+        deadline_stage = self._current_stage
+        deadline_endpoint = self._current_endpoint
+        if self._cycle_deadline_exhausted:
+            self._cycle_last_remaining_market_ids = tuple(dict.fromkeys(
+                str(item).strip()
+                for item in remaining_after_deadline
+                if str(item).strip()
+            ))[:_MAX_CYCLE_CONTINUATION_IDS]
+        cycle_continuation = (
+            {
+                "status": "DEGRADED",
+                "retryable": True,
+                "resolver": "retry_provider_call",
+                "next_action": "retry_next_collection_tick",
+                "timeout_reason": "COLLECTOR_CYCLE_DEADLINE_EXCEEDED",
+                "stage": deadline_stage,
+                "endpoint": deadline_endpoint,
+                "timeout_endpoint": deadline_endpoint,
+                "remaining_market_ids": list(self._cycle_last_remaining_market_ids),
+                "scope_cursor": scope_cursor,
+                "discovery_cursor": discovery_cursor,
+                "updated_at": ended.isoformat(),
+            }
+            if self._cycle_deadline_exhausted
+            else None
+        )
+        final_stage = (
+            "degraded"
+            if self._provider_timeout_evidence or self._cycle_deadline_exhausted
+            else "cycle_complete"
+        )
         self._set_current_stage(final_stage, self._current_endpoint, ended)
         cycle = CollectionCycle(
             started,
@@ -1031,6 +1187,8 @@ class PolymarketCollector:
                     dict(item) for item in cycle.provider_timeout_evidence
                 ],
                 "capacity_reason": capacity_reason,
+                "cycle_deadline_seconds": self.config.cycle_budget_seconds,
+                "cycle_continuation": cycle_continuation,
                 **counters,
             },
         )
@@ -1554,6 +1712,7 @@ class PolymarketCollector:
         except Exception:
             return []
         return providers if len(providers) >= 2 else []
+
     def _resolve_market_scopes(
         self,
         observed_at: datetime,
@@ -1651,6 +1810,9 @@ class PolymarketCollector:
                 refreshed_records: list[Mapping[str, Any]] = []
                 refreshed_snapshots: dict[str, PredictionMarketSnapshot] = {}
                 for raw_record in candidate_records:
+                    if self._cycle_remaining_seconds() is not None and self._cycle_remaining_seconds() <= 0:
+                        self._mark_cycle_exhaustion("scope_refresh")
+                        break
                     if not isinstance(raw_record, Mapping):
                         continue
                     market_id = str(raw_record.get("market_id", "")).strip()
@@ -1661,7 +1823,7 @@ class PolymarketCollector:
                             snapshot = self._refresh_scope_snapshot(
                                 snapshot,
                                 self.provider,
-                                started,
+                                observed_at,
                                 counters,
                             )
                     if snapshot is None:
@@ -2456,6 +2618,9 @@ class PolymarketCollector:
                 }
                 snapshot_by_id: dict[str, PredictionMarketSnapshot] = {}
                 for record in inventory_records_by_id.values():
+                    if self._cycle_remaining_seconds() is not None and self._cycle_remaining_seconds() <= 0:
+                        self._mark_cycle_exhaustion("scope_refresh")
+                        break
                     market_id = str(record.get("market_id", "")).strip()
                     snapshot = self._scope_snapshot_from_record(record, observed_at)
                     if suitability_enabled and snapshot is not None:
@@ -2717,6 +2882,9 @@ class PolymarketCollector:
             page_records: list[dict[str, Any]] = []
             freshly_assessed_ids: set[str] = set()
             for item in new_snapshots:
+                if self._cycle_remaining_seconds() is not None and self._cycle_remaining_seconds() <= 0:
+                    self._mark_cycle_exhaustion("scope_suitability")
+                    break
                 record = dict(self._scope_market_record(item, observed_at, provider))
                 if suitability_enabled:
                     assessment = self._suitable_market_assessment(
@@ -2736,6 +2904,9 @@ class PolymarketCollector:
                 page_records.append(record)
             if suitability_enabled:
                 for market_id, record in tuple(inventory_records_by_id.items()):
+                    if self._cycle_remaining_seconds() is not None and self._cycle_remaining_seconds() <= 0:
+                        self._mark_cycle_exhaustion("scope_suitability")
+                        break
                     if market_id in freshly_assessed_ids:
                         continue
                     snapshot = self._scope_snapshot_from_record(record, observed_at)
@@ -2842,6 +3013,9 @@ class PolymarketCollector:
             }
             if coverage_status == "COMPLETE":
                 for market_id, record in inventory_records_by_id.items():
+                    if self._cycle_remaining_seconds() is not None and self._cycle_remaining_seconds() <= 0:
+                        self._mark_cycle_exhaustion("scope_suitability")
+                        break
                     if market_id not in record_by_id:
                         snapshot = self._scope_snapshot_from_record(record, observed_at)
                         if snapshot is not None and suitability_enabled:
@@ -4452,13 +4626,18 @@ class PolymarketCollector:
         timestamp: datetime | None,
         request_started_at: datetime,
         response_received_at: datetime,
-        skew_seconds: float = 5.0,
+        *,
+        skew_seconds: float,
     ) -> bool:
         if timestamp is None:
             return True
-        # Provider timestamps may legitimately predate a request (a quote can
-        # be old), but may not be from the future beyond configured skew.
-        return ensure_utc(timestamp) <= ensure_utc(response_received_at) + timedelta(seconds=skew_seconds)
+        try:
+            stamp = ensure_utc(timestamp)
+            received = ensure_utc(response_received_at)
+            skew = max(0.0, float(skew_seconds))
+        except (TypeError, ValueError, OverflowError):
+            return False
+        return stamp <= received + timedelta(seconds=skew)
 
     def _provider_timestamp(
         self,
@@ -4503,7 +4682,6 @@ class PolymarketCollector:
             return ensure_utc(stamp) if stamp is not None else None
         except (TypeError, ValueError):
             return None
-
     def _fetch_trades(
         self,
         market_id: str,
@@ -4564,10 +4742,14 @@ class PolymarketCollector:
             if key in self._active_provider_calls:
                 existing = self._provider_futures.get(key)
                 if existing is not None and not existing.done():
+                    remaining = self._cycle_remaining_seconds()
+                    wait_timeout = (
+                        float(self.config.provider_timeout_seconds)
+                        if remaining is None
+                        else max(0.000001, remaining)
+                    )
                     try:
-                        existing.result(
-                            timeout=float(self.config.provider_timeout_seconds)
-                        )
+                        existing.result(timeout=wait_timeout)
                     except FutureTimeout:
                         pass
                     except BaseException:
@@ -4576,6 +4758,9 @@ class PolymarketCollector:
                     self._active_provider_calls.discard(key)
                     self._provider_futures.pop(key, None)
                 else:
+                    # Never wait beyond this tick on an operation owned by an
+                    # earlier tick; its provider thread is daemonized and the
+                    # next tick must remain bounded while preserving dedup.
                     raise _ProviderDeadlineExceeded(
                         endpoint,
                         float(self.config.provider_timeout_seconds),
@@ -4595,8 +4780,14 @@ class PolymarketCollector:
                 active_endpoint = active_for_provider[0]
                 existing = self._provider_futures.get((id(provider), active_endpoint))
                 if existing is not None and not existing.done():
+                    remaining = self._cycle_remaining_seconds()
+                    wait_timeout = (
+                        float(self.config.provider_timeout_seconds)
+                        if remaining is None
+                        else max(0.000001, remaining)
+                    )
                     try:
-                        existing.result(timeout=float(self.config.provider_timeout_seconds))
+                        existing.result(timeout=wait_timeout)
                     except FutureTimeout:
                         pass
                     except BaseException:
@@ -4637,10 +4828,20 @@ class PolymarketCollector:
         counters: dict[str, Any],
         *,
         in_flight: bool = False,
+        cycle_expired: bool = False,
     ) -> _ProviderDeadlineExceeded:
         timeout = float(self.config.provider_timeout_seconds)
-        error = _ProviderDeadlineExceeded(endpoint, timeout, in_flight=in_flight)
-        reason = "PROVIDER_CALL_IN_FLIGHT" if in_flight else "PROVIDER_CALL_TIMEOUT"
+        error = _ProviderDeadlineExceeded(
+            endpoint,
+            timeout,
+            in_flight=in_flight,
+            cycle_expired=cycle_expired,
+        )
+        reason = (
+            "COLLECTOR_CYCLE_DEADLINE_EXCEEDED"
+            if cycle_expired
+            else ("PROVIDER_CALL_IN_FLIGHT" if in_flight else "PROVIDER_CALL_TIMEOUT")
+        )
         self._set_current_stage("provider_timeout", endpoint, observed_at, persist=True)
         evidence = {
             "endpoint": str(endpoint),
@@ -4690,6 +4891,7 @@ class PolymarketCollector:
         last_error: Exception | None = None
         timeout = float(self.config.provider_timeout_seconds)
         for attempt in range(self.config.max_attempts):
+            self._cycle_budget_available(endpoint, observed_at, counters)
             counters["requests"] += 1
             request_started = time.monotonic()
             try:
@@ -4705,11 +4907,16 @@ class PolymarketCollector:
                         observed_at,
                         counters,
                         in_flight=exc.in_flight,
+                        cycle_expired=exc.cycle_expired,
                     )
+                    if exc.cycle_expired:
+                        self._cycle_deadline_exhausted = True
                     counters["provider_failures"] += 1
                     raise deadline_error
+                remaining = self._cycle_remaining_seconds()
+                wait_timeout = timeout if remaining is None else min(timeout, max(0.000001, remaining))
                 try:
-                    result = future.result(timeout=timeout)
+                    result = future.result(timeout=wait_timeout)
                 except FutureTimeout:
                     # ``FutureTimeout`` is also TimeoutError on supported
                     # Python versions.  A completed future carrying a
@@ -4718,11 +4925,15 @@ class PolymarketCollector:
                         self._release_provider_call(_key)
                         raise future.result()
                     future.cancel()
+                    cycle_expired = remaining is not None and remaining <= timeout
                     deadline_error = self._record_provider_timeout(
                         endpoint,
                         observed_at,
                         counters,
+                        cycle_expired=cycle_expired,
                     )
+                    if cycle_expired:
+                        self._cycle_deadline_exhausted = True
                     counters["provider_failures"] += 1
                     raise deadline_error
                 except BaseException:
@@ -4741,6 +4952,9 @@ class PolymarketCollector:
                     if retryable_error is not None and attempt + 1 < self.config.max_attempts:
                         delay = self._backoff_delay(endpoint, attempt, getattr(retryable_error, "retry_after", None))
                         if delay is not None:
+                            remaining = self._cycle_remaining_seconds()
+                            if remaining is not None and remaining <= delay:
+                                raise self._cycle_budget_error(endpoint, observed_at, counters)
                             counters["retries"] += 1
                             self.sleep(delay)
                             continue
@@ -4766,6 +4980,9 @@ class PolymarketCollector:
                     )
                     delay = self._backoff_delay(endpoint, attempt, retry_after)
                     if delay is not None:
+                        remaining = self._cycle_remaining_seconds()
+                        if remaining is not None and remaining <= delay:
+                            raise self._cycle_budget_error(endpoint, observed_at, counters)
                         counters["retries"] += 1
                         self.sleep(delay)
                         continue

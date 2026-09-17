@@ -117,7 +117,12 @@ _SHADOW_JOB_STATUSES = frozenset(
 )
 _SHADOW_JOB_LIST_LIMIT_MAX = 1_000
 _SHADOW_JOB_ID_MAX_LENGTH = 256
-_LOGGER = logging.getLogger(__name__)
+_COLLECTOR_STATE_MAX_BYTES = 256 * 1024
+_COLLECTOR_STATE_MAX_INVENTORY_RECORDS = 256
+_COLLECTOR_STATE_MAX_IDS = 2_048
+_COLLECTOR_STATE_MAX_CURSOR_HISTORY = 64
+_COLLECTOR_STATE_MAX_EVIDENCE = 64
+
 
 
 def _recent_rowid_cte(table: str, columns: str, *, alias: str = "recent_rows") -> str:
@@ -9136,20 +9141,43 @@ class AxiomStore:
             row = self._conn.execute(
                 "SELECT state_json FROM collector_state WHERE collector_name=?", (str(collector_name),)
             ).fetchone()
-        if row is None:
-            return None
-        try:
-            state = json.loads(row["state_json"])
-        except (TypeError, ValueError, json.JSONDecodeError):
-            return {}
-        return state if isinstance(state, Mapping) else {}
+            if row is None:
+                return None
+            raw = row["state_json"]
+            try:
+                state = json.loads(raw)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return {}
+            if not isinstance(state, Mapping):
+                return {}
+            compact = _compact_collector_state(state)
+            try:
+                encoded = _dump(compact)
+            except (TypeError, ValueError, OverflowError, RecursionError):
+                return {}
+            if encoded != raw:
+                # Loading an old oversized continuation is also a migration
+                # boundary; make the bounded representation durable immediately.
+                try:
+                    self._conn.execute(
+                        "UPDATE collector_state SET state_json=?,updated_at=? WHERE collector_name=?",
+                        (encoded, _now_iso(), str(collector_name)),
+                    )
+                    if not self._transaction_depth:
+                        self._conn.commit()
+                except sqlite3.Error:
+                    if not self._transaction_depth:
+                        self._conn.rollback()
+            return compact
 
     def set_collector_state(self, collector_name: str, state: Mapping[str, Any]) -> None:
+        compact = _compact_collector_state(state)
+        encoded = _dump(compact)
         with self._write_context():
             self._conn.execute(
                 "INSERT INTO collector_state(collector_name,state_json,updated_at) VALUES (?,?,?) "
                 "ON CONFLICT(collector_name) DO UPDATE SET state_json=excluded.state_json,updated_at=excluded.updated_at",
-                (str(collector_name), _dump(dict(state)), _now_iso()),
+                (str(collector_name), encoded, _now_iso()),
             )
     def get_scheduler_state(self, scheduler_name: str) -> dict[str, Any] | None:
         with self._lock:
@@ -19502,11 +19530,209 @@ def _jsonable(value: Any) -> Any:
         return _jsonable({name: getattr(value, name) for name in value.__dataclass_fields__})
     if isinstance(value, Mapping):
         return {str(key): _jsonable(item) for key, item in value.items()}
+
     if isinstance(value, (tuple, list)):
         return [_jsonable(item) for item in value]
     if isinstance(value, set):
         return sorted(_jsonable(item) for item in value)
     return value
+def _bounded_collector_value(value: Any, *, depth: int = 0) -> Any:
+    """Keep volatile collector state JSON-safe and bounded before persistence."""
+    if depth >= 4:
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value[:512] if isinstance(value, str) else value
+        return None
+    if isinstance(value, str):
+        return value[:1024]
+    if isinstance(value, Mapping):
+        return {
+            str(key)[:128]: _bounded_collector_value(child, depth=depth + 1)
+            for index, (key, child) in enumerate(value.items())
+            if index < 256
+        }
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [
+            _bounded_collector_value(child, depth=depth + 1)
+            for index, child in enumerate(value)
+            if index < 256
+        ]
+    return _jsonable(value)
+
+
+def _compact_collector_record(value: Any) -> dict[str, Any] | None:
+    """Retain only resolver inputs from a transient inventory record."""
+    if not isinstance(value, Mapping):
+        return None
+    fields = (
+        "market_id",
+        "condition_id",
+        "yes_token_id",
+        "no_token_id",
+        "instrument",
+        "instrument_type",
+        "venue",
+        "category",
+        "categories",
+        "tag",
+        "tags",
+        "question",
+        "expiry",
+        "liquidity",
+        "volume",
+        "spread",
+        "yes_spread",
+        "no_spread",
+        "source",
+        "provider",
+        "provider_name",
+        "active",
+        "open",
+        "closed",
+        "archived",
+        "settlement",
+        "outcome",
+        "accepting_orders",
+        "acceptingOrders",
+        "enable_order_book",
+        "enableOrderBook",
+        "book",
+        "book_available",
+        "order_book_available",
+        "source_type",
+        "observed_at",
+        "provider_timestamp",
+        "suitability_evidence",
+        "suitable_market",
+    )
+    compact = {
+        key: _bounded_collector_value(value[key], depth=1)
+        for key in fields
+        if key in value
+    }
+    market_id = compact.get("market_id")
+    return compact if isinstance(market_id, str) and market_id.strip() else None
+
+
+def _compact_collector_state(state: Mapping[str, Any]) -> dict[str, Any]:
+    """Migrate oversized collector state without dropping retry authority."""
+    if not isinstance(state, Mapping):
+        return {}
+    compact = {
+        str(key): _bounded_collector_value(value)
+        for key, value in state.items()
+    }
+    continuation = compact.get("scope_inventory_continuation")
+    if isinstance(continuation, Mapping):
+        continuation = dict(continuation)
+        records = continuation.get("inventory_records", ())
+        if isinstance(records, (list, tuple)):
+            continuation["inventory_records"] = [
+                record
+                for record in (
+                    _compact_collector_record(item)
+                    for item in records[:_COLLECTOR_STATE_MAX_INVENTORY_RECORDS]
+                )
+                if record is not None
+            ]
+        for name in ("seen_market_ids", "verified_market_ids"):
+            values = continuation.get(name)
+            if isinstance(values, (list, tuple, set, frozenset)):
+                continuation[name] = list(dict.fromkeys(
+                    str(item)[:1024]
+                    for item in values
+                    if str(item).strip()
+                ))[:_COLLECTOR_STATE_MAX_IDS]
+        for name in ("seen_cursor_history", "seen_cursors"):
+            values = continuation.get(name)
+            if isinstance(values, (list, tuple, set, frozenset)):
+                continuation[name] = list(dict.fromkeys(
+                    str(item)[:1024]
+                    for item in values
+                    if str(item).strip()
+                ))[-_COLLECTOR_STATE_MAX_CURSOR_HISTORY:]
+        for name in (
+            "suitable_market_evidence",
+            "suitability_exclusions",
+            "discovery_exclusions",
+        ):
+            values = continuation.get(name)
+            if isinstance(values, (list, tuple)):
+                continuation[name] = [
+                    _bounded_collector_value(item)
+                    for item in values[-_COLLECTOR_STATE_MAX_EVIDENCE:]
+                    if isinstance(item, Mapping)
+                ]
+        compact["scope_inventory_continuation"] = continuation
+    for name in ("suitable_market_evidence", "discovery_exclusions"):
+        values = compact.get(name)
+        if isinstance(values, list):
+            compact[name] = values[-_COLLECTOR_STATE_MAX_EVIDENCE:]
+    for name in (
+        "scheduled_market_ids",
+        "candidate_bound_markets",
+        "candidate_bound_scheduled",
+        "candidate_bound_fresh",
+        "candidate_bound_stale",
+        "candidate_bound_missing",
+        "paper_forward_markets",
+        "paper_forward_scheduled",
+        "discovery_scheduled",
+        "discovery_deferred",
+        "suitable_market_scheduled",
+        "suitable_market_deferred",
+    ):
+        values = compact.get(name)
+        if isinstance(values, list):
+            compact[name] = [str(item)[:1024] for item in values[:_COLLECTOR_STATE_MAX_IDS]]
+    # Drop non-authoritative payload history first if a provider supplied
+    # unusually large records outside the normal projection.
+    optional = (
+        "inventory_records",
+        "suitable_market_evidence",
+        "discovery_exclusions",
+        "candidate_references",
+        "request_latency_summary",
+    )
+    encoded = lambda value: json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    while len(encoded(compact).encode("utf-8")) > _COLLECTOR_STATE_MAX_BYTES:
+        removed = False
+        for name in optional:
+            if name in compact:
+                compact.pop(name, None)
+                removed = True
+                break
+        if removed:
+            continue
+        continuation = compact.get("scope_inventory_continuation")
+        if isinstance(continuation, dict):
+            for name in ("inventory_records", "seen_market_ids", "seen_cursor_history"):
+                values = continuation.get(name)
+                if isinstance(values, list) and values:
+                    continuation[name] = values[: max(1, len(values) // 2)]
+                    removed = True
+                    break
+        if removed:
+            continue
+        # Last-resort scalar projection; these keys are the durable retry
+        # contract and must survive migration.
+        required = {
+            name: compact[name]
+            for name in (
+                "last_cycle_started_at",
+                "last_cycle_ended_at",
+                "last_cycle_duration_seconds",
+                "current_stage",
+                "current_endpoint",
+                "provider_timeout_seconds",
+                "cycle_continuation",
+                "scope_inventory_continuation",
+                "discovery_continuation",
+            )
+            if name in compact
+        }
+        compact = required
+        break
+    return compact
 
 
 def _json_array_count(value: Any, *, limit: int) -> int | None:
