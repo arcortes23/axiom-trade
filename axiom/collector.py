@@ -413,6 +413,7 @@ class PolymarketCollector:
         # daemon workers that finish after the caller has returned.
         self._cycle_deadline_monotonic: float | None = None
         self._cycle_deadline_exhausted = False
+        self._scope_phase_active = False
         self._cycle_last_remaining_market_ids: tuple[str, ...] = ()
         # A present rolling selection is a closed collection authority.  If a
         # selected member has no exact scope resolution, discovery must not
@@ -563,18 +564,22 @@ class PolymarketCollector:
         counters = self._new_counters()
         discovery_exclusions: list[Mapping[str, Any]] = []
         self._scope_resolutions = {}
-        scope_candidate_ids, scope_candidate_markets, scope_discovered, scope_cursor = (
-            self._resolve_market_scopes(
-                started,
-                tuple(
-                    dict.fromkeys(
-                        [*(primary_candidate_ids or ()), *paper_ids, *observation_intent_ids]
-                    )
-                ),
-                root_state,
-                counters,
+        self._scope_phase_active = True
+        try:
+            scope_candidate_ids, scope_candidate_markets, scope_discovered, scope_cursor = (
+                self._resolve_market_scopes(
+                    started,
+                    tuple(
+                        dict.fromkeys(
+                            [*(primary_candidate_ids or ()), *paper_ids, *observation_intent_ids]
+                        )
+                    ),
+                    root_state,
+                    counters,
+                )
             )
-        )
+        finally:
+            self._scope_phase_active = False
         if isinstance(self._scope_inventory_continuation, Mapping):
             discovery_exclusions = [
                 *(
@@ -2381,24 +2386,27 @@ class PolymarketCollector:
 
 
 
-    def _scope_pipeline_budget_available(self) -> bool:
-        """Keep one provider-call window for a selected-token suitability probe.
+    def _downstream_collection_reserve_seconds(self) -> float:
+        """Reserve one bounded provider window for scheduled collection."""
+        cycle_budget = max(0.001, float(self.config.cycle_budget_seconds))
+        provider_window = max(0.001, float(self.config.provider_timeout_seconds))
+        return min(provider_window, cycle_budget * 0.5)
 
-        Scope inventory refreshes perform a metadata call followed by a
-        selected-token book/rules probe.  The cycle deadline is twice the
-        provider timeout, so spending the whole remainder on carried
-        metadata can leave no time for the only call that can authorize a
-        market.  Treat half a cycle (one provider timeout) as reserved for
-        that downstream probe.  A direct resolver invocation without a cycle
-        deadline remains unbounded.
-        """
+    def _downstream_collection_budget_available(self) -> bool:
+        """Whether scope work may consume time without starving collection."""
         remaining = self._cycle_remaining_seconds()
         if remaining is None:
             return True
-        cycle_budget = max(0.001, float(self.config.cycle_budget_seconds))
-        provider_window = max(0.001, float(self.config.provider_timeout_seconds))
-        reserve = min(provider_window, cycle_budget * 0.5)
-        return remaining > reserve + 1e-6
+        return remaining > self._downstream_collection_reserve_seconds() + 1e-6
+
+    def _scope_pipeline_budget_available(self) -> bool:
+        """Keep the downstream collection window behind scope probes.
+
+        A carried metadata refresh must still leave enough monotonic budget
+        for its selected-token book/rules probe.  The same window is the
+        minimum reserved for the first scheduled market collection.
+        """
+        return self._downstream_collection_budget_available()
 
     @staticmethod
     def _scope_exact_market_ids(
@@ -3273,6 +3281,10 @@ class PolymarketCollector:
             for item in new_snapshots:
                 if self._cycle_remaining_seconds() is not None and self._cycle_remaining_seconds() <= 0:
                     self._mark_cycle_exhaustion("scope_suitability")
+                    break
+                if suitability_enabled and not self._downstream_collection_budget_available():
+                    # Keep an explicit collection window after scope
+                    # authorization; page rows can continue on the next tick.
                     break
                 market_id = str(item.market_id).strip()
                 record = dict(self._scope_market_record(item, observed_at, provider))
@@ -5302,7 +5314,22 @@ class PolymarketCollector:
                     counters["provider_failures"] += 1
                     raise deadline_error
                 remaining = self._cycle_remaining_seconds()
-                wait_timeout = timeout if remaining is None else min(timeout, max(0.000001, remaining))
+                effective_timeout = timeout
+                if self._scope_phase_active and remaining is not None:
+                    # Scope discovery may use only the time above the
+                    # explicit downstream collection reservation.
+                    effective_timeout = min(
+                        timeout,
+                        max(
+                            0.000001,
+                            remaining - self._downstream_collection_reserve_seconds(),
+                        ),
+                    )
+                wait_timeout = (
+                    effective_timeout
+                    if remaining is None
+                    else min(effective_timeout, max(0.000001, remaining))
+                )
                 try:
                     result = future.result(timeout=wait_timeout)
                 except FutureTimeout:
@@ -5313,7 +5340,7 @@ class PolymarketCollector:
                         self._release_provider_call(_key)
                         raise future.result()
                     future.cancel()
-                    cycle_expired = remaining is not None and remaining <= timeout
+                    cycle_expired = remaining is not None and remaining <= effective_timeout
                     deadline_error = self._record_provider_timeout(
                         endpoint,
                         observed_at,

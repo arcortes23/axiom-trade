@@ -1967,6 +1967,59 @@ class MarketScopeCollectorTests(unittest.TestCase):
         self.assertTrue(invalid_evidence)
         self.assertEqual(invalid_evidence[-1]["reason"], "SUITABILITY_ASSUMPTIONS_UNKNOWN")
 
+    def test_full_cycle_reserves_collection_after_scope_authorization(self) -> None:
+        base = market("collect-after-scope")
+        selected_book = base.order_book
+        self.assertIsNotNone(selected_book)
+        selected = replace(base, order_book=None)
+
+        class CollectingProvider(_PagedProvider):
+            def order_books(self, market_id: str, depth: int = 20):
+                self.book_calls.append(str(market_id))
+                return {"yes": selected_book}
+
+        provider = CollectingProvider(
+            (selected,),
+            ({"snapshots": (selected,), "next_cursor": None},),
+        )
+        store = _ScopeStore(
+            {
+                "collect-candidate": {
+                    "experiment_plan": {
+                        "market_scope": scope(
+                            "EXACT_MARKETS",
+                            market_ids=("collect-after-scope",),
+                        ),
+                        "suitability": {"required_capital": 1.0},
+                    }
+                }
+            }
+        )
+        collector = _BudgetedScopeCollector(
+            provider,
+            store,
+            candidate_ids=("collect-candidate",),
+            config=CollectorConfig(
+                max_markets=1,
+                discovery_budget_per_cycle=1,
+                provider_timeout_seconds=1.0,
+                max_attempts=1,
+                backoff_initial_seconds=0,
+                jitter_seconds=0,
+            ),
+            clock=lambda: T0,
+            sleep=lambda _seconds: None,
+        )
+
+        cycle = collector.collect_once(now=T0)
+
+        self.assertIn("collect-after-scope", cycle.candidate_bound_scheduled)
+        self.assertIn("collect-after-scope", cycle.market_authorization["verified_market_ids"])  # type: ignore[index]
+        self.assertGreaterEqual(cycle.markets_attempted, 1)
+        self.assertGreaterEqual(cycle.snapshots_inserted, 1)
+        self.assertTrue(provider.market_calls)
+        self.assertTrue(provider.book_calls)
+
     def test_selected_token_book_never_uses_wrong_singleton(self) -> None:
         base = market("exact-book")
         wrong = replace(base.order_book, token_id="no-other-market")
