@@ -2091,7 +2091,7 @@ class MutationSchedulingTests(unittest.TestCase):
                         "scope_resolution": proof.as_dict(),
                         "rolling_research": True,
                         "paper_only": True,
-                        "operational_setup_hash": "sha256:legacy",
+                        "observation_capture_only": True,
                     },
                     registration_timestamp=T0,
                     candidate_id=candidate_id,
@@ -2242,7 +2242,10 @@ class MutationSchedulingTests(unittest.TestCase):
                 lifecycle_payload = {
                     "candidate_id": candidate_id,
                     "forward_test_id": successor.experiment_id,
-                    "paper_observation_intent_id": successor.experiment_id,
+                    "paper_observation_intent_id": (
+                        successor.config.get("observation_intent_id")
+                        or successor.config.get("paper_observation_intent_id")
+                    ),
                     "paper_observation_intent": True,
                     "paper_only": True,
                     "research_only": True,
@@ -2592,10 +2595,21 @@ class MutationSchedulingTests(unittest.TestCase):
                     and isinstance(item.config.get("observation_handoff"), Mapping)
                 }
                 self.assertEqual(len(migrated_ids), 1)
-                scheduler_state = store.get_scheduler_state(
-                    "autonomous-observation-setup-migration"
+                lifecycle_after_migration = store.load_candidate_lifecycle(candidate_id)
+                self.assertIsNotNone(lifecycle_after_migration)
+                assert lifecycle_after_migration is not None
+                self.assertNotEqual(
+                    lifecycle_after_migration["payload"]["forward_test_id"],
+                    old_forward_id,
                 )
-                self.assertIsNotNone(scheduler_state)
+                self.assertEqual(
+                    lifecycle_after_migration["payload"]["paper_observation_intent_id"],
+                    next(iter(migrated_ids)),
+                )
+                self.assertEqual(
+                    lifecycle_after_migration["payload"]["scope_resolution"],
+                    proof.as_dict(),
+                )
                 second_refresh = processor.refresh_rolling_evidence(T0 + timedelta(minutes=1))
                 self.assertIsInstance(second_refresh, Mapping)
                 migrated_rows_after_restart = [

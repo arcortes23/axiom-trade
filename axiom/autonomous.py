@@ -7755,7 +7755,25 @@ class AutonomousResearchProcessor:
                 continue
             config = dict(config)
             if config.get("observation_capture_only") is True:
-                continue
+                handoff = config.get("observation_handoff")
+                bound_market = _binding_value(config.get("capture_market_id"))
+                scope_document = config.get("market_scope", config.get("scope", {}))
+                scope_ids: tuple[str, ...] = ()
+                if isinstance(scope_document, Mapping):
+                    try:
+                        scope_ids = tuple(
+                            _binding_value(value)
+                            for value in normalize_market_scope(scope_document).market_ids
+                            if _binding_value(value)
+                        )
+                    except (TypeError, ValueError):
+                        scope_ids = ()
+                if (
+                    isinstance(handoff, Mapping)
+                    and bound_market
+                    and (not scope_ids or bound_market in scope_ids)
+                ):
+                    continue
             candidate_id = _binding_value(config.get("candidate_id"))
             strategy_document = config.get("strategy_document", config.get("strategy"))
             if not candidate_id or not isinstance(strategy_document, Mapping):
@@ -7768,32 +7786,279 @@ class AutonomousResearchProcessor:
                 continue
             try:
                 lifecycle = lifecycle_loader(candidate_id)
-            except (sqlite3.Error, AttributeError, KeyError, TypeError, ValueError, RuntimeError):
+            except (
+                sqlite3.Error,
+                AttributeError,
+                KeyError,
+                TypeError,
+                ValueError,
+                RuntimeError,
+            ):
                 lifecycle = None
-            if not isinstance(lifecycle, Mapping):
-                continue
-            stage = str(getattr(lifecycle.get("stage"), "value", lifecycle.get("stage")) or "").strip().upper()
-            if stage not in {"SCHEMA_VALIDATED", "PAPER_FORWARD", "PAPER_PROMOTABLE"}:
-                continue
+            if lifecycle is not None:
+                if not isinstance(lifecycle, Mapping):
+                    continue
+                stage = str(
+                    getattr(
+                        lifecycle.get("stage"),
+                        "value",
+                        lifecycle.get("stage"),
+                    )
+                    or ""
+                ).strip().upper()
+                if stage not in {
+                    "SCHEMA_VALIDATED",
+                    "PAPER_FORWARD",
+                    "PAPER_PROMOTABLE",
+                }:
+                    continue
             try:
                 current_intent_id = str(getattr(intent, "experiment_id", "")).strip()
-                existing_successor = any(
-                    str(getattr(existing, "experiment_id", "")).strip()
-                    and str(getattr(existing, "experiment_id", "")).strip() != current_intent_id
-                    and isinstance(existing.config, Mapping)
-                    and _binding_value(existing.config.get("candidate_id")) == candidate_id
-                    and (
-                        existing.config.get("observation_capture_only") is True
-                        or existing.config.get("canonical_operational_setup_required") is True
+
+                def valid_successor(existing: Any) -> bool:
+                    existing_id = str(getattr(existing, "experiment_id", "")).strip()
+                    existing_config = (
+                        existing.config
+                        if isinstance(getattr(existing, "config", None), Mapping)
+                        else {}
                     )
-                    and isinstance(existing.config.get("observation_handoff"), Mapping)
-                    and _binding_value(
-                        existing.config["observation_handoff"].get(
-                            "predecessor_observation_intent_id"
+                    if (
+                        not existing_id
+                        or existing_id == current_intent_id
+                        or _binding_value(existing_config.get("candidate_id"))
+                        != candidate_id
+                        or not isinstance(
+                            existing_config.get("observation_handoff"), Mapping
                         )
+                    ):
+                        return False
+                    if (
+                        _binding_value(
+                            existing_config["observation_handoff"].get(
+                                "predecessor_observation_intent_id"
+                            )
+                        )
+                        != current_intent_id
+                    ):
+                        return False
+                    source_scope = config.get("market_scope", config.get("scope"))
+                    existing_scope = existing_config.get(
+                        "market_scope", existing_config.get("scope")
                     )
-                    == current_intent_id
-                    for existing in scanned
+                    if (
+                        not isinstance(source_scope, Mapping)
+                        or not isinstance(existing_scope, Mapping)
+                        or _canonical_binding(source_scope)
+                        != _canonical_binding(existing_scope)
+                    ):
+                        return False
+                    try:
+                        source_policy = normalize_market_scope(source_scope)
+                        existing_policy = normalize_market_scope(existing_scope)
+                    except (TypeError, ValueError):
+                        return False
+                    if source_policy.as_dict() != existing_policy.as_dict():
+                        return False
+                    scope_ids = tuple(
+                        _binding_value(value)
+                        for value in source_policy.market_ids
+                        if _binding_value(value)
+                    )
+                    capture_successor = (
+                        existing_config.get("observation_capture_only") is True
+                    )
+                    if capture_successor:
+                        for name, expected in {
+                            "observation_capture_only": True,
+                            "observation_only_lineage": True,
+                            "observation_intent": True,
+                            "paper_only": True,
+                            "selection_excluded": True,
+                            "allocation_active": False,
+                            "canary_armed": False,
+                            "market_authority_required": False,
+                        }.items():
+                            if (
+                                type(existing_config.get(name)) is not bool
+                                or existing_config.get(name) is not expected
+                            ):
+                                return False
+                        if existing_config.get("execution_scope") != "OBSERVATION":
+                            return False
+                        bound_market = _binding_value(
+                            existing_config.get("capture_market_id")
+                        )
+                        if not bound_market or bound_market not in scope_ids:
+                            return False
+                        try:
+                            strict_sla = float(
+                                existing_config.get(
+                                    "scope_resolution_freshness_sla_seconds"
+                                )
+                            )
+                        except (TypeError, ValueError, OverflowError):
+                            return False
+                        if not math.isfinite(strict_sla) or strict_sla <= 0:
+                            return False
+                        proof = existing_config.get("scope_resolution")
+                        if not isinstance(proof, Mapping):
+                            return False
+                        if (
+                            str(proof.get("status", "")).strip().upper() != "MATCHED"
+                            or _binding_value(proof.get("candidate_id"))
+                            != candidate_id
+                            or _binding_value(proof.get("scope_hash"))
+                            != source_policy.scope_hash
+                            or _binding_value(proof.get("scope_version"))
+                            != source_policy.scope_version
+                        ):
+                            return False
+                        resolved_at = parse_timestamp(proof.get("resolved_at"))
+                        if (
+                            resolved_at is None
+                            or (ensure_utc(now) - ensure_utc(resolved_at)).total_seconds()
+                            < 0
+                            or (ensure_utc(now) - ensure_utc(resolved_at)).total_seconds()
+                            > strict_sla
+                        ):
+                            return False
+                    else:
+                        if (
+                            existing_config.get("canonical_operational_setup_required")
+                            is not True
+                            or existing_config.get("market_authority_required") is not False
+                        ):
+                            return False
+                        setup = existing_config.get("operational_setup")
+                        setup_hash = _binding_value(
+                            existing_config.get("operational_setup_hash")
+                        )
+                        if not isinstance(setup, Mapping) or not setup_hash:
+                            return False
+                        try:
+                            if _operational_setup_hash(setup) != setup_hash:
+                                return False
+                        except (TypeError, ValueError):
+                            return False
+                    identity_fields = (
+                        "candidate_id",
+                        "strategy_version_id",
+                        "research_trial_id",
+                        "source_strategy_hash",
+                        "rolling_strategy_hash",
+                        "market_scope_hash",
+                        "market_scope_version",
+                    )
+                    for field in identity_fields:
+                        if _binding_value(existing_config.get(field)) != _binding_value(
+                            config.get(field)
+                        ):
+                            return False
+                    try:
+                        linked = [
+                            materialized
+                            for materialized in registry.list()
+                            if str(getattr(materialized, "experiment_id", "")).strip()
+                            != existing_id
+                            and bool(materialized.allowed_markets)
+                        ]
+                    except (AttributeError, TypeError, ValueError, RuntimeError):
+                        return False
+                    for materialized in linked:
+                        materialized_config = (
+                            materialized.config
+                            if isinstance(getattr(materialized, "config", None), Mapping)
+                            else {}
+                        )
+                        if (
+                            _binding_value(materialized_config.get("candidate_id"))
+                            != candidate_id
+                            or materialized_config.get("market_authority_required")
+                            is not True
+                            or set(str(item).strip() for item in materialized.allowed_markets)
+                            != set(scope_ids)
+                        ):
+                            continue
+                        if _canonical_binding(
+                            materialized_config.get("market_scope", {})
+                        ) != _canonical_binding(existing_scope):
+                            continue
+                        if any(
+                            _binding_value(materialized_config.get(field))
+                            != _binding_value(existing_config.get(field))
+                            for field in identity_fields
+                        ):
+                            continue
+                        lifecycle_payload = (
+                            lifecycle.get("payload")
+                            if isinstance(lifecycle, Mapping)
+                            else None
+                        )
+                        if not isinstance(lifecycle_payload, Mapping):
+                            continue
+                        if (
+                            _binding_value(lifecycle_payload.get("candidate_id"))
+                            != candidate_id
+                            or _binding_value(
+                                lifecycle_payload.get("paper_observation_intent_id")
+                            )
+                            != existing_id
+                            or _binding_value(
+                                lifecycle_payload.get("forward_test_id")
+                            )
+                            != str(materialized.experiment_id).strip()
+                            or set(
+                                str(item).strip()
+                                for item in lifecycle_payload.get(
+                                    "allowed_markets", ()
+                                )
+                            )
+                            != set(scope_ids)
+                            or _binding_value(lifecycle_payload.get("scope_hash"))
+                            != source_policy.scope_hash
+                            or _binding_value(lifecycle_payload.get("scope_version"))
+                            != source_policy.scope_version
+                        ):
+                            continue
+                        lifecycle_safety_valid = True
+                        for name, expected in {
+                            "paper_observation_intent": True,
+                            "paper_only": True,
+                            "research_only": True,
+                            "observation_only_lineage": True,
+                            "selection_excluded": True,
+                            "allocation_active": False,
+                            "canary_armed": False,
+                        }.items():
+                            if (
+                                type(lifecycle_payload.get(name)) is not bool
+                                or lifecycle_payload.get(name) is not expected
+                            ):
+                                lifecycle_safety_valid = False
+                                break
+                        if (
+                            not lifecycle_safety_valid
+                            or lifecycle_payload.get("execution_scope")
+                            != "OBSERVATION"
+                        ):
+                            continue
+                        lifecycle_proof = lifecycle_payload.get(
+                            "scope_resolution",
+                            lifecycle_payload.get("market_scope_resolution"),
+                        )
+                        if (
+                            not isinstance(lifecycle_proof, Mapping)
+                            or _canonical_binding(lifecycle_proof)
+                            != _canonical_binding(
+                                existing_config.get("scope_resolution", {})
+                            )
+                        ):
+                            continue
+                        return True
+                    return False
+
+                existing_successor = any(
+                    valid_successor(existing) for existing in scanned
                 )
             except (sqlite3.Error, AttributeError, TypeError, ValueError, RuntimeError):
                 existing_successor = False
@@ -7806,7 +8071,8 @@ class AutonomousResearchProcessor:
                     {"experiment_id": str(getattr(intent, "experiment_id", "")), "reason": str(exc)[:160]}
                 )
                 continue
-            capture_only = derived_setup is None
+            capture_marker = config.get("observation_capture_only") is True
+            capture_only = capture_marker or derived_setup is None
             if capture_only:
                 family = str(strategy_document.get("family", "")).strip().lower()
                 parameters = strategy_document.get("parameters")
@@ -7817,13 +8083,16 @@ class AutonomousResearchProcessor:
                     threshold = float(parameters.get("threshold"))
                 except (TypeError, ValueError, OverflowError):
                     continue
+                supported_capture = False
                 if family in {"momentum", "mean_reversion"}:
-                    capture_only = type(lookback) is int and lookback == 1 and threshold == 0.05
+                    supported_capture = (
+                        type(lookback) is int
+                        and lookback == 1
+                        and threshold == 0.05
+                    )
                 elif family == "probability_mispricing":
-                    capture_only = threshold == 0.05
-                else:
-                    capture_only = False
-                if not capture_only:
+                    supported_capture = threshold == 0.05
+                if not supported_capture:
                     continue
             unchanged_setup = False
             if not capture_only:
@@ -7980,6 +8249,7 @@ class AutonomousResearchProcessor:
                     "observation_capture_only": capture_only,
                 }
                 if capture_only:
+                    strategy["capture_market_id"] = sorted(matched_ids)[0]
                     predecessor_setup_hash = str(
                         strategy.get("operational_setup_hash", "") or ""
                     ).strip()
@@ -8008,6 +8278,139 @@ class AutonomousResearchProcessor:
                     {"experiment_id": str(getattr(intent, "experiment_id", "")), "reason": str(exc)[:160]}
                 )
                 continue
+            if (
+                isinstance(binding, Mapping)
+                and isinstance(lifecycle, Mapping)
+                and callable(getattr(self.store, "load_forward_tests", None))
+            ):
+                try:
+                    intent_id = _binding_value(binding.get("intent_id"))
+                    materialized = next(
+                        (
+                            candidate
+                            for candidate in registry.list()
+                            if _binding_value(
+                                (
+                                    candidate.config
+                                    if isinstance(
+                                        getattr(candidate, "config", None), Mapping
+                                    )
+                                    else {}
+                                ).get("candidate_id")
+                            )
+                            == candidate_id
+                            and _binding_value(
+                                (
+                                    (
+                                        candidate.config
+                                        if isinstance(
+                                            getattr(candidate, "config", None), Mapping
+                                        )
+                                        else {}
+                                    ).get("observation_handoff")
+                                    or {}
+                                ).get("predecessor_observation_intent_id")
+                            )
+                            == str(getattr(intent, "experiment_id", "")).strip()
+                            and (
+                                candidate.config
+                                if isinstance(
+                                    getattr(candidate, "config", None), Mapping
+                                )
+                                else {}
+                            ).get("market_authority_required")
+                            is True
+                            and set(
+                                str(item).strip()
+                                for item in getattr(candidate, "allowed_markets", ())
+                            )
+                            == set(str(item).strip() for item in matched_ids)
+                        ),
+                        None,
+                    )
+                    lifecycle_stage = str(
+                        getattr(
+                            lifecycle.get("stage"),
+                            "value",
+                            lifecycle.get("stage"),
+                        )
+                        or ""
+                    ).strip()
+                    lifecycle_payload = lifecycle.get("payload")
+                    if (
+                        materialized is not None
+                        and intent_id
+                        and lifecycle_stage
+                        and isinstance(lifecycle_payload, Mapping)
+                        and callable(
+                            getattr(self.store, "save_candidate_lifecycle", None)
+                        )
+                    ):
+                        materialized_config = (
+                            materialized.config
+                            if isinstance(
+                                getattr(materialized, "config", None), Mapping
+                            )
+                            else {}
+                        )
+                        body = dict(lifecycle_payload)
+                        body.update(
+                            {
+                                "candidate_id": candidate_id,
+                                "paper_observation_intent": True,
+                                "paper_observation_intent_id": intent_id,
+                                "forward_test_id": str(
+                                    materialized.experiment_id
+                                ).strip(),
+                                "paper_only": True,
+                                "research_only": True,
+                                "execution_scope": "OBSERVATION",
+                                "observation_only_lineage": True,
+                                "selection_excluded": True,
+                                "allocation_active": False,
+                                "canary_armed": False,
+                                "allowed_markets": list(materialized.allowed_markets),
+                                "current_market_ids": list(matched_ids),
+                                "resolved_market_ids": list(matched_ids),
+                                "scope_hash": policy.scope_hash,
+                                "scope_version": policy.scope_version,
+                                "scope_resolution": dict(proof),
+                                "market_scope_resolution": dict(proof),
+                            }
+                        )
+                        for field in (
+                            "candidate_id",
+                            "strategy_version_id",
+                            "research_trial_id",
+                            "source_strategy_hash",
+                            "rolling_strategy_hash",
+                            "market_scope_hash",
+                            "market_scope_version",
+                        ):
+                            if field in materialized_config:
+                                body[field] = materialized_config[field]
+                        self.store.save_candidate_lifecycle(
+                            candidate_id,
+                            lifecycle_stage,
+                            body,
+                            from_stage=lifecycle_stage,
+                            reason="reconciled immutable observation successor",
+                            timestamp=now,
+                        )
+                except (
+                    sqlite3.Error,
+                    AttributeError,
+                    KeyError,
+                    TypeError,
+                    ValueError,
+                    RuntimeError,
+                ) as exc:
+                    failures.append(
+                        {
+                            "experiment_id": str(getattr(intent, "experiment_id", "")),
+                            "reason": f"LIFECYCLE_RECONCILE:{str(exc)[:140]}",
+                        }
+                    )
             if isinstance(binding, Mapping):
                 migrated.append(dict(binding))
         if callable(state_setter):
@@ -8115,7 +8518,9 @@ class AutonomousResearchProcessor:
         config = {
             "observation_intent": True,
             "observation_only_lineage": True,
-            "market_authority_required": capture_only,
+            # Registration is an unmaterialized intent.  Authority is granted
+            # only by materialize_observation_intent after scope resolution.
+            "market_authority_required": False,
             "candidate_id": candidate_id,
             "strategy_version_id": strategy_version_id,
             "research_trial_id": trial_id,
@@ -8145,15 +8550,6 @@ class AutonomousResearchProcessor:
             "allocation_active": False if capture_only else None,
             "canary_armed": False if capture_only else None,
         }
-        if capture_only:
-            for safety_key in (
-                "execution_scope",
-                "research_only",
-                "selection_excluded",
-                "allocation_active",
-                "canary_armed",
-            ):
-                config.pop(safety_key, None)
         if not strategy.get("observation_capture_only"):
             for safety_key in (
                 "execution_scope",

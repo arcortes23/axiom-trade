@@ -5741,12 +5741,19 @@ class ResearchNode:
             ).strip().upper()
             if stage not in {"SCHEMA_VALIDATED", "PAPER_FORWARD", "PAPER_PROMOTABLE"}:
                 raise ValueError("OBSERVATION_LIFECYCLE_STAGE_INVALID")
+            intent_id = str(
+                config.get("observation_intent_id")
+                or config.get("paper_observation_intent_id")
+                or ""
+            ).strip()
             if (
                 not isinstance(payload, Mapping)
+                or not intent_id
                 or str(payload.get("candidate_id", "")).strip() != candidate_id
-                or str(payload.get("forward_test_id", "")).strip() != str(spec.experiment_id)
-                or str(payload.get("paper_observation_intent_id", "")).strip()
+                or str(payload.get("forward_test_id", "")).strip()
                 != str(spec.experiment_id)
+                or str(payload.get("paper_observation_intent_id", "")).strip()
+                != intent_id
             ):
                 raise ValueError("OBSERVATION_LIFECYCLE_IDENTITY_MISMATCH")
             if not allowed:

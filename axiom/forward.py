@@ -139,6 +139,22 @@ def _validate_forward_config(config: Mapping[str, Any]) -> None:
                 raise ValueError("forward tests are paper-only")
             continue
         public[str(key)] = value
+    # Observation intents carry typed safety/provenance markers so the worker
+    # can fail closed.  They are control metadata, not public strategy input.
+    if config.get("observation_intent") is True:
+        for key in (
+            "observation_only_lineage",
+            "observation_intent",
+            "observation_capture_only",
+            "execution_scope",
+            "research_only",
+            "paper_only",
+            "selection_excluded",
+            "allocation_active",
+            "canary_armed",
+            "market_authority_required",
+        ):
+            public.pop(key, None)
     try:
         _validate_payload(public)
     except (ResearchBusPermissionError, TypeError, ValueError) as exc:
@@ -756,13 +772,18 @@ class ForwardTestRegistry:
             strategy,
             _canonical_forward_config(intent_config),
         )
+        identity_config = dict(normalized_config)
+        # The generated intent ID is persisted as provenance but must not
+        # participate in its own rolling digest.
+        identity_config.pop("observation_intent_id", None)
+        identity_config.pop("paper_observation_intent_id", None)
         computed_model_hash = _content_hash(normalized_model)
         normalized_risk_limits = dict(risk_limits or {})
         identity_material = {
             "candidate_id": identifier,
             "strategy_hash": computed_strategy_hash,
             "model_hash": computed_model_hash,
-            "config": normalized_config,
+            "config": identity_config,
             "bankroll": float(bankroll),
             "risk_limits": normalized_risk_limits,
         }
@@ -772,6 +793,10 @@ class ForwardTestRegistry:
             else "observation-intent-"
             + hashlib.sha256(_canonical(identity_material).encode("utf-8")).hexdigest()[:24]
         )
+        intent_config["observation_intent_id"] = experiment_id
+        intent_config["paper_observation_intent_id"] = experiment_id
+        normalized_config["observation_intent_id"] = experiment_id
+        normalized_config["paper_observation_intent_id"] = experiment_id
         existing = self.get(experiment_id)
         if existing is not None:
             existing_config = dict(existing.config)

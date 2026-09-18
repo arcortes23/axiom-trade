@@ -9598,6 +9598,20 @@ class AxiomStore:
                     raise ValueError(f"{normalized} must be a non-empty string")
                 continue
             public_config[str(key)] = value
+        if config.get("observation_intent") is True:
+            for key in (
+                "observation_only_lineage",
+                "observation_intent",
+                "observation_capture_only",
+                "execution_scope",
+                "research_only",
+                "paper_only",
+                "selection_excluded",
+                "allocation_active",
+                "canary_armed",
+                "market_authority_required",
+            ):
+                public_config.pop(key, None)
         try:
             from .research_bus import _validate_payload
 
