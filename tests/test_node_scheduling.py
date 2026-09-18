@@ -2076,7 +2076,7 @@ class MutationSchedulingTests(unittest.TestCase):
                     candidate_id,
                     {"market_scope": policy.as_dict()},
                     [current_market],
-                    resolved_at=T0,
+                    resolved_at=T0 - timedelta(seconds=120),
                 )
                 store.save_market_scope_resolution(proof)
                 registry = ForwardTestRegistry(store)
@@ -2159,7 +2159,8 @@ class MutationSchedulingTests(unittest.TestCase):
                 processor = AutonomousResearchProcessor(
                     store,
                     config=AutonomousResearchConfig(
-                        scope_resolution_freshness_sla_seconds=60
+                        scope_resolution_freshness_sla_seconds=60,
+                        observation_setup_migration_freshness_sla_seconds=300,
                     ),
                     clock=lambda: T0,
                 )
@@ -2229,6 +2230,77 @@ class MutationSchedulingTests(unittest.TestCase):
                     worker["payload"]["next_decision"],
                     "WAIT_FOR_ROLLING_REVIEW",
                 )
+                successor = next(
+                    item
+                    for item in registry.list()
+                    if item.allowed_markets
+                    and item.config.get("observation_capture_only") is True
+                )
+                capture_node = ResearchNode.__new__(ResearchNode)
+                capture_node.store = store
+                capture_node.config = SimpleNamespace(shadow_interval=60)
+                lifecycle_payload = {
+                    "candidate_id": candidate_id,
+                    "forward_test_id": successor.experiment_id,
+                    "paper_observation_intent_id": successor.experiment_id,
+                    "paper_observation_intent": True,
+                    "paper_only": True,
+                    "research_only": True,
+                    "execution_scope": "OBSERVATION",
+                    "observation_only_lineage": True,
+                    "selection_excluded": True,
+                    "allocation_active": False,
+                    "canary_armed": False,
+                    "scope_hash": policy.scope_hash,
+                    "scope_version": policy.scope_version,
+                }
+                capture_node.store.load_candidate_lifecycle = (
+                    lambda _candidate: {
+                        "stage": CandidateStage.PAPER_FORWARD.value,
+                        "payload": lifecycle_payload,
+                    }
+                )
+                capture_node.store.load_market_scope_resolution = (
+                    lambda *_args, **_kwargs: proof.as_dict()
+                )
+                stale_capture = capture_node._capture_legacy_observations(
+                    successor,
+                    [
+                        {
+                            "market_id": market_id,
+                            "timestamp": T0,
+                            "source_timestamp": T0,
+                            "source_snapshot_id": "stale-proof",
+                        }
+                    ],
+                    store=store,
+                    now=T0,
+                )
+                self.assertEqual(stale_capture["status"], "BLOCKED")
+                self.assertEqual(stale_capture["blocker"], "CURRENT_SCOPE_PROOF_STALE")
+                fresh_proof = resolve_market_scope(
+                    candidate_id,
+                    {"market_scope": policy.as_dict()},
+                    [current_market],
+                    resolved_at=T0,
+                )
+                capture_node.store.load_market_scope_resolution = (
+                    lambda *_args, **_kwargs: fresh_proof.as_dict()
+                )
+                fresh_capture = capture_node._capture_legacy_observations(
+                    successor,
+                    [
+                        {
+                            "market_id": market_id,
+                            "timestamp": T0,
+                            "source_timestamp": T0,
+                            "source_snapshot_id": "fresh-proof",
+                        }
+                    ],
+                    store=store,
+                    now=T0,
+                )
+                self.assertEqual(fresh_capture["status"], "OBSERVING")
 
 
 

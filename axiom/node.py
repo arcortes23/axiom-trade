@@ -918,6 +918,12 @@ class ResearchNode:
                     else float(config.interval_seconds),
                     float(config.interval_seconds),
                 ),
+                observation_setup_migration_freshness_sla_seconds=max(
+                    float(config.freshness_sla_seconds)
+                    if config.freshness_sla_seconds is not None
+                    else float(config.interval_seconds),
+                    float(config.rolling_evidence_interval_seconds),
+                ),
             ),
             clock=clock,
         )

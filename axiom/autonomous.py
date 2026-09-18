@@ -3932,6 +3932,7 @@ class AutonomousResearchConfig:
     mutation_enabled: bool = True
     promotion_criteria: PromotionCriteria = field(default_factory=PromotionCriteria)
     scope_resolution_freshness_sla_seconds: float | None = None
+    observation_setup_migration_freshness_sla_seconds: float | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -3963,6 +3964,17 @@ class AutonomousResearchConfig:
             if not math.isfinite(freshness) or freshness <= 0:
                 raise ValueError("scope_resolution_freshness_sla_seconds must be finite and positive")
             object.__setattr__(self, "scope_resolution_freshness_sla_seconds", freshness)
+        if self.observation_setup_migration_freshness_sla_seconds is not None:
+            freshness = float(self.observation_setup_migration_freshness_sla_seconds)
+            if not math.isfinite(freshness) or freshness <= 0:
+                raise ValueError(
+                    "observation_setup_migration_freshness_sla_seconds must be finite and positive"
+                )
+            object.__setattr__(
+                self,
+                "observation_setup_migration_freshness_sla_seconds",
+                freshness,
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -7876,20 +7888,35 @@ class AutonomousResearchProcessor:
                 resolved_at = parse_timestamp(proof.get("resolved_at"))
                 if resolved_at is None:
                     raise ValueError("CURRENT_SCOPE_PROOF_TIMESTAMP_MISSING")
+                strict_declared = config.get("scope_resolution_freshness_sla_seconds")
                 if "scope_resolution_freshness_sla_seconds" in config:
-                    freshness_value = config.get(
-                        "scope_resolution_freshness_sla_seconds"
+                    try:
+                        strict_value = float(strict_declared)
+                    except (TypeError, ValueError, OverflowError):
+                        raise ValueError("CURRENT_SCOPE_PROOF_SLA_UNAVAILABLE") from None
+                    if not math.isfinite(strict_value) or strict_value <= 0:
+                        raise ValueError("CURRENT_SCOPE_PROOF_SLA_UNAVAILABLE")
+                freshness_value = getattr(
+                    getattr(self, "config", None),
+                    "observation_setup_migration_freshness_sla_seconds",
+                    None,
+                )
+                if freshness_value is None:
+                    freshness_value = config.get("freshness_sla_seconds")
+                if freshness_value is None:
+                    freshness_value = getattr(
+                        getattr(self, "config", None),
+                        "freshness_sla_seconds",
+                        None,
                     )
-                else:
+                if freshness_value is None:
                     freshness_value = getattr(
                         getattr(self, "config", None),
                         "scope_resolution_freshness_sla_seconds",
                         None,
                     )
-                    if freshness_value is None:
-                        freshness_value = config.get("freshness_sla_seconds", 3600.0)
-                if freshness_value is None and capture_only:
-                    raise ValueError("CURRENT_SCOPE_PROOF_SLA_UNAVAILABLE")
+                if freshness_value is None:
+                    freshness_value = 3600.0
                 try:
                     freshness = float(freshness_value)
                 except (TypeError, ValueError, OverflowError):
