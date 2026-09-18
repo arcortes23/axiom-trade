@@ -349,6 +349,27 @@ class _ScopeStore:
         del if_absent
         self.resolutions.append(result)
         return result.resolution_id
+    def load_market_scope_resolution(
+        self,
+        candidate_id: str,
+        *,
+        scope_hash: str | None = None,
+        scope_version: str | None = None,
+        resolved_at=None,
+    ):
+        del resolved_at
+        for result in reversed(self.resolutions):
+            proof = result.as_dict() if hasattr(result, "as_dict") else result
+            if not isinstance(proof, dict):
+                continue
+            if str(proof.get("candidate_id", "")).strip() != str(candidate_id).strip():
+                continue
+            if scope_hash is not None and str(proof.get("scope_hash", "")).strip() != str(scope_hash).strip():
+                continue
+            if scope_version is not None and str(proof.get("scope_version", "")).strip() != str(scope_version).strip():
+                continue
+            return result
+        return None
     def candidate_forward_requirements(self, candidate_ids=None, **kwargs):
         del kwargs
         self.requirement_calls.append(tuple(candidate_ids or ()))
@@ -3981,6 +4002,167 @@ class MarketScopeCollectorTests(unittest.TestCase):
         self.assertEqual(restarted_cycle.paper_forward_markets, (market_id,))
         self.assertEqual(restarted_cycle.paper_forward_scheduled, (market_id,))
         restarted_collector.close()
+        fallback_store = _ScopeStore({candidate_id: lifecycle_payload})
+        fallback_store.documents[candidate_id]["stage"] = CandidateStage.SCHEMA_VALIDATED.value
+        fallback_store.forward_tests[intent.experiment_id] = intent.as_record()
+        fallback_store.resolutions.append(store.resolutions[0])
+        fallback_collector = self._collector(
+            _RecordingProvider((market(market_id),)),
+            fallback_store,
+            (),
+            max_markets=1,
+        )
+        fallback_candidate_ids: list[str] = []
+        fallback_markets: dict[str, list[str]] = {}
+        fallback_proofs: dict[str, object] = {}
+        fallback_collector._restore_current_observation_scope_proofs(
+            T0,
+            (candidate_id,),
+            fallback_candidate_ids,
+            fallback_markets,
+            fallback_proofs,
+        )
+        self.assertEqual(fallback_markets[candidate_id], [market_id])
+        ready = fallback_collector._materialize_observation_intents(
+            T0,
+            (candidate_id,),
+            fallback_markets,
+            {"errors": 0},
+            scope_resolutions=fallback_proofs,
+        )
+        mismatch_proof = dict(store.resolutions[0].as_dict())
+        mismatch_proof["scope_hash"] = "sha256:mismatched-scope"
+        mismatch_store = _ScopeStore({candidate_id: lifecycle_payload})
+        mismatch_store.documents[candidate_id]["stage"] = CandidateStage.SCHEMA_VALIDATED.value
+        mismatch_store.forward_tests[intent.experiment_id] = intent.as_record()
+        mismatch_store.resolutions.append(mismatch_proof)
+        mismatch_collector = self._collector(
+            _RecordingProvider((market(market_id),)),
+            mismatch_store,
+            (),
+            max_markets=1,
+        )
+        mismatch_candidate_ids: list[str] = []
+        mismatch_markets: dict[str, list[str]] = {}
+        mismatch_proofs: dict[str, object] = {}
+        mismatch_collector._restore_current_observation_scope_proofs(
+            T0,
+            (candidate_id,),
+            mismatch_candidate_ids,
+            mismatch_markets,
+            mismatch_proofs,
+        )
+        self.assertEqual(mismatch_markets, {})
+        mismatch_collector.close()
+        invalid_proofs = []
+        contradictory_proof = dict(store.resolutions[0].as_dict())
+        contradictory_proof["excluded_markets"] = [{"market_id": market_id, "reason": "CONTRADICTORY"}]
+        invalid_proofs.append(contradictory_proof)
+        malformed_proof = dict(store.resolutions[0].as_dict())
+        malformed_proof["excluded_markets"] = ["not-a-disposition"]
+        invalid_proofs.append(malformed_proof)
+        for invalid_proof in invalid_proofs:
+            invalid_store = _ScopeStore({candidate_id: lifecycle_payload})
+            invalid_store.documents[candidate_id]["stage"] = CandidateStage.SCHEMA_VALIDATED.value
+            invalid_store.forward_tests[intent.experiment_id] = intent.as_record()
+            invalid_store.resolutions.append(invalid_proof)
+            invalid_collector = self._collector(
+                _RecordingProvider((market(market_id),)),
+                invalid_store,
+                (),
+                max_markets=1,
+            )
+            invalid_candidate_ids: list[str] = []
+            invalid_markets: dict[str, list[str]] = {}
+            invalid_proofs_by_candidate: dict[str, object] = {}
+            invalid_collector._restore_current_observation_scope_proofs(
+                T0,
+                (candidate_id,),
+                invalid_candidate_ids,
+                invalid_markets,
+                invalid_proofs_by_candidate,
+            )
+            self.assertEqual(invalid_markets, {})
+            invalid_collector.close()
+        reset_store = _ScopeStore({candidate_id: lifecycle_payload})
+        reset_store.documents[candidate_id]["stage"] = CandidateStage.SCHEMA_VALIDATED.value
+        reset_store.forward_tests[intent.experiment_id] = intent.as_record()
+        reset_store.resolutions.append(store.resolutions[0])
+        reset_collector = self._collector(
+            _RecordingProvider((market(market_id),)),
+            reset_store,
+            (),
+            max_markets=1,
+        )
+        reset_collector._scope_inventory_continuation = {
+            "coverage_status": "ERROR",
+            "query_reset": True,
+            "rebase_required": True,
+        }
+        reset_candidate_ids: list[str] = []
+        reset_markets: dict[str, list[str]] = {}
+        reset_proofs: dict[str, object] = {}
+        self.assertFalse(reset_collector._scope_persisted_proof_restore_allowed())
+        if reset_collector._scope_persisted_proof_restore_allowed():
+            reset_collector._restore_current_observation_scope_proofs(
+                T0,
+                (candidate_id,),
+                reset_candidate_ids,
+                reset_markets,
+                reset_proofs,
+            )
+        self.assertEqual(reset_markets, {})
+        reset_collector.close()
+        with AxiomStore(":memory:") as real_store:
+            real_store.save_candidate_lifecycle(
+                candidate_id,
+                CandidateStage.IDEA.value,
+                lifecycle_payload,
+            )
+            real_store.save_candidate_lifecycle(
+                candidate_id,
+                CandidateStage.SCHEMA_VALIDATED.value,
+                lifecycle_payload,
+                from_stage=CandidateStage.IDEA.value,
+            )
+            real_store.save_forward_test(intent.experiment_id, intent.as_record())
+            real_store.save_market_scope_resolution(store.resolutions[0])
+            real_collector = self._collector(
+                _RecordingProvider((market(market_id),)),
+                real_store,
+                (),
+                max_markets=1,
+            )
+            real_candidate_ids: list[str] = []
+            real_markets: dict[str, list[str]] = {}
+            real_proofs: dict[str, object] = {}
+            real_collector._restore_current_observation_scope_proofs(
+                T0 + timedelta(minutes=1),
+                (candidate_id,),
+                real_candidate_ids,
+                real_markets,
+                real_proofs,
+            )
+            self.assertEqual(real_markets[candidate_id], [market_id])
+            real_ready = real_collector._materialize_observation_intents(
+                T0 + timedelta(minutes=1),
+                (candidate_id,),
+                real_markets,
+                {"errors": 0},
+                scope_resolutions=real_proofs,
+            )
+            self.assertEqual(real_ready, {candidate_id})
+            self.assertEqual(
+                real_store.load_candidate_lifecycle(candidate_id)["stage"],
+                CandidateStage.PAPER_FORWARD.value,
+            )
+            real_collector.close()
+        self.assertEqual(ready, {candidate_id})
+        self.assertEqual(
+            fallback_store.load_candidate_lifecycle(candidate_id)["stage"],
+            CandidateStage.PAPER_FORWARD.value,
+        )
+        fallback_collector.close()
 
         failed_store = _ScopeStore({candidate_id: lifecycle_payload})
         failed_store.documents[candidate_id]["stage"] = CandidateStage.SCHEMA_VALIDATED.value

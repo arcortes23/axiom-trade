@@ -774,6 +774,14 @@ class PolymarketCollector:
 
         finally:
             self._scope_phase_active = False
+        if self._scope_persisted_proof_restore_allowed():
+            self._restore_current_observation_scope_proofs(
+                started,
+                observation_intent_ids,
+                scope_candidate_ids,
+                scope_candidate_markets,
+                self._scope_resolutions,
+            )
         if isinstance(self._scope_inventory_continuation, Mapping):
             discovery_exclusions = [
                 *(
@@ -2219,6 +2227,132 @@ class PolymarketCollector:
                 )
             return True
         raise ValueError(f"observation lifecycle cannot advance from {current.stage.value}")
+    def _scope_persisted_proof_restore_allowed(self) -> bool:
+        continuation = self._scope_inventory_continuation
+        if not isinstance(continuation, Mapping):
+            return True
+        if continuation.get("query_reset") or continuation.get("rebase_required"):
+            return False
+        status = str(continuation.get("coverage_status", "")).strip().upper()
+        if status == "ERROR" or str(continuation.get("error_reason", "")).strip():
+            return False
+        if status not in {"", "PARTIAL", "INCOMPLETE", "BUDGET_EXHAUSTED"}:
+            return False
+        request_fingerprint = str(continuation.get("request_fingerprint", "")).strip()
+        expected_fingerprint = str(continuation.get("expected_query_fingerprint", "")).strip()
+        return not (
+            request_fingerprint
+            and expected_fingerprint
+            and request_fingerprint != expected_fingerprint
+        )
+
+
+    def _restore_current_observation_scope_proofs(
+        self,
+        observed_at: datetime,
+        candidate_ids: Sequence[str],
+        scope_candidate_ids: list[str],
+        candidate_markets: dict[str, list[str]],
+        scope_resolutions: dict[str, Any],
+    ) -> None:
+        loader = getattr(self.store, "load_market_scope_resolution", None)
+        lifecycle_loader = getattr(self.store, "load_candidate_lifecycle", None)
+        if not callable(loader):
+            return
+        try:
+            intents = ForwardTestRegistry(self.store).list_observation_intents()
+        except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+            return
+        intents_by_candidate = {
+            str((intent.config if isinstance(intent.config, Mapping) else {}).get("candidate_id", "")).strip(): intent
+            for intent in intents
+        }
+        observed = ensure_utc(observed_at)
+        freshness = self.config.freshness_sla_seconds or self.config.interval_seconds
+        try:
+            max_age = max(1.0, float(freshness))
+        except (TypeError, ValueError):
+            max_age = 60.0
+        for candidate_id in candidate_ids:
+            candidate_id = str(candidate_id).strip()
+            if not candidate_id or candidate_id in candidate_markets:
+                continue
+            intent = intents_by_candidate.get(candidate_id)
+            config = intent.config if intent is not None and isinstance(intent.config, Mapping) else {}
+            scope_hash = str(config.get("market_scope_hash", "")).strip()
+            scope_version = str(config.get("market_scope_version", "")).strip()
+            if (not scope_hash or not scope_version) and callable(lifecycle_loader):
+                try:
+                    lifecycle = lifecycle_loader(candidate_id)
+                except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+                    lifecycle = None
+                payload = lifecycle.get("payload") if isinstance(lifecycle, Mapping) else None
+                if isinstance(payload, Mapping):
+                    scope_hash = scope_hash or str(payload.get("market_scope_hash", "")).strip()
+                    scope_version = scope_version or str(payload.get("market_scope_version", "")).strip()
+            if not scope_hash or not scope_version:
+                continue
+            try:
+                proof = loader(
+                    candidate_id,
+                    scope_hash=scope_hash,
+                    scope_version=scope_version,
+                )
+            except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+                continue
+            if hasattr(proof, "as_dict") and callable(proof.as_dict):
+                try:
+                    proof = proof.as_dict()
+                except (AttributeError, TypeError, ValueError):
+                    continue
+            if not isinstance(proof, Mapping):
+                continue
+            if (
+                str(proof.get("candidate_id", "")).strip() != candidate_id
+                or str(proof.get("scope_hash", "")).strip() != scope_hash
+                or str(proof.get("scope_version", proof.get("version", ""))).strip() != scope_version
+                or str(proof.get("status", "")).strip().upper() != "MATCHED"
+            ):
+                continue
+            resolved_at = parse_timestamp(proof.get("resolved_at"))
+            if resolved_at is None:
+                continue
+            age = (observed - ensure_utc(resolved_at)).total_seconds()
+            if age < 0 or age > max_age:
+                continue
+            def disposition_ids(
+                value: Any,
+                *,
+                require_reason: bool,
+            ) -> list[str] | None:
+                if not isinstance(value, (list, tuple)):
+                    return None
+                result: list[str] = []
+                for row in value:
+                    if not isinstance(row, Mapping):
+                        return None
+                    market_id = str(row.get("market_id", row.get("id", ""))).strip()
+                    reason = str(row.get("reason", "")).strip()
+                    if not market_id or (require_reason and not reason) or market_id in result:
+                        return None
+                    result.append(market_id)
+                return result
+
+            matched_ids = disposition_ids(proof.get("matched_markets"), require_reason=False)
+            excluded_ids = disposition_ids(proof.get("excluded_markets"), require_reason=True)
+            deferred_ids = disposition_ids(proof.get("deferred_markets"), require_reason=True)
+            if (
+                not matched_ids
+                or excluded_ids is None
+                or deferred_ids is None
+                or deferred_ids
+                or set(matched_ids).intersection(excluded_ids)
+            ):
+                continue
+            candidate_markets[candidate_id] = matched_ids
+            scope_resolutions[candidate_id] = proof
+            if candidate_id not in scope_candidate_ids:
+                scope_candidate_ids.append(candidate_id)
 
 
     def _materialize_observation_intents(
