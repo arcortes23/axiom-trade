@@ -1798,7 +1798,8 @@ class MarketScopeCollectorTests(unittest.TestCase):
                 }
             }
         )
-        cycle = self._collector(provider, store, ("scoped-candidate",), max_markets=1).collect_once(now=T0)
+        collector = self._collector(provider, store, ("scoped-candidate",), max_markets=1)
+        cycle = collector.collect_once(now=T0)
 
         continuation = store.states["polymarket"]["scope_inventory_continuation"]
         self.assertEqual(cycle.candidate_bound_scheduled, ("verified-scope",))
@@ -1825,6 +1826,18 @@ class MarketScopeCollectorTests(unittest.TestCase):
                 "scope_version": expected.scope_version,
             }],
         )
+        stale = replace(suitable, order_book=None)
+        provider._markets["verified-scope"] = stale
+        provider.pages = [
+            {
+                "snapshots": (stale,),
+                "next_cursor": None,
+                "coverage_status": "COMPLETE",
+            }
+        ]
+        second_cycle = collector.collect_once(now=T0 + timedelta(minutes=1))
+        self.assertNotIn("verified-scope", second_cycle.candidate_bound_scheduled)
+        self.assertGreaterEqual(provider.book_calls.count("verified-scope"), 2)
     def test_scope_suitability_cache_reuses_identical_probe_with_explicit_ceiling(self) -> None:
         snapshot = replace(market("cached-scope"), order_book=None)
         provider = _PagedProvider((snapshot,), ())
@@ -2075,6 +2088,7 @@ class MarketScopeCollectorTests(unittest.TestCase):
             "inventory_records": records,
         }
         collector._scope_refresh_attempted = set()
+        collector._scope_broad_provider_unavailable = False
         collector._cycle_deadline_exhausted = False
         collector._discover_scope_inventory(
             T0,
@@ -2158,6 +2172,80 @@ class MarketScopeCollectorTests(unittest.TestCase):
             [item["market_id"] for item in proof["matched_markets"]],
             ["second-scope"],
         )
+    def test_broad_scope_timeout_fails_fast_and_rotates_large_refresh_queue(self) -> None:
+        markets = tuple(market(f"refresh-{index:03d}", category="politics") for index in range(76))
+        entered = threading.Event()
+        release = threading.Event()
+
+        class SaturatedBroadProvider(_PagedProvider):
+            def market(self, market_id: str):
+                identifier = str(market_id)
+                if identifier == "refresh-000":
+                    entered.set()
+                    release.wait(timeout=1.0)
+                return super().market(identifier)
+
+        provider = SaturatedBroadProvider(
+            markets,
+            ({"snapshots": (), "next_cursor": None},),
+        )
+        collector = self._collector(
+            provider,
+            _ScopeStore({}),
+            (),
+            max_markets=76,
+        )
+        collector.config = replace(
+            collector.config,
+            provider_timeout_seconds=0.02,
+            max_attempts=1,
+            discovery_budget_per_cycle=100,
+        )
+        records = [
+            PolymarketCollector._scope_market_record(item, T0, provider)
+            for item in markets
+        ]
+        document = {
+            "experiment_plan": {
+                "market_scope": scope("RULE_BASED_MARKETS", category="politics"),
+                "suitability": {"required_capital": 1.0},
+            }
+        }
+        collector._scope_broad_provider_unavailable = False
+        collector._scope_inventory_continuation = {
+            "after_cursor": "scope-cursor",
+            "coverage_status": "BUDGET_EXHAUSTED",
+            "suitability_enabled": True,
+            "suitability_refresh_queue": [item.market_id for item in markets],
+            "inventory_records": records,
+        }
+        collector._scope_phase_active = True
+        collector._cycle_deadline_monotonic = time.monotonic() + 2.0
+        counters = collector._new_counters()
+        collector._discover_scope_inventory(
+            T0,
+            counters,
+            carry_cursor="scope-cursor",
+            documents=(document,),
+        )
+        self.assertTrue(entered.wait(timeout=0.2))
+        self.assertEqual(counters["provider_timeouts"], 1)
+        self.assertTrue(collector._scope_broad_provider_unavailable)
+        queue = collector._scope_inventory_continuation["suitability_refresh_queue"]
+        self.assertEqual(len(queue), 76)
+        self.assertEqual(queue[0], "refresh-001")
+
+        release.set()
+        collector._scope_phase_active = False
+        downstream = collector._call_provider(
+            "collection:downstream",
+            lambda: provider.market("refresh-001"),
+            T0,
+            collector._new_counters(),
+        )
+        self.assertIsNotNone(downstream)
+        self.assertEqual(provider.market_calls.count("refresh-000"), 1)
+        collector.close()
     def test_reserved_pipeline_verifies_later_queue_head_before_broad_refresh(self) -> None:
         head = replace(market("queue-head"), order_book=None)
         suitable_base = market("queue-suitable")
@@ -2809,7 +2897,7 @@ class MarketScopeCollectorTests(unittest.TestCase):
                 if self.mode == "hang":
                     self.started.set()
                     release.wait(timeout=5.0)
-                    return None
+                    return closed
                 return closed
 
             def close(self) -> None:
@@ -2900,6 +2988,76 @@ class MarketScopeCollectorTests(unittest.TestCase):
             time.sleep(0.005)
         self.assertEqual(provider.clones[0].close_calls, 1)
 
+    def test_scope_direct_retries_worker_timeout_error(self) -> None:
+        target = market("retry-timeout")
+        calls = 0
+
+        class RetryClone:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def market(self, market_id: str):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise TimeoutError("worker timeout")
+                return target if str(market_id) == target.market_id else None
+
+            def close(self) -> None:
+                self.closed = True
+
+        class RetryProvider(_PagedProvider):
+            def __init__(self) -> None:
+                super().__init__((target,), ())
+                self.clones: list[RetryClone] = []
+
+            def isolated_worker_factory(self):
+                clone = RetryClone()
+                self.clones.append(clone)
+                return clone
+
+        provider = RetryProvider()
+        collector = self._collector(provider, _ScopeStore({}), ())
+        collector.config = replace(
+            collector.config,
+            max_attempts=2,
+            provider_timeout_seconds=0.1,
+            backoff_initial_seconds=0,
+            jitter_seconds=0,
+        )
+        counters = collector._new_counters()
+        result = collector._call_scope_direct(
+            "scope_refresh:/markets/retry-timeout",
+            lambda operation_provider: operation_provider.market("retry-timeout"),
+            T0,
+            counters,
+        )
+        self.assertEqual(result.market_id, "retry-timeout")
+        self.assertEqual(calls, 2)
+        self.assertEqual(counters["retries"], 1)
+        self.assertTrue(all(clone.closed for clone in provider.clones))
+        generic_calls = 0
+
+        def generic_operation():
+            nonlocal generic_calls
+            generic_calls += 1
+            if generic_calls == 1:
+                raise TimeoutError("generic worker timeout")
+            return target
+
+        generic_counters = collector._new_counters()
+        generic_result = collector._call_provider(
+            "collection:retry-timeout",
+            generic_operation,
+            T0,
+            generic_counters,
+            provider=provider,
+            pool_name="collection",
+        )
+        self.assertEqual(generic_result.market_id, "retry-timeout")
+        self.assertEqual(generic_calls, 2)
+        self.assertEqual(generic_counters["retries"], 1)
+        collector.close()
 
     def test_hanging_inventory_does_not_starve_direct_exact_scope_across_cycles(self) -> None:
         closed = replace(

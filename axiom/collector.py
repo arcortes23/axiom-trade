@@ -488,6 +488,7 @@ class PolymarketCollector:
         self._scope_direct_provider: Any | None = None
         self._scope_direct_provider_ids: set[int] = set()
         self._scope_direct_provider_refs: dict[int, Any] = {}
+        self._scope_broad_provider_unavailable = False
         self._active_provider_calls: set[tuple[int, str]] = set()
         self._provider_call_pools: dict[tuple[int, str], str] = {}
         self._provider_timeout_evidence: list[dict[str, Any]] = []
@@ -676,8 +677,9 @@ class PolymarketCollector:
 
         configured = requested or self.config.market_ids
         self._scope_suitability_cache = {}
-        self._scope_refresh_attempted = set()
         self._scope_refreshed_snapshots = {}
+        self._scope_broad_provider_unavailable = False
+        self._scope_refresh_attempted = set()
         self._scope_resolution_deferred_candidate_ids = tuple(
             str(item).strip()
             for item in root_state.get("scope_resolution_deferred_candidate_ids", ())
@@ -2739,7 +2741,7 @@ class PolymarketCollector:
                         if snapshot is not None:
                             refresh_kwargs: dict[str, Any] = {}
                             if "pool_name" in inspect.signature(self._refresh_scope_snapshot).parameters:
-                                refresh_kwargs["pool_name"] = "scope_direct" if exact_scope else None
+                                refresh_kwargs["pool_name"] = "scope_direct" if exact_scope else "scope"
                             snapshot = self._refresh_scope_snapshot(
                                 snapshot,
                                 suitability_provider,
@@ -2774,7 +2776,7 @@ class PolymarketCollector:
                         observed_at,
                         suitability_provider,
                         counters=counters,
-                        pool_name="scope_direct" if exact_scope else None,
+                        pool_name="scope_direct" if exact_scope else "scope",
                         **kwargs,
                     )
                     refreshed = dict(self._scope_market_record(snapshot, observed_at, suitability_provider))
@@ -3426,6 +3428,11 @@ class PolymarketCollector:
         if market_id:
             self._scope_refresh_attempted.add(market_id)
         provider_pool = pool_name or self._scope_provider_pool(provider)
+        broad_scope = provider_pool == "scope" or (
+            provider_pool is None and self._scope_phase_active
+        )
+        if broad_scope and self._scope_broad_provider_unavailable:
+            return None
         try:
             if provider_pool == "scope_direct":
                 self._close_scope_direct_provider(provider)
@@ -3448,6 +3455,8 @@ class PolymarketCollector:
                     market_id=snapshot.market_id,
                 )
         except _ProviderDeadlineExceeded:
+            if broad_scope:
+                self._scope_broad_provider_unavailable = True
             return None
         except Exception:
             return None
@@ -3852,6 +3861,10 @@ class PolymarketCollector:
                 refresh_index = 0
                 failed_refresh = False
                 for market_id in refresh_order:
+                    if self._scope_broad_provider_unavailable and market_id not in exact_ids:
+                        refresh_index += 1
+                        failed_refresh = True
+                        continue
                     if self._cycle_deadline_exhausted:
                         refresh_index += 1
                         failed_refresh = True
@@ -4185,6 +4198,11 @@ class PolymarketCollector:
                 failed_refresh = False
                 failed_market_id: str | None = None
                 for market_id in refresh_order:
+                    if self._scope_broad_provider_unavailable and market_id not in exact_ids:
+                        refresh_index += 1
+                        failed_refresh = True
+                        failed_market_id = failed_market_id or market_id
+                        continue
                     if self._cycle_deadline_exhausted:
                         refresh_index += 1
                         failed_refresh = True
@@ -4770,6 +4788,17 @@ class PolymarketCollector:
             "venue_fee_rate": fee_rate,
             "observed_at": ensure_utc(observed_at).isoformat(),
         }
+        broad_scope = operation_pool == "scope" or (
+            operation_pool is None and self._scope_phase_active
+        )
+        if broad_scope and self._scope_broad_provider_unavailable:
+            evidence.update(
+                category="PROVIDER_UNAVAILABLE",
+                reason="SCOPE_PROVIDER_UNAVAILABLE",
+                resolver="retry_provider_call",
+                next_action="retry_next_collection_tick",
+            )
+            return evidence
         try:
             snapshot_timestamp = ensure_utc(snapshot.timestamp)
         except (AttributeError, TypeError, ValueError, OverflowError):
@@ -6448,9 +6477,23 @@ class PolymarketCollector:
                 try:
                     result = future.result(timeout=wait_timeout)
                 except FutureTimeout:
-                    # A late completion is still stale: never authorize from
-                    # a future that crossed its deadline.
+                    # ``FutureTimeout`` aliases ``TimeoutError`` on Python
+                    # 3.11.  A completed worker exception is therefore a
+                    # normal provider failure and must retain retry/backoff;
+                    # only a successful late result is stale.
+                    worker_exception: BaseException | None = None
                     if future.done():
+                        try:
+                            worker_exception = future.exception()
+                        except BaseException as exc:
+                            worker_exception = exc
+                        if isinstance(worker_exception, Exception):
+                            self._release_provider_call(key)
+                            self._consume_transport_errors(provider)
+                            self._drain_provider_advisories_now(provider)
+                            if owned:
+                                self._close_scope_direct_provider(provider)
+                            raise worker_exception
                         self._release_provider_call(key)
                         self._consume_transport_errors(provider)
                         self._drain_provider_advisories_now(provider)
@@ -6563,11 +6606,18 @@ class PolymarketCollector:
     ) -> Any:
         provider = provider or self.provider
         provider_pool = pool_name or ("scope" if self._scope_phase_active else "collection")
+        scope_failfast = provider_pool == "scope" and endpoint.startswith(
+            (
+                "scope_refresh:",
+                "scope_keyset:",
+                "scope_markets:",
+                "suitability_order_book:",
+                "suitability_order_books:",
+            )
+        )
         ephemeral_scope_provider = (
             provider_pool == "scope_direct" and provider is not self.provider
         )
-        # Direct clones are intentionally one-shot: a timed-out daemon worker
-        # may still retain its session, so only completion can safely close it.
         last_error: Exception | None = None
         timeout = float(self.config.provider_timeout_seconds)
         for attempt in range(self.config.max_attempts):
@@ -6583,6 +6633,8 @@ class PolymarketCollector:
                         pool_name=provider_pool,
                     )
                 except _ProviderDeadlineExceeded as exc:
+                    if scope_failfast:
+                        self._scope_broad_provider_unavailable = True
                     if ephemeral_scope_provider:
                         self._close_scope_direct_provider(provider)
                     deadline_error = self._record_provider_timeout(
@@ -6618,15 +6670,23 @@ class PolymarketCollector:
                 try:
                     result = future.result(timeout=wait_timeout)
                 except FutureTimeout:
-                    # A timeout owns the deadline: never authorize a result
-                    # merely because the future completed during this branch.
-                    # Drain completed work and release its key, while a still
-                    # running daemon keeps the existing done cleanup.
+                    # ``FutureTimeout`` aliases ``TimeoutError`` on Python
+                    # 3.11.  Completed worker exceptions use normal retry;
+                    # only successful late results are stale.
+                    worker_exception: BaseException | None = None
                     if future.done():
                         try:
-                            future.result()
-                        except BaseException:
-                            pass
+                            worker_exception = future.exception()
+                        except BaseException as exc:
+                            worker_exception = exc
+                        if isinstance(worker_exception, Exception):
+                            self._release_provider_call(_key)
+                            self._consume_transport_errors(provider)
+                            if provider_pool == "scope_direct":
+                                self._drain_provider_advisories_now(provider)
+                            if ephemeral_scope_provider:
+                                self._close_scope_direct_provider(provider)
+                            raise worker_exception
                         self._release_provider_call(_key)
                         self._consume_transport_errors(provider)
                         if provider_pool == "scope_direct":
@@ -6637,6 +6697,8 @@ class PolymarketCollector:
                             future.add_done_callback(
                                 lambda _future, clone=provider: self._close_scope_direct_provider(clone)
                             )
+                    if scope_failfast:
+                        self._scope_broad_provider_unavailable = True
                     cycle_expired = remaining is not None and remaining <= effective_timeout
                     deadline_error = self._record_provider_timeout(
                         endpoint,
@@ -6680,6 +6742,8 @@ class PolymarketCollector:
                     self._close_scope_direct_provider(provider)
                 return result
             except _ProviderDeadlineExceeded:
+                if scope_failfast:
+                    self._scope_broad_provider_unavailable = True
                 raise
             except Exception as exc:
                 last_error = exc
