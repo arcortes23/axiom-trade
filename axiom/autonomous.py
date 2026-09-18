@@ -7755,26 +7755,6 @@ class AutonomousResearchProcessor:
             if not isinstance(config, Mapping):
                 continue
             config = dict(config)
-            if config.get("observation_capture_only") is True:
-                handoff = config.get("observation_handoff")
-                bound_market = _binding_value(config.get("capture_market_id"))
-                scope_document = config.get("market_scope", config.get("scope", {}))
-                scope_ids: tuple[str, ...] = ()
-                if isinstance(scope_document, Mapping):
-                    try:
-                        scope_ids = tuple(
-                            _binding_value(value)
-                            for value in normalize_market_scope(scope_document).market_ids
-                            if _binding_value(value)
-                        )
-                    except (TypeError, ValueError):
-                        scope_ids = ()
-                if (
-                    isinstance(handoff, Mapping)
-                    and bound_market
-                    and (not scope_ids or bound_market in scope_ids)
-                ):
-                    continue
             candidate_id = _binding_value(config.get("candidate_id"))
             strategy_document = config.get("strategy_document", config.get("strategy"))
             if not candidate_id or not isinstance(strategy_document, Mapping):
@@ -7949,7 +7929,71 @@ class AutonomousResearchProcessor:
                         bound_market = _binding_value(
                             existing_config.get("capture_market_id")
                         )
-                        if not bound_market or bound_market not in scope_ids:
+                        if not bound_market:
+                            return False
+                        current_resolution_loader = getattr(
+                            self.store,
+                            "load_market_scope_resolution",
+                            None,
+                        )
+                        if not callable(current_resolution_loader):
+                            return False
+                        try:
+                            current_proof = current_resolution_loader(
+                                candidate_id,
+                                scope_hash=source_policy.scope_hash,
+                                scope_version=source_policy.scope_version,
+                            )
+                            if hasattr(current_proof, "as_dict") and callable(
+                                current_proof.as_dict
+                            ):
+                                current_proof = current_proof.as_dict()
+                        except (
+                            sqlite3.Error,
+                            AttributeError,
+                            KeyError,
+                            TypeError,
+                            ValueError,
+                            RuntimeError,
+                        ):
+                            return False
+                        if (
+                            not isinstance(current_proof, Mapping)
+                            or str(current_proof.get("status", "")).strip().upper()
+                            != "MATCHED"
+                        ):
+                            return False
+                        current_matched = current_proof.get(
+                            "matched_markets",
+                            current_proof.get("resolved_markets", ()),
+                        )
+                        if isinstance(current_matched, str):
+                            current_matched = (current_matched,)
+                        if not isinstance(current_matched, (list, tuple, set, frozenset)):
+                            return False
+                        current_ids = {
+                            _binding_value(
+                                item.get("market_id", item.get("id"))
+                                if isinstance(item, Mapping)
+                                else getattr(item, "market_id", item)
+                            )
+                            for item in current_matched
+                            if _binding_value(
+                                item.get("market_id", item.get("id"))
+                                if isinstance(item, Mapping)
+                                else getattr(item, "market_id", item)
+                            )
+                        }
+                        if not current_ids or bound_market not in current_ids:
+                            return False
+                        existing_current_ids = tuple(
+                            sorted(
+                                _binding_value(item)
+                                for item in existing_config.get("current_market_ids", ())
+                                if _binding_value(item)
+                            )
+                        )
+                        if existing_current_ids != tuple(sorted(current_ids)):
                             return False
                         try:
                             strict_sla = float(
@@ -8358,7 +8402,23 @@ class AutonomousResearchProcessor:
                     "observation_capture_only": capture_only,
                 }
                 if capture_only:
-                    strategy["capture_market_id"] = sorted(matched_ids)[0]
+                    current_market_ids = tuple(
+                        sorted(
+                            {
+                                _binding_value(item)
+                                for item in matched_ids
+                                if _binding_value(item)
+                            }
+                        )
+                    )
+                    supplied_capture_market = _binding_value(
+                        strategy.get("capture_market_id")
+                    )
+                    strategy["capture_market_id"] = (
+                        supplied_capture_market
+                        if supplied_capture_market in current_market_ids
+                        else (current_market_ids[0] if current_market_ids else None)
+                    )
                     predecessor_setup_hash = str(
                         strategy.get("operational_setup_hash", "") or ""
                     ).strip()
@@ -8394,6 +8454,17 @@ class AutonomousResearchProcessor:
             ):
                 try:
                     intent_id = _binding_value(binding.get("intent_id"))
+                    predecessor_intent_ids = {
+                        str(getattr(intent, "experiment_id", "")).strip()
+                    }
+                    source_handoff = config.get("observation_handoff")
+                    if isinstance(source_handoff, Mapping):
+                        predecessor_intent_ids.add(
+                            _binding_value(
+                                source_handoff.get("predecessor_observation_intent_id")
+                            )
+                        )
+                    predecessor_intent_ids.discard("")
                     materialized = next(
                         (
                             candidate
@@ -8420,7 +8491,7 @@ class AutonomousResearchProcessor:
                                     or {}
                                 ).get("predecessor_observation_intent_id")
                             )
-                            == str(getattr(intent, "experiment_id", "")).strip()
+                            in predecessor_intent_ids
                             and (
                                 candidate.config
                                 if isinstance(
@@ -8582,11 +8653,6 @@ class AutonomousResearchProcessor:
                         scope_resolution = loader(candidate_id)
                 except (TypeError, ValueError, AttributeError):
                     scope_resolution = None
-        if hasattr(scope_resolution, "as_dict") and callable(scope_resolution.as_dict):
-            try:
-                scope_resolution = scope_resolution.as_dict()
-            except Exception:
-                scope_resolution = None
         selector = {
             key: value
             for key, value in (
@@ -8599,10 +8665,20 @@ class AutonomousResearchProcessor:
         if "observation_capture_only" in strategy and type(marker_value) is not bool:
             raise ValueError("OBSERVATION_CAPTURE_MARKER_INVALID")
         capture_only = marker_value is True
+        current_market_ids = tuple(
+            sorted(
+                {
+                    _binding_value(value)
+                    for value in market_ids
+                    if _binding_value(value)
+                }
+            )
+        )
+        supplied_capture_market = _binding_value(strategy.get("capture_market_id"))
         capture_market_id = (
-            sorted({str(value).strip() for value in market_ids if str(value).strip()})[0]
-            if capture_only and market_ids
-            else None
+            supplied_capture_market
+            if capture_only and supplied_capture_market in current_market_ids
+            else (current_market_ids[0] if capture_only and current_market_ids else None)
         )
         if "scope_resolution_freshness_sla_seconds" in strategy:
             scope_sla = strategy.get("scope_resolution_freshness_sla_seconds")
@@ -8650,6 +8726,7 @@ class AutonomousResearchProcessor:
             "rolling_research": True,
             "research_mode": "ROLLING_RESEARCH",
             "capture_market_id": capture_market_id,
+            "current_market_ids": list(current_market_ids),
             "scope_resolution_freshness_sla_seconds": scope_sla,
             "paper_only": True,
             "observation_capture_only": capture_only,
@@ -8818,6 +8895,36 @@ class AutonomousResearchProcessor:
                         ).get("predecessor_observation_intent_id")
                     )
                     == str(stale_intent.experiment_id).strip()
+                    and not (
+                        (
+                            existing.config
+                            if isinstance(existing.config, Mapping)
+                            else {}
+                        ).get("observation_capture_only")
+                        is True
+                        and _binding_value(
+                            (
+                                existing.config
+                                if isinstance(existing.config, Mapping)
+                                else {}
+                            ).get("capture_market_id")
+                        )
+                        == capture_market_id
+                        and tuple(
+                            sorted(
+                                _binding_value(item)
+                                for item in (
+                                    (
+                                        existing.config
+                                        if isinstance(existing.config, Mapping)
+                                        else {}
+                                    ).get("current_market_ids", ())
+                                )
+                                if _binding_value(item)
+                            )
+                        )
+                        == current_market_ids
+                    )
                 }
             )
             if sibling_ids:

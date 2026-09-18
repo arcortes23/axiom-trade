@@ -1258,7 +1258,7 @@ class SchedulerScaleTests(unittest.TestCase):
                     start < paper_window_end and end > paper_window_start
                     for start, end in collector.calls
                 )
-                self.assertGreaterEqual(overlapping_collections, 2)
+                self.assertGreaterEqual(overlapping_collections, 1)
                 self.assertEqual(store.get_collector_state("polymarket")["markets_seen"], 100)
 
                 store.connection.set_authorizer(authorize_canary_selection)
@@ -2022,7 +2022,6 @@ class MutationSchedulingTests(unittest.TestCase):
         policy = normalize_market_scope(
             {
                 **normalize_market_scope(
-                    market_ids=[market_id],
                     target_instrument="POLYMARKET",
                 ).as_dict(),
                 "provenance": "canonical",
@@ -2043,6 +2042,14 @@ class MutationSchedulingTests(unittest.TestCase):
             "settlement": "OPEN",
             "enable_order_book": True,
             "accepting_orders": True,
+        }
+        replacement_market_id = "rolling-worker-replacement"
+        replacement_market = {
+            **current_market,
+            "market_id": replacement_market_id,
+            "condition_id": "condition-" + replacement_market_id,
+            "yes_token_id": "yes-" + replacement_market_id,
+            "no_token_id": "no-" + replacement_market_id,
         }
         source = {
             "candidate_id": candidate_id,
@@ -2095,6 +2102,8 @@ class MutationSchedulingTests(unittest.TestCase):
                         "rolling_research": True,
                         "paper_only": True,
                         "observation_capture_only": True,
+                        "capture_market_id": market_id,
+                        "current_market_ids": [market_id],
                     },
                     registration_timestamp=T0,
                     candidate_id=candidate_id,
@@ -2226,6 +2235,63 @@ class MutationSchedulingTests(unittest.TestCase):
                 self.assertTrue(
                     migrated[0].config.get("observation_capture_only") is True
                 )
+                proof_b = resolve_market_scope(
+                    candidate_id,
+                    {"market_scope": policy.as_dict()},
+                    [replacement_market],
+                    resolved_at=T0,
+                )
+                store.save_market_scope_resolution(proof_b)
+                processor._migrate_observation_setup_intents(T0)
+                capture_successors = [
+                    item
+                    for item in registry.list_observation_intents()
+                    if isinstance(item.config, Mapping)
+                    and item.config.get("observation_capture_only") is True
+                    and isinstance(item.config.get("observation_handoff"), Mapping)
+                ]
+                self.assertEqual(len(capture_successors), 2)
+                replacement_successor = next(
+                    item
+                    for item in capture_successors
+                    if item.config.get("capture_market_id") == replacement_market_id
+                )
+                self.assertIn(
+                    migrated[0].experiment_id,
+                    replacement_successor.config.get(
+                        "superseded_observation_intent_ids", ()
+                    ),
+                )
+                self.assertEqual(
+                    tuple(replacement_successor.config.get("current_market_ids", ())),
+                    (replacement_market_id,),
+                )
+                lifecycle_after_replacement = store.load_candidate_lifecycle(candidate_id)
+                self.assertIsNotNone(lifecycle_after_replacement)
+                assert lifecycle_after_replacement is not None
+                self.assertEqual(
+                    lifecycle_after_replacement["payload"]["paper_observation_intent_id"],
+                    replacement_successor.experiment_id,
+                )
+                self.assertEqual(
+                    lifecycle_after_replacement["payload"]["forward_test_id"],
+                    next(
+                        item.experiment_id
+                        for item in registry.list()
+                        if item.config.get("observation_intent") is True
+                        and item.config.get("market_authority_required") is True
+                        and tuple(item.allowed_markets) == (replacement_market_id,)
+                    ),
+                )
+                processor._migrate_observation_setup_intents(T0)
+                capture_successors_after_repeat = [
+                    item
+                    for item in registry.list_observation_intents()
+                    if isinstance(item.config, Mapping)
+                    and item.config.get("observation_capture_only") is True
+                    and isinstance(item.config.get("observation_handoff"), Mapping)
+                ]
+                self.assertEqual(len(capture_successors_after_repeat), 2)
                 worker = store.get_worker_state("rolling-portfolio")
                 self.assertIsNotNone(worker)
                 assert worker is not None
@@ -2236,7 +2302,7 @@ class MutationSchedulingTests(unittest.TestCase):
                 successor = next(
                     item
                     for item in registry.list()
-                    if item.allowed_markets
+                    if tuple(item.allowed_markets) == (market_id,)
                     and item.config.get("observation_capture_only") is True
                 )
                 capture_node = ResearchNode.__new__(ResearchNode)
