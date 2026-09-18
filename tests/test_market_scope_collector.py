@@ -4126,6 +4126,7 @@ class MarketScopeCollectorTests(unittest.TestCase):
         timeout_collector._scope_inventory_continuation = {
             "coverage_status": "ERROR",
             "authorization_status": "UNAUTHORIZED",
+            "error_reason": "MALFORMED_ROWS",
             "request_fingerprint": "sha256:query",
             "expected_query_fingerprint": "sha256:query",
         }
@@ -4150,8 +4151,7 @@ class MarketScopeCollectorTests(unittest.TestCase):
         )
         integrity_collector._scope_inventory_continuation = {
             "coverage_status": "ERROR",
-            "authorization_status": "UNAUTHORIZED",
-            "integrity_error": True,
+            "scope_resolution_integrity_error": True,
         }
         self.assertFalse(integrity_collector._scope_persisted_proof_restore_allowed())
         integrity_collector.close()
