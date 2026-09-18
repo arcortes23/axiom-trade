@@ -10930,10 +10930,19 @@ class AutonomousResearchProcessor:
         record["evidence_digest"] = RollingEvidence.from_mapping(record).evidence_digest
         return record
 
-    def refresh_rolling_evidence(self, now: datetime | None = None) -> Mapping[str, Any]:
+    def refresh_rolling_evidence(
+        self,
+        now: datetime | None = None,
+        *,
+        skip_observation_setup_migration: bool = False,
+    ) -> Mapping[str, Any]:
         """Materialize bounded, source-separated rolling evidence and schedule retries."""
         current = ensure_utc(now or self.clock())
-        migrated_observations = self._migrate_observation_setup_intents(current)
+        migrated_observations = (
+            ()
+            if skip_observation_setup_migration
+            else self._migrate_observation_setup_intents(current)
+        )
         documents = self._rolling_strategy_documents()
         strategies = self._rolling_persist_strategy_lineage(documents, current)
         sources = ("HISTORICAL", "REPLAY", "PAPER", "LIVE")
@@ -11824,10 +11833,19 @@ class AutonomousResearchProcessor:
             saver(default.as_dict())
         return default
 
-    def review_rolling_portfolio(self, now: datetime | None = None, force: bool = False) -> Mapping[str, Any]:
+    def review_rolling_portfolio(
+        self,
+        now: datetime | None = None,
+        force: bool = False,
+        *,
+        skip_observation_setup_migration: bool = False,
+    ) -> Mapping[str, Any]:
         """Review only persisted rolling evidence and commit an append-only selection."""
         requested_now = ensure_utc(now or self.clock())
-        refreshed = self.refresh_rolling_evidence(requested_now)
+        refreshed = self.refresh_rolling_evidence(
+            requested_now,
+            skip_observation_setup_migration=skip_observation_setup_migration,
+        )
         policy = self._rolling_policy()
         previous = self.active_portfolio_selection()
         review_state_loader = getattr(self.store, "load_portfolio_review_state", None)

@@ -1999,6 +1999,237 @@ class MutationSchedulingTests(unittest.TestCase):
                 successor_config["predecessor_operational_setup_hash"],
                 "sha256:legacy",
             )
+    def test_rolling_worker_migrates_before_future_review_wait(self) -> None:
+        class StopAfterOneWait(threading.Event):
+            def wait(self, timeout: float | None = None) -> bool:
+                self.set()
+                return True
+
+        candidate_id = "rolling-worker-migration"
+        market_id = "rolling-worker-market"
+        strategy_document = {
+            "version": 1,
+            "market_type": "prediction",
+            "family": "probability_mispricing",
+            "parameters": {"threshold": 0.05},
+            "probability_model": "fixed",
+            "resolution_aware": True,
+            "resolution_inputs": ["expiry", "settlement"],
+        }
+        policy = normalize_market_scope(
+            {
+                **normalize_market_scope(
+                    market_ids=[market_id],
+                    target_instrument="POLYMARKET",
+                ).as_dict(),
+                "provenance": "canonical",
+            }
+        )
+        current_market = {
+            "market_id": market_id,
+            "condition_id": "condition-" + market_id,
+            "yes_token_id": "yes-" + market_id,
+            "no_token_id": "no-" + market_id,
+            "metadata_provenance": {"source_type": "CURRENT"},
+            "source_type": "CURRENT",
+            "provider": "polymarket",
+            "venue": "POLYMARKET",
+            "instrument": "POLYMARKET",
+            "active": True,
+            "closed": False,
+            "settlement": "OPEN",
+            "enable_order_book": True,
+            "accepting_orders": True,
+        }
+        source = {
+            "candidate_id": candidate_id,
+            "strategy_version_id": "rolling-worker-version",
+            "research_trial_id": "rolling-worker-trial",
+            "strategy_hash": _content_hash(
+                _normalized_strategy_document(strategy_document)
+            ),
+            "strategy_document": strategy_document,
+            "model_document": {"probability": 0.5},
+            "market_scope": policy.as_dict(),
+            "dataset_id": "rolling-worker-history",
+            "dataset_version": "v1",
+            "dataset_attestation": {
+                "dataset_id": "rolling-worker-history",
+                "dataset_version": "v1",
+                "integrity": "sha256:rolling-worker-history",
+            },
+            "dataset_boundary": {
+                "schema_version": "1",
+                "dataset_id": "rolling-worker-history",
+                "dataset_version": "v1",
+                "ordered_row_manifest_digest": "sha256:rolling-worker-boundary",
+                "exact_cutoff": "2025-01-01T00:00:00+00:00",
+                "row_count": 3,
+            },
+            "plan_id": "rolling-worker-plan",
+            "plan_hash": _rolling_hash({"plan_id": "rolling-worker-plan"}),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            db = str(Path(directory) / "rolling-worker-migration.sqlite")
+            with AxiomStore(db) as store:
+                proof = resolve_market_scope(
+                    candidate_id,
+                    {"market_scope": policy.as_dict()},
+                    [current_market],
+                    resolved_at=T0,
+                )
+                store.save_market_scope_resolution(proof)
+                registry = ForwardTestRegistry(store)
+                intent = registry.register_observation_intent(
+                    strategy=strategy_document,
+                    model={"probability": 0.5},
+                    config={
+                        **source,
+                        "observation_intent": True,
+                        "observation_only_lineage": True,
+                        "market_authority_required": False,
+                        "scope_resolution": proof.as_dict(),
+                        "rolling_research": True,
+                        "paper_only": True,
+                        "operational_setup_hash": "sha256:legacy",
+                    },
+                    registration_timestamp=T0,
+                    candidate_id=candidate_id,
+                    strategy_version_id=source["strategy_version_id"],
+                    research_trial_id=source["research_trial_id"],
+                    source_strategy_hash=source["strategy_hash"],
+                    rolling_strategy_hash=source["strategy_hash"],
+                    dataset_selector={
+                        "dataset_id": source["dataset_id"],
+                        "dataset_version": source["dataset_version"],
+                    },
+                    scope=policy.as_dict(),
+                    scope_resolution=proof.as_dict(),
+                )
+                old_intent_id = intent.experiment_id
+                store.save_candidate_lifecycle(
+                    candidate_id,
+                    CandidateStage.IDEA.value,
+                    {"candidate_id": candidate_id},
+                    timestamp=T0,
+                )
+                lifecycle_manager = CandidateLifecycleManager(store)
+                lifecycle_manager.advance(
+                    candidate_id,
+                    CandidateStage.SCHEMA_VALIDATED.value,
+                    {"candidate_id": candidate_id, "schema_valid": True},
+                    reason="schema validated",
+                )
+                lifecycle_manager.advance(
+                    candidate_id,
+                    CandidateStage.PAPER_FORWARD.value,
+                    {
+                        "candidate_id": candidate_id,
+                        "paper_observation_intent": True,
+                        "paper_observation_intent_id": old_intent_id,
+                        "forward_test_id": old_intent_id,
+                        "paper_only": True,
+                        "research_only": True,
+                        "execution_scope": "OBSERVATION",
+                        "observation_only_lineage": True,
+                        "selection_excluded": True,
+                        "allocation_active": False,
+                        "canary_armed": False,
+                        "paper_forward_started": True,
+                        "holdout_used": False,
+                        "allowed_markets": [market_id],
+                        "current_market_ids": [market_id],
+                        "resolved_market_ids": [market_id],
+                        "scope_resolution": proof.as_dict(),
+                        "market_scope_resolution": proof.as_dict(),
+                        "operational_setup_hash": "sha256:legacy",
+                        "market_scope": policy.as_dict(),
+                        "market_scope_hash": policy.scope_hash,
+                        "market_scope_version": policy.scope_version,
+                        "plan_hash": source["plan_hash"],
+                        "dataset_selector": {
+                            "dataset_id": source["dataset_id"],
+                            "dataset_version": source["dataset_version"],
+                        },
+                        "dataset_attestation": source["dataset_attestation"],
+                    },
+                    reason="legacy observation handoff",
+                    observation_only=True,
+                )
+                processor = AutonomousResearchProcessor(
+                    store,
+                    config=AutonomousResearchConfig(
+                        scope_resolution_freshness_sla_seconds=60
+                    ),
+                    clock=lambda: T0,
+                )
+                migration_calls: list[datetime] = []
+                migrate = processor._migrate_observation_setup_intents
+
+                def migrate_once(now: datetime) -> tuple[Mapping[str, Any], ...]:
+                    migration_calls.append(now)
+                    return migrate(now)
+
+                processor._migrate_observation_setup_intents = migrate_once
+                refresh_calls: list[bool] = []
+
+                def refresh_wait(
+                    *,
+                    now: datetime,
+                    skip_observation_setup_migration: bool = False,
+                ) -> Mapping[str, Any]:
+                    refresh_calls.append(skip_observation_setup_migration)
+                    return {"decision": "WAIT_FOR_ROLLING_REVIEW"}
+
+                processor.refresh_rolling_evidence = refresh_wait
+                node = ResearchNode(
+                    NodeConfig(
+                        db,
+                        crypto_enabled=False,
+                        rolling_review_interval_seconds=86400,
+                    ),
+                    provider=InMemoryPredictionProvider([]),
+                    store=store,
+                    clock=lambda: T0,
+                )
+                node.research_processor = processor
+                node.stop_event = StopAfterOneWait()
+                store.load_portfolio_review_state = lambda: {
+                    "review_due_at": (T0 + timedelta(days=1)).isoformat(),
+                    "refresh_identity": {},
+                }
+                processor.active_portfolio_selection = lambda: {
+                    "portfolio_selection_id": "future-selection"
+                }
+                node._rolling_portfolio_worker_loop()
+                self.assertEqual(len(migration_calls), 1)
+                self.assertEqual(refresh_calls, [True])
+                migrated = [
+                    item
+                    for item in registry.list_observation_intents()
+                    if item.experiment_id != old_intent_id
+                    and isinstance(item.config, Mapping)
+                    and isinstance(item.config.get("observation_handoff"), Mapping)
+                ]
+                self.assertEqual(len(migrated), 1)
+                self.assertNotEqual(migrated[0].experiment_id, old_intent_id)
+                self.assertEqual(
+                    migrated[0].config["observation_handoff"][
+                        "predecessor_observation_intent_id"
+                    ],
+                    old_intent_id,
+                )
+                self.assertTrue(
+                    migrated[0].config.get("observation_capture_only") is True
+                )
+                worker = store.get_worker_state("rolling-portfolio")
+                self.assertIsNotNone(worker)
+                assert worker is not None
+                self.assertEqual(
+                    worker["payload"]["next_decision"],
+                    "WAIT_FOR_ROLLING_REVIEW",
+                )
+
 
 
     def test_rolling_hash_only_successor_migrates_immutable_rows(self) -> None:

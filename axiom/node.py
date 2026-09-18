@@ -2256,11 +2256,28 @@ class ResearchNode:
                 successful = True
                 error: BaseException | str | None = None
                 review_due = True
+                migration: Any = ()
+                migration_error: str | None = None
                 try:
                     review = getattr(self.research_processor, "review_rolling_portfolio", None)
                     refresh = getattr(self.research_processor, "refresh_rolling_evidence", None)
+                    migrate = getattr(
+                        self.research_processor,
+                        "_migrate_observation_setup_intents",
+                        None,
+                    )
                     if not callable(review) or not callable(refresh):
                         raise RuntimeError("ROLLING_RESEARCH_API_UNAVAILABLE")
+                    if callable(migrate):
+                        try:
+                            migration = migrate(started)
+                        except BaseException as exc:
+                            migration_error = str(exc)[:240]
+                            self._log(
+                                logging.WARNING,
+                                "rolling observation migration failed: %s",
+                                exc,
+                            )
                     review_state_loader = getattr(self.store, "load_portfolio_review_state", None)
                     review_state = review_state_loader() if callable(review_state_loader) else None
                     previous_loader = getattr(self.research_processor, "active_portfolio_selection", None)
@@ -2363,10 +2380,17 @@ class ResearchNode:
                         else "refresh_rolling_evidence"
                     )
                     if review_due:
-                        reviewed = review(now=started, force=False)
+                        reviewed = review(
+                            now=started,
+                            force=False,
+                            skip_observation_setup_migration=True,
+                        )
                         result = dict(reviewed) if isinstance(reviewed, Mapping) else {}
                     else:
-                        refreshed = refresh(now=started)
+                        refreshed = refresh(
+                            now=started,
+                            skip_observation_setup_migration=True,
+                        )
                         result = dict(refreshed) if isinstance(refreshed, Mapping) else {}
                         result["decision"] = "WAIT_FOR_ROLLING_REVIEW"
                         result["review_due_at"] = due_at.isoformat()
@@ -2384,6 +2408,12 @@ class ResearchNode:
                     error=error,
                     extra={
                         "rolling_portfolio": result,
+                        "observation_setup_migrations": (
+                            len(migration)
+                            if isinstance(migration, (list, tuple))
+                            else 0
+                        ),
+                        "observation_setup_migration_error": migration_error,
                         "configured_interval_seconds": float(
                             self.config.rolling_evidence_interval_seconds
                         ),
