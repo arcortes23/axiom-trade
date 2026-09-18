@@ -3,6 +3,8 @@ from __future__ import annotations
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 import unittest
+from typing import Mapping
+from unittest.mock import patch
 
 from axiom.autonomous import (
     AutonomousResearchConfig,
@@ -682,6 +684,77 @@ class MarketScopeEndToEndTests(unittest.TestCase):
                 successor_intent.config["candidate_id"],
                 legacy_intent_candidate,
             )
+    def test_rejected_predeclared_successors_recover_without_historical_catalog(self) -> None:
+        with AxiomStore(":memory:") as store:
+            self._seed_predeclared_history(store)
+            bus = DurableResearchBus(store)
+            processor = AutonomousResearchProcessor(
+                store,
+                bus=bus,
+                config=AutonomousResearchConfig(max_items_per_cycle=3),
+                clock=lambda: T0,
+            )
+            predecessors = processor._enqueue_predeclared_from_persisted_scope(T0)
+            self.assertEqual(len(predecessors), 3)
+            for index, predecessor in enumerate(predecessors):
+                plan = ExperimentPlan.from_proposal(predecessor.payload)
+                parameters = plan.variants()[0]
+                candidate_id = _candidate_id(plan, parameters, generation=0)
+                strategy = plan.strategy_for(parameters, candidate_id)
+                processor._initialize_candidate(
+                    plan,
+                    candidate_id,
+                    strategy,
+                    parameters,
+                    trial_index=0,
+                    trial_count=1,
+                    now=T0,
+                )
+                claimed = bus.claim(f"legacy-predeclared-{index}", now=T0)
+                self.assertIsNotNone(claimed)
+                assert claimed is not None
+                bus.complete(
+                    claimed.item_id,
+                    result={
+                        "candidate_results": [
+                            {
+                                "candidate_id": candidate_id,
+                                "reason_code": "INSUFFICIENT_DATA",
+                                "reason": "at least three chronological observations are required",
+                            }
+                        ]
+                    },
+                    status=ResearchQueueStatus.REJECTED,
+                    error="at least three chronological observations are required",
+                    worker=f"legacy-predeclared-{index}",
+                    now=T0,
+                )
+
+            with patch.object(store, "list_dataset_catalog", return_value=[]):
+                successors = processor._enqueue_predeclared_from_persisted_scope(T0)
+            self.assertEqual(len(successors), 3)
+            self.assertTrue(
+                all(
+                    isinstance(item.payload.get("observation_handoff"), dict)
+                    for item in successors
+                )
+            )
+            rows = store.list_research_items(limit=20)
+            self.assertEqual(len(rows), 6)
+            self.assertEqual(
+                len(
+                    [
+                        row
+                        for row in rows
+                        if isinstance(row.get("payload"), Mapping)
+                        and row["payload"].get("observation_handoff")
+                    ]
+                ),
+                3,
+            )
+            cycle = processor.process_pending(worker="legacy-successors", now=T0)
+            self.assertEqual(cycle.claimed, 3, repr(cycle))
+            self.assertEqual(cycle.completed, 3, repr(cycle))
     def test_4096_row_history_preserves_exact_chronological_split_counts(self) -> None:
         with AxiomStore(":memory:") as store:
             self._seed_predeclared_history(store)
