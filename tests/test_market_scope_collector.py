@@ -4113,6 +4113,48 @@ class MarketScopeCollectorTests(unittest.TestCase):
             )
         self.assertEqual(reset_markets, {})
         reset_collector.close()
+        timeout_store = _ScopeStore({candidate_id: lifecycle_payload})
+        timeout_store.documents[candidate_id]["stage"] = CandidateStage.SCHEMA_VALIDATED.value
+        timeout_store.forward_tests[intent.experiment_id] = intent.as_record()
+        timeout_store.resolutions.append(store.resolutions[0])
+        timeout_collector = self._collector(
+            _RecordingProvider((market(market_id),)),
+            timeout_store,
+            (),
+            max_markets=1,
+        )
+        timeout_collector._scope_inventory_continuation = {
+            "coverage_status": "ERROR",
+            "authorization_status": "UNAUTHORIZED",
+            "request_fingerprint": "sha256:query",
+            "expected_query_fingerprint": "sha256:query",
+        }
+        timeout_candidate_ids: list[str] = []
+        timeout_markets: dict[str, list[str]] = {}
+        timeout_proofs: dict[str, object] = {}
+        self.assertTrue(timeout_collector._scope_persisted_proof_restore_allowed())
+        timeout_collector._restore_current_observation_scope_proofs(
+            T0 + timedelta(minutes=1),
+            (candidate_id,),
+            timeout_candidate_ids,
+            timeout_markets,
+            timeout_proofs,
+        )
+        self.assertEqual(timeout_markets[candidate_id], [market_id])
+        timeout_collector.close()
+        integrity_collector = self._collector(
+            _RecordingProvider((market(market_id),)),
+            timeout_store,
+            (),
+            max_markets=1,
+        )
+        integrity_collector._scope_inventory_continuation = {
+            "coverage_status": "ERROR",
+            "authorization_status": "UNAUTHORIZED",
+            "integrity_error": True,
+        }
+        self.assertFalse(integrity_collector._scope_persisted_proof_restore_allowed())
+        integrity_collector.close()
         with AxiomStore(":memory:") as real_store:
             real_store.save_candidate_lifecycle(
                 candidate_id,

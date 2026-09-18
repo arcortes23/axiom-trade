@@ -2233,10 +2233,17 @@ class PolymarketCollector:
             return True
         if continuation.get("query_reset") or continuation.get("rebase_required"):
             return False
-        status = str(continuation.get("coverage_status", "")).strip().upper()
-        if status == "ERROR" or str(continuation.get("error_reason", "")).strip():
+        explicit_outcome = str(
+            continuation.get("scope_resolution_outcome", continuation.get("scope_resolver_status", ""))
+        ).strip().upper()
+        if explicit_outcome in {"ERROR", "FAILED", "RESET", "REBASE", "INTEGRITY_ERROR"}:
             return False
-        if status not in {"", "PARTIAL", "INCOMPLETE", "BUDGET_EXHAUSTED"}:
+        if continuation.get("integrity_error") or continuation.get("scope_resolution_integrity_error"):
+            return False
+        if str(continuation.get("error_reason", "")).strip():
+            return False
+        status = str(continuation.get("coverage_status", "")).strip().upper()
+        if status not in {"", "PARTIAL", "INCOMPLETE", "BUDGET_EXHAUSTED", "ERROR"}:
             return False
         request_fingerprint = str(continuation.get("request_fingerprint", "")).strip()
         expected_fingerprint = str(continuation.get("expected_query_fingerprint", "")).strip()
