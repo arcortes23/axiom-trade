@@ -3869,6 +3869,85 @@ class MarketScopeCollectorTests(unittest.TestCase):
         self.assertEqual(second_calls[0], rolling_id)
         self.assertIn(target_id, collector._scope_authority_market_ids)
         collector.close()
+
+    def test_ready_observation_handoffs_use_bounded_batch_after_scope_reserve(self) -> None:
+        candidate_ids = tuple(f"batch-observation-{index}" for index in range(3))
+        store = _ScopeStore({})
+        for candidate_id in candidate_ids:
+            intent = ForwardTestSpec(
+                "observation-intent-" + candidate_id,
+                "sha256:batch-strategy-" + candidate_id,
+                "sha256:batch-model-" + candidate_id,
+                {
+                    "candidate_id": candidate_id,
+                    "observation_intent": True,
+                    "observation_only_lineage": True,
+                    "strategy_document": {
+                        "version": 1,
+                        "market_type": "prediction",
+                        "family": "momentum",
+                        "parameters": {"lookback": 1},
+                        "probability_model": "market-history",
+                    },
+                    "model_document": {"model_required": False},
+                    "execution": "paper_only",
+                },
+                T0,
+                1_000.0,
+                (),
+                {},
+            )
+            store.forward_tests[intent.experiment_id] = intent.as_record()
+        collector = self._collector(
+            _RecordingProvider(tuple(market("batch-market-" + str(index)) for index in range(3))),
+            store,
+            (),
+        )
+        collector._scope_pipeline_budget_available = lambda: False  # type: ignore[method-assign]
+        collector._observation_intent_requires_handoff = lambda _intent: True  # type: ignore[method-assign]
+        collector._observation_handoff_proof_current = (  # type: ignore[method-assign]
+            lambda *_args: True
+        )
+        collector._reconcile_materialized_observation_lifecycle = (  # type: ignore[method-assign]
+            lambda *_args: True
+        )
+        batch_markets = {
+            candidate_id: ("batch-market-" + str(index),)
+            for index, candidate_id in enumerate(candidate_ids)
+        }
+        batch_proofs = {
+            candidate_id: {
+                "candidate_id": candidate_id,
+                "status": "MATCHED",
+                "matched_markets": [{"market_id": "batch-market-" + str(index)}],
+                "resolved_at": T0.isoformat(),
+            }
+            for index, candidate_id in enumerate(candidate_ids)
+        }
+        ready = collector._materialize_observation_intents(
+            T0,
+            candidate_ids,
+            batch_markets,
+            collector._new_counters(),
+            scope_resolutions=batch_proofs,
+        )
+        self.assertEqual(set(ready), set(candidate_ids))
+        collector._observation_materialization_deferred_candidate_ids = (candidate_ids[0],)
+        forward_tests_before_expiry = dict(store.forward_tests)
+        collector._cycle_remaining_seconds = lambda: 0.0  # type: ignore[method-assign]
+        expired = collector._materialize_observation_intents(
+            T0,
+            candidate_ids,
+            batch_markets,
+            collector._new_counters(),
+            scope_resolutions=batch_proofs,
+        )
+        self.assertEqual(expired, set())
+        self.assertEqual(store.forward_tests, forward_tests_before_expiry)
+        self.assertIn(candidate_ids[0], collector._observation_materialization_deferred_candidate_ids)
+        self.assertTrue(collector._cycle_deadline_exhausted)
+        collector.close()
+
     def test_observation_materialization_advances_schema_lifecycle_and_restarts_idempotently(self) -> None:
         candidate_id = "observation-lifecycle-candidate"
         market_id = "observation-lifecycle-market"
@@ -3948,8 +4027,9 @@ class MarketScopeCollectorTests(unittest.TestCase):
         store = _ScopeStore({candidate_id: lifecycle_payload})
         store.documents[candidate_id]["stage"] = CandidateStage.SCHEMA_VALIDATED.value
         store.forward_tests[intent.experiment_id] = intent.as_record()
+        provider = _RecordingProvider((market(market_id),))
         collector = self._collector(
-            _RecordingProvider((market(market_id),)),
+            provider,
             store,
             (),
             max_markets=1,
@@ -3973,9 +4053,38 @@ class MarketScopeCollectorTests(unittest.TestCase):
         materialized = ForwardTestRegistry(store).get("forward-" + candidate_id)
         self.assertIsNotNone(materialized)
         self.assertEqual(materialized.allowed_markets, (market_id,))
+        stale_resume_id = "stale-resume-market"
+        unrelated_candidate_id = "unrelated-frozen-scope"
+        store.documents[unrelated_candidate_id] = {
+            "candidate_id": unrelated_candidate_id,
+            "stage": CandidateStage.FROZEN.value,
+            "payload": {
+                "candidate_id": unrelated_candidate_id,
+                "experiment_plan": {
+                    "market_scope": scope(
+                        "EXACT_MARKETS",
+                        market_ids=(stale_resume_id,),
+                    )
+                },
+            },
+        }
+        collector._candidate_ids = (unrelated_candidate_id,)
+        store.states["polymarket"]["cycle_continuation"] = {
+            "remaining_market_ids": [stale_resume_id],
+        }
+
+        def fail_slow_scope(*_args, **_kwargs):
+            raise AssertionError("fresh validated handoff must not wait on scope inventory")
+
+        collector._discover_scope_inventory = fail_slow_scope  # type: ignore[method-assign]
 
         second = collector.collect_once(now=T0 + timedelta(minutes=1))
+        self.assertNotIn(stale_resume_id, second.candidate_bound_scheduled)
+        self.assertNotIn(stale_resume_id, second.paper_forward_scheduled)
+        self.assertNotIn(stale_resume_id, second.discovery_scheduled)
         self.assertEqual(second.paper_forward_markets, (market_id,))
+        self.assertGreaterEqual(second.markets_attempted, 1)
+        self.assertGreaterEqual(second.snapshots_inserted, 1)
         self.assertEqual(second.paper_forward_scheduled, (market_id,))
         self.assertEqual(
             store.load_candidate_lifecycle(candidate_id)["stage"],
@@ -4002,6 +4111,29 @@ class MarketScopeCollectorTests(unittest.TestCase):
         self.assertEqual(restarted_cycle.paper_forward_markets, (market_id,))
         self.assertEqual(restarted_cycle.paper_forward_scheduled, (market_id,))
         restarted_collector.close()
+        lifecycle_before_failed_reconcile = dict(store.load_candidate_lifecycle(candidate_id)["payload"])
+        refreshed_proof = dict(store.resolutions[-1].as_dict())
+        refreshed_proof["resolved_at"] = (T0 + timedelta(seconds=30)).isoformat()
+        store.resolutions.append(refreshed_proof)
+        store.fail_lifecycle = True
+        failed_reconcile_collector = self._collector(
+            _RecordingProvider((market(market_id),)),
+            store,
+            (),
+            max_markets=1,
+        )
+        failed_reconcile_cycle = failed_reconcile_collector.collect_once(
+            now=T0 + timedelta(seconds=30)
+        )
+        self.assertEqual(
+            failed_reconcile_cycle.paper_forward_scheduled,
+            (),
+        )
+        self.assertEqual(
+            store.load_candidate_lifecycle(candidate_id)["payload"],
+            lifecycle_before_failed_reconcile,
+        )
+        failed_reconcile_collector.close()
         fallback_store = _ScopeStore({candidate_id: lifecycle_payload})
         fallback_store.documents[candidate_id]["stage"] = CandidateStage.SCHEMA_VALIDATED.value
         fallback_store.forward_tests[intent.experiment_id] = intent.as_record()

@@ -182,6 +182,8 @@ _MAX_SCOPE_RESOLUTION_CANDIDATES = 1_000
 _MAX_CANDIDATE_BOUND_MARKETS = 100
 
 _MAX_SCOPE_DIRECT_LOOKUPS = 256
+_MAX_OBSERVATION_HANDOFF_FAST_CYCLES = 3
+_MAX_OBSERVATION_HANDOFF_BATCH = 16
 
 # Discovery may assess one shared set of assumptions across the complete
 # durable inventory before candidate-specific resolution begins.  The product
@@ -477,6 +479,8 @@ class PolymarketCollector:
         self._observation_materialization_deferred_candidate_ids: tuple[str, ...] = ()
         self._observation_materialization_cursor = 0
         self._observation_materialization_turn = 0
+        self._scope_resolutions: dict[str, Any] = {}
+        self._scope_handoff_fast_streak = 0
         # Resolutions produced for this cycle are the only authority passed to
         # observation-intent materialization; callers cannot supply market ids
         self._provider_executor_lock = threading.Lock()
@@ -709,6 +713,13 @@ class PolymarketCollector:
             ) % 2
         except (TypeError, ValueError, OverflowError):
             self._observation_materialization_turn = 0
+        try:
+            self._scope_handoff_fast_streak = max(
+                0,
+                int(root_state.get("scope_handoff_fast_streak", 0)),
+            )
+        except (TypeError, ValueError, OverflowError):
+            self._scope_handoff_fast_streak = 0
         configured_values = tuple(dict.fromkeys([*configured, *rolling_non_exact_ids]))
 
         primary_candidate_ids = list(dict.fromkeys([
@@ -797,6 +808,12 @@ class PolymarketCollector:
             counters,
             scope_resolutions=self._scope_resolutions,
         )
+        validated_observation_handoff_ids = self._validated_observation_handoff_ids(
+            tuple(paper_set & observation_set),
+            scope_candidate_markets,
+            self._scope_resolutions,
+        )
+
         scope_candidate_set = set(scope_candidate_ids)
         scope_primary_ids = [
             identifier
@@ -810,6 +827,7 @@ class PolymarketCollector:
             and (
                 identifier in (paper_set - observation_set)
                 or identifier in set(materialized_observation_ids)
+                or identifier in validated_observation_handoff_ids
             )
         ]
         legacy_primary_ids = [
@@ -1444,6 +1462,10 @@ class PolymarketCollector:
                 "observation_materialization_turn": int(
                     self._observation_materialization_turn
                 ) % 2,
+                "scope_handoff_fast_streak": max(
+                    0,
+                    int(self._scope_handoff_fast_streak),
+                ),
                 "suitable_market_scheduled": list(discovery_scheduled),
                 "suitable_market_deferred": list(suitable_deferred),
                 "discovery_exclusions": [dict(item) for item in discovery_exclusions],
@@ -2352,6 +2374,34 @@ class PolymarketCollector:
                 scope_candidate_ids.append(candidate_id)
 
 
+    def _observation_handoff_proof_current(
+        self,
+        candidate_id: str,
+        markets: Sequence[str],
+        proof: Any,
+        observed_at: datetime,
+    ) -> bool:
+        if not isinstance(proof, Mapping):
+            return False
+        if str(proof.get("candidate_id", "")).strip() != str(candidate_id).strip():
+            return False
+        if str(proof.get("status", "")).strip().upper() != "MATCHED":
+            return False
+        matched_ids = tuple(self._scope_result_market_ids(proof))
+        allowed_ids = tuple(str(item).strip() for item in markets if str(item).strip())
+        if not matched_ids or matched_ids != allowed_ids:
+            return False
+        resolved_at = parse_timestamp(proof.get("resolved_at"))
+        if resolved_at is None:
+            return False
+        freshness = self.config.freshness_sla_seconds or self.config.interval_seconds
+        try:
+            max_age = max(1.0, float(freshness))
+        except (TypeError, ValueError):
+            max_age = 60.0
+        age = (ensure_utc(observed_at) - ensure_utc(resolved_at)).total_seconds()
+        return 0 <= age <= max_age
+
     def _materialize_observation_intents(
         self,
         observed_at: datetime,
@@ -2360,6 +2410,7 @@ class PolymarketCollector:
         counters: dict[str, Any],
         *,
         scope_resolutions: Mapping[str, Any] | None = None,
+
     ) -> set[str]:
         registry = ForwardTestRegistry(self.store)
         intents = registry.list_observation_intents()
@@ -2426,17 +2477,45 @@ class PolymarketCollector:
         blocked = False
         blocked_group: int | None = None
         blocked_index = 0
+        handoff_batch_used = 0
         for index, (group, candidate_id) in enumerate(ordered):
-            if not self._scope_pipeline_budget_available():
-                blocked = True
-                blocked_group = group
-                blocked_index = index
-                break
             markets = tuple(
                 str(item).strip()
                 for item in candidate_markets.get(candidate_id, ())
                 if str(item).strip()
             )
+            intent = by_candidate.get(candidate_id)
+            handoff_fast_path = bool(
+                intent is not None
+                and markets
+                and self._observation_intent_requires_handoff(intent)
+                and self._observation_handoff_proof_current(
+                    candidate_id,
+                    markets,
+                    (scope_resolutions or {}).get(candidate_id),
+                    observed_at,
+                )
+            )
+            remaining = self._cycle_remaining_seconds()
+            if remaining is not None and remaining <= 0:
+                self._mark_cycle_exhaustion("observation_materialization")
+                blocked = True
+                blocked_group = group
+                blocked_index = index
+                break
+            if not self._downstream_collection_budget_available() or (
+                not self._scope_pipeline_budget_available()
+                and (
+                    not handoff_fast_path
+                    or handoff_batch_used >= _MAX_OBSERVATION_HANDOFF_BATCH
+                )
+            ):
+                blocked = True
+                blocked_group = group
+                blocked_index = index
+                break
+            if handoff_fast_path:
+                handoff_batch_used += 1
             intent = by_candidate.get(candidate_id)
             if not markets or intent is None:
                 if group == 0:
@@ -2551,6 +2630,191 @@ class PolymarketCollector:
         else:
             self._observation_materialization_turn = 1
         return ready_ids
+
+    def _observation_handoff_payload_matches(
+        self,
+        candidate_id: str,
+        intent: ForwardTestSpec,
+        spec: ForwardTestSpec,
+        payload: Mapping[str, Any],
+        proof: Mapping[str, Any],
+        current_ids: tuple[str, ...],
+    ) -> bool:
+        required_safety = {
+            "schema_valid": True,
+            "paper_observation_intent": True,
+            "paper_only": True,
+            "research_only": True,
+            "paper_forward_started": True,
+            "holdout_used": False,
+            "execution_scope": "OBSERVATION",
+            "observation_only_lineage": True,
+            "selection_excluded": True,
+            "allocation_active": False,
+            "canary_armed": False,
+        }
+        if any(
+            type(payload.get(key)) is not type(expected)
+            or payload.get(key) != expected
+            for key, expected in required_safety.items()
+        ):
+            return False
+        config = spec.config if isinstance(spec.config, Mapping) else {}
+        if str(config.get("candidate_id", "")).strip() != candidate_id:
+            return False
+        for intent_field in ("observation_intent_id", "paper_observation_intent_id"):
+            bound_intent_id = str(config.get(intent_field, "")).strip()
+            if bound_intent_id and bound_intent_id != str(intent.experiment_id).strip():
+                return False
+        if (
+            str(payload.get("candidate_id", "")).strip() != candidate_id
+            or str(payload.get("paper_observation_intent_id", "")).strip()
+            != str(intent.experiment_id).strip()
+            or str(payload.get("forward_test_id", "")).strip()
+            != str(spec.experiment_id).strip()
+        ):
+            return False
+        forward_config = payload.get("forward_config")
+        if (
+            not isinstance(forward_config, Mapping)
+            or _stable_payload(forward_config) != _stable_payload(config)
+        ):
+            return False
+        for field in (
+            "experiment_plan",
+            "plan_id",
+            "plan_hash",
+            "market_scope",
+            "market_scope_hash",
+            "market_scope_version",
+            "dataset_selector",
+            "dataset_attestation",
+        ):
+            expected = config.get(field)
+            if expected in (None, "", {}, []):
+                continue
+            if field not in payload or _stable_payload(payload.get(field)) != _stable_payload(expected):
+                return False
+        for field in ("strategy_hash", "model_hash"):
+            if field in payload:
+                expected = getattr(spec, field, None)
+                if expected is None or str(payload.get(field)).strip() != str(expected).strip():
+                    return False
+        payload_ids = tuple(
+            str(item).strip()
+            for item in payload.get("allowed_markets", ())
+            if str(item).strip()
+        )
+        current_market_ids = tuple(
+            str(item).strip()
+            for item in payload.get("current_market_ids", ())
+            if str(item).strip()
+        )
+        resolved_market_ids = tuple(
+            str(item).strip()
+            for item in payload.get("resolved_market_ids", ())
+            if str(item).strip()
+        )
+        if payload_ids != current_ids or current_market_ids != current_ids or resolved_market_ids != current_ids:
+            return False
+        lifecycle_scope_resolution = payload.get("scope_resolution")
+        lifecycle_market_scope_resolution = payload.get("market_scope_resolution")
+        return (
+            isinstance(lifecycle_scope_resolution, Mapping)
+            and isinstance(lifecycle_market_scope_resolution, Mapping)
+            and _stable_payload(lifecycle_scope_resolution) == _stable_payload(proof)
+            and _stable_payload(lifecycle_market_scope_resolution) == _stable_payload(proof)
+        )
+
+    def _validated_observation_handoff_ids(
+        self,
+        candidate_ids: Sequence[str],
+        candidate_markets: Mapping[str, Sequence[str]],
+        scope_resolutions: Mapping[str, Any],
+    ) -> set[str]:
+        loader = getattr(self.store, "load_candidate_lifecycle", None)
+        if not callable(loader):
+            return set()
+        try:
+            intents = ForwardTestRegistry(self.store).list_observation_intents()
+        except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+            return set()
+        intents_by_candidate = {
+            str(
+                (intent.config if isinstance(intent.config, Mapping) else {}).get(
+                    "candidate_id", ""
+                )
+            ).strip(): intent
+            for intent in intents
+        }
+        registry = ForwardTestRegistry(self.store)
+        ready: set[str] = set()
+        for raw_candidate_id in candidate_ids:
+            candidate_id = str(raw_candidate_id).strip()
+            intent = intents_by_candidate.get(candidate_id)
+            if (
+                not candidate_id
+                or intent is None
+                or not self._observation_intent_requires_handoff(intent)
+            ):
+                continue
+            try:
+                lifecycle = loader(candidate_id)
+            except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+                continue
+            if not isinstance(lifecycle, Mapping):
+                continue
+            payload = lifecycle.get("payload")
+            forward_test_id = (
+                str(payload.get("forward_test_id", "")).strip()
+                if isinstance(payload, Mapping)
+                else ""
+            )
+            if not forward_test_id:
+                continue
+            try:
+                spec = registry.get(forward_test_id)
+            except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+                continue
+            if spec is None:
+                continue
+            if str(lifecycle.get("stage", "")).strip().upper() not in {
+                CandidateStage.PAPER_FORWARD.value,
+                CandidateStage.PAPER_PROMOTABLE.value,
+            }:
+                continue
+            payload = lifecycle.get("payload")
+            proof = scope_resolutions.get(candidate_id)
+            if not isinstance(payload, Mapping) or not isinstance(proof, Mapping):
+                continue
+            matched_ids = self._scope_result_market_ids(proof)
+            current_ids = tuple(
+                str(item).strip()
+                for item in candidate_markets.get(candidate_id, ())
+                if str(item).strip()
+            )
+            if (
+                str(proof.get("candidate_id", "")).strip() != candidate_id
+                or str(proof.get("status", "")).strip().upper() != "MATCHED"
+                or tuple(matched_ids) != current_ids
+                or tuple(spec.allowed_markets) != current_ids
+                or str(payload.get("market_scope_hash", "")).strip()
+                != str(proof.get("scope_hash", "")).strip()
+                or str(payload.get("market_scope_version", "")).strip()
+                != str(proof.get("scope_version", "")).strip()
+                or not self._observation_handoff_payload_matches(
+                    candidate_id,
+                    intent,
+                    spec,
+                    payload,
+                    proof,
+                    current_ids,
+                )
+            ):
+                continue
+
+            ready.add(candidate_id)
+        return ready
 
     def _isolated_worker_providers(self) -> list[Any]:
         if self.config.max_concurrency <= 1:
@@ -2672,6 +2936,101 @@ class PolymarketCollector:
             for item in candidate_ids
             if str(item).strip()
         ))
+        # A current, already validated observation handoff is allowed to
+        # bypass broad inventory/suitability work.  The persisted proof is
+        # exact and freshness-bounded; using it here preserves a downstream
+        # collection window when an unrelated provider call is slow.
+        preloaded_scope_ids: list[str] = []
+        preloaded_scope_markets: dict[str, list[str]] = {}
+        preloaded_scope_resolutions: dict[str, Any] = {}
+        if self._scope_persisted_proof_restore_allowed():
+            self._restore_current_observation_scope_proofs(
+                observed_at,
+                current_candidate_ids,
+                preloaded_scope_ids,
+                preloaded_scope_markets,
+                preloaded_scope_resolutions,
+            )
+            fast_path_loader_failed = False
+            preloaded_handoff_ids = self._validated_observation_handoff_ids(
+                preloaded_scope_ids,
+                preloaded_scope_markets,
+                preloaded_scope_resolutions,
+            )
+            if (
+                preloaded_handoff_ids
+                and self._scope_handoff_fast_streak < _MAX_OBSERVATION_HANDOFF_FAST_CYCLES
+            ):
+                ordered_handoff_ids = [
+                    candidate_id
+                    for candidate_id in current_candidate_ids
+                    if candidate_id in preloaded_handoff_ids
+                ]
+                fast_scope_candidate_ids: list[str] = []
+                authority_market_ids: set[str] = set()
+                for candidate_id in current_candidate_ids:
+                    try:
+                        record = loader(candidate_id)
+                    except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+                        fast_path_loader_failed = True
+                        record = None
+                    payload = record.get("payload") if isinstance(record, Mapping) else None
+                    rolling_payload = (
+                        rolling_documents.get(candidate_id)
+                        if isinstance(rolling_documents, Mapping)
+                        else None
+                    )
+                    if not isinstance(payload, Mapping):
+                        if isinstance(rolling_payload, Mapping):
+                            payload = rolling_payload
+                        else:
+                            fast_path_loader_failed = True
+                            continue
+                    if not self._has_scope_material(payload):
+                        continue
+                    fast_scope_candidate_ids.append(candidate_id)
+                    try:
+                        authority_market_ids.update(
+                            self._scope_exact_market_ids((self._scope_document(payload),))
+                        )
+                    except (TypeError, ValueError):
+                        continue
+                for payload in (
+                    rolling_documents.values()
+                    if isinstance(rolling_documents, Mapping)
+                    else ()
+                ):
+                    if isinstance(payload, Mapping) and self._has_scope_material(payload):
+                        try:
+                            authority_market_ids.update(
+                                self._scope_exact_market_ids((self._scope_document(payload),))
+                            )
+                        except (TypeError, ValueError):
+                            continue
+                if not fast_path_loader_failed:
+                    self._scope_authority_market_ids = authority_market_ids
+                    self._scope_resolution_deferred_candidate_ids = tuple(
+                        candidate_id
+                        for candidate_id in fast_scope_candidate_ids
+                        if candidate_id not in preloaded_handoff_ids
+                    )[:_MAX_SCOPE_RESOLUTION_CANDIDATES]
+                    self._scope_resolutions.update(
+                        {
+                            candidate_id: preloaded_scope_resolutions[candidate_id]
+                            for candidate_id in ordered_handoff_ids
+                        }
+                    )
+                    self._scope_handoff_fast_streak += 1
+                    return (
+                        fast_scope_candidate_ids,
+                        {
+                            candidate_id: preloaded_scope_markets[candidate_id]
+                            for candidate_id in ordered_handoff_ids
+                        },
+                        {},
+                        self._scope_cursor(root_state),
+                    )
+        self._scope_handoff_fast_streak = 0
         current_rolling_ids = {
             str(item).strip()
             for item in getattr(self, "_rolling_scope_candidate_ids", ())
@@ -2844,7 +3203,13 @@ class PolymarketCollector:
             protected_cursor = 0
         protected_cursor %= len(protected_priority_exact_ids) if protected_priority_exact_ids else 1
         protected_cursor_start = protected_cursor
-        if protected_priority_exact_ids and self._scope_pipeline_budget_available():
+        if (
+            protected_priority_exact_ids
+            and self._cycle_remaining_seconds() is not None
+            and self._cycle_remaining_seconds() <= 0
+        ):
+            self._mark_cycle_exhaustion("scope_exact_lookup")
+        if protected_priority_exact_ids and self._scope_direct_budget_available():
             protected_probe_ids = [
                 protected_priority_exact_ids[
                     (protected_cursor + offset) % len(protected_priority_exact_ids)
@@ -2854,7 +3219,11 @@ class PolymarketCollector:
                 )
             ]
             for market_id in protected_probe_ids:
-                if not self._scope_pipeline_budget_available():
+                remaining = self._cycle_remaining_seconds()
+                if remaining is not None and remaining <= 0:
+                    self._mark_cycle_exhaustion("scope_exact_lookup")
+                    break
+                if not self._scope_direct_budget_available():
                     break
                 pre_direct_attempted_ids.add(market_id)
                 try:
@@ -3067,19 +3436,19 @@ class PolymarketCollector:
                 )
             ] if missing_deferred_ids else []
             direct_ids = [*protected_priority_ids, *priority_ids, *deferred_ids]
+            priority_id_set = set(missing_priority_ids)
+            protected_priority_id_set = set(protected_priority_ids)
             direct_loop_attempted_ids: set[str] = set()
             attempted_direct = 0
             attempted_protected = 0
             attempted_priority = 0
             attempted_deferred = 0
-            priority_id_set = set(missing_priority_ids)
-            protected_priority_id_set = set(protected_priority_ids)
             for market_id in direct_ids:
-                if (
-                    self._cycle_remaining_seconds() is not None
-                    and self._cycle_remaining_seconds() <= 0
-                ):
+                remaining = self._cycle_remaining_seconds()
+                if remaining is not None and remaining <= 0:
                     self._mark_cycle_exhaustion("scope_exact_lookup")
+                    break
+                if not self._scope_direct_budget_available():
                     break
                 direct_attempted_ids.add(market_id)
                 direct_loop_attempted_ids.add(market_id)
@@ -3946,6 +4315,18 @@ class PolymarketCollector:
         if remaining is None:
             return True
         return remaining > self._scope_phase_reserve_seconds() + 1e-6
+
+    def _scope_direct_budget_available(self) -> bool:
+        """Allow exact lookups their independent phase share without overrunning collection."""
+        remaining = self._cycle_remaining_seconds()
+        if remaining is None:
+            return True
+        if remaining <= 0:
+            return False
+        if self._scope_direct_budget_remaining is not None and self._scope_direct_budget_remaining <= 0:
+            return False
+        phase_timeout = self._provider_phase_timeout("scope_direct", remaining)
+        return phase_timeout > 0 and remaining > self._downstream_collection_reserve_seconds()
 
     @staticmethod
     def _scope_exact_market_ids(
