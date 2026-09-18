@@ -431,6 +431,7 @@ class CandidateLifecycleManager:
         evidence: Mapping[str, Any] | None = None,
         *,
         reason: str = "",
+        observation_only: bool = False,
     ) -> CandidateLifecycle:
         current = self.get(candidate_id)
         if current is None:
@@ -445,7 +446,20 @@ class CandidateLifecycleManager:
             raise ValueError("use reject() to record a rejection")
         current_index = _STAGE_ORDER.index(current.stage)
         target_index = _STAGE_ORDER.index(target_stage)
-        if target_index != current_index + 1:
+        valid_observation_handoff = (
+            bool(observation_only)
+            and current.stage is CandidateStage.SCHEMA_VALIDATED
+            and target_stage is CandidateStage.PAPER_FORWARD
+            and isinstance(evidence, Mapping)
+            and evidence.get("execution_scope") == "OBSERVATION"
+            and evidence.get("observation_only_lineage") is True
+            and evidence.get("paper_only") is True
+            and evidence.get("research_only") is True
+            and evidence.get("selection_excluded") is True
+            and evidence.get("allocation_active") is False
+            and evidence.get("canary_armed") is False
+        )
+        if target_index != current_index + 1 and not valid_observation_handoff:
             raise ValueError(f"candidate transition must advance one stage: {current.stage.value} -> {target_stage.value}")
         body = dict(current.payload)
         body.update(dict(evidence or {}))

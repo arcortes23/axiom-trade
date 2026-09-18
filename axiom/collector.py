@@ -36,7 +36,8 @@ from .domain import (
     utc_now,
 )
 from .storage import AxiomStore
-from .forward import ForwardTestRegistry
+from .forward import ForwardTestRegistry, ForwardTestSpec
+from .lifecycle import CandidateLifecycleManager, CandidateStage
 _UNSET = object()
 _MAX_SCOPE_REQUEST_PATH_LENGTH = 512
 _MAX_SCOPE_QUERY_DEPTH = 8
@@ -781,7 +782,7 @@ class PolymarketCollector:
                     if isinstance(item, Mapping)
                 ),
             ]
-        self._materialize_observation_intents(
+        materialized_observation_ids = self._materialize_observation_intents(
             started,
             observation_intent_ids,
             scope_candidate_markets,
@@ -798,7 +799,10 @@ class PolymarketCollector:
             identifier
             for identifier in scope_candidate_ids
             if identifier not in primary_candidate_set
-            and (identifier in paper_set or identifier in observation_set)
+            and (
+                identifier in (paper_set - observation_set)
+                or identifier in set(materialized_observation_ids)
+            )
         ]
         legacy_primary_ids = [
             identifier for identifier in primary_candidate_ids
@@ -2021,6 +2025,201 @@ class PolymarketCollector:
             ):
                 result.append(candidate_id)
         return list(dict.fromkeys(result))
+    @staticmethod
+    def _observation_intent_requires_handoff(intent: Any) -> bool:
+        config = getattr(intent, "config", None)
+        if not isinstance(config, Mapping):
+            return False
+        return (
+            config.get("observation_only_lineage") is True
+            or isinstance(config.get("observation_handoff"), Mapping)
+        )
+    def _observation_lifecycle_requires_reconcile(self, candidate_id: str) -> bool:
+        loader = getattr(self.store, "load_candidate_lifecycle", None)
+        if not callable(loader):
+            return False
+        try:
+            record = loader(candidate_id)
+        except (AttributeError, KeyError, TypeError, ValueError, RuntimeError):
+            return False
+        if not isinstance(record, Mapping):
+            return False
+        stage = str(record.get("stage", "")).strip().upper()
+        if stage in {CandidateStage.IDEA.value, CandidateStage.SCHEMA_VALIDATED.value}:
+            return True
+        if stage not in {
+            CandidateStage.PAPER_FORWARD.value,
+            CandidateStage.PAPER_PROMOTABLE.value,
+        }:
+            return True
+        return True
+
+    def _reconcile_materialized_observation_lifecycle(
+        self,
+        candidate_id: str,
+        intent: Any,
+        spec: ForwardTestSpec,
+        markets: Sequence[str],
+        scope_resolution: Any,
+        observed_at: datetime,
+    ) -> bool:
+        proof = (
+            scope_resolution
+            if isinstance(scope_resolution, Mapping)
+            else (
+                scope_resolution.as_dict()
+                if hasattr(scope_resolution, "as_dict")
+                and callable(scope_resolution.as_dict)
+                else None
+            )
+        )
+        if not isinstance(proof, Mapping):
+            raise ValueError("observation materialization requires persisted scope proof")
+        matched_ids = tuple(self._scope_result_market_ids(proof))
+        allowed_ids = tuple(str(item).strip() for item in markets if str(item).strip())
+        if (
+            str(proof.get("status", "")).strip().upper() != "MATCHED"
+            or matched_ids != allowed_ids
+            or tuple(spec.allowed_markets) != allowed_ids
+        ):
+            raise ValueError("observation materialization scope is not the verified current match")
+        manager = CandidateLifecycleManager(self.store)
+        current = manager.get(candidate_id)
+        if current is None:
+            raise ValueError("observation materialization lifecycle is missing")
+        config = dict(spec.config) if isinstance(spec.config, Mapping) else {}
+        evidence = dict(current.payload)
+        for field in (
+            "experiment_plan",
+            "plan_id",
+            "plan_hash",
+            "market_scope",
+            "market_scope_hash",
+            "market_scope_version",
+            "dataset_selector",
+            "dataset_attestation",
+        ):
+            value = config.get(field)
+            if value in (None, "", {}, []):
+                continue
+            existing = evidence.get(field)
+            if existing not in (None, "", {}, []) and _stable_payload(existing) != _stable_payload(value):
+                raise ValueError(f"observation lifecycle binding conflicts for {field}")
+            evidence[field] = value
+        intent_id = str(getattr(intent, "experiment_id", "") or "").strip()
+        if not intent_id:
+            raise ValueError("observation materialization intent identity is missing")
+        evidence.update(
+            {
+                "schema_valid": True,
+                "paper_observation_intent_id": intent_id,
+                "paper_observation_intent": True,
+                "paper_only": True,
+                "research_only": True,
+                "execution_scope": "OBSERVATION",
+                "observation_only_lineage": True,
+                "selection_excluded": True,
+                "allocation_active": False,
+                "canary_armed": False,
+                "scope_resolution": dict(proof),
+                "market_scope_resolution": dict(proof),
+            }
+        )
+        if current.stage is CandidateStage.IDEA:
+            manager.advance(
+                candidate_id,
+                CandidateStage.SCHEMA_VALIDATED,
+                evidence,
+                reason="current observation scope verified after schema intent registration",
+            )
+            return False
+        if current.stage is CandidateStage.SCHEMA_VALIDATED:
+            forward_evidence = dict(current.payload)
+            forward_evidence.update(
+                {
+                    "paper_forward_started": True,
+                    "holdout_used": False,
+                    "forward_test_id": spec.experiment_id,
+                    "forward_config": config,
+                    "allowed_markets": list(allowed_ids),
+                    "current_market_ids": list(allowed_ids),
+                    "resolved_market_ids": list(allowed_ids),
+                    "scope_resolution": dict(proof),
+                    "market_scope_resolution": dict(proof),
+                    "paper_only": True,
+                    "research_only": True,
+                    "execution_scope": "OBSERVATION",
+                    "observation_only_lineage": True,
+                    "selection_excluded": True,
+                    "allocation_active": False,
+                    "canary_armed": False,
+                }
+            )
+            manager.advance(
+                candidate_id,
+                CandidateStage.PAPER_FORWARD,
+                forward_evidence,
+                reason="current observation scope materialized as paper forward",
+                observation_only=True,
+            )
+            return True
+        if current.stage in {CandidateStage.PAPER_FORWARD, CandidateStage.PAPER_PROMOTABLE}:
+            required_safety = {
+                "paper_observation_intent": True,
+                "paper_only": True,
+                "research_only": True,
+                "execution_scope": "OBSERVATION",
+                "observation_only_lineage": True,
+                "selection_excluded": True,
+                "allocation_active": False,
+                "canary_armed": False,
+            }
+            if any(
+                type(current.payload.get(key)) is not type(expected)
+                or current.payload.get(key) != expected
+                for key, expected in required_safety.items()
+            ):
+                raise ValueError("observation lifecycle paper authority safety is not persisted")
+            existing_id = str(current.payload.get("forward_test_id", "")).strip()
+            existing_markets = tuple(
+                str(item).strip()
+                for item in current.payload.get("allowed_markets", ())
+                if str(item).strip()
+            )
+            if (
+                existing_id != str(spec.experiment_id).strip()
+                or existing_markets != allowed_ids
+                or current.payload.get("scope_resolution") != dict(proof)
+                or current.payload.get("market_scope_resolution") != dict(proof)
+            ):
+                evidence = {
+                    **dict(current.payload),
+                    "forward_test_id": spec.experiment_id,
+                    "forward_config": config,
+                    "allowed_markets": list(allowed_ids),
+                    "current_market_ids": list(allowed_ids),
+                    "resolved_market_ids": list(allowed_ids),
+                    "scope_resolution": dict(proof),
+                    "market_scope_resolution": dict(proof),
+                    "paper_forward_started": True,
+                    "holdout_used": False,
+                    "paper_only": True,
+                    "research_only": True,
+                    "execution_scope": "OBSERVATION",
+                    "observation_only_lineage": True,
+                    "selection_excluded": True,
+                    "allocation_active": False,
+                    "canary_armed": False,
+                }
+                manager.record_evidence(
+                    candidate_id,
+                    evidence,
+                    expected_stage=current.stage,
+                    reason="observation materialization lifecycle reconciliation",
+                )
+            return True
+        raise ValueError(f"observation lifecycle cannot advance from {current.stage.value}")
+
 
     def _materialize_observation_intents(
         self,
@@ -2030,7 +2229,7 @@ class PolymarketCollector:
         counters: dict[str, Any],
         *,
         scope_resolutions: Mapping[str, Any] | None = None,
-    ) -> None:
+    ) -> set[str]:
         registry = ForwardTestRegistry(self.store)
         intents = registry.list_observation_intents()
         superseded_candidates, superseded_intents = self._observation_superseded_ids(intents)
@@ -2053,11 +2252,12 @@ class PolymarketCollector:
             not in superseded_candidates
             and str(spec.experiment_id).strip() not in superseded_intents
         }
+        ready_ids: set[str] = set()
         if not prior_deferred and not current_ids:
             self._observation_materialization_deferred_candidate_ids = ()
             self._observation_materialization_cursor = 0
             self._observation_materialization_turn = 0
-            return
+            return ready_ids
 
         if prior_deferred:
             cursor = self._observation_materialization_cursor % len(prior_deferred)
@@ -2071,7 +2271,10 @@ class PolymarketCollector:
             if (
                 candidate_id not in deferred_set
                 and candidate_id in by_candidate
-                and registry.get("forward-" + candidate_id) is None
+                and (
+                    registry.get("forward-" + candidate_id) is None
+                    or self._observation_lifecycle_requires_reconcile(candidate_id)
+                )
                 and any(
                     str(item).strip()
                     for item in candidate_markets.get(candidate_id, ())
@@ -2108,24 +2311,78 @@ class PolymarketCollector:
                 if group == 0:
                     deferred_consumed.add(candidate_id)
                 continue
-            # Later ticks refresh current scope authority, not the immutable
-            # experiment or its original registration timestamp.
-            if registry.get("forward-" + candidate_id) is not None:
-                if group == 0:
-                    deferred_consumed.add(candidate_id)
+            existing_spec = registry.get("forward-" + candidate_id)
+            if (
+                existing_spec is not None
+                and not self._observation_lifecycle_requires_reconcile(candidate_id)
+            ):
+                try:
+                    lifecycle_ready = True
+                    if (
+                        isinstance(existing_spec, ForwardTestSpec)
+                        and self._observation_intent_requires_handoff(intent)
+                    ):
+                        lifecycle_ready = self._reconcile_materialized_observation_lifecycle(
+                            candidate_id,
+                            intent,
+                            existing_spec,
+                            markets,
+                            (scope_resolutions or {}).get(candidate_id),
+                            observed_at,
+                        )
+                except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+                    counters["errors"] += 1
+                    if group == 0:
+                        deferred_retries.append(candidate_id)
+                    else:
+                        current_retries.append(candidate_id)
+                    continue
+                if lifecycle_ready:
+                    ready_ids.add(candidate_id)
+                    if group == 0:
+                        deferred_consumed.add(candidate_id)
+                elif group == 0:
+                    deferred_retries.append(candidate_id)
+                else:
+                    current_retries.append(candidate_id)
                 continue
             try:
-                registry.materialize_observation_intent(
-                    intent,
-                    allowed_markets=markets[:100],
-                    registration_timestamp=observed_at,
-                    now=observed_at,
-                    candidate_id=candidate_id,
-                    scope_resolution=(scope_resolutions or {}).get(candidate_id),
+                transaction_factory = getattr(self.store, "transaction", None)
+                transaction = (
+                    transaction_factory()
+                    if callable(transaction_factory)
+                    else nullcontext()
                 )
-                if group == 0:
-                    deferred_consumed.add(candidate_id)
-            except (TypeError, ValueError):
+                with transaction:
+                    materialized = existing_spec or registry.materialize_observation_intent(
+                        intent,
+                        allowed_markets=markets[:100],
+                        registration_timestamp=observed_at,
+                        now=observed_at,
+                        candidate_id=candidate_id,
+                        scope_resolution=(scope_resolutions or {}).get(candidate_id),
+                    )
+                    if (
+                        isinstance(materialized, ForwardTestSpec)
+                        and self._observation_intent_requires_handoff(intent)
+                    ):
+                        lifecycle_ready = self._reconcile_materialized_observation_lifecycle(
+                            candidate_id,
+                            intent,
+                            materialized,
+                            markets,
+                            (scope_resolutions or {}).get(candidate_id),
+                            observed_at,
+                        )
+                    else:
+                        lifecycle_ready = True
+                if lifecycle_ready:
+                    ready_ids.add(candidate_id)
+                    if group == 0:
+                        deferred_consumed.add(candidate_id)
+                elif group == 0:
+                    deferred_retries.append(candidate_id)
+            except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
                 counters["errors"] += 1
                 if group == 0:
                     deferred_retries.append(candidate_id)
@@ -2162,6 +2419,7 @@ class PolymarketCollector:
             self._observation_materialization_turn = 0
         else:
             self._observation_materialization_turn = 1
+        return ready_ids
 
     def _isolated_worker_providers(self) -> list[Any]:
         if self.config.max_concurrency <= 1:

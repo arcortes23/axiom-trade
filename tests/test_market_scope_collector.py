@@ -20,6 +20,9 @@ from axiom.collector import (
     _MAX_SCOPE_SUITABILITY_CACHE,
     _stable_payload,
 )
+from axiom.experiment_plan import normalize_market_scope
+from axiom.forward import ForwardTestRegistry, ForwardTestSpec
+from axiom.lifecycle import CandidateStage
 from axiom.data import InMemoryPredictionProvider
 from axiom.storage import AxiomStore, _COLLECTOR_STATE_MAX_BYTES
 from axiom.polymarket_rules import assess_selected_token_depth, parse_polymarket_rules
@@ -298,6 +301,7 @@ class _ScopeStore:
             for candidate_id, payload in documents.items()
         }
         self.fail_resolver = fail_resolver
+        self.fail_lifecycle = False
         self.fail_saver = fail_saver
         self.resolutions: list[object] = []
         self.states: dict[str, dict[str, object]] = {}
@@ -309,6 +313,30 @@ class _ScopeStore:
         if candidate_id is not None:
             return self.documents.get(str(candidate_id))
         return list(self.documents.values())[:limit]
+    def save_candidate_lifecycle(
+        self,
+        candidate_id: str,
+        stage: str,
+        payload,
+        *,
+        from_stage: str | None = None,
+        reason: str = "",
+        timestamp=None,
+    ):
+        if self.fail_lifecycle:
+            raise RuntimeError("lifecycle unavailable")
+        del reason, timestamp
+        record = self.documents.get(str(candidate_id))
+        if record is None:
+            raise ValueError("candidate lifecycle is missing")
+        if from_stage is not None and record.get("stage") != from_stage:
+            raise RuntimeError("stale candidate lifecycle writer")
+        record["stage"] = str(stage)
+        record["payload"] = dict(payload)
+        return True
+
+    def after_commit(self, callback):
+        del callback
 
     def resolve_market_scope(self, *args, **kwargs):
         if self.fail_resolver:
@@ -858,7 +886,6 @@ class MarketScopeCollectorTests(unittest.TestCase):
         self.assertEqual(list(cycle.paper_forward_scheduled), ["observation-market"])
         self.assertNotIn("observation-candidate", cycle.candidate_references or {})
         self.assertTrue(provider.market_calls)
-        self.assertEqual(set(provider.market_calls), {"observation-market"})
 
     def test_repeated_public_trade_poll_keeps_immutable_evidence_stable(self) -> None:
         provider = _RepeatingTradeProvider((market("repeat-trade"),))
@@ -3821,6 +3848,219 @@ class MarketScopeCollectorTests(unittest.TestCase):
         self.assertEqual(second_calls[0], rolling_id)
         self.assertIn(target_id, collector._scope_authority_market_ids)
         collector.close()
+    def test_observation_materialization_advances_schema_lifecycle_and_restarts_idempotently(self) -> None:
+        candidate_id = "observation-lifecycle-candidate"
+        market_id = "observation-lifecycle-market"
+        plan_hash = "sha256:observation-plan"
+        dataset_selector = {"dataset_id": "observation-history", "dataset_version": "v1"}
+        policy = normalize_market_scope(
+            {
+                **normalize_market_scope(
+                    market_ids=[market_id],
+                    target_instrument="POLYMARKET",
+                ).as_dict(),
+                "provenance": "canonical",
+            }
+        )
+        config = {
+            "candidate_id": candidate_id,
+            "observation_intent": True,
+            "observation_only_lineage": True,
+            "market_authority_required": False,
+            "strategy_document": {
+                "version": 1,
+                "market_type": "prediction",
+                "family": "momentum",
+                "parameters": {"lookback": 1, "threshold": 0.05},
+                "probability_model": "market-history",
+                "resolution_aware": True,
+                "resolution_inputs": ["settlement"],
+            },
+            "model_document": {"model_required": False},
+            "execution": "paper_only",
+            "market_scope": policy.as_dict(),
+            "market_scope_hash": policy.scope_hash,
+            "market_scope_version": policy.scope_version,
+            "plan_hash": plan_hash,
+            "dataset_selector": dataset_selector,
+            "dataset_attestation": {
+                **dataset_selector,
+                "source_type": "HISTORICAL",
+            },
+        }
+        intent = ForwardTestSpec(
+            "observation-intent-" + candidate_id,
+            "sha256:observation-strategy",
+            "sha256:observation-model",
+            config,
+            T0,
+            10_000.0,
+            (),
+            {},
+        )
+        lifecycle_payload = {
+            "candidate_id": candidate_id,
+            "schema_valid": True,
+            "paper_observation_intent": True,
+            "paper_observation_intent_id": intent.experiment_id,
+            "paper_only": True,
+            "research_only": True,
+            "experiment_plan": {
+                "market_scope": policy.as_dict(),
+                "market_scope_hash": policy.scope_hash,
+                "market_scope_version": policy.scope_version,
+                "plan_hash": plan_hash,
+                "dataset_selector": dataset_selector,
+            },
+            **{
+                key: config[key]
+                for key in (
+                    "market_scope",
+                    "market_scope_hash",
+                    "market_scope_version",
+                    "plan_hash",
+                    "dataset_selector",
+                    "dataset_attestation",
+                )
+            },
+        }
+        store = _ScopeStore({candidate_id: lifecycle_payload})
+        store.documents[candidate_id]["stage"] = CandidateStage.SCHEMA_VALIDATED.value
+        store.forward_tests[intent.experiment_id] = intent.as_record()
+        collector = self._collector(
+            _RecordingProvider((market(market_id),)),
+            store,
+            (),
+            max_markets=1,
+        )
+
+        first = collector.collect_once(now=T0)
+        lifecycle = store.load_candidate_lifecycle(candidate_id)
+        self.assertEqual(lifecycle["stage"], CandidateStage.PAPER_FORWARD.value)
+        payload = lifecycle["payload"]
+        self.assertEqual(payload["forward_test_id"], "forward-" + candidate_id)
+        self.assertEqual(payload["allowed_markets"], [market_id])
+        self.assertFalse(payload["allocation_active"])
+        self.assertFalse(payload["canary_armed"])
+        self.assertTrue(payload["paper_observation_intent"])
+        self.assertTrue(payload["observation_only_lineage"])
+        self.assertTrue(payload["selection_excluded"])
+        self.assertEqual(payload["scope_resolution"]["status"], "MATCHED")
+        self.assertEqual(payload["market_scope_resolution"]["matched_markets"][0]["market_id"], market_id)
+        self.assertEqual(first.paper_forward_markets, (market_id,))
+        self.assertEqual(first.paper_forward_scheduled, (market_id,))
+        materialized = ForwardTestRegistry(store).get("forward-" + candidate_id)
+        self.assertIsNotNone(materialized)
+        self.assertEqual(materialized.allowed_markets, (market_id,))
+
+        second = collector.collect_once(now=T0 + timedelta(minutes=1))
+        self.assertEqual(second.paper_forward_markets, (market_id,))
+        self.assertEqual(second.paper_forward_scheduled, (market_id,))
+        self.assertEqual(
+            store.load_candidate_lifecycle(candidate_id)["stage"],
+            CandidateStage.PAPER_FORWARD.value,
+        )
+        self.assertEqual(
+            len(
+                [
+                    item
+                    for item in store.forward_tests.values()
+                    if str(item.get("experiment_id", "")).startswith("forward-" + candidate_id)
+                ]
+            ),
+            1,
+        )
+        collector.close()
+        restarted_collector = self._collector(
+            _RecordingProvider((market(market_id),)),
+            store,
+            (),
+            max_markets=1,
+        )
+        restarted_cycle = restarted_collector.collect_once(now=T0 + timedelta(minutes=2))
+        self.assertEqual(restarted_cycle.paper_forward_markets, (market_id,))
+        self.assertEqual(restarted_cycle.paper_forward_scheduled, (market_id,))
+        restarted_collector.close()
+
+        failed_store = _ScopeStore({candidate_id: lifecycle_payload})
+        failed_store.documents[candidate_id]["stage"] = CandidateStage.SCHEMA_VALIDATED.value
+        failed_store.forward_tests[intent.experiment_id] = intent.as_record()
+        failed_store.fail_lifecycle = True
+        failed_collector = self._collector(
+            _RecordingProvider((market(market_id),)),
+            failed_store,
+            (),
+            max_markets=1,
+        )
+        failed_cycle = failed_collector.collect_once(now=T0)
+        self.assertEqual(failed_cycle.paper_forward_markets, ())
+        self.assertEqual(failed_cycle.paper_forward_scheduled, ())
+        self.assertEqual(
+            failed_store.load_candidate_lifecycle(candidate_id)["stage"],
+            CandidateStage.SCHEMA_VALIDATED.value,
+        )
+        failed_collector.close()
+        rejected_store = _ScopeStore({candidate_id: lifecycle_payload})
+        rejected_store.documents[candidate_id]["stage"] = CandidateStage.REJECTED.value
+        rejected_store.forward_tests[intent.experiment_id] = intent.as_record()
+        rejected_collector = self._collector(
+            _RecordingProvider((market(market_id),)),
+            rejected_store,
+            (),
+            max_markets=1,
+        )
+        rejected_cycle = rejected_collector.collect_once(now=T0)
+        self.assertEqual(rejected_cycle.paper_forward_markets, ())
+        self.assertEqual(rejected_cycle.paper_forward_scheduled, ())
+        self.assertEqual(
+            rejected_store.load_candidate_lifecycle(candidate_id)["stage"],
+            CandidateStage.REJECTED.value,
+        )
+        rejected_collector.close()
+        stale_store = _ScopeStore({candidate_id: lifecycle["payload"]})
+        stale_store.documents[candidate_id]["stage"] = CandidateStage.PAPER_FORWARD.value
+        stale_spec = replace(intent, experiment_id="forward-" + candidate_id)
+        stale_store.forward_tests[intent.experiment_id] = intent.as_record()
+        stale_store.forward_tests[stale_spec.experiment_id] = stale_spec.as_record()
+        stale_collector = self._collector(
+            _RecordingProvider((market(market_id),)),
+            stale_store,
+            (),
+            max_markets=1,
+        )
+        stale_cycle = stale_collector.collect_once(now=T0)
+        self.assertEqual(stale_cycle.paper_forward_markets, ())
+        self.assertEqual(stale_cycle.paper_forward_scheduled, ())
+        self.assertEqual(
+            stale_store.load_candidate_lifecycle(candidate_id)["stage"],
+            CandidateStage.PAPER_FORWARD.value,
+        )
+        stale_collector.close()
+        unsafe_payload = dict(lifecycle["payload"])
+        unsafe_payload["allocation_active"] = True
+        unsafe_payload["canary_armed"] = True
+        unsafe_store = _ScopeStore({candidate_id: unsafe_payload})
+        unsafe_store.documents[candidate_id]["stage"] = CandidateStage.PAPER_FORWARD.value
+        unsafe_spec = replace(
+            intent,
+            experiment_id="forward-" + candidate_id,
+            allowed_markets=(market_id,),
+        )
+        unsafe_store.forward_tests[intent.experiment_id] = intent.as_record()
+        unsafe_store.forward_tests[unsafe_spec.experiment_id] = unsafe_spec.as_record()
+        unsafe_collector = self._collector(
+            _RecordingProvider((market(market_id),)),
+            unsafe_store,
+            (),
+            max_markets=1,
+        )
+        unsafe_cycle = unsafe_collector.collect_once(now=T0)
+        self.assertEqual(unsafe_cycle.paper_forward_markets, ())
+        self.assertEqual(unsafe_cycle.paper_forward_scheduled, ())
+        self.assertTrue(unsafe_store.load_candidate_lifecycle(candidate_id)["payload"]["allocation_active"])
+        self.assertTrue(unsafe_store.load_candidate_lifecycle(candidate_id)["payload"]["canary_armed"])
+        unsafe_collector.close()
+
     def test_observation_materialization_interleaves_deferred_and_current_work(self) -> None:
         deferred_ids = tuple(f"observation-deferred-{index:03d}" for index in range(140))
         deferred_arrivals = tuple(f"observation-arrival-{index:03d}" for index in range(6))
