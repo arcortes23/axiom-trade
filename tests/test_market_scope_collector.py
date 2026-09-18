@@ -4728,6 +4728,128 @@ class MarketScopeCollectorTests(unittest.TestCase):
         self.assertTrue(unsafe_store.load_candidate_lifecycle(candidate_id)["payload"]["canary_armed"])
         unsafe_collector.close()
 
+    def test_existing_observation_lifecycle_rejects_scope_shrink(self) -> None:
+        candidate_id = "observation-scope-shrink"
+        intent = SimpleNamespace(
+            experiment_id="observation-intent-" + candidate_id,
+            config={"candidate_id": candidate_id, "observation_intent": True},
+        )
+        spec = SimpleNamespace(
+            experiment_id="forward-" + candidate_id,
+            allowed_markets=("market-one", "market-two"),
+        )
+        store = _ScopeStore(
+            {
+                candidate_id: {
+                    "candidate_id": candidate_id,
+                    "forward_test_id": spec.experiment_id,
+                    "paper_observation_intent": True,
+                    "paper_observation_intent_id": intent.experiment_id,
+                    "paper_only": True,
+                    "research_only": True,
+                    "paper_forward_started": True,
+                    "holdout_used": False,
+                    "selection_excluded": True,
+                    "allocation_active": False,
+                    "canary_armed": False,
+                    "allowed_markets": ["market-one", "market-two"],
+                }
+            }
+        )
+        store.documents[candidate_id]["stage"] = CandidateStage.PAPER_FORWARD.value
+        collector = self._collector(
+            _RecordingProvider((market("market-one"), market("market-two"))),
+            store,
+            (),
+        )
+        self.assertTrue(
+            collector._existing_observation_lifecycle_is_active(
+                candidate_id,
+                spec,
+                intent=intent,
+                allowed_markets=("market-one", "market-two"),
+            )
+        )
+        self.assertFalse(
+            collector._existing_observation_lifecycle_is_active(
+                candidate_id,
+                spec,
+                intent=intent,
+                allowed_markets=("market-one",),
+            )
+        )
+        collector._scope_pipeline_budget_available = lambda: True  # type: ignore[method-assign]
+        materialization_markets: list[tuple[str, ...]] = []
+
+        class RecordingRegistry:
+            def __init__(self, _store):
+                pass
+
+            def list_observation_intents(self):
+                return (intent,)
+
+            def get(self, _experiment_id):
+                return spec
+
+            def materialize_observation_intent(self, _intent, **kwargs):
+                materialization_markets.append(tuple(kwargs["allowed_markets"]))
+                return object()
+
+        with patch("axiom.collector.ForwardTestRegistry", RecordingRegistry):
+            collector._materialize_observation_intents(
+                T0,
+                (candidate_id,),
+                {candidate_id: ("market-one",)},
+                {"errors": 0},
+            )
+        self.assertEqual(materialization_markets, [("market-one",)])
+        collector.close()
+
+
+    def test_existing_observation_lifecycle_rejects_empty_worker_scope(self) -> None:
+        candidate_id = "observation-empty-worker-scope"
+        intent = SimpleNamespace(
+            experiment_id="observation-intent-" + candidate_id,
+            config={"observation_intent": True},
+        )
+        spec = SimpleNamespace(
+            experiment_id="forward-" + candidate_id,
+            allowed_markets=(),
+        )
+        store = _ScopeStore(
+            {
+                candidate_id: {
+                    "candidate_id": candidate_id,
+                    "forward_test_id": spec.experiment_id,
+                    "paper_observation_intent": True,
+                    "paper_observation_intent_id": intent.experiment_id,
+                    "paper_only": True,
+                    "research_only": True,
+                    "paper_forward_started": True,
+                    "holdout_used": False,
+                    "selection_excluded": True,
+                    "allocation_active": False,
+                    "canary_armed": False,
+                    "allowed_markets": ["market-one"],
+                }
+            }
+        )
+        store.documents[candidate_id]["stage"] = CandidateStage.PAPER_FORWARD.value
+        collector = self._collector(
+            _RecordingProvider((market("market-one"),)),
+            store,
+            (),
+        )
+        self.assertFalse(
+            collector._existing_observation_lifecycle_is_active(
+                candidate_id,
+                spec,
+                intent=intent,
+                allowed_markets=("market-one",),
+            )
+        )
+        collector.close()
+
     def test_observation_materialization_interleaves_deferred_and_current_work(self) -> None:
         deferred_ids = tuple(f"observation-deferred-{index:03d}" for index in range(140))
         deferred_arrivals = tuple(f"observation-arrival-{index:03d}" for index in range(6))
@@ -4769,6 +4891,16 @@ class MarketScopeCollectorTests(unittest.TestCase):
             def _scope_pipeline_budget_available(self):
                 self._materialization_budget_calls += 1
                 return self._materialization_budget_calls <= 1
+            def _existing_observation_lifecycle_is_active(
+                self,
+                candidate_id,
+                spec,
+                *,
+                intent=None,
+                allowed_markets=(),
+            ):
+                del candidate_id, spec, intent, allowed_markets
+                return True
 
         store = _ScopeStore({})
         candidate_markets = {

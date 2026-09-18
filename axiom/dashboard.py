@@ -7937,8 +7937,9 @@ class DashboardData:
                 if "rolling_portfolio" not in result:
                     result["rolling_portfolio"] = self.rolling_portfolio_data()
             return result
-        market_scope_funnel = self.market_scope_funnel_data()
+        market_scope_funnel: Mapping[str, Any] = {}
         if self.store is None or not callable(getattr(self.store, "dashboard_overview_summary", None)):
+            market_scope_funnel = self.market_scope_funnel_data()
             candidate_records = self._bounded_candidate_lifecycle()
             candidate_ids = [
                 str(item.get("candidate_id") or "").strip()
@@ -7977,6 +7978,7 @@ class DashboardData:
                 "live_execution": False,
             }
         aggregate = self.store.dashboard_overview_summary(activity_limit=8)
+        market_scope_funnel = self.market_scope_funnel_data()
         research_progress = self._research_progress_projection(aggregate=aggregate)
         campaign_progress = self._campaign_progress_projection()
         campaign_activity = self._campaign_activity_rows()

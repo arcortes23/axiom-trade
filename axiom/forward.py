@@ -1071,6 +1071,59 @@ _ABSOLUTE_MOVE_PREDICATE = {
     "units": "probability",
     "boundary": "inclusive",
 }
+def _operational_dataset_identity(
+    config: Mapping[str, Any],
+) -> tuple[Any, Any]:
+    """Require one dataset identity across every bounded setup authority."""
+    containers: list[tuple[str, Mapping[str, Any]]] = [("config", config)]
+    for name in (
+        "dataset_selector",
+        "dataset_boundary",
+        "dataset_attestation",
+        "assessment_manifest_ref",
+        "experiment_plan",
+        "plan",
+        "forward_config",
+        "config",
+    ):
+        value = config.get(name)
+        if isinstance(value, Mapping):
+            containers.append((name, value))
+    values: dict[str, list[Any]] = {"dataset_id": [], "dataset_version": []}
+
+    def add(field: str, value: Any) -> None:
+        if value not in (None, ""):
+            values[field].append(value)
+
+    for name, container in containers:
+        add("dataset_id", container.get("dataset_id"))
+        add("dataset_version", container.get("dataset_version"))
+        if name in {"dataset_selector", "dataset_boundary", "dataset_attestation"}:
+            add("dataset_version", container.get("version"))
+        selector = container.get("dataset_selector")
+        if isinstance(selector, Mapping):
+            add("dataset_id", selector.get("dataset_id"))
+            add(
+                "dataset_version",
+                selector.get("dataset_version", selector.get("version")),
+            )
+        for binding_name in ("dataset_boundary", "dataset_attestation"):
+            binding = container.get(binding_name)
+            if isinstance(binding, Mapping):
+                add("dataset_id", binding.get("dataset_id"))
+                add(
+                    "dataset_version",
+                    binding.get("dataset_version", binding.get("version")),
+                )
+    result: list[Any] = []
+    for field in ("dataset_id", "dataset_version"):
+        distinct = {_canonical(value) for value in values[field]}
+        if len(distinct) > 1:
+            raise ValueError(f"conflicting operational dataset identity: {field}")
+        result.append(values[field][0] if values[field] else None)
+    return result[0], result[1]
+
+
 
 
 def _operational_setup_for_strategy(
@@ -1079,42 +1132,87 @@ def _operational_setup_for_strategy(
 ) -> dict[str, Any] | None:
     """Return the canonical setup for one exact directional strategy.
 
-    A setup is intentionally recognized only when all of its immutable
-    contract dimensions are present.  This prevents this compatibility layer
-    from reinterpreting older strategy versions or silently assigning a new
-    contract to an unrelated family.
+    Setup derivation is deliberately stricter than the general strategy
+    compatibility helpers.  A malformed or non-canonical document must never
+    acquire the directional paper contract through fallback parsing or scalar
+    coercion.
     """
-    document = _plain_json(_normalized_strategy_document(strategy))
+    try:
+        from .strategy import load_strategy
+
+        document = _plain_json(load_strategy(strategy).to_dict())
+    except Exception:
+        return None
     if not isinstance(document, Mapping):
         return None
-    family = str(document.get("family", "")).strip().lower()
-    if family not in _DIRECTIONAL_SETUP_FAMILIES:
+    if document.get("market_type") != "prediction":
+        return None
+    family = document.get("family")
+    if not isinstance(family, str) or family not in _DIRECTIONAL_SETUP_FAMILIES:
         return None
     parameters = document.get("parameters")
     if not isinstance(parameters, Mapping):
         return None
-
-    def scalar(value: Any) -> Any:
-        if isinstance(value, (list, tuple)) and len(value) == 1:
-            return value[0]
-        return value
-
-    try:
-        lookback = int(scalar(parameters.get("lookback")))
-        threshold = float(scalar(parameters.get("threshold")))
-    except (TypeError, ValueError, OverflowError):
+    lookback = parameters.get("lookback")
+    threshold = parameters.get("threshold")
+    if (
+        type(lookback) is not int
+        or lookback != 1
+        or type(threshold) is not float
+        or not math.isfinite(threshold)
+        or threshold != 0.05
+    ):
         return None
     predicate = parameters.get("entry_predicate")
     if (
-        lookback != 1
-        or not math.isfinite(threshold)
-        or abs(threshold - 0.05) > 1e-12
-        or not isinstance(predicate, Mapping)
+        not isinstance(predicate, Mapping)
         or _canonical(predicate) != _canonical(_ABSOLUTE_MOVE_PREDICATE)
     ):
         return None
 
     source = _plain_json(dict(config or {}))
+    dataset_id, dataset_version = _operational_dataset_identity(source)
+    raw_manifest = source.get("assessment_manifest_ref")
+    boundary = source.get("dataset_boundary")
+    attestation = source.get("dataset_attestation")
+    if boundary is not None and not isinstance(boundary, Mapping):
+        return None
+    if attestation is not None and not isinstance(attestation, Mapping):
+        return None
+    attestation_hash = (
+        str(attestation.get("attestation_hash", "")).strip()
+        if isinstance(attestation, Mapping)
+        else ""
+    )
+    if isinstance(raw_manifest, Mapping):
+        manifest = _plain_json(raw_manifest)
+        if not isinstance(manifest, Mapping):
+            return None
+        manifest = dict(manifest)
+    else:
+        manifest = {
+            "kind": "dataset_boundary" if isinstance(boundary, Mapping) else "dataset_attestation",
+        }
+    if dataset_id not in (None, ""):
+        manifest["dataset_id"] = dataset_id
+    if dataset_version not in (None, ""):
+        manifest["dataset_version"] = dataset_version
+    if isinstance(boundary, Mapping):
+        manifest["dataset_boundary"] = dict(boundary)
+        manifest["manifest_digest"] = boundary.get(
+            "ordered_row_manifest_digest",
+            boundary.get("content_hash"),
+        )
+    if attestation_hash:
+        manifest["attestation_hash"] = attestation_hash
+    if source.get("plan_hash") is not None:
+        manifest["plan_hash"] = source.get("plan_hash")
+    manifest = {
+        key: value
+        for key, value in manifest.items()
+        if value is not None and value != ""
+    }
+
     scope_source = source.get("market_scope", source.get("scope"))
     if isinstance(scope_source, Mapping):
         try:
@@ -1122,7 +1220,7 @@ def _operational_setup_for_strategy(
 
             scope = normalize_market_scope(scope_source).as_dict()
         except (TypeError, ValueError):
-            scope = _plain_json(scope_source)
+            return None
     else:
         scope = {
             "schema_version": "1",
@@ -1133,46 +1231,6 @@ def _operational_setup_for_strategy(
             "filters": {},
             "regime_restrictions": [],
             "provenance": "canonical",
-        }
-
-    raw_manifest = source.get("assessment_manifest_ref")
-    boundary = source.get("dataset_boundary")
-    attestation = source.get("dataset_attestation")
-    attestation_hash = (
-        str(attestation.get("attestation_hash", "")).strip()
-        if isinstance(attestation, Mapping)
-        else ""
-    )
-    if isinstance(raw_manifest, Mapping):
-        manifest = _plain_json(raw_manifest)
-        # A boundary alone is not sufficient to identify the assessed
-        # dataset: an attestation can rotate while its ordered rows remain
-        # unchanged.  Bind only the bounded canonical attestation identity,
-        # never the potentially large attestation document.
-        if isinstance(boundary, Mapping) and attestation_hash:
-            manifest = dict(manifest)
-            manifest["attestation_hash"] = attestation_hash
-    else:
-        manifest = {
-            "kind": "dataset_boundary" if isinstance(boundary, Mapping) else "dataset_attestation",
-            "dataset_id": source.get("dataset_id"),
-            "dataset_version": source.get("dataset_version"),
-        }
-        if isinstance(boundary, Mapping):
-            manifest["manifest_digest"] = boundary.get(
-                "ordered_row_manifest_digest",
-                boundary.get("content_hash"),
-            )
-            if attestation_hash:
-                manifest["attestation_hash"] = attestation_hash
-        elif isinstance(attestation, Mapping):
-            manifest["manifest_digest"] = attestation.get("attestation_hash")
-        if source.get("plan_hash") is not None:
-            manifest["plan_hash"] = source.get("plan_hash")
-        manifest = {
-            key: value
-            for key, value in manifest.items()
-            if value is not None and value != ""
         }
     setup_id = f"{family}:absolute-move-v1:L1:H1"
     return {
@@ -1246,14 +1304,36 @@ def _operational_setup_hash(setup: Mapping[str, Any]) -> str:
     return _content_hash(_plain_json(setup))
 
 
+def _is_directional_setup_candidate(strategy: Any) -> bool:
+    try:
+        from .strategy import load_strategy
+
+        document = _plain_json(load_strategy(strategy).to_dict())
+    except Exception:
+        return False
+    parameters = document.get("parameters") if isinstance(document, Mapping) else None
+    predicate = parameters.get("entry_predicate") if isinstance(parameters, Mapping) else None
+    return (
+        isinstance(document, Mapping)
+        and document.get("market_type") == "prediction"
+        and document.get("family") in _DIRECTIONAL_SETUP_FAMILIES
+        and isinstance(predicate, Mapping)
+        and _canonical(predicate) == _canonical(_ABSOLUTE_MOVE_PREDICATE)
+    )
+
+
 def _bind_operational_setup(
     strategy: Any,
     config: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Canonicalize a new config's setup while preserving supplied identity."""
     result = _plain_json(dict(config or {}))
+    handoff = result.get("observation_handoff")
+    strict_observation = result.get("canonical_operational_setup_required") is True
     setup = _operational_setup_for_strategy(strategy, result)
     if setup is None:
+        if strict_observation:
+            raise ValueError("OPERATIONAL_SETUP_UNSUPPORTED")
         return result
     supplied = result.get("operational_setup")
     if supplied is not None and _canonical(supplied) != _canonical(setup):

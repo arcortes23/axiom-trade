@@ -1197,7 +1197,7 @@ class MarketScopeEndToEndTests(unittest.TestCase):
                 sleep=lambda _seconds: None,
             )
             first_collection = collector.collect_once(now=T0)
-            self.assertEqual(first_collection.errors, 0)
+            self.assertEqual(first_collection.errors, 0, repr(first_collection))
             self.assertEqual(first_collection.candidate_bound_markets, ())
             self.assertEqual(first_collection.candidate_bound_scheduled, ())
             self.assertEqual(first_collection.candidate_bound_fresh, ())

@@ -18756,7 +18756,11 @@ class AxiomStore:
             "quality": quality,
         }
 
-    def dashboard_overview_summary(self, *, activity_limit: int = 8) -> dict[str, Any]:
+    def dashboard_overview_summary(
+        self,
+        *,
+        activity_limit: int = 8,
+    ) -> dict[str, Any]:
         """Return bounded SQL aggregates for the dashboard overview."""
         if isinstance(activity_limit, bool) or not isinstance(activity_limit, int) or not 1 <= activity_limit <= 32:
             raise ValueError("activity_limit must be between 1 and 32")

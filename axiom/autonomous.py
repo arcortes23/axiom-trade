@@ -3187,6 +3187,10 @@ def _rolling_source_binding(record: Mapping[str, Any]) -> dict[str, Any]:
         "canonical_accounting",
         "strategy_accounting",
         "resolved_bet",
+        "experiment_plan",
+        "plan",
+        "forward_config",
+        "config",
     ):
         child = record.get(name)
         if isinstance(child, Mapping):
@@ -3203,6 +3207,12 @@ def _rolling_source_binding(record: Mapping[str, Any]) -> dict[str, Any]:
         "dataset_id",
         "dataset_version",
         "version",
+        "plan_id",
+        "plan_hash",
+        "dataset_attestation",
+        "dataset_boundary",
+        "operational_setup",
+        "operational_setup_hash",
         "market_scope",
         "market_scope_hash",
         "market_scope_version",
@@ -3256,6 +3266,56 @@ def _rolling_source_binding(record: Mapping[str, Any]) -> dict[str, Any]:
             raise ValueError("conflicting rolling dataset/scope selector: research_trial_id")
         binding.setdefault("research_trial_id", binding["trial_id"])
     return binding
+def _rolling_dataset_identity(record: Mapping[str, Any]) -> tuple[Any, Any]:
+    """Require one dataset id/version across every persisted authority."""
+    containers: list[Mapping[str, Any]] = [record]
+    for name in (
+        "payload",
+        "provenance",
+        "experiment_plan",
+        "plan",
+        "forward_config",
+        "config",
+    ):
+        value = record.get(name)
+        if isinstance(value, Mapping):
+            containers.append(value)
+            nested = value.get("provenance")
+            if isinstance(nested, Mapping):
+                containers.append(nested)
+    values: dict[str, list[Any]] = {"dataset_id": [], "dataset_version": []}
+
+    def add(field: str, value: Any) -> None:
+        if value not in (None, ""):
+            values[field].append(value)
+
+    for container in containers:
+        add("dataset_id", container.get("dataset_id"))
+        add("dataset_version", container.get("dataset_version"))
+        selector = container.get("dataset_selector")
+        if isinstance(selector, Mapping):
+            add("dataset_id", selector.get("dataset_id"))
+            add(
+                "dataset_version",
+                selector.get("dataset_version", selector.get("version")),
+            )
+        for name in ("dataset_boundary", "dataset_attestation"):
+            binding = container.get(name)
+            if isinstance(binding, Mapping):
+                add("dataset_id", binding.get("dataset_id"))
+                add(
+                    "dataset_version",
+                    binding.get("dataset_version", binding.get("version")),
+                )
+    result: list[Any] = []
+    for field in ("dataset_id", "dataset_version"):
+        distinct = {_canonical_binding(value) for value in values[field]}
+        if len(distinct) > 1:
+            raise ValueError(f"conflicting rolling dataset identity: {field}")
+        result.append(values[field][0] if values[field] else None)
+    return result[0], result[1]
+
+
 
 def _rolling_binding_shape_is_valid(value: Any) -> bool:
     """Reject structured/non-finite identity values at source boundaries."""
@@ -7648,9 +7708,17 @@ class AutonomousResearchProcessor:
         strategy_document = strategy.get("strategy_document", strategy.get("canonical_strategy"))
         if not candidate_id or not strategy_version_id or not trial_id or not isinstance(strategy_document, Mapping):
             raise ValueError("PAPER_OBSERVATION_BINDING_INCOMPLETE")
-        model_document, model_resolution = self._resolve_rolling_model(strategy)
+        model_document: Mapping[str, Any] = {}
+        model_resolution: Mapping[str, Any] = {}
         registry = ForwardTestRegistry(self.store)
         source_binding = _rolling_source_binding(strategy)
+        dataset_id, dataset_version = _rolling_dataset_identity(strategy)
+        dataset_id = dataset_id if dataset_id not in (None, "") else source_binding.get("dataset_id")
+        dataset_version = (
+            dataset_version
+            if dataset_version not in (None, "")
+            else source_binding.get("dataset_version")
+        )
         scope = source_binding.get("market_scope", source_binding.get("scope", {}))
         scope = scope if isinstance(scope, Mapping) else {}
         scope_resolution = strategy.get("scope_resolution")
@@ -7675,36 +7743,86 @@ class AutonomousResearchProcessor:
             except Exception:
                 scope_resolution = None
         selector = {
-            key: source_binding[key]
-            for key in ("dataset_id", "dataset_version")
-            if source_binding.get(key) not in (None, "")
+            key: value
+            for key, value in (
+                ("dataset_id", dataset_id),
+                ("dataset_version", dataset_version),
+            )
+            if value not in (None, "")
         }
         config = {
             "observation_intent": True,
+            "observation_only_lineage": True,
             "market_authority_required": False,
             "candidate_id": candidate_id,
             "strategy_version_id": strategy_version_id,
             "research_trial_id": trial_id,
+            "plan_id": source_binding.get("plan_id"),
+            "plan_hash": source_binding.get("plan_hash"),
             "source_strategy_hash": strategy.get("strategy_hash"),
             "rolling_strategy_hash": strategy.get("strategy_hash"),
             "strategy_document": dict(strategy_document),
             "model_document": dict(model_document),
             "model_resolution": dict(model_resolution),
+            "dataset_id": dataset_id,
+            "dataset_version": dataset_version,
             "dataset_selector": selector,
-            "dataset_version": selector.get("dataset_version"),
+            "scope": dict(scope),
             "market_scope": dict(scope),
+            "dataset_attestation": source_binding.get("dataset_attestation"),
+            "dataset_boundary": source_binding.get("dataset_boundary"),
             "rolling_research": True,
             "research_mode": "ROLLING_RESEARCH",
             "paper_only": True,
         }
         if isinstance(scope_resolution, Mapping):
             config["scope_resolution"] = dict(scope_resolution)
+        for name in ("experiment_plan", "plan", "forward_config"):
+            value = strategy.get(name)
+            if isinstance(value, Mapping):
+                config[name] = dict(value)
+        declared_setup = source_binding.get("operational_setup")
+        declared_setup_hash = str(
+            source_binding.get("operational_setup_hash", "") or ""
+        ).strip()
+        if declared_setup not in (None, ""):
+            if not isinstance(declared_setup, Mapping):
+                raise ValueError("OPERATIONAL_SETUP_INVALID")
+            config["operational_setup"] = dict(declared_setup)
+        if declared_setup_hash:
+            config["operational_setup_hash"] = declared_setup_hash
+        derived_setup = _operational_setup_for_strategy(strategy_document, config)
+        if derived_setup is not None:
+            config["canonical_operational_setup_required"] = True
+        supplied_setup = config.get("operational_setup")
+        if derived_setup is None and supplied_setup is not None:
+            raise ValueError("OPERATIONAL_SETUP_UNSUPPORTED")
+        if supplied_setup is None:
+            if derived_setup is not None:
+                supplied_setup = derived_setup
+                config["operational_setup"] = dict(derived_setup)
+        elif (
+            derived_setup is not None
+            and _canonical_binding(supplied_setup) != _canonical_binding(derived_setup)
+        ):
+            raise ValueError("OPERATIONAL_SETUP_MISMATCH")
+        if isinstance(supplied_setup, Mapping):
+            canonical_setup_hash = _operational_setup_hash(supplied_setup)
+            if declared_setup_hash and declared_setup_hash != canonical_setup_hash:
+                raise ValueError("OPERATIONAL_SETUP_HASH_MISMATCH")
+            config["operational_setup_hash"] = canonical_setup_hash
+        elif declared_setup_hash:
+            raise ValueError("OPERATIONAL_SETUP_MISSING")
+        model_document, model_resolution = self._resolve_rolling_model(strategy)
+        config["model_document"] = dict(model_document)
+        config["model_resolution"] = dict(model_resolution)
         expected_config = _canonical_forward_config(config)
         expected_strategy_hash = _content_hash(
             _normalized_strategy_document(strategy_document)
         )
         expected_model_hash = str(model_resolution["model_hash"])
         intent = None
+        stale_intent = None
         for existing in registry.list_observation_intents():
             existing_config = existing.config if isinstance(existing.config, Mapping) else {}
             if _binding_value(existing_config.get("candidate_id")) != candidate_id:
@@ -7712,18 +7830,65 @@ class AutonomousResearchProcessor:
             # Reuse is valid only for the complete immutable identity.  A
             # changed document, paper assumption, selector, scope, or hash
             # intentionally gets a new deterministic observation intent.
+            if (
+                str(existing.strategy_hash).strip() == expected_strategy_hash
+                and str(existing.model_hash).strip() == expected_model_hash
+                and isinstance(existing_config.get("observation_handoff"), Mapping)
+            ):
+                existing_base = {
+                    key: value
+                    for key, value in existing_config.items()
+                    if key != "observation_handoff"
+                }
+                expected_base = {
+                    key: value
+                    for key, value in expected_config.items()
+                    if key != "observation_handoff"
+                }
+                if _canonical_binding(existing_base) == _canonical_binding(expected_base):
+                    intent = existing
+                    break
             try:
                 existing_canonical = _canonical_forward_config(existing_config)
             except (TypeError, ValueError):
+                if stale_intent is None:
+                    stale_intent = existing
                 continue
             if (
                 str(existing.strategy_hash).strip() != expected_strategy_hash
                 or str(existing.model_hash).strip() != expected_model_hash
                 or _canonical_binding(existing_canonical) != _canonical_binding(expected_config)
             ):
+                if stale_intent is None:
+                    stale_intent = existing
                 continue
             intent = existing
             break
+        if intent is None and stale_intent is not None:
+            # A persisted hash-only/partial intent is immutable.  Link the
+            # repaired intent to it so active discovery suppresses only the
+            # stale intent (the candidate identity remains eligible).
+            config["observation_handoff"] = {
+                "version": "operational-setup-repair-v1",
+                "predecessor_candidate_id": None,
+                "predecessor_observation_intent_id": stale_intent.experiment_id,
+                "predecessor_profitability_inherited": False,
+                "predecessor_allocation_authority_inherited": False,
+            }
+            expected_config = _canonical_forward_config(config)
+            for existing in registry.list_observation_intents():
+                existing_config = existing.config if isinstance(existing.config, Mapping) else {}
+                if (
+                    _binding_value(existing_config.get("candidate_id")) == candidate_id
+                    and str(existing.strategy_hash).strip() == expected_strategy_hash
+                    and str(existing.model_hash).strip() == expected_model_hash
+                ):
+                    try:
+                        if _canonical_binding(_canonical_forward_config(existing_config)) == _canonical_binding(expected_config):
+                            intent = existing
+                            break
+                    except (TypeError, ValueError):
+                        continue
         if intent is None:
             intent = registry.register_observation_intent(
                 strategy=dict(strategy_document),
@@ -16098,6 +16263,12 @@ class AutonomousResearchProcessor:
                 "last_automatic_reassessment_at": ensure_utc(now).isoformat(),
                 "paper_only": True,
                 "research_only": True,
+                "selection_excluded": True,
+                "allocation_active": False,
+                "canary_armed": False,
+                "execution_scope": "OBSERVATION",
+                "observation_only_lineage": True,
+                "holdout_used": False,
             }
         )
         committed = self.store.save_candidate_lifecycle(
@@ -19129,6 +19300,12 @@ class AutonomousResearchProcessor:
                         "forward_max_drawdown": 0.0,
                         "paper_only": True,
                     },
+                    "selection_excluded": True,
+                    "allocation_active": False,
+                    "canary_armed": False,
+                    "execution_scope": "OBSERVATION",
+                    "observation_only_lineage": True,
+                    "holdout_used": False,
                 },
                 reason="genuine forward registration created at current time",
             )
@@ -19655,6 +19832,8 @@ class AutonomousResearchProcessor:
                 "dataset_selector",
                 "dataset_id",
                 "dataset_version",
+                "dataset_attestation",
+                "dataset_boundary",
             )
         }
         return _hash_document(

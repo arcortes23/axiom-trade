@@ -1,25 +1,35 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-import math
 import os
-import sqlite3
+import math
 import tempfile
 import threading
 import time
 import traceback
 import unittest
+import sqlite3
 from unittest.mock import Mock, patch
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
-from axiom.autonomous import AutonomousResearchProcessor
+from axiom.autonomous import AutonomousResearchProcessor, _rolling_hash
+from axiom.canary_settings import CanarySettingsService
 from axiom.collector import CollectionCycle, CollectorConfig, PolymarketCollector
 from axiom.data import InMemoryPredictionProvider
 from axiom.data.polymarket import MarketDiscoveryPage
 from axiom.domain import PredictionMarketSnapshot
 from axiom.dashboard import DashboardData
-from axiom.forward import ForwardTestRegistry
+from axiom.experiment_plan import normalize_market_scope
+from axiom.forward import (
+    ForwardTestRegistry,
+    _content_hash,
+    _normalized_strategy_document,
+    _operational_setup_for_strategy,
+    _operational_setup_hash,
+)
+from axiom.lifecycle import CandidateLifecycleManager, CandidateStage
+from axiom.market_scope import resolve_market_scope
 from axiom.node import (
     ISOLATED_EXECUTION_PROFILE,
     POLYMARKET_AUTONOMY_PROTOCOL_ID,
@@ -1169,10 +1179,10 @@ class SchedulerScaleTests(unittest.TestCase):
                     _database: str | None,
                     _source: str | None,
                 ) -> int:
-                    if _action == sqlite3.SQLITE_READ and table == "canary_selection":
-                        canary_selection_reads.append(lock_probe.held_by_current_thread())
-                        return sqlite3.SQLITE_DENY
-                    return sqlite3.SQLITE_OK
+                    if _action != sqlite3.SQLITE_READ or table != "canary_selection":
+                        return sqlite3.SQLITE_OK
+                    canary_selection_reads.append(lock_probe.held_by_current_thread())
+                    return sqlite3.SQLITE_DENY
 
                 store.connection.set_authorizer(authorize_canary_selection)
                 try:
@@ -1580,6 +1590,670 @@ class MutationSchedulingTests(unittest.TestCase):
                     spec.config["strategy_document"]["family"],
                     "probability_mispricing",
                 )
+
+    def test_registry_strict_successor_setup_and_generic_campaign_compatibility(self) -> None:
+        malformed_directional = {
+            "version": 1,
+            "market_type": "prediction",
+            "family": "momentum",
+            "parameters": {
+                "lookback": 1,
+                "threshold": 0.10,
+                "entry_predicate": {
+                    "version": "absolute-move-v1",
+                    "minimum_move": 0.05,
+                    "units": "probability",
+                    "boundary": "inclusive",
+                },
+            },
+            "probability_model": "market-history",
+            "resolution_aware": True,
+            "resolution_inputs": ["market_history"],
+        }
+        for strict_fields in (
+            {
+                "observation_handoff": {
+                    "version": "forged-handoff-v1",
+                    "predecessor_observation_intent_id": "legacy-intent",
+                },
+                "canonical_operational_setup_required": True,
+            },
+            {"canonical_operational_setup_required": True},
+        ):
+            with self.subTest(strict_fields=strict_fields):
+                with self.assertRaisesRegex(
+                    ValueError, "OPERATIONAL_SETUP_UNSUPPORTED"
+                ):
+                    ForwardTestRegistry().register_observation_intent(
+                        strategy=malformed_directional,
+                        model={"model_required": False},
+                        config={
+                            "strategy_document": malformed_directional,
+                            "model_document": {"model_required": False},
+                            **strict_fields,
+                        },
+                        registration_timestamp=T0,
+                        candidate_id="forged-successor-" + str(len(strict_fields)),
+                    )
+        malformed_predicate = {
+            **malformed_directional,
+            "parameters": {
+                "entry_predicate": {
+                    "version": "unsupported-predicate",
+                }
+            },
+        }
+        with self.assertRaisesRegex(ValueError, "OPERATIONAL_SETUP_UNSUPPORTED"):
+            ForwardTestRegistry().register_observation_intent(
+                strategy=malformed_predicate,
+                model={"model_required": False},
+                config={
+                    "strategy_document": malformed_predicate,
+                    "model_document": {"model_required": False},
+                    "canonical_operational_setup_required": True,
+                },
+                registration_timestamp=T0,
+                candidate_id="strict-malformed-predicate",
+            )
+
+
+        generic = {
+            "version": 1,
+            "market_type": "prediction",
+            "family": "probability_mispricing",
+            "parameters": {},
+            "probability_model": "market",
+            "resolution_aware": True,
+            "resolution_inputs": ["expiry"],
+        }
+        spec = ForwardTestRegistry().register_observation_intent(
+            strategy=generic,
+            model={"yes_probability": 0.6},
+            config={
+                "strategy_document": generic,
+                "model_document": {"yes_probability": 0.6},
+                "operational_setup": {"legacy_setup": "accepted"},
+                "operational_setup_hash": "legacy-setup-hash",
+            },
+            registration_timestamp=T0,
+            candidate_id="generic-predeclared-campaign",
+        )
+        generic_handoff = ForwardTestRegistry().register_observation_intent(
+            strategy=generic,
+            model={"yes_probability": 0.6},
+            config={
+                "strategy_document": generic,
+                "model_document": {"yes_probability": 0.6},
+                "observation_handoff": {
+                    "version": "legacy-generic-handoff",
+                    "predecessor_observation_intent_id": "generic-legacy-intent",
+                },
+            },
+            registration_timestamp=T0,
+            candidate_id="generic-handoff-without-setup",
+        )
+        self.assertNotIn("operational_setup", generic_handoff.config)
+        self.assertEqual(
+            generic_handoff.config["observation_handoff"]["version"],
+            "legacy-generic-handoff",
+        )
+        self.assertEqual(spec.config["operational_setup"], {"legacy_setup": "accepted"})
+
+    def test_rolling_successor_binds_setup_and_paper_worker_processes_observation(self) -> None:
+        candidate_id = "rolling-setup-successor"
+        market_id = "rolling-setup-market"
+        strategy_document = {
+            "version": 1,
+            "market_type": "prediction",
+            "family": "momentum",
+            "parameters": {
+                "lookback": 1,
+                "threshold": 0.05,
+                "entry_predicate": {
+                    "version": "absolute-move-v1",
+                    "minimum_move": 0.05,
+                    "units": "probability",
+                    "boundary": "inclusive",
+                },
+            },
+            "probability_model": "market-history",
+            "resolution_aware": True,
+            "resolution_inputs": ["market_history"],
+        }
+        policy = normalize_market_scope(
+            {
+                **normalize_market_scope(
+                    market_ids=[market_id],
+                    target_instrument="POLYMARKET",
+                ).as_dict(),
+                "provenance": "canonical",
+            }
+        )
+        source = {
+            "candidate_id": candidate_id,
+            "strategy_version_id": "rolling-setup-version",
+            "research_trial_id": "rolling-setup-trial",
+            "strategy_hash": _content_hash(_normalized_strategy_document(strategy_document)),
+            "strategy_document": strategy_document,
+            "model_document": {"model_required": False},
+            "market_scope": policy.as_dict(),
+            "plan_id": "rolling-setup-plan",
+            "plan_hash": _rolling_hash({"plan_id": "rolling-setup-plan", "version": 1}),
+            "dataset_id": "rolling-setup-history",
+            "dataset_version": "v1",
+            "dataset_attestation": {
+                "dataset_id": "rolling-setup-history",
+                "dataset_version": "v1",
+                "integrity": "sha256:rolling-setup-history",
+            },
+        }
+        current_market = {
+            "market_id": market_id,
+            "condition_id": "condition-" + market_id,
+            "yes_token_id": "yes-" + market_id,
+            "no_token_id": "no-" + market_id,
+            "metadata_provenance": {"source_type": "CURRENT"},
+            "source_type": "CURRENT",
+            "provider": "polymarket",
+            "venue": "POLYMARKET",
+            "instrument": "POLYMARKET",
+            "active": True,
+            "closed": False,
+            "settlement": "OPEN",
+            "enable_order_book": True,
+            "accepting_orders": True,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            db = str(Path(directory) / "rolling-setup-worker.sqlite")
+            with AxiomStore(db) as store:
+                proof = resolve_market_scope(
+                    candidate_id,
+                    {"market_scope": policy.as_dict()},
+                    [current_market],
+                    resolved_at=T0,
+                )
+                store.save_market_scope_resolution(proof)
+                processor = AutonomousResearchProcessor(store, clock=lambda: T0)
+                binding = processor._ensure_rolling_paper_observation(
+                    source,
+                    T0,
+                    market_ids=(market_id,),
+                )
+                registry = ForwardTestRegistry(store)
+                intent = registry.get(binding["intent_id"])
+                self.assertIsNotNone(intent)
+                assert intent is not None
+                setup = intent.config.get("operational_setup")
+                self.assertIsInstance(setup, Mapping)
+                assert isinstance(setup, Mapping)
+                self.assertEqual(
+                    intent.config["operational_setup_hash"],
+                    _operational_setup_hash(setup),
+                )
+                lifecycle_payload = {
+                    **dict(intent.config),
+                    "candidate_id": candidate_id,
+                    "schema_valid": True,
+                    "paper_observation_intent": True,
+                    "paper_observation_intent_id": intent.experiment_id,
+                    "paper_only": True,
+                    "research_only": True,
+                }
+                store.save_candidate_lifecycle(
+                    candidate_id,
+                    CandidateStage.IDEA.value,
+                    {"candidate_id": candidate_id},
+                    timestamp=T0,
+                )
+                CandidateLifecycleManager(store).advance(
+                    candidate_id,
+                    CandidateStage.SCHEMA_VALIDATED,
+                    lifecycle_payload,
+                    reason="schema intent registered",
+                )
+                collector = PolymarketCollector(
+                    InMemoryPredictionProvider([]),
+                    store,
+                    CollectorConfig(max_markets=1),
+                    clock=lambda: T0,
+                    sleep=lambda _seconds: None,
+                )
+                counters = collector._new_counters()
+                ready = collector._materialize_observation_intents(
+                    T0,
+                    (candidate_id,),
+                    {candidate_id: [market_id]},
+                    counters,
+                    scope_resolutions={candidate_id: proof.as_dict()},
+                )
+                collector.close()
+                lifecycle = store.load_candidate_lifecycle(candidate_id)
+                self.assertIsNotNone(lifecycle)
+                assert lifecycle is not None
+                self.assertEqual(lifecycle["stage"], CandidateStage.PAPER_FORWARD.value)
+                self.assertEqual(
+                    lifecycle["payload"]["operational_setup_hash"],
+                    intent.config["operational_setup_hash"],
+                )
+                successor = registry.get(lifecycle["payload"]["forward_test_id"])
+                self.assertIsNotNone(successor)
+                assert successor is not None
+                store.save_polymarket_snapshot(
+                    "rolling-setup-snapshot",
+                    market_id,
+                    T0,
+                    T0,
+                    {
+                        "source_type": "FORWARD_COLLECTED",
+                        "snapshot": {
+                            "timestamp": T0.isoformat(),
+                            "market_id": market_id,
+                            "yes_mid": 0.50,
+                            "yes_bid": 0.49,
+                            "yes_ask": 0.51,
+                            "no_mid": 0.50,
+                            "no_bid": 0.49,
+                            "no_ask": 0.51,
+                            "settlement": "OPEN",
+                        },
+                    },
+                    source_type="FORWARD_COLLECTED",
+                )
+                CanarySettingsService(store, clock=lambda: T0)
+                node = ResearchNode(
+                    NodeConfig(
+                        db,
+                        crypto_enabled=False,
+                        paper_observations_per_candidate=1,
+                    ),
+                    provider=InMemoryPredictionProvider([]),
+                    store=store,
+                    clock=lambda: T0 + timedelta(minutes=1),
+                    sleep=lambda _seconds: None,
+                )
+                result = node._run_single_paper_worker(successor)
+                self.assertNotIn("error", result or {})
+                self.assertGreaterEqual((result or {}).get("observations_seen", 0), 1)
+                worker = next(
+                    row
+                    for row in store.list_worker_states(limit=32)
+                    if row["worker_name"] == f"paper:{successor.experiment_id}"
+                )
+                self.assertEqual(worker["status"], "idle")
+
+    def test_rolling_hash_only_successor_migrates_immutable_rows(self) -> None:
+        candidate_id = "rolling-hash-only-successor"
+        market_id = "rolling-hash-only-market"
+        strategy_document = {
+            "version": 1,
+            "market_type": "prediction",
+            "family": "momentum",
+            "parameters": {
+                "lookback": 1,
+                "threshold": 0.05,
+                "entry_predicate": {
+                    "version": "absolute-move-v1",
+                    "minimum_move": 0.05,
+                    "units": "probability",
+                    "boundary": "inclusive",
+                },
+            },
+            "probability_model": "market-history",
+            "resolution_aware": True,
+            "resolution_inputs": ["market_history"],
+        }
+        policy = normalize_market_scope(
+            {
+                **normalize_market_scope(
+                    market_ids=[market_id],
+                    target_instrument="POLYMARKET",
+                ).as_dict(),
+                "provenance": "canonical",
+            }
+        )
+        source = {
+            "candidate_id": candidate_id,
+            "strategy_version_id": "rolling-hash-only-version",
+            "research_trial_id": "rolling-hash-only-trial",
+            "strategy_hash": _content_hash(_normalized_strategy_document(strategy_document)),
+            "strategy_document": strategy_document,
+            "model_document": {"model_required": False},
+            "market_scope": policy.as_dict(),
+            "plan_id": "rolling-hash-only-plan",
+            "plan_hash": _rolling_hash({"plan_id": "rolling-hash-only-plan", "version": 1}),
+            "dataset_id": "rolling-hash-only-history",
+            "dataset_version": "v1",
+            "dataset_attestation": {
+                "dataset_id": "rolling-hash-only-history",
+                "dataset_version": "v1",
+                "attestation_hash": "sha256:rolling-hash-only-attestation",
+                "integrity": "sha256:rolling-hash-only-history",
+            },
+            "dataset_boundary": {
+                "schema_version": "1",
+                "dataset_id": "rolling-hash-only-history",
+                "dataset_version": "v1",
+                "ordered_row_manifest_digest": "sha256:rolling-hash-only-boundary",
+                "exact_cutoff": "2025-01-01T00:00:00+00:00",
+                "row_count": 3,
+            },
+        }
+        current_market = {
+            "market_id": market_id,
+            "condition_id": "condition-" + market_id,
+            "yes_token_id": "yes-" + market_id,
+            "no_token_id": "no-" + market_id,
+            "metadata_provenance": {"source_type": "CURRENT"},
+            "source_type": "CURRENT",
+            "provider": "polymarket",
+            "venue": "POLYMARKET",
+            "instrument": "POLYMARKET",
+            "active": True,
+            "closed": False,
+            "settlement": "OPEN",
+            "enable_order_book": True,
+            "accepting_orders": True,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            db = str(Path(directory) / "rolling-hash-only-migration.sqlite")
+            with AxiomStore(db) as store:
+                proof = resolve_market_scope(
+                    candidate_id,
+                    {"market_scope": policy.as_dict()},
+                    [current_market],
+                    resolved_at=T0,
+                )
+                store.save_market_scope_resolution(proof)
+                selector = {
+                    "dataset_id": source["dataset_id"],
+                    "dataset_version": source["dataset_version"],
+                }
+                probe = ForwardTestRegistry()
+                canonical_intent = probe.register_observation_intent(
+                    strategy=strategy_document,
+                    model={"model_required": False},
+                    config={
+                        "observation_intent": True,
+                        "observation_only_lineage": True,
+                        "market_authority_required": False,
+                        "candidate_id": candidate_id,
+                        "strategy_version_id": source["strategy_version_id"],
+                        "research_trial_id": source["research_trial_id"],
+                        "strategy_document": strategy_document,
+                        "model_document": {"model_required": False},
+                        "dataset_selector": selector,
+                        "dataset_version": source["dataset_version"],
+                        "dataset_attestation": source["dataset_attestation"],
+                        "plan_id": source["plan_id"],
+                        "plan_hash": source["plan_hash"],
+                        "market_scope": policy.as_dict(),
+                        "rolling_research": True,
+                        "paper_only": True,
+                    },
+                    registration_timestamp=T0,
+                    candidate_id=candidate_id,
+                    strategy_version_id=source["strategy_version_id"],
+                    research_trial_id=source["research_trial_id"],
+                    source_strategy_hash=source["strategy_hash"],
+                    rolling_strategy_hash=source["strategy_hash"],
+                    dataset_selector=selector,
+                    scope=policy.as_dict(),
+                    scope_resolution=proof.as_dict(),
+                )
+                setup = canonical_intent.config["operational_setup"]
+                assert isinstance(setup, Mapping)
+                old_intent_id = "observation-intent-" + candidate_id + "-legacy"
+                old_intent_config = dict(canonical_intent.config)
+                old_intent_config.pop("operational_setup", None)
+                old_intent_config["operational_setup_hash"] = _operational_setup_hash(setup)
+                old_intent_record = canonical_intent.as_record()
+                old_intent_record["experiment_id"] = old_intent_id
+                old_intent_record["config"] = old_intent_config
+                old_intent_record["allowed_markets"] = []
+                store.save_forward_test(old_intent_id, old_intent_record)
+                old_forward_id = "forward-" + candidate_id
+                old_forward_config = dict(old_intent_config)
+                old_forward_config["market_authority_required"] = True
+                old_forward_record = canonical_intent.as_record()
+                old_forward_record["experiment_id"] = old_forward_id
+                old_forward_record["config"] = old_forward_config
+                old_forward_record["allowed_markets"] = [market_id]
+                store.save_forward_test(old_forward_id, old_forward_record)
+                store.save_candidate_lifecycle(
+                    candidate_id,
+                    CandidateStage.IDEA.value,
+                    {"candidate_id": candidate_id},
+                    timestamp=T0,
+                )
+                store.save_candidate_lifecycle(
+                    candidate_id,
+                    CandidateStage.PAPER_FORWARD.value,
+                    {
+                        "candidate_id": candidate_id,
+                        "paper_observation_intent": True,
+                        "paper_observation_intent_id": old_intent_id,
+                        "forward_test_id": old_forward_id,
+                        "paper_only": True,
+                        "research_only": True,
+                        "execution_scope": "OBSERVATION",
+                        "observation_only_lineage": True,
+                        "selection_excluded": True,
+                        "allocation_active": False,
+                        "canary_armed": False,
+                        "allowed_markets": [market_id],
+                        "current_market_ids": [market_id],
+                        "resolved_market_ids": [market_id],
+                        "scope_resolution": proof.as_dict(),
+                        "market_scope_resolution": proof.as_dict(),
+                        "paper_forward_started": True,
+                        "holdout_used": False,
+                        "operational_setup_hash": _operational_setup_hash(setup),
+                    },
+                    from_stage=CandidateStage.IDEA.value,
+                    timestamp=T0,
+                )
+                processor = AutonomousResearchProcessor(store, clock=lambda: T0)
+                expected_setup = _operational_setup_for_strategy(strategy_document, source)
+                self.assertIsNotNone(expected_setup)
+                assert expected_setup is not None
+                with self.assertRaisesRegex(ValueError, "OPERATIONAL_SETUP_HASH_MISMATCH"):
+                    processor._ensure_rolling_paper_observation(
+                        {
+                            **source,
+                            "operational_setup": dict(expected_setup),
+                            "operational_setup_hash": "sha256:" + ("0" * 64),
+                        },
+                        T0,
+                        market_ids=(market_id,),
+                    )
+                unsupported_strategy = {
+                    **strategy_document,
+                    "family": "probability_mispricing",
+                }
+                with self.assertRaisesRegex(ValueError, "OPERATIONAL_SETUP_UNSUPPORTED"):
+                    processor._ensure_rolling_paper_observation(
+                        {
+                            **source,
+                            "strategy_document": unsupported_strategy,
+                            "strategy_hash": _content_hash(
+                                _normalized_strategy_document(unsupported_strategy)
+                            ),
+                            "operational_setup": dict(setup),
+                            "operational_setup_hash": _operational_setup_hash(setup),
+                        },
+                        T0,
+                        market_ids=(market_id,),
+                    )
+                malformed_directional_documents = (
+                    {
+                        **strategy_document,
+                        "parameters": {
+                            **strategy_document["parameters"],
+                            "threshold": "0.05",
+                        },
+                    },
+                    {
+                        **strategy_document,
+                        "parameters": {
+                            **strategy_document["parameters"],
+                            "lookback": [1],
+                        },
+                    },
+                    {
+                        **strategy_document,
+                        "market_type": "crypto_spot",
+                    },
+                )
+                for malformed in malformed_directional_documents:
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "OPERATIONAL_SETUP_UNSUPPORTED",
+                    ):
+                        processor._ensure_rolling_paper_observation(
+                            {
+                                **source,
+                                "strategy_document": malformed,
+                                "strategy_hash": _content_hash(
+                                    _normalized_strategy_document(malformed)
+                                ),
+                                "operational_setup": dict(setup),
+                                "operational_setup_hash": _operational_setup_hash(setup),
+                            },
+                            T0,
+                            market_ids=(market_id,),
+                        )
+                conflicting_sources = (
+                    {
+                        **source,
+                        "dataset_boundary": {
+                            **source["dataset_boundary"],
+                            "dataset_id": "conflicting-history",
+                        },
+                    },
+                    {
+                        **source,
+                        "dataset_attestation": {
+                            **source["dataset_attestation"],
+                            "dataset_version": "conflicting-v2",
+                        },
+                    },
+                    {
+                        **source,
+                        "dataset_selector": {
+                            "dataset_id": "conflicting-selector",
+                            "dataset_version": source["dataset_version"],
+                        },
+                    },
+                )
+                for conflicting_source in conflicting_sources:
+                    with self.assertRaisesRegex(
+                        ValueError, "conflicting .*dataset"
+                    ):
+                        processor._ensure_rolling_paper_observation(
+                            conflicting_source,
+                            T0,
+                            market_ids=(market_id,),
+                        )
+                binding = processor._ensure_rolling_paper_observation(
+                    source,
+                    T0,
+                    market_ids=(market_id,),
+                )
+                registry = ForwardTestRegistry(store)
+                migrated_intent = registry.get(binding["intent_id"])
+                self.assertIsNotNone(migrated_intent)
+                assert migrated_intent is not None
+                self.assertEqual(
+                    migrated_intent.config["dataset_id"],
+                    source["dataset_id"],
+                )
+                self.assertEqual(
+                    migrated_intent.config["dataset_version"],
+                    source["dataset_version"],
+                )
+                self.assertEqual(
+                    migrated_intent.config["dataset_boundary"],
+                    source["dataset_boundary"],
+                )
+                self.assertEqual(
+                    migrated_intent.config["operational_setup"]["assessment_manifest_ref"][
+                        "dataset_boundary"
+                    ],
+                    source["dataset_boundary"],
+                )
+                restarted = AutonomousResearchProcessor(store, clock=lambda: T0)
+                restarted_binding = restarted._ensure_rolling_paper_observation(
+                    source,
+                    T0,
+                    market_ids=(market_id,),
+                )
+                self.assertEqual(restarted_binding["intent_id"], migrated_intent.experiment_id)
+                restarted_intent = registry.get(restarted_binding["intent_id"])
+                self.assertIsNotNone(restarted_intent)
+                assert restarted_intent is not None
+                self.assertEqual(
+                    restarted_intent.config,
+                    migrated_intent.config,
+                )
+                self.assertNotEqual(migrated_intent.experiment_id, old_intent_id)
+                self.assertEqual(
+                    migrated_intent.config["observation_handoff"][
+                        "predecessor_observation_intent_id"
+                    ],
+                    old_intent_id,
+                )
+                migrated_setup = migrated_intent.config["operational_setup"]
+                self.assertIsInstance(migrated_setup, Mapping)
+                assert isinstance(migrated_setup, Mapping)
+                self.assertEqual(
+                    migrated_setup["assessment_manifest_ref"]["dataset_id"],
+                    source["dataset_id"],
+                )
+                self.assertEqual(
+                    migrated_setup["assessment_manifest_ref"]["dataset_version"],
+                    source["dataset_version"],
+                )
+                self.assertEqual(
+                    migrated_setup["assessment_manifest_ref"]["manifest_digest"],
+                    source["dataset_boundary"]["ordered_row_manifest_digest"],
+                )
+                self.assertEqual(
+                    migrated_setup["assessment_manifest_ref"]["attestation_hash"],
+                    source["dataset_attestation"]["attestation_hash"],
+                )
+                collector = PolymarketCollector(
+                    InMemoryPredictionProvider([]),
+                    store,
+                    CollectorConfig(max_markets=1),
+                    clock=lambda: T0,
+                    sleep=lambda _seconds: None,
+                )
+                counters = collector._new_counters()
+                ready = collector._materialize_observation_intents(
+                    T0,
+                    (candidate_id,),
+                    {candidate_id: [market_id]},
+                    counters,
+                    scope_resolutions={candidate_id: proof.as_dict()},
+                )
+                self.assertEqual(ready, {candidate_id})
+                lifecycle = store.load_candidate_lifecycle(candidate_id)
+                self.assertIsNotNone(lifecycle)
+                assert lifecycle is not None
+                self.assertNotEqual(lifecycle["payload"]["forward_test_id"], old_forward_id)
+                successor = registry.get(lifecycle["payload"]["forward_test_id"])
+                self.assertIsNotNone(successor)
+                assert successor is not None
+                self.assertEqual(
+                    successor.config["operational_setup_hash"],
+                    migrated_intent.config["operational_setup_hash"],
+                )
+                old_successor = registry.get(old_forward_id)
+                self.assertIsNotNone(old_successor)
+                assert old_successor is not None
+                self.assertNotIn("operational_setup", old_successor.config)
+                active_candidates = collector._active_observation_intent_ids()
+                self.assertEqual(active_candidates, [candidate_id])
 
     def test_rolling_initialization_commit_rolls_back_and_restart_retries_once(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

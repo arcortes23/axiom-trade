@@ -477,6 +477,8 @@ class PolymarketCollector:
         self._scope_refreshed_snapshots: dict[str, PredictionMarketSnapshot] = {}
         self._scope_resolution_deferred_candidate_ids: tuple[str, ...] = ()
         self._observation_materialization_deferred_candidate_ids: tuple[str, ...] = ()
+        self._observation_materialization_attempted_ids: set[str] = set()
+        self._observation_materialization_completed_ids: set[str] = set()
         self._observation_materialization_cursor = 0
         self._observation_materialization_turn = 0
         self._scope_resolutions: dict[str, Any] = {}
@@ -703,6 +705,11 @@ class PolymarketCollector:
             for item in root_state.get("observation_materialization_deferred_candidate_ids", ())
             if str(item).strip()
         )[:_MAX_SCOPE_RESOLUTION_CANDIDATES]
+        self._observation_materialization_completed_ids = {
+            str(item).strip()
+            for item in root_state.get("observation_materialization_completed_ids", ())
+            if str(item).strip()
+        }
         try:
             self._observation_materialization_cursor = max(
                 0,
@@ -1483,6 +1490,9 @@ class PolymarketCollector:
                 "observation_materialization_deferred_candidate_ids": list(
                     self._observation_materialization_deferred_candidate_ids
                 )[:_MAX_SCOPE_RESOLUTION_CANDIDATES],
+                "observation_materialization_completed_ids": list(
+                    self._observation_materialization_completed_ids
+                )[:_MAX_SCOPE_RESOLUTION_CANDIDATES],
                 "observation_materialization_cursor": max(
                     0,
                     int(self._observation_materialization_cursor),
@@ -2092,6 +2102,128 @@ class PolymarketCollector:
             config.get("observation_only_lineage") is True
             or isinstance(config.get("observation_handoff"), Mapping)
         )
+    def _existing_observation_lifecycle_is_active(
+        self,
+        candidate_id: str,
+        spec: ForwardTestSpec,
+        *,
+        intent: ForwardTestSpec | None = None,
+        allowed_markets: Sequence[str] = (),
+    ) -> bool:
+        loader = getattr(self.store, "load_candidate_lifecycle", None)
+        if not callable(loader):
+            return False
+        try:
+            record = loader(candidate_id)
+        except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+            return False
+        if not isinstance(record, Mapping):
+            return False
+        stage = str(record.get("stage", "")).strip().upper()
+        if stage not in {
+            CandidateStage.PAPER_FORWARD.value,
+            CandidateStage.PAPER_PROMOTABLE.value,
+        }:
+            return False
+        payload = record.get("payload")
+        if not isinstance(payload, Mapping):
+            return False
+        required = {
+            "paper_observation_intent": True,
+            "paper_only": True,
+            "research_only": True,
+            "paper_forward_started": True,
+            "holdout_used": False,
+            "selection_excluded": True,
+            "allocation_active": False,
+            "canary_armed": False,
+        }
+        if any(
+            type(payload.get(key)) is not type(expected)
+            or payload.get(key) != expected
+            for key, expected in required.items()
+        ):
+            return False
+        if str(payload.get("candidate_id", "")).strip() != str(candidate_id).strip():
+            return False
+        spec_id = str(getattr(spec, "experiment_id", "")).strip()
+        if not spec_id or str(payload.get("forward_test_id", "")).strip() != spec_id:
+            return False
+        if intent is not None and (
+            str(payload.get("paper_observation_intent_id", "")).strip()
+            != str(getattr(intent, "experiment_id", "")).strip()
+        ):
+            return False
+        expected_markets = tuple(
+            dict.fromkeys(
+                str(item).strip()
+                for item in allowed_markets
+                if str(item).strip()
+            )
+        )
+        payload_markets = tuple(
+            dict.fromkeys(
+                str(item).strip()
+                for item in payload.get("allowed_markets", ())
+                if str(item).strip()
+            )
+        )
+        expected_market_set = set(expected_markets)
+        payload_market_set = set(payload_markets)
+        if (
+            not expected_market_set
+            or not payload_market_set
+            or payload_market_set != expected_market_set
+        ):
+            return False
+        raw_spec_markets = getattr(spec, "allowed_markets", ())
+        spec_markets = {
+            str(item).strip() for item in raw_spec_markets if str(item).strip()
+        }
+        if not spec_markets or spec_markets != expected_market_set:
+            return False
+        return True
+    def _legacy_observation_lifecycle_is_active(
+        self,
+        candidate_id: str,
+        spec: ForwardTestSpec,
+        *,
+        allowed_markets: Sequence[str] = (),
+    ) -> bool:
+        """Recognize safe pre-marker paper rows without broadening market scope."""
+        loader = getattr(self.store, "load_candidate_lifecycle", None)
+        if not callable(loader):
+            return False
+        try:
+            record = loader(candidate_id)
+        except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+            return False
+        if not isinstance(record, Mapping):
+            return False
+        if str(record.get("stage", "")).strip().upper() not in {
+            CandidateStage.PAPER_FORWARD.value,
+            CandidateStage.PAPER_PROMOTABLE.value,
+        }:
+            return False
+        payload = record.get("payload")
+        if not isinstance(payload, Mapping):
+            return False
+        if str(payload.get("candidate_id", "")).strip() != str(candidate_id).strip():
+            return False
+        spec_id = str(getattr(spec, "experiment_id", "")).strip()
+        if not spec_id or str(payload.get("forward_test_id", "")).strip() != spec_id:
+            return False
+        if payload.get("allocation_active") is True or payload.get("canary_armed") is True:
+            return False
+        expected = {
+            str(item).strip() for item in allowed_markets if str(item).strip()
+        }
+        actual = {
+            str(item).strip()
+            for item in getattr(spec, "allowed_markets", ())
+            if str(item).strip()
+        }
+        return bool(expected) and bool(actual) and actual == expected
     def _observation_lifecycle_requires_reconcile(self, candidate_id: str) -> bool:
         loader = getattr(self.store, "load_candidate_lifecycle", None)
         if not callable(loader):
@@ -2101,17 +2233,21 @@ class PolymarketCollector:
         except (AttributeError, KeyError, TypeError, ValueError, RuntimeError):
             return False
         if not isinstance(record, Mapping):
-            return False
-        stage = str(record.get("stage", "")).strip().upper()
-        if stage in {CandidateStage.IDEA.value, CandidateStage.SCHEMA_VALIDATED.value}:
             return True
-        if stage not in {
+        stage = str(record.get("stage", "")).strip().upper()
+        if stage in {
             CandidateStage.PAPER_FORWARD.value,
             CandidateStage.PAPER_PROMOTABLE.value,
         }:
-            return True
-        return True
-
+            payload = record.get("payload")
+            return (
+                isinstance(payload, Mapping)
+                and type(payload.get("allocation_active")) is bool
+                and payload.get("allocation_active") is False
+                and type(payload.get("canary_armed")) is bool
+                and payload.get("canary_armed") is False
+            )
+        return stage not in {CandidateStage.REJECTED.value}
     def _reconcile_materialized_observation_lifecycle(
         self,
         candidate_id: str,
@@ -2146,6 +2282,7 @@ class PolymarketCollector:
         if current is None:
             raise ValueError("observation materialization lifecycle is missing")
         config = dict(spec.config) if isinstance(spec.config, Mapping) else {}
+        allow_identity_repair = isinstance(config.get("observation_handoff"), Mapping)
         evidence = dict(current.payload)
         for field in (
             "experiment_plan",
@@ -2154,14 +2291,23 @@ class PolymarketCollector:
             "market_scope",
             "market_scope_hash",
             "market_scope_version",
+            "dataset_id",
+            "dataset_version",
             "dataset_selector",
             "dataset_attestation",
+            "dataset_boundary",
+            "operational_setup",
+            "operational_setup_hash",
         ):
             value = config.get(field)
             if value in (None, "", {}, []):
                 continue
             existing = evidence.get(field)
-            if existing not in (None, "", {}, []) and _stable_payload(existing) != _stable_payload(value):
+            if (
+                existing not in (None, "", {}, [])
+                and _stable_payload(existing) != _stable_payload(value)
+                and not allow_identity_repair
+            ):
                 raise ValueError(f"observation lifecycle binding conflicts for {field}")
             evidence[field] = value
         intent_id = str(getattr(intent, "experiment_id", "") or "").strip()
@@ -2192,7 +2338,7 @@ class PolymarketCollector:
             )
             return False
         if current.stage is CandidateStage.SCHEMA_VALIDATED:
-            forward_evidence = dict(current.payload)
+            forward_evidence = dict(evidence)
             forward_evidence.update(
                 {
                     "paper_forward_started": True,
@@ -2249,9 +2395,29 @@ class PolymarketCollector:
                 or existing_markets != allowed_ids
                 or current.payload.get("scope_resolution") != dict(proof)
                 or current.payload.get("market_scope_resolution") != dict(proof)
+                or any(
+                    config.get(field) not in (None, "", {}, [])
+                    and _stable_payload(current.payload.get(field))
+                    != _stable_payload(config.get(field))
+                    for field in (
+                        "experiment_plan",
+                        "plan_id",
+                        "plan_hash",
+                        "market_scope",
+                        "market_scope_hash",
+                        "market_scope_version",
+                        "dataset_id",
+                        "dataset_version",
+                        "dataset_selector",
+                        "dataset_attestation",
+                        "dataset_boundary",
+                        "operational_setup",
+                        "operational_setup_hash",
+                    )
+                )
             ):
                 evidence = {
-                    **dict(current.payload),
+                    **dict(evidence),
                     "forward_test_id": spec.experiment_id,
                     "forward_config": config,
                     "allowed_markets": list(allowed_ids),
@@ -2440,6 +2606,7 @@ class PolymarketCollector:
         scope_resolutions: Mapping[str, Any] | None = None,
 
     ) -> set[str]:
+        self._observation_materialization_attempted_ids.clear()
         registry = ForwardTestRegistry(self.store)
         intents = registry.list_observation_intents()
         superseded_candidates, superseded_intents = self._observation_superseded_ids(intents)
@@ -2462,19 +2629,145 @@ class PolymarketCollector:
             not in superseded_candidates
             and str(spec.experiment_id).strip() not in superseded_intents
         }
+        def completion_key(candidate_id: str) -> str:
+            intent = by_candidate.get(candidate_id)
+            intent_id = str(getattr(intent, "experiment_id", "")).strip()
+            if not intent_id:
+                return candidate_id
+            market_ids = tuple(
+                sorted(
+                    {
+                        str(item).strip()
+                        for item in candidate_markets.get(candidate_id, ())
+                        if str(item).strip()
+                    }
+                )
+            )
+            return f"{candidate_id}\x1f{intent_id}\x1f{','.join(market_ids)}"
+        def spec_scope_matches(candidate_id: str, spec: Any) -> bool:
+            expected = {
+                str(item).strip()
+                for item in candidate_markets.get(candidate_id, ())
+            }
+            raw_spec_markets = getattr(spec, "allowed_markets", None)
+            if raw_spec_markets is None:
+                return True
+            actual = {
+                str(item).strip()
+                for item in raw_spec_markets
+                if str(item).strip()
+            }
+            return bool(expected) and bool(actual) and actual == expected
+        def lifecycle_active(candidate_id: str, spec: Any, intent: Any) -> bool:
+            strict_active = self._existing_observation_lifecycle_is_active(
+                candidate_id,
+                spec,
+                intent=intent,
+                allowed_markets=candidate_markets.get(candidate_id, ()),
+            )
+            if strict_active and self._observation_intent_requires_handoff(intent):
+                proof = (scope_resolutions or {}).get(candidate_id)
+                loader = getattr(self.store, "load_candidate_lifecycle", None)
+                if not isinstance(proof, Mapping) or not callable(loader):
+                    return False
+                try:
+                    record = loader(candidate_id)
+                except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+                    return False
+                payload = record.get("payload") if isinstance(record, Mapping) else None
+                if not isinstance(payload, Mapping):
+                    return False
+                current_ids = tuple(
+                    dict.fromkeys(
+                        str(item).strip()
+                        for item in candidate_markets.get(candidate_id, ())
+                        if str(item).strip()
+                    )
+                )
+                if not self._observation_handoff_payload_matches(
+                    candidate_id,
+                    intent,
+                    spec,
+                    payload,
+                    proof,
+                    current_ids,
+                ):
+                    return False
+            if strict_active:
+                return True
+            return (
+                not self._observation_intent_requires_handoff(intent)
+                and self._legacy_observation_lifecycle_is_active(
+                    candidate_id,
+                    spec,
+                    allowed_markets=candidate_markets.get(candidate_id, ()),
+                )
+            )
         ready_ids: set[str] = set()
-        if not prior_deferred and not current_ids:
-            self._observation_materialization_deferred_candidate_ids = ()
-            self._observation_materialization_cursor = 0
-            self._observation_materialization_turn = 0
-            return ready_ids
-
+        deferred_set = set(prior_deferred)
+        existing_forward_specs = {
+            candidate_id: registry.get("forward-" + candidate_id)
+            for candidate_id in current_ids
+        }
+        self._observation_materialization_completed_ids.update(
+            completion_key(candidate_id)
+            for candidate_id, spec in existing_forward_specs.items()
+            if (
+                spec is not None
+                and candidate_id in by_candidate
+                and spec_scope_matches(candidate_id, spec)
+                and lifecycle_active(
+                    candidate_id,
+                    spec,
+                    by_candidate[candidate_id],
+                )
+            )
+        )
+        materialized_existing_ids = {
+            candidate_id
+            for candidate_id in current_ids
+            if (
+                candidate_id in by_candidate
+                and any(
+                    str(item).strip()
+                    for item in candidate_markets.get(candidate_id, ())
+                )
+                and existing_forward_specs.get(candidate_id) is not None
+                and lifecycle_active(
+                    candidate_id,
+                    existing_forward_specs[candidate_id],
+                    by_candidate[candidate_id],
+                )
+            )
+        }
+        ready_existing_ids = {
+            candidate_id
+            for candidate_id in materialized_existing_ids
+            if lifecycle_active(
+                candidate_id,
+                existing_forward_specs[candidate_id],
+                by_candidate[candidate_id],
+            )
+        }
+        ready_ids.update(ready_existing_ids)
         if prior_deferred:
             cursor = self._observation_materialization_cursor % len(prior_deferred)
-            deferred_order = prior_deferred[cursor:] + prior_deferred[:cursor]
+            deferred_order = [
+                candidate_id
+                for candidate_id in (
+                    prior_deferred[cursor:] + prior_deferred[:cursor]
+                )
+                if (
+                    candidate_id not in materialized_existing_ids
+                    and candidate_id not in self._observation_materialization_attempted_ids
+                    and (
+                        completion_key(candidate_id) not in self._observation_materialization_completed_ids
+                        or self._observation_intent_requires_handoff(by_candidate.get(candidate_id))
+                    )
+                )
+            ]
         else:
             deferred_order = []
-        deferred_set = set(prior_deferred)
         pending_current_ids = [
             candidate_id
             for candidate_id in current_ids
@@ -2482,8 +2775,28 @@ class PolymarketCollector:
                 candidate_id not in deferred_set
                 and candidate_id in by_candidate
                 and (
-                    registry.get("forward-" + candidate_id) is None
-                    or self._observation_lifecycle_requires_reconcile(candidate_id)
+                    completion_key(candidate_id) not in self._observation_materialization_completed_ids
+                    or self._observation_intent_requires_handoff(by_candidate[candidate_id])
+                )
+                and candidate_id not in self._observation_materialization_attempted_ids
+                and (
+                    existing_forward_specs.get(candidate_id) is None
+                    or (
+                        self._observation_intent_requires_handoff(by_candidate[candidate_id])
+                        and self._observation_lifecycle_requires_reconcile(candidate_id)
+                    )
+                    or (
+                        not self._observation_intent_requires_handoff(by_candidate[candidate_id])
+                        and self._observation_lifecycle_requires_reconcile(candidate_id)
+                    )
+                    or (
+                        existing_forward_specs.get(candidate_id) is not None
+                        and not lifecycle_active(
+                            candidate_id,
+                            existing_forward_specs[candidate_id],
+                            by_candidate[candidate_id],
+                        )
+                    )
                 )
                 and any(
                     str(item).strip()
@@ -2499,7 +2812,16 @@ class PolymarketCollector:
                 if offset < len(values):
                     ordered.append((group, values[offset]))
 
-        deferred_consumed: set[str] = set()
+        completed_deferred = {
+            candidate_id
+            for candidate_id in deferred_set
+            if completion_key(candidate_id) in self._observation_materialization_completed_ids
+        }
+        deferred_consumed: set[str] = (
+            materialized_existing_ids
+            | self._observation_materialization_attempted_ids
+            | completed_deferred
+        ) & deferred_set
         deferred_retries: list[str] = []
         current_retries: list[str] = []
         blocked = False
@@ -2550,10 +2872,26 @@ class PolymarketCollector:
                     deferred_consumed.add(candidate_id)
                 continue
             existing_spec = registry.get("forward-" + candidate_id)
-            if (
+            existing_active = (
                 existing_spec is not None
-                and not self._observation_lifecycle_requires_reconcile(candidate_id)
-            ):
+                and self._existing_observation_lifecycle_is_active(
+                    candidate_id,
+                    existing_spec,
+                    intent=intent,
+                    allowed_markets=markets,
+                )
+            )
+            lifecycle_needs_reconcile = (
+                existing_spec is not None
+                and (
+                    not existing_active
+                    or (
+                        self._observation_intent_requires_handoff(intent)
+                        and self._observation_lifecycle_requires_reconcile(candidate_id)
+                    )
+                )
+            )
+            if existing_spec is not None and not lifecycle_needs_reconcile:
                 try:
                     lifecycle_ready = True
                     if (
@@ -2573,7 +2911,8 @@ class PolymarketCollector:
                     if group == 0:
                         deferred_retries.append(candidate_id)
                     else:
-                        current_retries.append(candidate_id)
+                        if candidate_id not in self._observation_materialization_attempted_ids:
+                            current_retries.append(candidate_id)
                     continue
                 if lifecycle_ready:
                     ready_ids.add(candidate_id)
@@ -2582,7 +2921,8 @@ class PolymarketCollector:
                 elif group == 0:
                     deferred_retries.append(candidate_id)
                 else:
-                    current_retries.append(candidate_id)
+                    if candidate_id not in self._observation_materialization_attempted_ids:
+                        current_retries.append(candidate_id)
                 continue
             try:
                 transaction_factory = getattr(self.store, "transaction", None)
@@ -2592,40 +2932,79 @@ class PolymarketCollector:
                     else nullcontext()
                 )
                 with transaction:
-                    materialized = existing_spec or registry.materialize_observation_intent(
-                        intent,
-                        allowed_markets=markets[:100],
-                        registration_timestamp=observed_at,
-                        now=observed_at,
-                        candidate_id=candidate_id,
-                        scope_resolution=(scope_resolutions or {}).get(candidate_id),
-                    )
-                    if (
-                        isinstance(materialized, ForwardTestSpec)
-                        and self._observation_intent_requires_handoff(intent)
-                    ):
-                        lifecycle_ready = self._reconcile_materialized_observation_lifecycle(
-                            candidate_id,
+                    self._observation_materialization_attempted_ids.add(candidate_id)
+                    materialized = (
+                        registry.materialize_observation_intent(
                             intent,
-                            materialized,
-                            markets,
-                            (scope_resolutions or {}).get(candidate_id),
-                            observed_at,
+                            allowed_markets=markets[:100],
+                            registration_timestamp=observed_at,
+                            now=observed_at,
+                            candidate_id=candidate_id,
+                            scope_resolution=(scope_resolutions or {}).get(candidate_id),
                         )
+                        if existing_spec is None or lifecycle_needs_reconcile
+                        else existing_spec
+                    )
+                    if materialized is not None:
+                        self._observation_materialization_completed_ids.add(
+                            completion_key(candidate_id)
+                        )
+                    if isinstance(materialized, ForwardTestSpec):
+                        if self._observation_intent_requires_handoff(intent):
+                            lifecycle_ready = self._reconcile_materialized_observation_lifecycle(
+                                candidate_id,
+                                intent,
+                                materialized,
+                                markets,
+                                (scope_resolutions or {}).get(candidate_id),
+                                observed_at,
+                            )
+                        else:
+                            lifecycle_ready = existing_spec is None
                     else:
-                        lifecycle_ready = True
+                        lifecycle_ready = False
                 if lifecycle_ready:
                     ready_ids.add(candidate_id)
                     if group == 0:
                         deferred_consumed.add(candidate_id)
                 elif group == 0:
                     deferred_retries.append(candidate_id)
-            except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+                else:
+                    if candidate_id not in self._observation_materialization_attempted_ids:
+                        current_retries.append(candidate_id)
+            except (AttributeError, KeyError, RuntimeError, TypeError, ValueError) as exc:
                 counters["errors"] += 1
+                try:
+                    self.store.save_collection_error(
+                        candidate_id,
+                        observed_at,
+                        "observation_materialization",
+                        str(exc),
+                    )
+                except Exception:
+                    pass
                 if group == 0:
                     deferred_retries.append(candidate_id)
                 else:
-                    current_retries.append(candidate_id)
+                    if candidate_id not in self._observation_materialization_attempted_ids:
+                        current_retries.append(candidate_id)
+        remaining_now = self._cycle_remaining_seconds()
+        if remaining_now is not None and remaining_now <= 0:
+            self._mark_cycle_exhaustion("observation_materialization")
+            if prior_deferred:
+                deferred_retries.extend(
+                    candidate_id
+                    for candidate_id in prior_deferred
+                    if candidate_id not in deferred_retries
+                )
+            deferred_retries.extend(
+                candidate_id
+                for candidate_id in prior_deferred
+                if (
+                    candidate_id in self._observation_materialization_attempted_ids
+                    and candidate_id not in deferred_retries
+                )
+            )
         deferred_next = [
             candidate_id
             for candidate_id in deferred_order
@@ -2723,8 +3102,13 @@ class PolymarketCollector:
             "market_scope",
             "market_scope_hash",
             "market_scope_version",
+            "dataset_id",
+            "dataset_version",
             "dataset_selector",
             "dataset_attestation",
+            "dataset_boundary",
+            "operational_setup",
+            "operational_setup_hash",
         ):
             expected = config.get(field)
             if expected in (None, "", {}, []):
