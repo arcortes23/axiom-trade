@@ -1311,6 +1311,23 @@ class PolymarketCollector:
             self._cycle_deadline_exhausted
             or self._scope_fast_suppressed_resume_ids
         )
+        if has_retryable_continuation and not deadline_endpoint:
+            if self._cycle_deadline_exhausted:
+                fallback_ids = tuple(
+                    dict.fromkeys(
+                        [
+                            *self._scope_fast_suppressed_resume_ids,
+                            *remaining_after_deadline,
+                            *self._cycle_last_remaining_market_ids,
+                        ]
+                    )
+                )
+                deadline_endpoint = (
+                    f"market:{fallback_ids[0]}" if fallback_ids else "collector:cycle_deadline"
+                )
+            else:
+                deadline_endpoint = "collector:scope_resolution"
+            self._current_endpoint = deadline_endpoint
         cycle_continuation = (
             {
                 "status": "DEGRADED",

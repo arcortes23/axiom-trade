@@ -69,6 +69,7 @@ _MAX_DATASET_ROWS = 100_000
 _MAX_FORWARD_ROWS = 100_000
 _MAX_LEGACY_RECOVERY_ITEMS = 64
 _MAX_PREDECLARED_SUCCESSOR_SCAN = 512
+_MAX_OBSERVATION_SETUP_MIGRATION_SCAN = 512
 _MAX_ROLLING_STRATEGIES = 128
 _MAX_ROLLING_DISCOVERY_SCAN = 2_048
 _ROLLING_DISCOVERY_PAGE = 64
@@ -177,6 +178,7 @@ _ROLLING_HERMES_ID_FIELDS = (
 )
 _LEGACY_RECOVERY_STATE_NAME = "autonomous-legacy-recovery"
 _PREDECLARED_SUCCESSOR_STATE_NAME = "autonomous-predeclared-successor"
+_OBSERVATION_SETUP_MIGRATION_STATE_NAME = "autonomous-observation-setup-migration"
 _MAX_AUTOMATIC_REASSESSMENTS = 3
 _MUTABLE_DATASET_VERSION_ALIASES = frozenset({"latest", "current", "default", "unversioned"})
 # Source-loader failures with a deterministic prerequisite must remain
@@ -7693,6 +7695,235 @@ class AutonomousResearchProcessor:
 
     _resolve_rolling_model_document = _resolve_rolling_model
 
+    def _migrate_observation_setup_intents(self, now: datetime) -> tuple[Mapping[str, Any], ...]:
+        """Repair bounded legacy observation intents during ordinary rolling ticks."""
+        registry = ForwardTestRegistry(self.store)
+        state_loader = getattr(self.store, "get_scheduler_state", None)
+        state_setter = getattr(self.store, "set_scheduler_state", None)
+        state_error = False
+        try:
+            state = (
+                state_loader(_OBSERVATION_SETUP_MIGRATION_STATE_NAME)
+                if callable(state_loader)
+                else None
+            )
+        except (sqlite3.Error, AttributeError, TypeError, ValueError, RuntimeError):
+            state = None
+            state_error = True
+        if state_error:
+            return ()
+        cursor = str(state.get("cursor", "")).strip() if isinstance(state, Mapping) else ""
+        try:
+            scanned = list(
+                registry.list_observation_intents(
+                    limit=_MAX_OBSERVATION_SETUP_MIGRATION_SCAN,
+                    after_experiment_id=cursor or None,
+                )
+            )
+            if cursor and not scanned:
+                scanned = list(
+                    registry.list_observation_intents(
+                        limit=_MAX_OBSERVATION_SETUP_MIGRATION_SCAN
+                    )
+                )
+        except (sqlite3.Error, AttributeError, TypeError, ValueError, RuntimeError):
+            scanned = []
+        migrated: list[Mapping[str, Any]] = []
+        failures: list[dict[str, Any]] = []
+        for intent in scanned:
+            config = getattr(intent, "config", None)
+            if not isinstance(config, Mapping):
+                continue
+            config = dict(config)
+            candidate_id = _binding_value(config.get("candidate_id"))
+            strategy_document = config.get("strategy_document", config.get("strategy"))
+            if not candidate_id or not isinstance(strategy_document, Mapping):
+                continue
+            # A historical intent is eligible only while its candidate remains
+            # in one of the explicit handoff stages.  Missing lifecycle rows
+            # and terminal/rejected rows fail closed before any registry write.
+            lifecycle_loader = getattr(self.store, "load_candidate_lifecycle", None)
+            if not callable(lifecycle_loader):
+                continue
+            try:
+                lifecycle = lifecycle_loader(candidate_id)
+            except (sqlite3.Error, AttributeError, KeyError, TypeError, ValueError, RuntimeError):
+                lifecycle = None
+            if not isinstance(lifecycle, Mapping):
+                continue
+            stage = str(getattr(lifecycle.get("stage"), "value", lifecycle.get("stage")) or "").strip().upper()
+            if stage not in {"SCHEMA_VALIDATED", "PAPER_FORWARD", "PAPER_PROMOTABLE"}:
+                continue
+            try:
+                derived_setup = _operational_setup_for_strategy(strategy_document, config)
+            except (sqlite3.Error, AttributeError, KeyError, TypeError, ValueError, RuntimeError) as exc:
+                failures.append(
+                    {"experiment_id": str(getattr(intent, "experiment_id", "")), "reason": str(exc)[:160]}
+                )
+                continue
+            if derived_setup is None:
+                continue
+            try:
+                existing_setup = config.get("operational_setup")
+                existing_hash = str(config.get("operational_setup_hash", "") or "").strip()
+                unchanged_setup = (
+                    isinstance(existing_setup, Mapping)
+                    and existing_hash == _operational_setup_hash(existing_setup)
+                    and _canonical_binding(existing_setup) == _canonical_binding(derived_setup)
+                )
+            except (sqlite3.Error, AttributeError, KeyError, TypeError, ValueError, RuntimeError) as exc:
+                failures.append(
+                    {"experiment_id": str(getattr(intent, "experiment_id", "")), "reason": str(exc)[:160]}
+                )
+                continue
+            if unchanged_setup:
+                continue
+            scope = config.get("market_scope", config.get("scope", {}))
+            scope = scope if isinstance(scope, Mapping) else {}
+            loader = getattr(self.store, "load_market_scope_resolution", None)
+            if not callable(loader):
+                continue
+            try:
+                policy = normalize_market_scope(scope)
+                # The persisted row is the sole authority.  In particular,
+                # never reuse a proof embedded in the old intent.
+                proof = loader(
+                    candidate_id,
+                    scope_hash=policy.scope_hash,
+                    scope_version=policy.scope_version,
+                )
+                if hasattr(proof, "as_dict") and callable(proof.as_dict):
+                    proof = proof.as_dict()
+                if not isinstance(proof, Mapping):
+                    raise ValueError("CURRENT_SCOPE_PROOF_UNAVAILABLE")
+                if str(proof.get("status", "")).strip().upper() != "MATCHED":
+                    raise ValueError("CURRENT_SCOPE_PROOF_NOT_MATCHED")
+                if str(proof.get("candidate_id", "")).strip() != candidate_id:
+                    raise ValueError("CURRENT_SCOPE_PROOF_CANDIDATE_MISMATCH")
+                proof_policy = proof.get("policy")
+                if isinstance(proof_policy, Mapping):
+                    nested_hash = str(
+                        proof_policy.get("scope_hash", proof_policy.get("market_scope_hash", ""))
+                    ).strip()
+                    nested_version = str(
+                        proof_policy.get(
+                            "scope_version",
+                            proof_policy.get("market_scope_version", proof_policy.get("version", "")),
+                        )
+                    ).strip()
+                    if nested_hash and nested_hash != policy.scope_hash:
+                        raise ValueError("CURRENT_SCOPE_PROOF_POLICY_HASH_MISMATCH")
+                    if nested_version and nested_version != policy.scope_version:
+                        raise ValueError("CURRENT_SCOPE_PROOF_POLICY_VERSION_MISMATCH")
+                if str(proof.get("scope_hash", proof.get("market_scope_hash", ""))).strip() != policy.scope_hash:
+                    raise ValueError("CURRENT_SCOPE_PROOF_HASH_MISMATCH")
+                if str(
+                    proof.get("scope_version", proof.get("market_scope_version", proof.get("version", "")))
+                ).strip() != policy.scope_version:
+                    raise ValueError("CURRENT_SCOPE_PROOF_VERSION_MISMATCH")
+                resolved_at = parse_timestamp(proof.get("resolved_at"))
+                if resolved_at is None:
+                    raise ValueError("CURRENT_SCOPE_PROOF_TIMESTAMP_MISSING")
+                freshness_value = config.get(
+                    "scope_resolution_freshness_sla_seconds",
+                    config.get("freshness_sla_seconds", 3600.0),
+                )
+                freshness = float(freshness_value)
+                age = (ensure_utc(now) - ensure_utc(resolved_at)).total_seconds()
+                if not math.isfinite(freshness) or freshness <= 0 or age < 0 or age > freshness:
+                    raise ValueError("CURRENT_SCOPE_PROOF_STALE")
+
+                def proof_ids(value: Any, *, name: str) -> tuple[str, ...]:
+                    if value in (None, ""):
+                        return ()
+                    values = (value,) if isinstance(value, str) else value
+                    if not isinstance(values, (list, tuple, set, frozenset)):
+                        raise ValueError(f"{name}_MALFORMED")
+                    result: list[str] = []
+                    for item in values:
+                        if isinstance(item, Mapping):
+                            item = item.get("market_id", item.get("id"))
+                        else:
+                            item = getattr(item, "market_id", item)
+                        text = str(item).strip() if item is not None else ""
+                        if not text or text in result:
+                            raise ValueError(f"{name}_MALFORMED")
+                        result.append(text)
+                    return tuple(result)
+
+                matched_ids = proof_ids(
+                    proof.get("matched_markets", proof.get("resolved_markets", ())),
+                    name="MATCHED_MARKETS",
+                )
+                if not matched_ids:
+                    raise ValueError("CURRENT_SCOPE_PROOF_EMPTY")
+                excluded_ids = proof_ids(
+                    proof.get("excluded_markets", proof.get("excluded_market_ids", ())),
+                    name="EXCLUDED_MARKETS",
+                )
+                if set(matched_ids).intersection(excluded_ids):
+                    raise ValueError("CURRENT_SCOPE_PROOF_OVERLAP")
+                deferred_ids = proof_ids(
+                    proof.get("deferred_markets", proof.get("deferred_market_ids", ())),
+                    name="DEFERRED_MARKETS",
+                )
+                if deferred_ids:
+                    raise ValueError("CURRENT_SCOPE_PROOF_DEFERRED")
+            except (sqlite3.Error, AttributeError, KeyError, TypeError, ValueError, RuntimeError) as exc:
+                failures.append(
+                    {"experiment_id": str(getattr(intent, "experiment_id", "")), "reason": str(exc)[:160]}
+                )
+                continue
+            try:
+                strategy: dict[str, Any] = {
+                    **config,
+                    "candidate_id": candidate_id,
+                    "strategy_document": dict(strategy_document),
+                    "strategy_hash": _binding_value(
+                        config.get("strategy_hash", getattr(intent, "strategy_hash", ""))
+                    ),
+                    "strategy_version_id": _binding_value(config.get("strategy_version_id")),
+                    "research_trial_id": _binding_value(config.get("research_trial_id")),
+                    "operational_setup": dict(derived_setup),
+                    "operational_setup_hash": _operational_setup_hash(derived_setup),
+                    "scope_resolution": dict(proof),
+                }
+                if not strategy["strategy_hash"]:
+                    strategy["strategy_hash"] = str(getattr(intent, "strategy_hash", "")).strip()
+            except (sqlite3.Error, AttributeError, KeyError, TypeError, ValueError, RuntimeError) as exc:
+                failures.append(
+                    {"experiment_id": str(getattr(intent, "experiment_id", "")), "reason": str(exc)[:160]}
+                )
+                continue
+            try:
+                binding = self._ensure_rolling_paper_observation(
+                    strategy,
+                    now,
+                    market_ids=matched_ids,
+                )
+            except (sqlite3.Error, AttributeError, KeyError, RuntimeError, TypeError, ValueError) as exc:
+                failures.append(
+                    {"experiment_id": str(getattr(intent, "experiment_id", "")), "reason": str(exc)[:160]}
+                )
+                continue
+            if isinstance(binding, Mapping):
+                migrated.append(dict(binding))
+        if callable(state_setter):
+            next_cursor = str(getattr(scanned[-1], "experiment_id", "")) if scanned else ""
+            try:
+                state_setter(
+                    _OBSERVATION_SETUP_MIGRATION_STATE_NAME,
+                    {
+                        "schema_version": "autonomous-observation-setup-v1",
+                        "updated_at": ensure_utc(now).isoformat(),
+                        "cursor": next_cursor,
+                        "failures": failures[-64:],
+                    },
+                )
+            except (sqlite3.Error, TypeError, ValueError, RuntimeError):
+                pass
+        return tuple(migrated)
+
 
     def _ensure_rolling_paper_observation(
         self,
@@ -10425,6 +10656,7 @@ class AutonomousResearchProcessor:
     def refresh_rolling_evidence(self, now: datetime | None = None) -> Mapping[str, Any]:
         """Materialize bounded, source-separated rolling evidence and schedule retries."""
         current = ensure_utc(now or self.clock())
+        migrated_observations = self._migrate_observation_setup_intents(current)
         documents = self._rolling_strategy_documents()
         strategies = self._rolling_persist_strategy_lineage(documents, current)
         sources = ("HISTORICAL", "REPLAY", "PAPER", "LIVE")

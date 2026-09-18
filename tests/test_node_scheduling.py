@@ -2005,6 +2005,7 @@ class MutationSchedulingTests(unittest.TestCase):
                 old_intent_id = "observation-intent-" + candidate_id + "-legacy"
                 old_intent_config = dict(canonical_intent.config)
                 old_intent_config.pop("operational_setup", None)
+                old_intent_config["dataset_boundary"] = source["dataset_boundary"]
                 old_intent_config["operational_setup_hash"] = _operational_setup_hash(setup)
                 old_intent_record = canonical_intent.as_record()
                 old_intent_record["experiment_id"] = old_intent_id
@@ -2154,11 +2155,37 @@ class MutationSchedulingTests(unittest.TestCase):
                             T0,
                             market_ids=(market_id,),
                         )
-                binding = processor._ensure_rolling_paper_observation(
-                    source,
-                    T0,
-                    market_ids=(market_id,),
+                refresh_state = processor.refresh_rolling_evidence(T0)
+                self.assertIsInstance(refresh_state, Mapping)
+                migrated_rows = [
+                    item
+                    for item in ForwardTestRegistry(store).list_observation_intents()
+                    if str(item.config.get("candidate_id", "")).strip() == candidate_id
+                ]
+                migrated_ids = {
+                    str(item.experiment_id)
+                    for item in migrated_rows
+                    if isinstance(item.config, Mapping)
+                    and isinstance(item.config.get("observation_handoff"), Mapping)
+                }
+                self.assertEqual(len(migrated_ids), 1)
+                scheduler_state = store.get_scheduler_state(
+                    "autonomous-observation-setup-migration"
                 )
+                self.assertIsNotNone(scheduler_state)
+                second_refresh = processor.refresh_rolling_evidence(T0 + timedelta(minutes=1))
+                self.assertIsInstance(second_refresh, Mapping)
+                migrated_rows_after_restart = [
+                    item
+                    for item in ForwardTestRegistry(store).list_observation_intents()
+                    if str(item.config.get("candidate_id", "")).strip() == candidate_id
+                    and isinstance(item.config.get("observation_handoff"), Mapping)
+                ]
+                self.assertEqual(
+                    [item.experiment_id for item in migrated_rows_after_restart],
+                    sorted(migrated_ids),
+                )
+                binding = {"intent_id": next(iter(migrated_ids))}
                 registry = ForwardTestRegistry(store)
                 migrated_intent = registry.get(binding["intent_id"])
                 self.assertIsNotNone(migrated_intent)
@@ -2182,12 +2209,18 @@ class MutationSchedulingTests(unittest.TestCase):
                     source["dataset_boundary"],
                 )
                 restarted = AutonomousResearchProcessor(store, clock=lambda: T0)
-                restarted_binding = restarted._ensure_rolling_paper_observation(
-                    source,
-                    T0,
-                    market_ids=(market_id,),
+                restarted.refresh_rolling_evidence(T0 + timedelta(minutes=2))
+                restarted_rows = [
+                    item
+                    for item in registry.list_observation_intents()
+                    if str(item.config.get("candidate_id", "")).strip() == candidate_id
+                    and isinstance(item.config.get("observation_handoff"), Mapping)
+                ]
+                self.assertEqual(
+                    [item.experiment_id for item in restarted_rows],
+                    sorted(migrated_ids),
                 )
-                self.assertEqual(restarted_binding["intent_id"], migrated_intent.experiment_id)
+                restarted_binding = {"intent_id": next(iter(migrated_ids))}
                 restarted_intent = registry.get(restarted_binding["intent_id"])
                 self.assertIsNotNone(restarted_intent)
                 assert restarted_intent is not None
@@ -2244,6 +2277,7 @@ class MutationSchedulingTests(unittest.TestCase):
                 successor = registry.get(lifecycle["payload"]["forward_test_id"])
                 self.assertIsNotNone(successor)
                 assert successor is not None
+                self.assertEqual(successor.allowed_markets, (market_id,))
                 self.assertEqual(
                     successor.config["operational_setup_hash"],
                     migrated_intent.config["operational_setup_hash"],
@@ -2255,6 +2289,123 @@ class MutationSchedulingTests(unittest.TestCase):
                 active_candidates = collector._active_observation_intent_ids()
                 self.assertEqual(active_candidates, [candidate_id])
 
+    def test_observation_setup_migration_is_bounded_and_retries_failures(self) -> None:
+        class _Policy:
+            scope_hash = "scope-hash"
+            scope_version = "scope-v1"
+
+        class _Store:
+            def __init__(self) -> None:
+                self.records = []
+                self.calls = []
+                self.state = {}
+                self.fail_load = False
+                self.fail_save = False
+                self.proof_mode = "MATCHED"
+
+            def load_observation_intents(self, *, limit: int, after_experiment_id: str | None = None):
+                self.calls.append((limit, after_experiment_id))
+                ordered = self.records
+                if after_experiment_id:
+                    ordered = [row for row in ordered if row["experiment_id"] > after_experiment_id]
+                return ordered[:limit]
+
+            def get_scheduler_state(self, name: str):
+                if self.fail_load:
+                    raise sqlite3.OperationalError("state read")
+                return dict(self.state.get(name, {}))
+
+            def set_scheduler_state(self, name: str, payload: Mapping[str, Any]):
+                if self.fail_save:
+                    raise sqlite3.OperationalError("state write")
+                self.state[name] = dict(payload)
+
+            def load_candidate_lifecycle(self, candidate_id: str):
+                stage = "REJECTED" if candidate_id == "candidate-0006" else "PAPER_FORWARD"
+                return {"candidate_id": candidate_id, "stage": stage, "payload": {}}
+            def load_market_scope_resolution(self, candidate_id: str, **_kwargs: Any):
+                if self.proof_mode == "MISSING":
+                    return None
+                return {
+                    "candidate_id": candidate_id,
+                    "scope_hash": "scope-hash",
+                    "scope_version": "scope-v1",
+                    "resolved_at": (
+                        T0 - timedelta(hours=2)
+                        if self.proof_mode == "STALE"
+                        else T0
+                    ).isoformat(),
+                    "status": "UNMATCHED" if self.proof_mode == "UNMATCHED" else "MATCHED",
+                    "matched_markets": [{"market_id": "market-" + candidate_id}],
+                    "excluded_markets": [],
+                    "deferred_markets": [],
+                }
+
+        T0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        store = _Store()
+        for index in range(513):
+            candidate_id = f"candidate-{index:04d}"
+            store.records.append(
+                {
+                    "experiment_id": f"observation-intent-{index:04d}",
+                    "strategy_hash": "sha256:strategy",
+                    "model_hash": "sha256:model",
+                    "config": {
+                        "observation_intent": True,
+                        "candidate_id": candidate_id,
+                        "strategy_document": {"family": "directional"},
+                        "strategy_version_id": "version-" + candidate_id,
+                        "research_trial_id": "trial-" + candidate_id,
+                    },
+                    "start_timestamp": T0,
+                    "bankroll": 100.0,
+                    "allowed_markets": [],
+                    "risk_limits": {},
+                    "quality": "PAPER_FORWARD",
+                }
+            )
+        processor = object.__new__(AutonomousResearchProcessor)
+        processor.store = store
+        failed_once = {"candidate-0005": True}
+        created: list[str] = []
+
+        def ensure(strategy: Mapping[str, Any], _now: datetime, *, market_ids=()):
+            candidate_id = str(strategy["candidate_id"])
+            if failed_once.pop(candidate_id, False):
+                raise sqlite3.OperationalError("transient materialization")
+            created.append(candidate_id)
+            self.assertEqual(tuple(market_ids), ("market-" + candidate_id,))
+            return {"candidate_id": candidate_id}
+
+        processor._ensure_rolling_paper_observation = ensure
+        with patch("axiom.autonomous.normalize_market_scope", return_value=_Policy()), patch(
+            "axiom.autonomous._operational_setup_for_strategy",
+            return_value={"setup": "canonical"},
+        ):
+            first = processor._migrate_observation_setup_intents(T0)
+            self.assertEqual(len(first), 510)
+            self.assertEqual(store.calls[0], (512, None))
+            self.assertEqual(store.state["autonomous-observation-setup-migration"]["cursor"], "observation-intent-0511")
+            self.assertNotIn("candidate-0006", created)
+            second = processor._migrate_observation_setup_intents(T0)
+            self.assertEqual(store.calls[1], (512, "observation-intent-0511"))
+            self.assertEqual(len(second), 1)
+            third = processor._migrate_observation_setup_intents(T0)
+            self.assertEqual(store.calls[2:], [(512, "observation-intent-0512"), (512, None)])
+            self.assertIn("candidate-0005", created)
+            self.assertGreaterEqual(len(third), 1)
+            self.assertTrue(store.state["autonomous-observation-setup-migration"]["failures"] == [])
+            for mode in ("STALE", "UNMATCHED", "MISSING"):
+                store.proof_mode = mode
+                store.state["autonomous-observation-setup-migration"]["cursor"] = ""
+                before = len(created)
+                self.assertEqual(processor._migrate_observation_setup_intents(T0), ())
+                self.assertEqual(len(created), before)
+            store.proof_mode = "MATCHED"
+            store.fail_save = True
+            self.assertIsInstance(processor._migrate_observation_setup_intents(T0), tuple)
+            store.fail_load = True
+            self.assertEqual(processor._migrate_observation_setup_intents(T0), ())
     def test_rolling_initialization_commit_rolls_back_and_restart_retries_once(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             db = str(Path(directory) / "rolling-initialization-atomic.sqlite")

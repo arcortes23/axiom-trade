@@ -9673,6 +9673,46 @@ class AxiomStore:
             }
             for row in rows
         ]
+
+    def load_observation_intents(
+        self,
+        *,
+        limit: int = 512,
+        after_experiment_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            raise ValueError("limit must be a non-negative integer")
+        clauses = [
+            "experiment_id LIKE 'observation-intent-%'",
+            "json_extract(config_json,'$.observation_intent')=1",
+        ]
+        values: list[Any] = []
+        if after_experiment_id:
+            clauses.append("experiment_id>?")
+            values.append(str(after_experiment_id))
+        values.append(int(limit))
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM forward_tests WHERE "
+                + " AND ".join(clauses)
+                + " ORDER BY experiment_id LIMIT ?",
+                values,
+            ).fetchall()
+        return [
+            {
+                "experiment_id": row["experiment_id"],
+                "strategy_hash": row["strategy_hash"],
+                "model_hash": row["model_hash"],
+                "config": json.loads(row["config_json"]),
+                "start_timestamp": _parse_datetime(row["start_timestamp"]),
+                "bankroll": float(row["bankroll"]),
+                "allowed_markets": json.loads(row["allowed_markets_json"]),
+                "risk_limits": json.loads(row["risk_limits_json"]),
+                "quality": row["quality"],
+                "created_at": _parse_datetime(row["created_at"]),
+            }
+            for row in rows
+        ]
     def load_forward_test(self, experiment_id: str) -> dict[str, Any] | None:
         identifier = str(experiment_id).strip()
         if not identifier:

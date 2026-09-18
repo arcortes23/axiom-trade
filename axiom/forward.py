@@ -810,13 +810,55 @@ class ForwardTestRegistry:
             experiment_id=experiment_id,
         )
 
-    def list_observation_intents(self) -> tuple[ForwardTestSpec, ...]:
-        return tuple(
+    def list_observation_intents(
+        self,
+        *,
+        limit: int | None = None,
+        after_experiment_id: str | None = None,
+    ) -> tuple[ForwardTestSpec, ...]:
+        def convert(record: Mapping[str, Any]) -> ForwardTestSpec:
+            timestamp = parse_timestamp(record["start_timestamp"])
+            if timestamp is None:
+                raise ValueError(f"invalid persisted forward-test timestamp: {record['experiment_id']}")
+            return ForwardTestSpec(
+                record["experiment_id"],
+                record["strategy_hash"],
+                record["model_hash"],
+                record["config"],
+                timestamp,
+                record["bankroll"],
+                tuple(record["allowed_markets"]),
+                record["risk_limits"],
+                ResearchQuality(record["quality"]),
+                timestamp,
+            )
+        if (
+            self.store is not None
+            and callable(getattr(self.store, "load_observation_intents", None))
+            and (limit is not None or after_experiment_id is not None)
+        ):
+            records = self.store.load_observation_intents(
+                limit=512 if limit is None else int(limit),
+                after_experiment_id=after_experiment_id,
+            )
+            return tuple(convert(record) for record in records)
+        if self.store is not None and not callable(
+            getattr(self.store, "load_observation_intents", None)
+        ) and limit is not None:
+            # A persistent migration scan must never fall back to loading all
+            # historical rows from an unbounded compatibility API.
+            return ()
+        specs = tuple(
             spec
             for spec in self.list()
             if bool((spec.config if isinstance(spec.config, Mapping) else {}).get("observation_intent"))
             and spec.experiment_id.startswith("observation-intent-")
+            and (
+                not after_experiment_id
+                or spec.experiment_id > str(after_experiment_id)
+            )
         )
+        return specs if limit is None else specs[: int(limit)]
 
     def materialize_observation_intent(
         self,
