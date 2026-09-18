@@ -94,6 +94,95 @@ class PolymarketMarketScopeAdapterTests(unittest.TestCase):
         self.assertEqual(adapter.token_ids("gamma-market-42"), {})
         errors = adapter.consume_validation_errors()
         self.assertTrue(any(isinstance(error, PolymarketTokenMappingError) for error in errors))
+    def test_scope_market_accepts_terminal_misaligned_gamma_without_tokens(self) -> None:
+        fixture = dict(
+            GAMMA_MARKET,
+            outcomes='["Over", "Under"]',
+            clobTokenIds='["over-token", "under-token"]',
+            outcomePrices='["0", "1"]',
+            active=True,
+            closed=True,
+            acceptingOrders=False,
+        )
+        adapter = self._adapter(fixture)
+        snapshot = adapter.scope_market("gamma-market-42")
+        self.assertIsNotNone(snapshot)
+        assert snapshot is not None
+        self.assertTrue(snapshot.closed)
+        self.assertTrue(snapshot.active)
+        self.assertFalse(snapshot.accepting_orders)
+        self.assertIsNone(snapshot.yes_token_id)
+        self.assertIsNone(snapshot.no_token_id)
+        self.assertIsNone(snapshot.yes_mid)
+        self.assertIsNone(snapshot.no_mid)
+
+    def test_scope_market_rejects_open_misaligned_gamma(self) -> None:
+        fixture = dict(
+            GAMMA_MARKET,
+            outcomes='["Over", "Under"]',
+            clobTokenIds='["over-token", "under-token"]',
+            active=True,
+            closed=False,
+            acceptingOrders=True,
+        )
+        adapter = self._adapter(fixture)
+        self.assertIsNone(adapter.scope_market("gamma-market-42"))
+
+    def test_scope_market_accepts_resolved_or_void_misaligned_gamma(self) -> None:
+        for resolution, expected in (
+            ("Yes", SettlementState.RESOLVED_YES),
+            ("No", SettlementState.RESOLVED_NO),
+            ("void", SettlementState.VOID),
+        ):
+            with self.subTest(resolution=resolution):
+                fixture = dict(
+                    GAMMA_MARKET,
+                    outcomes='["Over", "Under"]',
+                    clobTokenIds='["over-token", "under-token"]',
+                    active=True,
+                    closed=False,
+                    acceptingOrders=True,
+                    resolvedOutcome=resolution,
+                )
+                adapter = self._adapter(fixture)
+                snapshot = adapter.scope_market("gamma-market-42")
+                self.assertIsNotNone(snapshot)
+                assert snapshot is not None
+                self.assertEqual(snapshot.settlement, expected)
+                self.assertIsNone(snapshot.yes_token_id)
+                self.assertIsNone(snapshot.no_token_id)
+    def test_scope_market_projects_strict_terminal_lifecycle(self) -> None:
+        for overrides in (
+            {"resolved": True},
+            {"resolutionStatus": "expired"},
+        ):
+            with self.subTest(overrides=overrides):
+                adapter = self._adapter(dict(GAMMA_MARKET, **overrides))
+                snapshot = adapter.scope_market("gamma-market-42")
+                self.assertIsNotNone(snapshot)
+                assert snapshot is not None
+                self.assertTrue(snapshot.closed)
+                self.assertIsNotNone(snapshot.yes_token_id)
+                self.assertIsNotNone(snapshot.no_token_id)
+    def test_scope_market_accepts_inactive_or_archived_misaligned_gamma(self) -> None:
+        for overrides in (
+            {"active": False, "closed": False, "archived": False},
+            {"active": True, "closed": False, "archived": True},
+        ):
+            with self.subTest(overrides=overrides):
+                fixture = dict(
+                    GAMMA_MARKET,
+                    outcomes='["Over", "Under"]',
+                    clobTokenIds='["over-token", "under-token"]',
+                    acceptingOrders=True,
+                    **overrides,
+                )
+                adapter = self._adapter(fixture)
+                snapshot = adapter.scope_market("gamma-market-42")
+                self.assertIsNotNone(snapshot)
+                assert snapshot is not None
+                self.assertIsNone(snapshot.yes_token_id)
+                self.assertIsNone(snapshot.no_token_id)
 
     def test_empty_book_is_available_and_unavailable_book_is_none(self) -> None:
         empty = self._adapter(book={

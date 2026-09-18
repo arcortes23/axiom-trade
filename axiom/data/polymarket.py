@@ -13,7 +13,7 @@ import json
 import math
 import urllib.parse
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 import re
 from typing import Any, Callable, Mapping, Sequence
@@ -396,6 +396,179 @@ class PolymarketAdapter(PredictionMarketDataProvider):
             return None
         self._remember(payload)
         return self._snapshot(payload, expected_market_id=identifier)
+
+    def scope_market(self, market_id: str) -> PredictionMarketSnapshot | None:
+        """Return Gamma lifecycle identity without requiring a CLOB token pair.
+
+        Exact scope authority may exclude a terminal Gamma market even when
+        its historical outcome labels are not the YES/NO pair required by
+        collection pricing.  Open malformed mappings remain fail-closed.
+        """
+        identifier = _text(market_id)
+        if identifier is None:
+            return None
+        self._provider_timestamps.pop(("market", identifier), None)
+        payload = self._gamma_get("/markets/" + urllib.parse.quote(identifier, safe=""))
+        if not isinstance(payload, Mapping):
+            return None
+        self._remember(payload)
+        try:
+            explicit_resolved = _optional_bool(payload, "resolved", "isResolved", "is_resolved")
+        except ValueError:
+            explicit_resolved = None
+        raw_status = _text(
+            _first_present(
+                payload,
+                "resolutionStatus",
+                "resolution_status",
+                "settlement",
+                "outcome",
+            )
+        )
+        raw_terminal = (raw_status or "").strip().casefold() in {
+            "resolved",
+            "resolved_yes",
+            "resolved_no",
+            "void",
+            "closed",
+            "expired",
+        }
+        strict = self._snapshot(payload, expected_market_id=identifier)
+        if strict is not None:
+            if explicit_resolved is True or raw_terminal:
+                return replace(strict, closed=True)
+            return strict
+        try:
+            active = _optional_bool(payload, "active")
+            closed = _optional_bool(payload, "closed")
+            archived = _optional_bool(payload, "archived")
+            accepting_orders = _optional_bool(
+                payload,
+                "acceptingOrders",
+                "accepting_orders",
+            )
+            enable_order_book = _optional_bool(
+                payload,
+                "enableOrderBook",
+                "enable_order_book",
+            )
+            resolved = _optional_bool(payload, "resolved", "isResolved", "is_resolved")
+        except ValueError:
+            return None
+        settlement = _settlement(payload)
+        raw_settlement = _text(
+            _first_present(
+                payload,
+                "resolutionStatus",
+                "resolution_status",
+                "settlement",
+                "outcome",
+            )
+        )
+        terminal_settlement = (raw_settlement or "").strip().casefold() in {
+            "resolved",
+            "resolved_yes",
+            "resolved_no",
+            "void",
+            "closed",
+            "expired",
+        }
+        try:
+            expiry_raw = _first_present(
+                payload,
+                "endDate",
+                "end_date",
+                "endDateIso",
+                "expirationDate",
+            )
+            expiry = parse_timestamp(expiry_raw)
+            if expiry_raw not in (None, "") and expiry is None:
+                return None
+        except (TypeError, ValueError):
+            return None
+        terminal = (
+            closed is True
+            or archived is True
+            or active is False
+            or accepting_orders is False
+            or resolved is True
+            or terminal_settlement
+            or settlement in {
+                SettlementState.RESOLVED_YES,
+                SettlementState.RESOLVED_NO,
+                SettlementState.VOID,
+            }
+        )
+        if not terminal:
+            return None
+        lifecycle_closed = (
+            closed is True
+            or resolved is True
+            or terminal_settlement
+        )
+        try:
+            resolved_id, condition_id = _market_identity(payload)
+            timestamp_raw = _first_present(payload, "updatedAt", "updated_at")
+            timestamp = parse_timestamp(timestamp_raw)
+            if timestamp_raw not in (None, "") and timestamp is None:
+                return None
+            timestamp = timestamp or _EPOCH
+            expiry_raw = _first_present(
+                payload,
+                "endDate",
+                "end_date",
+                "endDateIso",
+                "expirationDate",
+            )
+            expiry = parse_timestamp(expiry_raw)
+            if expiry_raw not in (None, "") and expiry is None:
+                return None
+            question = _text(payload.get("question"))
+            if question is None or resolved_id != identifier:
+                return None
+        except (PolymarketPayloadError, TypeError, ValueError):
+            return None
+        snapshot = PredictionMarketSnapshot(
+            timestamp=timestamp,
+            market_id=resolved_id,
+            question=question,
+            yes_bid=None,
+            yes_ask=None,
+            yes_mid=None,
+            no_bid=None,
+            no_ask=None,
+            no_mid=None,
+            volume=_nonnegative(_first_float(payload, "volume", "volumeNum", "volume_num")),
+            liquidity=_nonnegative(_first_float(payload, "liquidity", "liquidityNum", "liquidity_num")),
+            expiry=expiry,
+            settlement=settlement,
+            resolution_criteria=_text(
+                payload.get(
+                    _first_present_key(
+                        payload,
+                        "resolutionCriteria",
+                        "resolution_criteria",
+                        "rules",
+                        "description",
+                    )
+                )
+            ) or "",
+            category=_text(payload.get("category")),
+            tags=_tags(payload.get("tags", payload.get("tag", []))),
+            source=self.provider_name,
+            yes_token_id=None,
+            no_token_id=None,
+            condition_id=condition_id,
+            slug=_text(payload.get("slug")),
+            provider_timestamp=parse_timestamp(timestamp_raw),
+            active=active,
+            closed=True if lifecycle_closed else closed,
+            archived=archived,
+            accepting_orders=accepting_orders,
+            enable_order_book=enable_order_book,
+        )
+        self._provider_timestamps[("market", identifier)] = snapshot.provider_timestamp
+        return snapshot
 
     def price_history(
         self,

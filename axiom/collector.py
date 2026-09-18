@@ -482,9 +482,12 @@ class PolymarketCollector:
         # Exact selected ids use a provider clone as well as a separate
         # executor.  A provider may carry a session/throttle lock that a
         # broad inventory request can hold until its transport deadline.
+        # Fresh clones isolate each exact operation; completed callers release
+        # them after diagnostics while timed-out workers remain bounded here.
         self._scope_direct_provider_executor: _BoundedProviderExecutor | None = None
         self._scope_direct_provider: Any | None = None
-        self._collection_provider_executor: _BoundedProviderExecutor | None = None
+        self._scope_direct_provider_ids: set[int] = set()
+        self._scope_direct_provider_refs: dict[int, Any] = {}
         self._active_provider_calls: set[tuple[int, str]] = set()
         self._provider_call_pools: dict[tuple[int, str], str] = {}
         self._provider_timeout_evidence: list[dict[str, Any]] = []
@@ -501,22 +504,36 @@ class PolymarketCollector:
                 return
             self._closed = True
             executor_values = (
-                self._provider_executor,
-                self._scope_provider_executor,
-                self._scope_direct_provider_executor,
-                self._collection_provider_executor,
-                self._collection_executor,
+                getattr(self, "_provider_executor", None),
+                getattr(self, "_scope_provider_executor", None),
+                getattr(self, "_scope_direct_provider_executor", None),
+                getattr(self, "_collection_provider_executor", None),
+                getattr(self, "_collection_executor", None),
             )
             executors: list[_BoundedProviderExecutor] = []
             seen: set[int] = set()
             for executor in executor_values:
                 if executor is not None and id(executor) not in seen:
-                    seen.add(id(executor))
                     executors.append(executor)
+                    seen.add(id(executor))
         for executor in executors:
             executor.shutdown()
-        direct_provider = self._scope_direct_provider
-        if direct_provider is not None and direct_provider is not self.provider:
+        with self._provider_executor_lock:
+            active_direct_provider_ids = {
+                provider_id
+                for provider_id, endpoint in self._active_provider_calls
+                if self._provider_call_pools.get((provider_id, endpoint)) == "scope_direct"
+            }
+            direct_providers = [
+                provider
+                for provider in self._scope_direct_provider_refs.values()
+                if id(provider) not in active_direct_provider_ids
+            ]
+        seen_providers: set[int] = set()
+        for direct_provider in direct_providers:
+            if direct_provider is self.provider or id(direct_provider) in seen_providers:
+                continue
+            seen_providers.add(id(direct_provider))
             close = getattr(direct_provider, "close", None)
             if callable(close):
                 try:
@@ -1964,16 +1981,7 @@ class PolymarketCollector:
             return []
         return providers if len(providers) >= 2 else []
     def _scope_direct_lookup_provider(self) -> Any:
-        """Return one bounded provider clone for exact-scope requests.
-
-        The broad scope pool and exact pool intentionally have separate
-        executors, but that is not sufficient for providers whose request
-        session or throttle is serialized internally.  Reuse the established
-        provider factory when available; otherwise preserve the provider's
-        existing single-instance behavior.
-        """
-        if self._scope_direct_provider is not None:
-            return self._scope_direct_provider
+        """Create one fresh isolated provider for an exact operation."""
         factory = getattr(self.provider, "isolated_worker_factory", None)
         if callable(factory):
             try:
@@ -1982,20 +1990,53 @@ class PolymarketCollector:
                     worker = worker()
                 if worker is not None and worker is not self.provider:
                     self._scope_direct_provider = worker
+                    self._scope_direct_provider_ids.add(id(worker))
+                    self._scope_direct_provider_refs[id(worker)] = worker
                     return worker
             except Exception:
                 pass
         return self.provider
 
     def _scope_provider_pool(self, provider: Any) -> str | None:
-        """Use the isolated exact pool for calls on its provider clone."""
-        if (
-            self._scope_direct_provider is not None
-            and provider is self._scope_direct_provider
-        ):
+        """Use the isolated exact pool for fresh provider clones."""
+        if id(provider) in self._scope_direct_provider_ids:
             return "scope_direct"
         return None
-
+    @staticmethod
+    def _scope_market_operation(provider: Any, market_id: str) -> Any:
+        fetcher = getattr(provider, "scope_market", None)
+        if not callable(fetcher):
+            fetcher = getattr(provider, "market", None)
+        if not callable(fetcher):
+            raise RuntimeError("provider has no exact market operation")
+        return fetcher(market_id)
+    def _close_scope_direct_provider(self, provider: Any) -> None:
+        """Drain diagnostics, then close one exact clone exactly once."""
+        provider_id = id(provider)
+        with self._provider_executor_lock:
+            owned = self._scope_direct_provider_refs.get(provider_id)
+            if owned is not provider:
+                return
+            self._scope_direct_provider_refs.pop(provider_id, None)
+            self._scope_direct_provider_ids.discard(provider_id)
+            if self._scope_direct_provider is provider:
+                self._scope_direct_provider = None
+        # Providers may invalidate their advisory buffers during close, so
+        # diagnostics must be consumed first on both normal and orphan paths.
+        self._drain_provider_advisories_now(provider)
+        close = getattr(provider, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+    def _finish_scope_direct_orphan(
+        self,
+        provider: Any,
+        key: tuple[int, str],
+    ) -> None:
+        self._close_scope_direct_provider(provider)
+        self._release_provider_call(key)
 
     def _resolve_market_scopes(
         self,
@@ -2207,7 +2248,6 @@ class PolymarketCollector:
         pre_direct_attempted_ids: set[str] = set()
         pre_direct_snapshots: dict[str, PredictionMarketSnapshot] = {}
         pre_direct_provider: Any | None = None
-        pre_direct_fetcher = None
         try:
             protected_cursor = int(self._scope_direct_protected_lookup_cursor)
         except (TypeError, ValueError, OverflowError):
@@ -2215,9 +2255,6 @@ class PolymarketCollector:
         protected_cursor %= len(protected_priority_exact_ids) if protected_priority_exact_ids else 1
         protected_cursor_start = protected_cursor
         if protected_priority_exact_ids and self._scope_pipeline_budget_available():
-            pre_direct_provider = self._scope_direct_lookup_provider()
-            pre_direct_fetcher = getattr(pre_direct_provider, "market", None)
-        if protected_priority_exact_ids and callable(pre_direct_fetcher):
             protected_probe_ids = [
                 protected_priority_exact_ids[
                     (protected_cursor + offset) % len(protected_priority_exact_ids)
@@ -2231,14 +2268,14 @@ class PolymarketCollector:
                     break
                 pre_direct_attempted_ids.add(market_id)
                 try:
-                    direct_snapshot = self._call_provider(
+                    direct_snapshot = self._call_scope_direct(
                         f"scope_exact:/markets/{market_id}",
-                        lambda identifier=market_id: pre_direct_fetcher(identifier),
+                        lambda operation_provider, identifier=market_id: self._scope_market_operation(
+                            operation_provider,
+                            identifier,
+                        ),
                         observed_at,
                         counters,
-                        provider=pre_direct_provider,
-                        market_id=market_id,
-                        pool_name="scope_direct",
                     )
                 except _ProviderDeadlineExceeded as exc:
                     if exc.cycle_expired:
@@ -2381,11 +2418,7 @@ class PolymarketCollector:
             *missing_deferred_ids,
         ]
         direct_provider = pre_direct_provider or self.provider
-        direct_fetcher = getattr(direct_provider, "market", None)
         if missing_exact_ids:
-            direct_provider = self._scope_direct_lookup_provider()
-            direct_fetcher = getattr(direct_provider, "market", None)
-        if missing_exact_ids and callable(direct_fetcher):
             try:
                 direct_cursor = int(self._scope_direct_lookup_cursor)
             except (TypeError, ValueError):
@@ -2460,23 +2493,23 @@ class PolymarketCollector:
                     break
                 direct_attempted_ids.add(market_id)
                 direct_loop_attempted_ids.add(market_id)
+                attempted_direct += 1
                 if market_id in protected_priority_id_set:
                     attempted_protected += 1
                 elif market_id in priority_id_set:
                     attempted_priority += 1
                 else:
                     attempted_deferred += 1
-                attempted_direct += 1
 
                 try:
-                    direct_snapshot = self._call_provider(
+                    direct_snapshot = self._call_scope_direct(
                         f"scope_exact:/markets/{market_id}",
-                        lambda identifier=market_id: direct_fetcher(identifier),
+                        lambda operation_provider, identifier=market_id: self._scope_market_operation(
+                            operation_provider,
+                            identifier,
+                        ),
                         observed_at,
                         counters,
-                        provider=direct_provider,
-                        market_id=market_id,
-                        pool_name="scope_direct",
                     )
                 except _ProviderDeadlineExceeded as exc:
                     if exc.cycle_expired:
@@ -2572,11 +2605,7 @@ class PolymarketCollector:
                 and str(getattr(policy, "mode", "")).upper() == "EXACT_MARKETS"
             )
             suitability_configured = self._suitability_is_configured(document)
-            suitability_provider = (
-                self._scope_direct_lookup_provider()
-                if exact_scope
-                else self.provider
-            )
+            suitability_provider = self.provider
             kwargs = self._suitability_kwargs(document) if suitability_configured else {}
 
             direct_exact_scope = exact_scope and bool(
@@ -2708,11 +2737,15 @@ class PolymarketCollector:
                     elif snapshot is None and market_id not in self._scope_refresh_attempted:
                         snapshot = self._scope_snapshot_from_record(raw_record, observed_at)
                         if snapshot is not None:
+                            refresh_kwargs: dict[str, Any] = {}
+                            if "pool_name" in inspect.signature(self._refresh_scope_snapshot).parameters:
+                                refresh_kwargs["pool_name"] = "scope_direct" if exact_scope else None
                             snapshot = self._refresh_scope_snapshot(
                                 snapshot,
                                 suitability_provider,
                                 observed_at,
                                 counters,
+                                **refresh_kwargs,
                             )
                             if snapshot is not None:
                                 self._scope_refreshed_snapshots[market_id] = snapshot
@@ -2741,9 +2774,9 @@ class PolymarketCollector:
                         observed_at,
                         suitability_provider,
                         counters=counters,
+                        pool_name="scope_direct" if exact_scope else None,
                         **kwargs,
                     )
-                    self._suitable_market_evidence.append(dict(assessment))
                     refreshed = dict(self._scope_market_record(snapshot, observed_at, suitability_provider))
                     refreshed["suitability_evidence"] = dict(assessment)
                     refreshed["suitable_market"] = assessment.get("action") == "SUITABLE"
@@ -3385,24 +3418,35 @@ class PolymarketCollector:
         provider: Any,
         observed_at: datetime,
         counters: dict[str, Any],
+        *,
+        pool_name: str | None = None,
     ) -> PredictionMarketSnapshot | None:
         """Refresh carried inventory metadata before using its evidence."""
         market_id = str(snapshot.market_id).strip()
         if market_id:
             self._scope_refresh_attempted.add(market_id)
-        fetcher = getattr(provider, "market", None)
-        if not callable(fetcher):
-            return None
+        provider_pool = pool_name or self._scope_provider_pool(provider)
         try:
-            current = self._call_provider(
-                f"scope_refresh:/markets/{snapshot.market_id}",
-                lambda: fetcher(snapshot.market_id),
-                observed_at,
-                counters,
-                provider=provider,
-                market_id=snapshot.market_id,
-                pool_name=self._scope_provider_pool(provider),
-            )
+            if provider_pool == "scope_direct":
+                self._close_scope_direct_provider(provider)
+                current = self._call_scope_direct(
+                    f"scope_refresh:/markets/{snapshot.market_id}",
+                    lambda operation_provider: operation_provider.market(snapshot.market_id),
+                    observed_at,
+                    counters,
+                )
+            else:
+                fetcher = getattr(provider, "market", None)
+                if not callable(fetcher):
+                    return None
+                current = self._call_provider(
+                    f"scope_refresh:/markets/{snapshot.market_id}",
+                    lambda: fetcher(snapshot.market_id),
+                    observed_at,
+                    counters,
+                    provider=provider,
+                    market_id=snapshot.market_id,
+                )
         except _ProviderDeadlineExceeded:
             return None
         except Exception:
@@ -3504,18 +3548,14 @@ class PolymarketCollector:
         )
         suitability_enabled = bool(suitability_specs)
         exact_market_ids = set(self._scope_exact_market_ids(documents))
-        exact_suitability_provider = (
-            self._scope_direct_lookup_provider()
-            if suitability_enabled and exact_market_ids
-            else provider
-        )
 
         def suitability_provider_for(market_id: str) -> Any:
-            return (
-                exact_suitability_provider
-                if str(market_id).strip() in exact_market_ids
-                else provider
-            )
+            return provider
+
+        def suitability_pool_for(market_id: str) -> str | None:
+            if str(market_id).strip() in exact_market_ids:
+                return "scope_direct"
+            return None
         suitability_kwargs: dict[str, Any] = (
             dict(suitability_specs[0][3]) if suitability_specs else {}
         )
@@ -3833,11 +3873,15 @@ class PolymarketCollector:
                         observed_at,
                     )
                     if suitability_enabled and snapshot is not None:
+                        refresh_kwargs: dict[str, Any] = {}
+                        if "pool_name" in inspect.signature(self._refresh_scope_snapshot).parameters:
+                            refresh_kwargs["pool_name"] = suitability_pool_for(market_id)
                         snapshot = self._refresh_scope_snapshot(
                             snapshot,
                             suitability_provider_for(market_id),
                             observed_at,
                             counters,
+                            **refresh_kwargs,
                         )
                     if suitability_enabled and snapshot is None:
                         refresh_index += 1
@@ -4170,11 +4214,15 @@ class PolymarketCollector:
                         failed_refresh = True
                         failed_market_id = failed_market_id or market_id
                         continue
+                    refresh_kwargs: dict[str, Any] = {}
+                    if "pool_name" in inspect.signature(self._refresh_scope_snapshot).parameters:
+                        refresh_kwargs["pool_name"] = suitability_pool_for(market_id)
                     snapshot = self._refresh_scope_snapshot(
                         snapshot,
                         suitability_provider_for(market_id),
                         observed_at,
                         counters,
+                        **refresh_kwargs,
                     )
                     if snapshot is None:
                         refresh_index += 1
@@ -4199,6 +4247,7 @@ class PolymarketCollector:
                         observed_at,
                         suitability_provider_for(market_id),
                         counters=counters,
+                        pool_name=suitability_pool_for(market_id),
                         **probe_kwargs,
                     )
                     self._suitable_market_evidence.append(dict(assessment))
@@ -4266,6 +4315,7 @@ class PolymarketCollector:
                         observed_at,
                         suitability_provider_for(market_id),
                         counters=counters,
+                        pool_name=suitability_pool_for(market_id),
                         **probe_kwargs,
                     )
                     self._suitable_market_evidence.append(dict(assessment))
@@ -4482,8 +4532,9 @@ class PolymarketCollector:
                 assessment = self._cached_scope_suitability_assessment(
                     item,
                     observed_at,
-                    suitability_provider,
+                    suitability_provider_for(market_id),
                     counters=counters,
+                    pool_name=suitability_pool_for(market_id),
                     **probe_kwargs,
                 )
                 suitability_evidence.append(dict(assessment))
@@ -4635,6 +4686,7 @@ class PolymarketCollector:
         provider: Any,
         *,
         counters: dict[str, Any] | None = None,
+        pool_name: str | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
         """Reuse one scope suitability probe for the duration of a tick."""
@@ -4642,18 +4694,17 @@ class PolymarketCollector:
         cached = self._scope_suitability_cache.get(key)
         if cached is not None:
             return dict(cached)
+        provider_pool = pool_name or self._scope_provider_pool(provider)
         assessment = self._suitable_market_assessment(
             snapshot,
             observed_at,
             provider,
             counters=counters,
+            pool_name=provider_pool,
             **kwargs,
         )
         # Do not evict: callers may revisit an earlier market later in the
         # same resolution pass, and eviction would repeat its provider probe.
-        # The resolver/inventory caps bound the complete key space covered by
-        # one tick, so an uncached key here is only possible for direct,
-        # out-of-band callers that exceed those caps.
         if len(self._scope_suitability_cache) < _MAX_SCOPE_SUITABILITY_CACHE:
             self._scope_suitability_cache[key] = dict(assessment)
         return dict(assessment)
@@ -4665,6 +4716,7 @@ class PolymarketCollector:
         observed_at: datetime,
         provider: Any,
         *,
+        pool_name: str | None = None,
         counters: dict[str, Any] | None = None,
         intended_token: str | None = None,
         required_capital: float | None = None,
@@ -4679,6 +4731,7 @@ class PolymarketCollector:
         authority.  A later execution controller must re-read canonical rules,
         token identity, and depth immediately before any order decision.
         """
+        operation_pool = pool_name or self._scope_provider_pool(provider)
         token = str(intended_token if intended_token is not None else self.config.intended_token).strip().lower()
         capital = float(self.config.required_capital if required_capital is None else required_capital)
         entry_floor = float(self.config.min_entry_depth if min_entry_depth is None else min_entry_depth)
@@ -4795,21 +4848,30 @@ class PolymarketCollector:
             return evidence
         book: Any = snapshot.order_book
         attached_token = self._book_token_id(book)
-        if attached_token != str(token_id).strip():
-            # A snapshot normally carries a YES book.  It must not be reused
-            # when the configured intended token is NO, and an unbound book is
-            # not evidence for either token.
+        if attached_token is not None and attached_token != str(token_id).strip():
             book = None
-        def call_public(endpoint: str, operation: Callable[[], Any]) -> Any:
+        def call_public(
+            endpoint: str,
+            operation_factory: Callable[[Any], Any],
+        ) -> Any:
+            if operation_pool == "scope_direct":
+                if counters is None:
+                    return operation_factory(provider)
+                return self._call_scope_direct(
+                    endpoint,
+                    operation_factory,
+                    observed_at,
+                    counters,
+                )
             if counters is None:
-                return operation()
+                return operation_factory(provider)
             return self._call_provider(
                 endpoint,
-                operation,
+                lambda: operation_factory(provider),
                 observed_at,
                 counters,
                 provider=provider,
-                pool_name=self._scope_provider_pool(provider),
+                pool_name=operation_pool,
             )
 
         if book is None:
@@ -4818,7 +4880,10 @@ class PolymarketCollector:
                 try:
                     book = call_public(
                         f"suitability_order_book:{snapshot.market_id}",
-                        lambda: fetch_for_token(str(token_id), depth=self.config.depth),
+                        lambda operation_provider: operation_provider.order_book_for_token(
+                            str(token_id),
+                            depth=self.config.depth,
+                        ),
                     )
                 except _ProviderDeadlineExceeded as exc:
                     evidence.update(
@@ -4836,7 +4901,10 @@ class PolymarketCollector:
                 try:
                     books = call_public(
                         f"suitability_order_books:{snapshot.market_id}",
-                        lambda: fetcher(snapshot.market_id, depth=self.config.depth),
+                        lambda operation_provider: operation_provider.order_books(
+                            snapshot.market_id,
+                            depth=self.config.depth,
+                        ),
                     )
                     if isinstance(books, Mapping):
                         # The provider's map key is only a lookup hint.  The
@@ -4872,9 +4940,9 @@ class PolymarketCollector:
         attached_token = self._book_token_id(book)
         if attached_token != str(token_id).strip():
             evidence.update(
-                category="DATA_QUALITY",
-                reason="SELECTED_TOKEN_MISMATCH",
-                resolver="refresh_selected_token_order_book",
+                category="CAPITAL_OR_MARKET_CONSTRAINT",
+                reason="NO_DEPTH",
+                resolver="inspect_selected_token_depth",
                 next_action="recheck_next_discovery_tick",
             )
             return evidence
@@ -6193,6 +6261,18 @@ class PolymarketCollector:
                     self._active_provider_calls.discard(active_key)
                     self._provider_futures.pop(active_key, None)
                     self._provider_call_pools.pop(active_key, None)
+            active_direct_keys = [
+                active_key
+                for active_key in self._active_provider_calls
+                if self._provider_call_pools.get(active_key) == "scope_direct"
+            ]
+            if pool_name == "scope_direct" and len(active_direct_keys) >= 2:
+                raise _ProviderDeadlineExceeded(
+                    endpoint,
+                    float(self.config.provider_timeout_seconds),
+                    in_flight=True,
+                )
+            active_limit = 1 if pool_name == "scope_direct" else self.config.max_concurrency
             active_for_provider = [
                 active_endpoint
                 for active_provider_id, active_endpoint in self._active_provider_calls
@@ -6203,7 +6283,6 @@ class PolymarketCollector:
                     ) == pool_name
                 )
             ]
-            active_limit = 1 if pool_name == "scope_direct" else self.config.max_concurrency
             if len(active_for_provider) >= active_limit:
                 active_endpoint = active_for_provider[0]
                 existing = self._provider_futures.get((id(provider), active_endpoint))
@@ -6241,10 +6320,10 @@ class PolymarketCollector:
             elif pool_name == "scope_direct":
                 executor = self._scope_direct_provider_executor
                 if executor is None:
-                    executor = _BoundedProviderExecutor(1)
+                    executor = _BoundedProviderExecutor(2)
                     self._scope_direct_provider_executor = executor
             else:
-                executor = self._collection_provider_executor
+                executor = getattr(self, "_collection_provider_executor", None)
                 if executor is None:
                     executor = _BoundedProviderExecutor(self.config.max_concurrency)
                     self._collection_provider_executor = executor
@@ -6317,6 +6396,160 @@ class PolymarketCollector:
         except Exception:
             pass
         return error
+    def _call_scope_direct(
+        self,
+        endpoint: str,
+        operation_factory: Callable[[Any], Any],
+        observed_at: datetime,
+        counters: dict[str, Any],
+    ) -> Any:
+        """Run one exact operation on a fresh clone for every attempt."""
+        last_error: Exception | None = None
+        timeout = float(self.config.provider_timeout_seconds)
+        for attempt in range(self.config.max_attempts):
+            self._cycle_budget_available(endpoint, observed_at, counters)
+            counters["requests"] += 1
+            request_started = time.monotonic()
+            provider = self._scope_direct_lookup_provider()
+            owned = provider is not self.provider
+            try:
+                try:
+                    future, key = self._submit_provider_call(
+                        provider,
+                        endpoint,
+                        lambda: operation_factory(provider),
+                        pool_name="scope_direct",
+                    )
+                except _ProviderDeadlineExceeded as exc:
+                    if owned:
+                        self._close_scope_direct_provider(provider)
+                    deadline_error = self._record_provider_timeout(
+                        exc.endpoint,
+                        observed_at,
+                        counters,
+                        in_flight=exc.in_flight,
+                        cycle_expired=exc.cycle_expired,
+                    )
+                    if exc.cycle_expired:
+                        self._cycle_deadline_exhausted = True
+                    counters["provider_failures"] += 1
+                    raise deadline_error
+                remaining = self._cycle_remaining_seconds()
+                effective_timeout = (
+                    self._provider_phase_timeout("scope_direct", remaining)
+                    if remaining is not None
+                    else timeout
+                )
+                wait_timeout = (
+                    effective_timeout
+                    if remaining is None
+                    else min(effective_timeout, max(0.000001, remaining))
+                )
+                try:
+                    result = future.result(timeout=wait_timeout)
+                except FutureTimeout:
+                    # A late completion is still stale: never authorize from
+                    # a future that crossed its deadline.
+                    if future.done():
+                        self._release_provider_call(key)
+                        self._consume_transport_errors(provider)
+                        self._drain_provider_advisories_now(provider)
+                        if owned:
+                            self._close_scope_direct_provider(provider)
+                    else:
+                        future.cancel()
+                        future.add_done_callback(
+                            lambda _future, clone=provider, call_key=key: self._finish_scope_direct_orphan(
+                                clone,
+                                call_key,
+                            )
+                        )
+                    cycle_expired = remaining is not None and remaining <= effective_timeout
+                    deadline_error = self._record_provider_timeout(
+                        endpoint,
+                        observed_at,
+                        counters,
+                        cycle_expired=cycle_expired,
+                    )
+                    if cycle_expired:
+                        self._cycle_deadline_exhausted = True
+                    counters["provider_failures"] += 1
+                    raise deadline_error
+                except BaseException:
+                    self._release_provider_call(key)
+                    raise
+                self._release_provider_call(key)
+                transport_errors = self._consume_transport_errors(provider)
+                self._drain_provider_advisories_now(provider)
+                if owned:
+                    self._close_scope_direct_provider(provider)
+                retryable_error = next(
+                    (
+                        error
+                        for error in reversed(transport_errors)
+                        if getattr(error, "retryable", False)
+                    ),
+                    None,
+                )
+                if transport_errors:
+                    counters["rate_limits"] += sum(
+                        1 for error in transport_errors
+                        if getattr(error, "status", None) == 429
+                    )
+                    if retryable_error is not None and attempt + 1 < self.config.max_attempts:
+                        delay = self._backoff_delay(
+                            endpoint,
+                            attempt,
+                            getattr(retryable_error, "retry_after", None),
+                        )
+                        if delay is not None:
+                            remaining = self._cycle_remaining_seconds()
+                            if remaining is not None and remaining <= delay:
+                                raise self._cycle_budget_error(endpoint, observed_at, counters)
+                            counters["retries"] += 1
+                            self.sleep(delay)
+                            continue
+                    detail = "; ".join(str(error) for error in transport_errors)
+                    raise RuntimeError(f"{endpoint} provider failure: {detail}")
+                return result
+            except _ProviderDeadlineExceeded:
+                raise
+            except Exception as exc:
+                last_error = exc
+                transport_errors = self._consume_transport_errors(provider)
+                self._drain_provider_advisories_now(provider)
+                if owned:
+                    self._close_scope_direct_provider(provider)
+                counters["rate_limits"] += sum(
+                    1 for error in transport_errors
+                    if getattr(error, "status", None) == 429
+                )
+                if isinstance(exc, HTTPFetchError) and exc.status == 429:
+                    counters["rate_limits"] += 1
+                retryable = isinstance(exc, (OSError, TimeoutError)) or (
+                    isinstance(exc, HTTPFetchError) and exc.retryable
+                )
+                if retryable and attempt + 1 < self.config.max_attempts:
+                    retry_after = exc.retry_after if isinstance(exc, HTTPFetchError) else (
+                        getattr(transport_errors[-1], "retry_after", None)
+                        if transport_errors else None
+                    )
+                    delay = self._backoff_delay(endpoint, attempt, retry_after)
+                    if delay is not None:
+                        remaining = self._cycle_remaining_seconds()
+                        if remaining is not None and remaining <= delay:
+                            raise self._cycle_budget_error(endpoint, observed_at, counters)
+                        counters["retries"] += 1
+                        self.sleep(delay)
+                        continue
+                counters["provider_failures"] += 1
+                raise
+            finally:
+                elapsed = max(0.0, time.monotonic() - request_started)
+                self._consume_provider_phase_budget("scope_direct", elapsed)
+                counters.setdefault("_request_latencies", []).append(elapsed)
+        raise RuntimeError(f"{endpoint} failed after retries: {last_error}")
+
     def _call_provider(
         self,
         endpoint: str,
@@ -6329,13 +6562,12 @@ class PolymarketCollector:
         pool_name: str | None = None,
     ) -> Any:
         provider = provider or self.provider
-        del market_id
         provider_pool = pool_name or ("scope" if self._scope_phase_active else "collection")
-        # Provider-call stage is volatile telemetry.  Persisting it before
-        # every request rewrites the potentially multi-megabyte collector
-        # state and can itself delay a bounded tick.  Timeout and terminal
-        # cycle paths persist the durable evidence instead.
-        self._set_current_stage("provider_call", endpoint, observed_at)
+        ephemeral_scope_provider = (
+            provider_pool == "scope_direct" and provider is not self.provider
+        )
+        # Direct clones are intentionally one-shot: a timed-out daemon worker
+        # may still retain its session, so only completion can safely close it.
         last_error: Exception | None = None
         timeout = float(self.config.provider_timeout_seconds)
         for attempt in range(self.config.max_attempts):
@@ -6351,6 +6583,8 @@ class PolymarketCollector:
                         pool_name=provider_pool,
                     )
                 except _ProviderDeadlineExceeded as exc:
+                    if ephemeral_scope_provider:
+                        self._close_scope_direct_provider(provider)
                     deadline_error = self._record_provider_timeout(
                         exc.endpoint,
                         observed_at,
@@ -6362,6 +6596,10 @@ class PolymarketCollector:
                         self._cycle_deadline_exhausted = True
                     counters["provider_failures"] += 1
                     raise deadline_error
+                except BaseException:
+                    if ephemeral_scope_provider:
+                        self._close_scope_direct_provider(provider)
+                    raise
                 remaining = self._cycle_remaining_seconds()
                 effective_timeout = timeout
                 if (
@@ -6380,13 +6618,25 @@ class PolymarketCollector:
                 try:
                     result = future.result(timeout=wait_timeout)
                 except FutureTimeout:
-                    # ``FutureTimeout`` is also TimeoutError on supported
-                    # Python versions.  A completed future carrying a
-                    # provider TimeoutError must retain normal retry behavior.
+                    # A timeout owns the deadline: never authorize a result
+                    # merely because the future completed during this branch.
+                    # Drain completed work and release its key, while a still
+                    # running daemon keeps the existing done cleanup.
                     if future.done():
+                        try:
+                            future.result()
+                        except BaseException:
+                            pass
                         self._release_provider_call(_key)
-                        raise future.result()
-                    future.cancel()
+                        self._consume_transport_errors(provider)
+                        if provider_pool == "scope_direct":
+                            self._drain_provider_advisories_now(provider)
+                    else:
+                        future.cancel()
+                        if ephemeral_scope_provider:
+                            future.add_done_callback(
+                                lambda _future, clone=provider: self._close_scope_direct_provider(clone)
+                            )
                     cycle_expired = remaining is not None and remaining <= effective_timeout
                     deadline_error = self._record_provider_timeout(
                         endpoint,
@@ -6426,6 +6676,8 @@ class PolymarketCollector:
                             continue
                     detail = "; ".join(str(error) for error in transport_errors)
                     raise RuntimeError(f"{endpoint} provider failure: {detail}")
+                if ephemeral_scope_provider:
+                    self._close_scope_direct_provider(provider)
                 return result
             except _ProviderDeadlineExceeded:
                 raise
@@ -6434,6 +6686,8 @@ class PolymarketCollector:
                 transport_errors = self._consume_transport_errors(provider)
                 if provider_pool == "scope_direct":
                     self._drain_provider_advisories_now(provider)
+                if ephemeral_scope_provider:
+                    self._close_scope_direct_provider(provider)
                 counters["rate_limits"] += sum(
                     1 for error in transport_errors if getattr(error, "status", None) == 429
                 )

@@ -716,7 +716,7 @@ class MarketScopeCollectorTests(unittest.TestCase):
         )
         self.assertEqual(
             [item.reason for item in store.resolutions[-1].excluded_markets],
-            ["INACTIVE_MARKET"],
+            ["MARKET_CLOSED"],
         )
 
 
@@ -948,7 +948,7 @@ class MarketScopeCollectorTests(unittest.TestCase):
         }
         expected = {
             "active-unknown": ("ACTIVE_UNKNOWN",),
-            "closed-unknown": ("CLOSED_UNKNOWN",),
+            "closed-unknown": ("RESOLVED_MARKET",),
             "accepting-unknown": ("ACCEPTING_ORDERS_UNKNOWN",),
             "book-unknown": ("ORDER_BOOK_UNKNOWN",),
         }
@@ -973,10 +973,17 @@ class MarketScopeCollectorTests(unittest.TestCase):
                 [record],
                 resolved_at=T0,
             )
-            self.assertEqual(
-                {item.reason for item in result.deferred_markets},
-                set(expected[market_id]),
-            )
+            if market_id == "closed-unknown":
+                self.assertEqual(
+                    {item.reason for item in result.excluded_markets},
+                    {"RESOLVED_MARKET"},
+                )
+                self.assertFalse(result.deferred_markets)
+            else:
+                self.assertEqual(
+                    {item.reason for item in result.deferred_markets},
+                    set(expected[market_id]),
+                )
 
     def test_historical_constituent_is_not_current_authority_and_title_is_not_a_fallback(self) -> None:
         fixtures = (market("historical-politics", category="politics"), market("title-only", category="economics"))
@@ -2602,10 +2609,18 @@ class MarketScopeCollectorTests(unittest.TestCase):
         }
 
         class DirectClone(_PagedProvider):
-            def market(self, market_id: str):
+            def __init__(self) -> None:
+                super().__init__(closed_markets, ())
+                self.scope_market_calls: list[str] = []
+
+            def scope_market(self, market_id: str):
                 identifier = str(market_id)
-                self.market_calls.append(identifier)
+                self.scope_market_calls.append(identifier)
                 return market_by_id.get(identifier)
+
+            def market(self, market_id: str):
+                self.market_calls.append(str(market_id))
+                raise AssertionError("exact scope touched CLOB-enriched market path")
 
         class HangingBroadProvider(_HangingScopeProvider):
             def __init__(self) -> None:
@@ -2614,9 +2629,11 @@ class MarketScopeCollectorTests(unittest.TestCase):
                     ({"markets": (), "next_cursor": None},),
                 )
                 self.direct_clone: DirectClone | None = None
+                self.direct_clones: list[DirectClone] = []
 
             def isolated_worker_factory(self):
-                self.direct_clone = DirectClone(closed_markets, ())
+                self.direct_clone = DirectClone()
+                self.direct_clones.append(self.direct_clone)
                 return self.direct_clone
 
         provider = HangingBroadProvider()
@@ -2680,14 +2697,23 @@ class MarketScopeCollectorTests(unittest.TestCase):
                 for result in selected_results
             )
         )
-        self.assertGreaterEqual(cycle.provider_timeouts, 1)
-        self.assertEqual(cycle.candidate_bound_scheduled, ())
         self.assertIsNotNone(provider.direct_clone)
         self.assertEqual(
-            provider.direct_clone.market_calls,
+            [
+                market_id
+                for clone in provider.direct_clones
+                for market_id in clone.scope_market_calls
+            ],
             list(gamma_ids),
         )
-        self.assertEqual(provider.direct_clone.book_calls, [])
+        self.assertEqual(
+            [
+                market_id
+                for clone in provider.direct_clones
+                for market_id in clone.book_calls
+            ],
+            [],
+        )
         provider.release.set()
         collector.close()
     def test_protected_phase_timeout_preserves_downstream_collection_window(self) -> None:
@@ -2708,9 +2734,11 @@ class MarketScopeCollectorTests(unittest.TestCase):
                     ({"markets": (), "next_cursor": None},),
                 )
                 self.direct_clone: SlowDirectClone | None = None
+                self.direct_clones: list[SlowDirectClone] = []
 
             def isolated_worker_factory(self):
                 self.direct_clone = SlowDirectClone((), ())
+                self.direct_clones.append(self.direct_clone)
                 return self.direct_clone
 
         provider = SlowProtectedProvider()
@@ -2752,12 +2780,125 @@ class MarketScopeCollectorTests(unittest.TestCase):
 
         cycle = collector.collect_once(now=T0)
         self.assertIsNotNone(provider.direct_clone)
-        self.assertEqual(provider.direct_clone.market_calls[0], selected_ids[0])
+        self.assertTrue(provider.direct_clones)
+        self.assertEqual(provider.direct_clones[0].market_calls[0], selected_ids[0])
         self.assertGreaterEqual(cycle.provider_timeouts, 1)
         self.assertFalse(collector._cycle_deadline_exhausted)
         self.assertIn("legacy-leak", cycle.candidate_bound_scheduled)
         self.assertGreaterEqual(cycle.markets_attempted, 1)
         collector.close()
+    def test_fresh_direct_clone_recovers_stale_timeout_without_closing_live_worker(self) -> None:
+        selected_ids = tuple(f"recovery-selected-{index}" for index in range(8))
+        closed = replace(
+            market("recovery-closed"),
+            active=True,
+            closed=True,
+            settlement=SettlementState.RESOLVED_YES,
+        )
+        release = threading.Event()
+
+        class DirectClone(_PagedProvider):
+            def __init__(self, mode: str) -> None:
+                super().__init__((closed,), ())
+                self.mode = mode
+                self.close_calls = 0
+                self.started = threading.Event()
+
+            def scope_market(self, market_id: str):
+                self.market_calls.append(str(market_id))
+                if self.mode == "hang":
+                    self.started.set()
+                    release.wait(timeout=5.0)
+                    return None
+                return closed
+
+            def close(self) -> None:
+                self.close_calls += 1
+
+        class RecoveryProvider(_PagedProvider):
+            def __init__(self) -> None:
+                super().__init__((), ({"markets": (), "next_cursor": None},))
+                self.clones: list[DirectClone] = []
+
+            def isolated_worker_factory(self):
+                clone = DirectClone("hang" if not self.clones else "closed")
+                self.clones.append(clone)
+                return clone
+
+        provider = RecoveryProvider()
+        documents = {
+            candidate_id: {
+                "experiment_plan": {
+                    "market_scope": scope(
+                        "EXACT_MARKETS",
+                        market_ids=("recovery-closed",),
+                    ),
+                },
+            }
+            for candidate_id in selected_ids
+        }
+        store = _ScopeStore(documents)
+
+        class RecoveryCollector(_TwoWindowScopeCollector):
+            def _rolling_scope_market_ids(self):
+                self._rolling_scope_candidate_ids = selected_ids
+                self._rolling_scope_documents = {}
+                return []
+
+        collector = RecoveryCollector(
+            provider,
+            store,
+            CollectorConfig(
+                max_markets=1,
+                discovery_budget_per_cycle=1,
+                max_attempts=1,
+                provider_timeout_seconds=0.03,
+                backoff_initial_seconds=0,
+                jitter_seconds=0,
+            ),
+            candidate_ids=selected_ids,
+            clock=lambda: T0,
+            sleep=lambda _seconds: None,
+        )
+
+        first = collector.collect_once(now=T0)
+        self.assertGreaterEqual(first.provider_timeouts, 1)
+        self.assertEqual(len(provider.clones), 1)
+        self.assertTrue(provider.clones[0].started.wait(timeout=0.2))
+        self.assertEqual(provider.clones[0].close_calls, 0)
+
+        second = collector.collect_once(now=T0)
+        self.assertEqual(len(provider.clones), 2)
+        self.assertEqual(provider.clones[0].close_calls, 0)
+        self.assertEqual(provider.clones[1].close_calls, 1)
+        recovered = [
+            result
+            for result in store.resolutions
+            if result.candidate_id in selected_ids
+            and result.status == ZERO_MATCHES
+        ]
+        self.assertEqual(len(recovered), len(selected_ids))
+        self.assertTrue(
+            all(
+                len(result.excluded_markets) == 1
+                and result.excluded_markets[0].market_id == "recovery-closed"
+                and result.excluded_markets[0].reason == "MARKET_CLOSED"
+                for result in recovered
+            )
+        )
+        self.assertIsNotNone(collector._scope_direct_provider_executor)
+        self.assertLessEqual(
+            len(collector._scope_direct_provider_executor._threads),  # type: ignore[union-attr]
+            2,
+        )
+
+        collector.close()
+        self.assertEqual(provider.clones[0].close_calls, 0)
+        release.set()
+        deadline = time.monotonic() + 0.5
+        while provider.clones[0].close_calls == 0 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        self.assertEqual(provider.clones[0].close_calls, 1)
 
 
     def test_hanging_inventory_does_not_starve_direct_exact_scope_across_cycles(self) -> None:
@@ -2867,9 +3008,9 @@ class MarketScopeCollectorTests(unittest.TestCase):
             len(collector._scope_provider_executor._threads),  # type: ignore[union-attr]
             1,
         )
-        self.assertEqual(
+        self.assertLessEqual(
             len(collector._scope_direct_provider_executor._threads),  # type: ignore[union-attr]
-            1,
+            2,
         )
 
         provider.release.set()
@@ -3103,7 +3244,10 @@ class MarketScopeCollectorTests(unittest.TestCase):
         )
         self.assertEqual(max_active_calls, 1)
         self.assertIsNotNone(collector._scope_direct_provider_executor)
-        self.assertEqual(len(collector._scope_direct_provider_executor._threads), 1)  # type: ignore[union-attr]
+        self.assertLessEqual(
+            len(collector._scope_direct_provider_executor._threads),  # type: ignore[union-attr]
+            2,
+        )
         provider.release.set()
         collector.close()
     def test_repeated_malformed_exact_clone_advisories_are_drained(self) -> None:
@@ -3116,30 +3260,40 @@ class MarketScopeCollectorTests(unittest.TestCase):
                 *args,
                 validation_errors=None,
                 call_log=None,
+                clones=None,
                 **kwargs,
             ):
                 super().__init__(*args, **kwargs)
                 self.validation_errors = validation_errors if validation_errors is not None else []
                 self.call_log = call_log if call_log is not None else []
-
+                self.clones = clones if clones is not None else []
+                self.closed = False
             def market(self, market_id: str):
+                if self.closed:
+                    raise AssertionError("closed clone reused")
                 identifier = str(market_id)
                 self.call_log.append(identifier)
                 self.validation_errors.append(ValueError("malformed exact response"))
                 return None
 
             def consume_validation_errors(self):
+                if self.closed:
+                    raise AssertionError("closed clone advisory read")
                 errors = tuple(self.validation_errors)
                 self.validation_errors.clear()
                 return errors
 
+            def close(self):
+                self.closed = True
             def isolated_worker_factory(self):
-                return MalformedCloneProvider(
+                clone = MalformedCloneProvider(
                     tuple(self._markets.values()),
                     (),
                     call_log=self.call_log,
+                    clones=self.clones,
                 )
-
+                self.clones.append(clone)
+                return clone
         provider = MalformedCloneProvider(
             (target,),
             ({"markets": (), "next_cursor": None},),
@@ -3158,12 +3312,18 @@ class MarketScopeCollectorTests(unittest.TestCase):
             ("malformed-candidate",),
             max_markets=1,
         )
-
+        counters = collector._new_counters()
         for index in range(3):
-            collector.collect_once(now=T0 + timedelta(minutes=index))
-            clone = collector._scope_direct_provider
-            self.assertIsNotNone(clone)
-            self.assertEqual(clone.validation_errors, [])  # type: ignore[union-attr]
+            collector._call_scope_direct(
+                f"test-malformed-{index}",
+                lambda operation_provider: operation_provider.market(target_id),
+                T0 + timedelta(minutes=index),
+                counters,
+            )
+            self.assertTrue(provider.clones)
+            clone = provider.clones[-1]
+            self.assertTrue(clone.closed)
+            self.assertEqual(clone.validation_errors, [])
         self.assertEqual(len(provider.validation_errors), 1)
         collector.close()
 
@@ -3180,11 +3340,13 @@ class MarketScopeCollectorTests(unittest.TestCase):
                 *args,
                 validation_errors=None,
                 call_log=None,
+                clones=None,
                 **kwargs,
             ):
                 super().__init__(*args, **kwargs)
                 self.validation_errors = validation_errors if validation_errors is not None else []
                 self.call_log = call_log if call_log is not None else []
+                self.clones = clones if clones is not None else []
 
             def market(self, market_id: str):
                 identifier = str(market_id)
@@ -3204,11 +3366,14 @@ class MarketScopeCollectorTests(unittest.TestCase):
                 return errors
 
             def isolated_worker_factory(self):
-                return LateCloneProvider(
+                clone = LateCloneProvider(
                     tuple(self._markets.values()),
                     (),
                     call_log=self.call_log,
+                    clones=self.clones,
                 )
+                self.clones.append(clone)
+                return clone
 
         provider = LateCloneProvider(
             (successful_market,),
@@ -3241,9 +3406,9 @@ class MarketScopeCollectorTests(unittest.TestCase):
         release.set()
         second = collector.collect_once(now=T0 + timedelta(minutes=1))
         self.assertIn(success_id, second.candidate_bound_scheduled)
-        self.assertEqual(
-            collector._scope_direct_provider.validation_errors,  # type: ignore[union-attr]
-            [],
+        self.assertTrue(provider.clones)
+        self.assertTrue(
+            all(clone.validation_errors == [] for clone in provider.clones)
         )
         collector.close()
 

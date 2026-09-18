@@ -614,6 +614,26 @@ def _current_eligibility(raw: Mapping[str, Any], now: datetime) -> tuple[str, st
 
     active = _bool(_nested(raw, "active"), None)
     open_state = _bool(_nested(raw, "open"), None)
+    archived = _bool(_nested(raw, "archived"), None)
+    closed = _bool(_nested(raw, "closed"), None)
+    settlement = _text(_nested(raw, "settlement", "outcome", "resolution_status")).casefold()
+    resolved_flag = _bool(_nested(raw, "resolved", "is_resolved"), None)
+    accepting = _bool(_nested(raw, "accepting_orders", "acceptingOrders"), None)
+
+    # Explicit terminal facts are authoritative even when a provider omits
+    # active/open state from a lifecycle-only response.  Do not infer active
+    # state; only defer when these terminal facts are absent or unknown.
+    if archived:
+        return "exclude", "MARKET_CLOSED"
+    if closed is True:
+        return "exclude", "MARKET_CLOSED"
+    if active is False or open_state is False:
+        return "exclude", "INACTIVE_MARKET"
+    if resolved_flag is True or settlement in {"resolved_yes", "resolved_no", "void", "closed", "expired"}:
+        return "exclude", "RESOLVED_MARKET"
+    if accepting is False:
+        return "exclude", "ACCEPTING_ORDERS_FALSE"
+
     if active is None and open_state is None:
         return "defer", "ACTIVE_UNKNOWN"
     if active is None:
@@ -622,20 +642,10 @@ def _current_eligibility(raw: Mapping[str, Any], now: datetime) -> tuple[str, st
         open_state = active
     if not active or not open_state:
         return "exclude", "INACTIVE_MARKET"
-    archived = _bool(_nested(raw, "archived"), None)
-    if archived:
-        return "exclude", "MARKET_CLOSED"
-    closed = _bool(_nested(raw, "closed"), None)
     if closed is None:
         return "defer", "CLOSED_UNKNOWN"
     if closed:
         return "exclude", "MARKET_CLOSED"
-    settlement = _text(_nested(raw, "settlement", "outcome", "resolution_status")).casefold()
-    resolved_flag = _bool(_nested(raw, "resolved", "is_resolved"), None)
-    if resolved_flag is True or settlement in {"resolved_yes", "resolved_no", "void", "closed", "expired"}:
-        return "exclude", "RESOLVED_MARKET"
-
-    accepting = _bool(_nested(raw, "accepting_orders", "acceptingOrders"), None)
     if accepting is None:
         return "defer", "ACCEPTING_ORDERS_UNKNOWN"
     if not accepting:

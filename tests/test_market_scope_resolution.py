@@ -84,7 +84,7 @@ class MarketScopeResolutionTests(unittest.TestCase):
         policy = {"schema_version": "1", "mode": "EXACT_MARKETS", "market_ids": ["m1"]}
         closed = resolve_market_scope("closed", {"market_scope": policy}, [market("m1", active=False)], resolved_at=T0)
         self.assertEqual(closed.status, ZERO_MATCHES)
-        self.assertEqual(closed.excluded_markets[0].reason, "INACTIVE_MARKET")
+        self.assertEqual(closed.excluded_markets[0].reason, "MARKET_CLOSED")
 
         missing_state = market("m1")
         for key in ("accepting_orders", "enable_order_book"):
