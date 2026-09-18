@@ -4053,6 +4053,211 @@ class MarketScopeCollectorTests(unittest.TestCase):
         self.assertEqual(second.paper_forward_scheduled, market_ids)
         collector.close()
 
+    def test_mixed_catalog_fast_handoff_defers_unresolved_loaders_until_normal_cycle(self) -> None:
+        target_ids = tuple(f"mixed-target-{index}" for index in range(3))
+        target_markets = tuple(f"mixed-market-{index}" for index in range(3))
+        unrelated_ids = ("mixed-missing", "mixed-malformed", "mixed-error", "mixed-resume")
+        resume_market_id = "mixed-resume-market"
+        class MixedCatalogStore(_ScopeStore):
+            def __init__(self) -> None:
+                super().__init__({})
+                self.lifecycle_calls: list[str] = []
+                self.allow_resume = False
+                self.resume_record: dict[str, object] | None = None
+
+            def load_candidate_lifecycle(self, candidate_id=None, *, limit: int = 1000):
+                if candidate_id is not None:
+                    identifier = str(candidate_id)
+                    self.lifecycle_calls.append(identifier)
+                    if identifier == "mixed-missing":
+                        return None
+                    if identifier == "mixed-malformed":
+                        return {
+                            "candidate_id": identifier,
+                            "stage": CandidateStage.FROZEN.value,
+                            "payload": "malformed",
+                        }
+                    if identifier == "mixed-error":
+                        raise RuntimeError("transient lifecycle loader failure")
+                    if identifier == "mixed-resume":
+                        return self.resume_record if self.allow_resume else None
+                return super().load_candidate_lifecycle(candidate_id, limit=limit)
+
+        store = MixedCatalogStore()
+        for index, (candidate_id, market_id) in enumerate(zip(target_ids, target_markets)):
+            policy = normalize_market_scope(
+                {
+                    **normalize_market_scope(
+                        market_ids=[market_id],
+                        target_instrument="POLYMARKET",
+                    ).as_dict(),
+                    "provenance": "canonical",
+                }
+            )
+            dataset_selector = {
+                "dataset_id": "mixed-history",
+                "dataset_version": "v1",
+            }
+            config = {
+                "candidate_id": candidate_id,
+                "observation_intent": True,
+                "observation_only_lineage": True,
+                "strategy_document": {
+                    "version": 1,
+                    "market_type": "prediction",
+                    "family": "momentum",
+                    "parameters": {"lookback": 1},
+                    "probability_model": "market-history",
+                },
+                "model_document": {"model_required": False},
+                "execution": "paper_only",
+                "market_scope": policy.as_dict(),
+                "market_scope_hash": policy.scope_hash,
+                "market_scope_version": policy.scope_version,
+                "plan_hash": f"sha256:mixed-plan-{index}",
+                "dataset_selector": dataset_selector,
+                "dataset_attestation": {
+                    **dataset_selector,
+                    "source_type": "HISTORICAL",
+                },
+            }
+            intent = ForwardTestSpec(
+                f"observation-intent-{candidate_id}",
+                f"sha256:mixed-strategy-{index}",
+                f"sha256:mixed-model-{index}",
+                config,
+                T0,
+                1_000.0,
+                (),
+                {},
+            )
+            store.forward_tests[intent.experiment_id] = intent.as_record()
+            store.documents[candidate_id] = {
+                "candidate_id": candidate_id,
+                "stage": CandidateStage.SCHEMA_VALIDATED.value,
+                "payload": {
+                    **config,
+                    "schema_valid": True,
+                    "paper_observation_intent": True,
+                    "paper_observation_intent_id": intent.experiment_id,
+                    "paper_only": True,
+                    "research_only": True,
+                    "experiment_plan": {
+                        "market_scope": policy.as_dict(),
+                        "market_scope_hash": policy.scope_hash,
+                        "market_scope_version": policy.scope_version,
+                        "plan_hash": config["plan_hash"],
+                        "dataset_selector": dataset_selector,
+                    },
+                },
+            }
+            store.resolutions.append(
+                {
+                    "candidate_id": candidate_id,
+                    "scope_hash": policy.scope_hash,
+                    "scope_version": policy.scope_version,
+                    "resolved_at": T0.isoformat(),
+                    "status": "MATCHED",
+                    "reason": "MATCHED",
+                    "matched_markets": [{"market_id": market_id}],
+                    "excluded_markets": [],
+                    "deferred_markets": [],
+                }
+            )
+
+        resume_policy = normalize_market_scope(
+            {
+                **normalize_market_scope(
+                    market_ids=[resume_market_id],
+                    target_instrument="POLYMARKET",
+                ).as_dict(),
+                "provenance": "canonical",
+            }
+        )
+        resume_dataset = {
+            "dataset_id": "mixed-resume-history",
+            "dataset_version": "v1",
+        }
+        resume_config = {
+            "candidate_id": "mixed-resume",
+            "strategy_document": {
+                "version": 1,
+                "market_type": "prediction",
+                "family": "momentum",
+                "parameters": {"lookback": 1},
+                "probability_model": "market-history",
+            },
+            "model_document": {"model_required": False},
+            "execution": "paper_only",
+            "market_scope": resume_policy.as_dict(),
+            "market_scope_hash": resume_policy.scope_hash,
+            "market_scope_version": resume_policy.scope_version,
+            "plan_hash": "sha256:mixed-resume-plan",
+            "dataset_selector": resume_dataset,
+            "dataset_attestation": {
+                **resume_dataset,
+                "source_type": "HISTORICAL",
+            },
+        }
+        store.resume_record = {
+            "candidate_id": "mixed-resume",
+            "stage": CandidateStage.FROZEN.value,
+            "payload": {
+                **resume_config,
+                "experiment_plan": {
+                    "market_scope": resume_policy.as_dict(),
+                    "market_scope_hash": resume_policy.scope_hash,
+                    "market_scope_version": resume_policy.scope_version,
+                    "plan_hash": resume_config["plan_hash"],
+                    "dataset_selector": resume_dataset,
+                },
+            },
+        }
+        store.states["polymarket"] = {
+            "cycle_continuation": {
+                "remaining_market_ids": [resume_market_id],
+            }
+        }
+
+        class MixedProvider(_PagedProvider):
+            pass
+
+        all_markets = (*target_markets, resume_market_id)
+        provider = MixedProvider(
+            tuple(market(market_id) for market_id in all_markets),
+            ({"snapshots": tuple(market(market_id) for market_id in all_markets), "next_cursor": None},),
+        )
+        collector = self._collector(
+            provider,
+            store,
+            unrelated_ids,
+            max_markets=4,
+        )
+        cycles = []
+        fast_states = []
+        for offset in range(4):
+            if offset == 3:
+                store.allow_resume = True
+            cycles.append(collector.collect_once(now=T0 + timedelta(seconds=offset)))
+            if offset < 3:
+                fast_states.append(dict(store.states["polymarket"]))
+                self.assertNotIn(resume_market_id, provider.market_calls)
+        for index, cycle in enumerate(cycles[:3]):
+            self.assertEqual(cycle.paper_forward_scheduled, target_markets, msg=f"fast cycle {index}")
+            self.assertNotIn("legacy-leak", cycle.paper_forward_markets)
+        for state in fast_states:
+            continuation = state["cycle_continuation"]
+            self.assertIn(resume_market_id, continuation["remaining_market_ids"])
+        self.assertGreaterEqual(cycles[0].markets_attempted, 3)
+        self.assertGreaterEqual(cycles[0].snapshots_inserted, 3)
+        self.assertGreaterEqual(len(provider.page_calls), 1)
+        for candidate_id in unrelated_ids:
+            self.assertGreaterEqual(
+                store.lifecycle_calls.count(candidate_id),
+                4,
+            )
+        collector.close()
+
     def test_observation_materialization_advances_schema_lifecycle_and_restarts_idempotently(self) -> None:
         candidate_id = "observation-lifecycle-candidate"
         market_id = "observation-lifecycle-market"

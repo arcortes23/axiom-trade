@@ -481,6 +481,8 @@ class PolymarketCollector:
         self._observation_materialization_turn = 0
         self._scope_resolutions: dict[str, Any] = {}
         self._scope_handoff_fast_streak = 0
+        self._scope_handoff_fast_path_active = False
+        self._scope_fast_suppressed_resume_ids: tuple[str, ...] = ()
         # Resolutions produced for this cycle are the only authority passed to
         # observation-intent materialization; callers cannot supply market ids
         self._provider_executor_lock = threading.Lock()
@@ -633,8 +635,9 @@ class PolymarketCollector:
         monotonic_started = time.monotonic()
         self._cycle_deadline_monotonic = monotonic_started + self.config.cycle_budget_seconds
         self._cycle_deadline_exhausted = False
+        self._scope_handoff_fast_path_active = False
+        self._scope_fast_suppressed_resume_ids = ()
         self._scope_inventory_budget_remaining = None
-        self._scope_direct_budget_remaining = None
         self._cycle_last_remaining_market_ids = ()
         root_state = self.store.get_collector_state(self.config.collector_name) or {}
         previous_cycle_continuation = (
@@ -773,14 +776,24 @@ class PolymarketCollector:
                 for values in scope_candidate_markets.values()
                 for market_id in values
             }
-            resume_ids = [
-                market_id
-                for market_id in resume_ids
-                if (
-                    market_id not in self._scope_authority_market_ids
-                    or market_id in scope_authorized_market_ids
-                )
-            ]
+            if self._scope_handoff_fast_path_active:
+                self._scope_fast_suppressed_resume_ids = tuple(
+                    dict.fromkeys(
+                        str(item).strip()
+                        for item in resume_ids
+                        if str(item).strip()
+                    )
+                )[:_MAX_CYCLE_CONTINUATION_IDS]
+                resume_ids = []
+            else:
+                resume_ids = [
+                    market_id
+                    for market_id in resume_ids
+                    if (
+                        market_id not in self._scope_authority_market_ids
+                        or market_id in scope_authorized_market_ids
+                    )
+                ]
 
 
         finally:
@@ -1280,17 +1293,32 @@ class PolymarketCollector:
         deadline_endpoint = self._current_endpoint
         if self._cycle_deadline_exhausted:
             self._cycle_last_remaining_market_ids = tuple(dict.fromkeys(
-                str(item).strip()
-                for item in remaining_after_deadline
-                if str(item).strip()
+                [
+                    *self._scope_fast_suppressed_resume_ids,
+                    *remaining_after_deadline,
+                ]
             ))[:_MAX_CYCLE_CONTINUATION_IDS]
+        elif self._scope_fast_suppressed_resume_ids:
+            self._cycle_last_remaining_market_ids = self._scope_fast_suppressed_resume_ids
+        has_retryable_continuation = bool(
+            self._cycle_deadline_exhausted
+            or self._scope_fast_suppressed_resume_ids
+        )
         cycle_continuation = (
             {
                 "status": "DEGRADED",
                 "retryable": True,
-                "resolver": "retry_provider_call",
+                "resolver": (
+                    "retry_provider_call"
+                    if self._cycle_deadline_exhausted
+                    else "retry_scope_resolution"
+                ),
                 "next_action": "retry_next_collection_tick",
-                "timeout_reason": "COLLECTOR_CYCLE_DEADLINE_EXCEEDED",
+                "timeout_reason": (
+                    "COLLECTOR_CYCLE_DEADLINE_EXCEEDED"
+                    if self._cycle_deadline_exhausted
+                    else "UNRESOLVED_SCOPE_HANDOFF_RESUME"
+                ),
                 "stage": deadline_stage,
                 "endpoint": deadline_endpoint,
                 "timeout_endpoint": deadline_endpoint,
@@ -1299,7 +1327,7 @@ class PolymarketCollector:
                 "discovery_cursor": discovery_cursor,
                 "updated_at": ended.isoformat(),
             }
-            if self._cycle_deadline_exhausted
+            if has_retryable_continuation
             else None
         )
         final_stage = (
@@ -2991,7 +3019,6 @@ class PolymarketCollector:
                 preloaded_scope_markets,
                 preloaded_scope_resolutions,
             )
-            fast_path_loader_failed = False
             preloaded_handoff_ids = self._validated_observation_handoff_ids(
                 preloaded_scope_ids,
                 preloaded_scope_markets,
@@ -3007,29 +3034,29 @@ class PolymarketCollector:
                     for candidate_id in current_candidate_ids
                     if candidate_id in preloaded_handoff_ids
                 ]
-                fast_scope_candidate_ids: list[str] = []
+                # Keep every current id inside the scope projection while
+                # this handoff-only fast path is active.  Unresolved catalog
+                # rows therefore cannot fall through to legacy requirements;
+                # only validated handoffs receive market authority below.
+                fast_scope_candidate_ids = list(current_candidate_ids)
                 authority_market_ids: set[str] = set()
                 for candidate_id in current_candidate_ids:
-                    try:
-                        record = loader(candidate_id)
-                    except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
-                        fast_path_loader_failed = True
-                        record = None
+                    record = None
+                    if callable(loader):
+                        try:
+                            record = loader(candidate_id)
+                        except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+                            record = None
                     payload = record.get("payload") if isinstance(record, Mapping) else None
                     rolling_payload = (
                         rolling_documents.get(candidate_id)
                         if isinstance(rolling_documents, Mapping)
                         else None
                     )
-                    if not isinstance(payload, Mapping):
-                        if isinstance(rolling_payload, Mapping):
-                            payload = rolling_payload
-                        else:
-                            fast_path_loader_failed = True
-                            continue
-                    if not self._has_scope_material(payload):
+                    if not isinstance(payload, Mapping) and isinstance(rolling_payload, Mapping):
+                        payload = rolling_payload
+                    if not isinstance(payload, Mapping) or not self._has_scope_material(payload):
                         continue
-                    fast_scope_candidate_ids.append(candidate_id)
                     try:
                         authority_market_ids.update(
                             self._scope_exact_market_ids((self._scope_document(payload),))
@@ -3048,29 +3075,29 @@ class PolymarketCollector:
                             )
                         except (TypeError, ValueError):
                             continue
-                if not fast_path_loader_failed:
-                    self._scope_authority_market_ids = authority_market_ids
-                    self._scope_resolution_deferred_candidate_ids = tuple(
-                        candidate_id
-                        for candidate_id in fast_scope_candidate_ids
-                        if candidate_id not in preloaded_handoff_ids
-                    )[:_MAX_SCOPE_RESOLUTION_CANDIDATES]
-                    self._scope_resolutions.update(
-                        {
-                            candidate_id: preloaded_scope_resolutions[candidate_id]
-                            for candidate_id in ordered_handoff_ids
-                        }
-                    )
-                    self._scope_handoff_fast_streak += 1
-                    return (
-                        fast_scope_candidate_ids,
-                        {
-                            candidate_id: preloaded_scope_markets[candidate_id]
-                            for candidate_id in ordered_handoff_ids
-                        },
-                        {},
-                        self._scope_cursor(root_state),
-                    )
+                self._scope_authority_market_ids = authority_market_ids
+                self._scope_resolution_deferred_candidate_ids = tuple(
+                    candidate_id
+                    for candidate_id in current_candidate_ids
+                    if candidate_id not in preloaded_handoff_ids
+                )[:_MAX_SCOPE_RESOLUTION_CANDIDATES]
+                self._scope_resolutions.update(
+                    {
+                        candidate_id: preloaded_scope_resolutions[candidate_id]
+                        for candidate_id in ordered_handoff_ids
+                    }
+                )
+                self._scope_handoff_fast_path_active = True
+                self._scope_handoff_fast_streak += 1
+                return (
+                    fast_scope_candidate_ids,
+                    {
+                        candidate_id: preloaded_scope_markets[candidate_id]
+                        for candidate_id in ordered_handoff_ids
+                    },
+                    {},
+                    self._scope_cursor(root_state),
+                )
         self._scope_handoff_fast_streak = 0
         current_rolling_ids = {
             str(item).strip()
@@ -3154,7 +3181,7 @@ class PolymarketCollector:
         for candidate_id in candidate_order:
             try:
                 record = loader(candidate_id) if callable(loader) else None
-            except (AttributeError, KeyError, TypeError, ValueError):
+            except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
                 record = None
             if not isinstance(record, Mapping):
                 rolling_document = (
