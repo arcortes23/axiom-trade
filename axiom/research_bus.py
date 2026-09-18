@@ -44,6 +44,8 @@ class ResearchQueueItem:
     dedupe_key: str | None = None
     result: Any | None = None
     schema_version: str = "1"
+    priority: int = 0
+
     @classmethod
     def from_record(cls, record: Mapping[str, Any]) -> "ResearchQueueItem":
         return cls(
@@ -63,6 +65,7 @@ class ResearchQueueItem:
             str(record["dedupe_key"]) if record.get("dedupe_key") is not None else None,
             record.get("result"),
             str(record.get("schema_version", "1")),
+            int(record.get("priority", 0)),
         )
 
     def as_record(self) -> dict[str, Any]:
@@ -83,8 +86,9 @@ class ResearchQueueItem:
             "dedupe_key": self.dedupe_key,
             "result": self.result,
             "schema_version": self.schema_version,
-        }
+            "priority": self.priority,
 
+        }
 
 _ALLOWED_TYPES = frozenset({"hypothesis", "candidate", "report", "review_request", "experiment_result"})
 _FORBIDDEN_FIELD_TOKENS = frozenset(
@@ -448,9 +452,24 @@ class DurableResearchBus:
         record = self._store.get_research_item(item_id)
         return ResearchQueueItem.from_record(record) if record else None
 
-    def list(self, *, status: ResearchQueueStatus | str | None = None, limit: int = 100) -> tuple[ResearchQueueItem, ...]:
+    def list(
+        self,
+        *,
+        status: ResearchQueueStatus | str | None = None,
+        limit: int = 100,
+        after_priority: int | None = None,
+        after_created_at: datetime | str | None = None,
+        after_item_id: str | None = None,
+    ) -> tuple[ResearchQueueItem, ...]:
         value = status.value if isinstance(status, ResearchQueueStatus) else status
-        return tuple(ResearchQueueItem.from_record(item) for item in self._store.list_research_items(status=value, limit=limit))
+        records = self._store.list_research_items(
+            status=value,
+            limit=limit,
+            after_priority=after_priority,
+            after_created_at=after_created_at,
+            after_item_id=after_item_id,
+        )
+        return tuple(ResearchQueueItem.from_record(item) for item in records)
 
     def stats(self) -> dict[str, int]:
         return self._store.research_queue_stats()

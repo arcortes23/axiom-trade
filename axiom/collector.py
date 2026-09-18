@@ -664,6 +664,9 @@ class PolymarketCollector:
             else None
         )
         requested = tuple(dict.fromkeys(str(item).strip() for item in (market_ids or ()) if str(item).strip()))
+        superseded_candidate_ids, superseded_intent_ids = (
+            self._superseded_observation_ids()
+        )
         rolling_scope_ids = self._rolling_scope_market_ids()
         rolling_exact_scope_ids = {
             market_id
@@ -693,11 +696,27 @@ class PolymarketCollector:
         configured_values = tuple(dict.fromkeys([*configured, *rolling_non_exact_ids]))
 
         primary_candidate_ids = list(dict.fromkeys([
-            *(self._active_primary_candidate_ids() or ()),
-            *getattr(self, "_rolling_scope_candidate_ids", ()),
+            *(
+                candidate_id
+                for candidate_id in (self._active_primary_candidate_ids() or ())
+                if candidate_id not in superseded_candidate_ids
+            ),
+            *(
+                candidate_id
+                for candidate_id in getattr(self, "_rolling_scope_candidate_ids", ())
+                if candidate_id not in superseded_candidate_ids
+            ),
         ]))
-        paper_ids = self._active_paper_forward_ids()
-        observation_intent_ids = self._active_observation_intent_ids()
+        paper_ids = [
+            candidate_id
+            for candidate_id in self._active_paper_forward_ids()
+            if candidate_id not in superseded_candidate_ids
+        ]
+        observation_intent_ids = [
+            candidate_id
+            for candidate_id in self._active_observation_intent_ids()
+            if candidate_id not in superseded_candidate_ids
+        ]
 
         primary_candidate_set = set(primary_candidate_ids)
         paper_set = set(paper_ids)
@@ -1525,6 +1544,7 @@ class PolymarketCollector:
         self._rolling_scope_blocked = False
         self._rolling_scope_candidate_ids = ()
         self._rolling_scope_documents = {}
+        superseded_candidate_ids, _ = self._superseded_observation_ids()
         selection_loader = getattr(self.store, "load_current_portfolio_selection", None)
 
         if not callable(selection_loader):
@@ -1691,6 +1711,8 @@ class PolymarketCollector:
                 self._rolling_scope_blocked = True
                 continue
             candidate_id = candidate_ids[0] if candidate_ids else None
+            if candidate_id and candidate_id in superseded_candidate_ids:
+                continue
             scope_documents: list[Mapping[str, Any]] = []
             legacy_ids: list[str] = []
             canonical_scope_seen = False
@@ -1786,13 +1808,18 @@ class PolymarketCollector:
         return list(dict.fromkeys(result))[: self.config.max_markets]
 
 
-    def _active_primary_candidate_ids(self) -> list[str] | None:
+    def _active_primary_candidate_ids(
+        self,
+        superseded_candidate_ids: set[str] | None = None,
+    ) -> list[str] | None:
         """Return the currently selected/eligible ranking universe.
 
         PAPER_FORWARD is not a disqualifier here: a paper candidate can be
         ranked and therefore remain in tier one.  Unranked paper candidates
         are discovered separately as tier two.
         """
+        if superseded_candidate_ids is None:
+            superseded_candidate_ids, _ = self._superseded_observation_ids()
         lock = getattr(self.store, "_lock", None)
         with lock if lock is not None else nullcontext():
             try:
@@ -1801,7 +1828,12 @@ class PolymarketCollector:
                     "SELECT candidate_id FROM canary_rankings "
                     "WHERE selected=1 ORDER BY rank,candidate_id LIMIT 1000"
                 ).fetchall()
-                ranked = [str(row[0]).strip() for row in rows if str(row[0]).strip()]
+                ranked = [
+                    str(row[0]).strip()
+                    for row in rows
+                    if str(row[0]).strip()
+                    and str(row[0]).strip() not in superseded_candidate_ids
+                ]
                 if ranked:
                     return list(dict.fromkeys(ranked))
             except Exception:
@@ -1811,7 +1843,12 @@ class PolymarketCollector:
                 rows = connection.execute(
                     "SELECT candidate_id FROM canary_eligibility ORDER BY eligible_at,candidate_id LIMIT 1000"
                 ).fetchall()
-                eligible = [str(row[0]).strip() for row in rows if str(row[0]).strip()]
+                eligible = [
+                    str(row[0]).strip()
+                    for row in rows
+                    if str(row[0]).strip()
+                    and str(row[0]).strip() not in superseded_candidate_ids
+                ]
                 if eligible:
                     return list(dict.fromkeys(eligible))
             except Exception:
@@ -1881,7 +1918,19 @@ class PolymarketCollector:
             "missing": list(fallback_markets),
         }
 
-    def _active_paper_forward_ids(self) -> list[str]:
+    def _superseded_observation_ids(self) -> tuple[set[str], set[str]]:
+        try:
+            intents = ForwardTestRegistry(self.store).list_observation_intents()
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            return set(), set()
+        return self._observation_superseded_ids(intents)
+
+    def _active_paper_forward_ids(
+        self,
+        superseded_candidate_ids: set[str] | None = None,
+    ) -> list[str]:
+        if superseded_candidate_ids is None:
+            superseded_candidate_ids, _ = self._superseded_observation_ids()
         method = getattr(self.store, "load_candidate_lifecycle", None)
         if not callable(method):
             return []
@@ -1897,15 +1946,57 @@ class PolymarketCollector:
             if isinstance(row, Mapping)
             and str(row.get("stage", "")).strip().upper() in {"PAPER_FORWARD", "PAPER_PROMOTABLE"}
             and str(row.get("candidate_id", "")).strip()
+            and str(row.get("candidate_id", "")).strip() not in superseded_candidate_ids
         ))
 
-    def _active_observation_intent_ids(self) -> list[str]:
+    @staticmethod
+    def _observation_superseded_ids(
+        intents: Sequence[Any],
+    ) -> tuple[set[str], set[str]]:
+        superseded_candidates: set[str] = set()
+        superseded_intents: set[str] = set()
+        for spec in intents:
+            config = spec.config if isinstance(spec.config, Mapping) else {}
+            handoff = config.get("observation_handoff")
+            if not isinstance(handoff, Mapping):
+                continue
+            predecessor_candidate_id = str(
+                handoff.get("predecessor_candidate_id", "")
+            ).strip()
+            predecessor_intent_id = str(
+                handoff.get("predecessor_observation_intent_id", "")
+            ).strip()
+            if predecessor_candidate_id:
+                superseded_candidates.add(predecessor_candidate_id)
+            if predecessor_intent_id:
+                superseded_intents.add(predecessor_intent_id)
+        return superseded_candidates, superseded_intents
+    def _active_observation_intent_ids(
+        self,
+        superseded_candidate_ids: set[str] | None = None,
+        superseded_intent_ids: set[str] | None = None,
+    ) -> list[str]:
         intents = ForwardTestRegistry(self.store).list_observation_intents()
+        discovered_candidates, discovered_intents = self._observation_superseded_ids(intents)
+        superseded_candidate_ids = (
+            discovered_candidates
+            if superseded_candidate_ids is None
+            else superseded_candidate_ids
+        )
+        superseded_intent_ids = (
+            discovered_intents
+            if superseded_intent_ids is None
+            else superseded_intent_ids
+        )
         result: list[str] = []
         for spec in intents:
             config = spec.config if isinstance(spec.config, Mapping) else {}
             candidate_id = str(config.get("candidate_id", "")).strip()
-            if candidate_id:
+            if (
+                candidate_id
+                and candidate_id not in superseded_candidate_ids
+                and str(spec.experiment_id).strip() not in superseded_intent_ids
+            ):
                 result.append(candidate_id)
         return list(dict.fromkeys(result))
 
@@ -1922,16 +2013,26 @@ class PolymarketCollector:
             self._observation_materialization_deferred_candidate_ids = ()
             return
         registry = ForwardTestRegistry(self.store)
+        intents = registry.list_observation_intents()
+        superseded_candidates, superseded_intents = self._observation_superseded_ids(intents)
         by_candidate = {
             str(spec.config.get("candidate_id", "")).strip(): spec
-            for spec in registry.list_observation_intents()
+            for spec in intents
             if isinstance(spec.config, Mapping)
             and str(spec.config.get("candidate_id", "")).strip()
+            and str(spec.config.get("candidate_id", "")).strip()
+            not in superseded_candidates
+            and str(spec.experiment_id).strip() not in superseded_intents
         }
         ordered_ids = list(dict.fromkeys([
             *self._observation_materialization_deferred_candidate_ids,
             *(str(item).strip() for item in candidate_ids if str(item).strip()),
         ]))
+        ordered_ids = [
+            candidate_id
+            for candidate_id in ordered_ids
+            if candidate_id not in superseded_candidates
+        ]
         deferred_ids: list[str] = []
         for index, candidate_id in enumerate(ordered_ids):
             if not self._scope_pipeline_budget_available():

@@ -4,7 +4,12 @@ from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 import unittest
 
-from axiom.autonomous import AutonomousResearchConfig, AutonomousResearchProcessor
+from axiom.autonomous import (
+    AutonomousResearchConfig,
+    AutonomousResearchProcessor,
+    _candidate_id,
+    _legacy_recovery_key,
+)
 from axiom.forward import ForwardTestRegistry
 from axiom.lifecycle import CandidateStage, PromotionCriteria
 from axiom.paper_engine import run_forward_paper
@@ -463,6 +468,220 @@ class MarketScopeEndToEndTests(unittest.TestCase):
             )
             self.assertEqual(store.list_reports(), [])
 
+    def test_predeclared_insufficient_history_defers_after_durable_observation_handoff(self) -> None:
+        with AxiomStore(":memory:") as store:
+            self._seed_predeclared_history(store)
+            bus = DurableResearchBus(store)
+            processor = AutonomousResearchProcessor(store, bus=bus, clock=lambda: T0)
+
+            queued = processor._enqueue_predeclared_from_persisted_scope(T0)
+            self.assertEqual(len(queued), 3)
+            cycle = processor.process_pending(worker="predeclared-handoff", now=T0)
+            self.assertEqual(cycle.completed, 1, repr(cycle))
+            self.assertEqual(cycle.rejected, 0, repr(cycle))
+            completed_items = [
+                candidate
+                for candidate in (bus.get(item.item_id) for item in queued)
+                if candidate is not None
+                and candidate.status is ResearchQueueStatus.COMPLETED
+            ]
+            self.assertEqual(len(completed_items), 1)
+            item = completed_items[0]
+            self.assertTrue(item.result["accepted"])
+            self.assertEqual(item.result["status"], "DEFERRED")
+            self.assertEqual(item.result["queue_outcome"], "OBSERVATION_DEFERRED")
+
+            versions = store.list_strategy_versions(limit=10)
+            trials = store.list_research_trials(limit=10)
+            enrollments = store.list_rolling_enrollments(limit=10)
+            self.assertEqual(len(versions), 1)
+            self.assertEqual(len(trials), 1)
+            self.assertEqual(len(enrollments), 1)
+            version = versions[0]
+            trial = trials[0]
+            enrollment = enrollments[0]
+            self.assertEqual(version["strategy_version_id"], trial["strategy_version_id"])
+            self.assertEqual(version["strategy_version_id"], enrollment["strategy_version_id"])
+            self.assertEqual(enrollment["status"], "ACCEPTED")
+            self.assertEqual(enrollment["validation_version"], "rolling-enrollment-v2")
+            self.assertEqual(version["execution_scope"], "OBSERVATION")
+            self.assertTrue(version["paper_only"])
+            self.assertTrue(version["research_only"])
+            self.assertFalse(version["allocation_active"])
+            self.assertFalse(version["canary_armed"])
+            self.assertFalse(version["provenance"]["predecessor_profitability_inherited"])
+            self.assertFalse(version["provenance"]["live_eligibility_inherited"])
+            self.assertEqual(
+                version["market_scope"]["mode"],
+                "RULE_BASED_MARKETS",
+            )
+            self.assertEqual(
+                version["market_scope"]["instrument"],
+                "POLYMARKET",
+            )
+            intents = ForwardTestRegistry(store).list_observation_intents()
+            self.assertEqual(len(intents), 1)
+            config = dict(intents[0].config)
+            self.assertEqual(config["strategy_version_id"], version["strategy_version_id"])
+            self.assertEqual(config["research_trial_id"], trial["research_trial_id"])
+            self.assertEqual(config["enrollment_id"], enrollment["enrollment_id"])
+            self.assertEqual(config["execution"], "paper_only")
+    def test_predeclared_terminal_lookback_gets_one_linked_successor(self) -> None:
+        with AxiomStore(":memory:") as store:
+            self._seed_predeclared_history(store)
+            bus = DurableResearchBus(store)
+            processor = AutonomousResearchProcessor(store, bus=bus, clock=lambda: T0)
+
+            original = processor._enqueue_predeclared_from_persisted_scope(T0)
+            predecessor = original[0]
+            legacy_plan = ExperimentPlan.from_proposal(predecessor.payload)
+            legacy_parameters = legacy_plan.variants()[0]
+            legacy_candidate = _candidate_id(
+                legacy_plan,
+                legacy_parameters,
+                generation=0,
+            )
+            legacy_strategy = legacy_plan.strategy_for(
+                legacy_parameters,
+                legacy_candidate,
+            )
+            processor._initialize_candidate(
+                legacy_plan,
+                legacy_candidate,
+                legacy_strategy,
+                legacy_parameters,
+                trial_index=0,
+                trial_count=1,
+                now=T0,
+            )
+            legacy_intents = ForwardTestRegistry(store).list_observation_intents()
+            self.assertEqual(len(legacy_intents), 1)
+            legacy_intent_candidate = legacy_intents[0].config["candidate_id"]
+            claimed = bus.claim("legacy-predeclared-worker", now=T0)
+            self.assertIsNotNone(claimed)
+            assert claimed is not None
+            predecessor = bus.complete(
+                claimed.item_id,
+                result={
+                    "candidate_results": [
+                        {
+                            "candidate_id": legacy_candidate,
+                            "reason_code": "INSUFFICIENT_DATA",
+                            "reason": "at least three chronological observations are required",
+                        }
+                    ]
+                },
+                status=ResearchQueueStatus.REJECTED,
+                error="at least three chronological observations are required",
+                worker="legacy-predeclared-worker",
+                now=T0,
+            )
+            first_refresh = processor._enqueue_predeclared_from_persisted_scope(T0)
+            successors = [
+                item
+                for item in first_refresh
+                if isinstance(item.payload.get("observation_handoff"), dict)
+            ]
+            self.assertEqual(len(successors), 1)
+            successor = successors[0]
+            self.assertEqual(
+                successor.payload["observation_handoff"]["predecessor_queue_id"],
+                predecessor.item_id,
+            )
+            self.assertEqual(
+                successor.dedupe_key,
+                f"predeclared-successor:{predecessor.item_id}:predeclared-observation-v1",
+            )
+            restarted = AutonomousResearchProcessor(
+                store,
+                bus=DurableResearchBus(store),
+                clock=lambda: T0,
+            )
+            restart_refresh = restarted._enqueue_predeclared_from_persisted_scope(T0)
+            self.assertEqual(
+                [
+                    item.item_id
+                    for item in restart_refresh
+                    if isinstance(item.payload.get("observation_handoff"), dict)
+                ],
+                [successor.item_id],
+            )
+            self.assertEqual(bus.stats()["total"], 4)
+            second_refresh = processor._enqueue_predeclared_from_persisted_scope(T0)
+            self.assertEqual(
+                [
+                    item.item_id
+                    for item in second_refresh
+                    if isinstance(item.payload.get("observation_handoff"), dict)
+                ],
+                [successor.item_id],
+            )
+            self.assertEqual(bus.stats()["total"], 4)
+
+            for index in range(4):
+                processor.process_pending(worker=f"predeclared-worker-{index}", now=T0)
+            completed_successor = bus.get(successor.item_id)
+            self.assertIsNotNone(completed_successor)
+            assert completed_successor is not None
+            self.assertEqual(completed_successor.status, ResearchQueueStatus.COMPLETED)
+            self.assertEqual(completed_successor.result["status"], "DEFERRED")
+            self.assertEqual(
+                completed_successor.result["queue_outcome"],
+                "OBSERVATION_DEFERRED",
+            )
+            successor_versions = [
+                version
+                for version in store.list_strategy_versions(limit=20)
+                if version.get("provenance", {}).get("predecessor_queue_id")
+                == predecessor.item_id
+            ]
+            self.assertEqual(len(successor_versions), 1)
+            successor_version = successor_versions[0]
+            self.assertFalse(
+                successor_version["provenance"]["predecessor_profitability_inherited"]
+            )
+            self.assertFalse(
+                successor_version["provenance"]["predecessor_live_eligibility_inherited"]
+            )
+            self.assertEqual(successor_version["execution_scope"], "OBSERVATION")
+            self.assertFalse(successor_version["allocation_active"])
+            self.assertFalse(successor_version["canary_armed"])
+            successor_trials = [
+                trial
+                for trial in store.list_research_trials(limit=20)
+                if trial.get("strategy_version_id")
+                == successor_version["strategy_version_id"]
+            ]
+            successor_enrollments = [
+                enrollment
+                for enrollment in store.list_rolling_enrollments(limit=20)
+                if enrollment.get("strategy_version_id")
+                == successor_version["strategy_version_id"]
+            ]
+            self.assertEqual(len(successor_trials), 1)
+            self.assertEqual(len(successor_enrollments), 1)
+            intents = ForwardTestRegistry(store).list_observation_intents()
+            self.assertEqual(
+                len(
+                    [
+                        intent
+                        for intent in intents
+                        if intent.config.get("strategy_version_id")
+                        == successor_version["strategy_version_id"]
+                    ]
+                ),
+                1,
+            )
+            successor_intent = next(
+                intent
+                for intent in intents
+                if intent.config.get("strategy_version_id")
+                == successor_version["strategy_version_id"]
+            )
+            self.assertNotEqual(
+                successor_intent.config["candidate_id"],
+                legacy_intent_candidate,
+            )
     def test_4096_row_history_preserves_exact_chronological_split_counts(self) -> None:
         with AxiomStore(":memory:") as store:
             self._seed_predeclared_history(store)
@@ -1706,6 +1925,21 @@ class MarketScopeRuntimeQualificationTests(unittest.TestCase):
             self.assertEqual(len(cycle.legacy_recovery), 1)
             recovery = cycle.legacy_recovery[0]
             self.assertEqual(recovery["classification"], "LEGACY_UNAMBIGUOUS")
+            expected_recovery_key = _legacy_recovery_key(
+                store.load_candidate_lifecycle("legacy-predecessor-e2e"),
+                "legacy-predecessor-e2e",
+                recovery["predecessor_frozen_hash"],
+            )
+            self.assertTrue(expected_recovery_key)
+            self.assertEqual(recovery["recovery_key"], expected_recovery_key)
+            self.assertEqual(
+                expected_recovery_key,
+                _legacy_recovery_key(
+                    store.load_candidate_lifecycle("legacy-predecessor-e2e"),
+                    "legacy-predecessor-e2e",
+                    recovery["predecessor_frozen_hash"],
+                ),
+            )
             self.assertEqual(recovery["progress"], "ENQUEUED")
             self.assertTrue(recovery["evidence_persisted"])
             successor_item = bus.get(str(recovery["queue_item_id"]))

@@ -13846,14 +13846,54 @@ class AxiomStore:
                         (event_id, row["item_id"], "TESTING", "PENDING", _dump({"reason": "lease_expired"}), current_iso),
                     )
         return released
-    def list_research_items(self, *, status: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+    def list_research_items(
+        self,
+        *,
+        status: str | None = None,
+        limit: int = 100,
+        after_priority: int | None = None,
+        after_created_at: datetime | str | None = None,
+        after_item_id: str | None = None,
+    ) -> list[dict[str, Any]]:
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
             raise ValueError("limit must be a non-negative integer")
+        cursor_supplied = (
+            after_priority is not None
+            or after_created_at is not None
+            or after_item_id is not None
+        )
+        if cursor_supplied and (
+            after_priority is None
+            or after_created_at is None
+            or not str(after_item_id or "").strip()
+        ):
+            raise ValueError("research queue cursor requires priority, timestamp, and item id")
         query = "SELECT * FROM research_queue"
         values: list[Any] = []
+        clauses: list[str] = []
         if status is not None:
-            query += " WHERE status=?"
+            clauses.append("status=?")
             values.append(str(status).upper())
+        if cursor_supplied:
+            try:
+                priority = int(after_priority)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("research queue cursor priority is invalid") from exc
+            timestamp = (
+                _iso(after_created_at)
+                if isinstance(after_created_at, datetime)
+                else str(after_created_at).strip()
+            )
+            item_id = str(after_item_id).strip()
+            if not timestamp or not item_id:
+                raise ValueError("research queue cursor values must be non-empty")
+            clauses.append(
+                "(priority<? OR (priority=? AND "
+                "(created_at>? OR (created_at=? AND item_id>?))))"
+            )
+            values.extend([priority, priority, timestamp, timestamp, item_id])
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
         query += " ORDER BY priority DESC,created_at,item_id LIMIT ?"
         values.append(int(limit))
         with self._lock:

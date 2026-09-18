@@ -2606,7 +2606,13 @@ class Phase3LifecycleBusTests(unittest.TestCase):
                 now=T0 + timedelta(seconds=2),
             )
             self.assertEqual(completed.status, ResearchQueueStatus.COMPLETED)
-            self.assertEqual(completed.as_record()["payload"], payload)
+            queue_record = completed.as_record()
+            self.assertEqual(queue_record["payload"], payload)
+            self.assertEqual(queue_record["dedupe_key"], "p1")
+            self.assertIsNone(queue_record["lease_until"])
+            self.assertIn("updated_at", queue_record)
+            self.assertIsNone(queue_record["lease_owner"])
+            self.assertEqual(queue_record["priority"], 0)
             self.assertEqual(completed.result, {"result": "paper-only"})
             with self.assertRaises(ResearchBusPermissionError):
                 bus.submit_hypothesis({"statement": "bad", "source": "x", "tests": [], "risk": "override"})

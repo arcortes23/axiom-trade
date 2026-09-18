@@ -68,6 +68,7 @@ _MAX_QUEUE_RESULT_ITEMS = 64
 _MAX_DATASET_ROWS = 100_000
 _MAX_FORWARD_ROWS = 100_000
 _MAX_LEGACY_RECOVERY_ITEMS = 64
+_MAX_PREDECLARED_SUCCESSOR_SCAN = 512
 _MAX_ROLLING_STRATEGIES = 128
 _MAX_ROLLING_DISCOVERY_SCAN = 2_048
 _ROLLING_DISCOVERY_PAGE = 64
@@ -175,6 +176,7 @@ _ROLLING_HERMES_ID_FIELDS = (
     "candidate_ids",
 )
 _LEGACY_RECOVERY_STATE_NAME = "autonomous-legacy-recovery"
+_PREDECLARED_SUCCESSOR_STATE_NAME = "autonomous-predeclared-successor"
 _MAX_AUTOMATIC_REASSESSMENTS = 3
 _MUTABLE_DATASET_VERSION_ALIASES = frozenset({"latest", "current", "default", "unversioned"})
 # Source-loader failures with a deterministic prerequisite must remain
@@ -3969,6 +3971,19 @@ class AutonomousResearchProcessor:
         base = dict(proposal)
         base.pop("proposal_id", None)
         base.pop("hypothesis_id", None)
+        observation_handoff = base.get("observation_handoff")
+        successor_dedupe_key = None
+        if isinstance(observation_handoff, Mapping):
+            predecessor_queue_id = str(
+                observation_handoff.get("predecessor_queue_id", "")
+            ).strip()
+            handoff_version = str(
+                observation_handoff.get("version", "")
+            ).strip()
+            if predecessor_queue_id and handoff_version:
+                successor_dedupe_key = (
+                    f"predeclared-successor:{predecessor_queue_id}:{handoff_version}"
+                )
         items: list[ResearchQueueItem] = []
         for index, strategy in enumerate(selected):
             if not isinstance(strategy, Mapping):
@@ -4075,7 +4090,10 @@ class AutonomousResearchProcessor:
             )
             item = self.bus.submit_hypothesis(
                 item_payload,
-                dedupe_key=f"predeclared:{proposal_id}:{attestation_hash or 'unattested'}",
+                dedupe_key=(
+                    successor_dedupe_key
+                    or f"predeclared:{proposal_id}:{attestation_hash or 'unattested'}"
+                ),
                 priority=priority,
                 available_at=available_at,
             )
@@ -4426,7 +4444,11 @@ class AutonomousResearchProcessor:
             )
             return ()
         try:
-            return self.enqueue_predeclared_starting_set(proposal, priority=0, available_at=now)
+            queued = self.enqueue_predeclared_starting_set(
+                proposal,
+                priority=0,
+                available_at=now,
+            )
         except (AutonomousResearchError, ResearchBusPermissionError, TypeError, ValueError, RuntimeError) as exc:
             blocker = str(getattr(exc, "reason", "")).strip().upper() or "PREDECLARED_SEED_ENQUEUE_FAILED"
             evidence = self._predeclared_seed_blocker(
@@ -4442,6 +4464,319 @@ class AutonomousResearchProcessor:
                 dataset_version=dataset_version,
             )
             return ()
+
+        # A previous worker may have terminally rejected only the transient
+        # historical-lookback gate.  That immutable row must not be revived:
+        # enqueue one linked successor identity whose paper observation
+        # lineage can collect current-market evidence.  Genuine schema or
+        # strategy rejections remain untouched.
+        successors: list[ResearchQueueItem] = []
+        existing_successors: dict[tuple[str, str], ResearchQueueItem] = {}
+        try:
+            existing_rows = self.bus.list(limit=4096)
+        except (TypeError, ValueError, RuntimeError):
+            existing_rows = ()
+        for existing in existing_rows:
+            existing_handoff = existing.payload.get("observation_handoff")
+            if not isinstance(existing_handoff, Mapping):
+                continue
+            predecessor_id = str(
+                existing_handoff.get("predecessor_queue_id", "")
+            ).strip()
+            handoff_version = str(existing_handoff.get("version", "")).strip()
+            if predecessor_id and handoff_version:
+                existing_successors[(predecessor_id, handoff_version)] = existing
+        def has_normalized_lineage(previous: ResearchQueueItem) -> bool:
+            candidate_ids: set[str] = set()
+            payload_candidate = previous.payload.get("candidate_id")
+            if str(payload_candidate or "").strip():
+                candidate_ids.add(str(payload_candidate).strip())
+            result = previous.result if isinstance(previous.result, Mapping) else {}
+            result_candidates = result.get("candidate_results", ())
+            if isinstance(result_candidates, Sequence) and not isinstance(
+                result_candidates, (str, bytes, bytearray)
+            ):
+                for candidate in result_candidates:
+                    if isinstance(candidate, Mapping) and str(
+                        candidate.get("candidate_id", "")
+                    ).strip():
+                        candidate_ids.add(str(candidate["candidate_id"]).strip())
+            loaders = {
+                "experiment": getattr(self.store, "load_experiment", None),
+                "lifecycle": getattr(self.store, "load_candidate_lifecycle", None),
+                "strategy": getattr(self.store, "load_strategy_version", None),
+                "trial": getattr(self.store, "load_research_trial", None),
+                "enrollment": getattr(self.store, "load_rolling_enrollment", None),
+            }
+            for candidate_id in candidate_ids:
+                records: list[Mapping[str, Any]] = []
+                for loader in (loaders["experiment"], loaders["lifecycle"]):
+                    if not callable(loader):
+                        continue
+                    try:
+                        value = loader(candidate_id)
+                    except (TypeError, ValueError, RuntimeError):
+                        value = None
+                    if isinstance(value, Mapping):
+                        records.append(value)
+                identifiers = {
+                    str(record.get(field, "")).strip()
+                    for record in records
+                    for field in (
+                        "strategy_version_id",
+                        "research_trial_id",
+                        "enrollment_id",
+                    )
+                    if str(record.get(field, "")).strip()
+                }
+                strategy_version_id = next(
+                    (
+                        str(record.get("strategy_version_id", "")).strip()
+                        for record in records
+                        if str(record.get("strategy_version_id", "")).strip()
+                    ),
+                    "",
+                )
+                trial_id = next(
+                    (
+                        str(record.get("research_trial_id", "")).strip()
+                        for record in records
+                        if str(record.get("research_trial_id", "")).strip()
+                    ),
+                    "",
+                )
+                if (
+                    not strategy_version_id
+                    or not trial_id
+                    or not callable(loaders["strategy"])
+                    or not callable(loaders["trial"])
+                ):
+                    continue
+                try:
+                    version = loaders["strategy"](strategy_version_id)
+                    trial = loaders["trial"](trial_id)
+                except (TypeError, ValueError, RuntimeError):
+                    continue
+                if not isinstance(version, Mapping) or not isinstance(trial, Mapping):
+                    continue
+                if not callable(loaders["enrollment"]):
+                    return True
+                enrollment_id = next(
+                    (
+                        identifier
+                        for identifier in identifiers
+                        if identifier.startswith("rolling-enrollment-")
+                    ),
+                    "",
+                )
+                if enrollment_id:
+                    try:
+                        enrollment = loaders["enrollment"](enrollment_id)
+                    except (TypeError, ValueError, RuntimeError):
+                        enrollment = None
+                    if isinstance(enrollment, Mapping) and str(
+                        enrollment.get("status", "")
+                    ).strip().upper() == "ACCEPTED":
+                        return True
+            return False
+        def is_transient_predeclared(previous: ResearchQueueItem) -> bool:
+            payload = previous.payload
+            if (
+                previous.item_type != "hypothesis"
+                or not bool(payload.get("predeclared_starting_set"))
+                or str(previous.last_error or "").strip().casefold()
+                != "at least three chronological observations are required"
+            ):
+                return False
+            internal = _generated_queue_provenance(payload)
+            if not isinstance(internal, Mapping):
+                return False
+            if (
+                internal.get("generated") is not True
+                or str(internal.get("kind", "")).strip()
+                != "predeclared_starting_set"
+                or str(internal.get("proposal_identity", "")).strip()
+                != _proposal_identity(payload)
+            ):
+                return False
+            result = previous.result if isinstance(previous.result, Mapping) else {}
+            candidates = result.get("candidate_results")
+            if not isinstance(candidates, Sequence) or isinstance(
+                candidates, (str, bytes, bytearray)
+            ):
+                return False
+            return any(
+                isinstance(candidate, Mapping)
+                and str(candidate.get("reason_code", "")).strip().upper()
+                == "INSUFFICIENT_DATA"
+                and str(candidate.get("reason", "")).strip().casefold()
+                == "at least three chronological observations are required"
+                for candidate in candidates
+            )
+
+
+        state_loader = getattr(self.store, "get_scheduler_state", None)
+        state_setter = getattr(self.store, "set_scheduler_state", None)
+        state: Mapping[str, Any] = {}
+        cursor = {}
+        if callable(state_loader):
+            try:
+                loaded_state = state_loader(_PREDECLARED_SUCCESSOR_STATE_NAME)
+            except (TypeError, ValueError, RuntimeError):
+                loaded_state = None
+            if isinstance(loaded_state, Mapping):
+                state = loaded_state
+                raw_cursor = loaded_state.get("cursor")
+                if isinstance(raw_cursor, Mapping):
+                    cursor = dict(raw_cursor)
+        list_kwargs: dict[str, Any] = {
+            "status": ResearchQueueStatus.REJECTED,
+            "limit": _MAX_PREDECLARED_SUCCESSOR_SCAN,
+        }
+        if (
+            cursor.get("priority") is not None
+            and str(cursor.get("created_at", "")).strip()
+            and str(cursor.get("item_id", "")).strip()
+        ):
+            list_kwargs.update(
+                {
+                    "after_priority": int(cursor["priority"]),
+                    "after_created_at": str(cursor["created_at"]),
+                    "after_item_id": str(cursor["item_id"]),
+                }
+            )
+        try:
+            rejected_rows = self.bus.list(**list_kwargs)
+            if not rejected_rows and list_kwargs.get("after_item_id"):
+                list_kwargs = {
+                    "status": ResearchQueueStatus.REJECTED,
+                    "limit": _MAX_PREDECLARED_SUCCESSOR_SCAN,
+                }
+                cursor = {}
+                rejected_rows = self.bus.list(**list_kwargs)
+        except (TypeError, ValueError, RuntimeError):
+            rejected_rows = ()
+        last_scanned = rejected_rows[-1] if rejected_rows else None
+        for previous in rejected_rows:
+            if not is_transient_predeclared(previous):
+                continue
+            plan_document = previous.payload.get("experiment_plan")
+            if has_normalized_lineage(previous):
+                continue
+            plan_document = plan_document if isinstance(plan_document, Mapping) else {}
+            template = str(
+                plan_document.get("template", previous.payload.get("template", ""))
+            ).strip().lower()
+            parameters = plan_document.get("parameters", previous.payload.get("parameters", {}))
+            if not template or not isinstance(parameters, Mapping):
+                continue
+            strategy_document = plan_document.get("strategy_document")
+            metadata = (
+                strategy_document.get("metadata", {})
+                if isinstance(strategy_document, Mapping)
+                else {}
+            )
+            strategy: dict[str, Any] = {
+                "template": template,
+                "parameters": dict(parameters),
+            }
+            if isinstance(metadata, Mapping):
+                strategy["metadata"] = dict(metadata)
+            model_document = plan_document.get("model_document")
+            if isinstance(model_document, Mapping):
+                strategy["model_document"] = dict(model_document)
+            result = previous.result if isinstance(previous.result, Mapping) else {}
+            predecessor_candidate_id = ""
+            candidate_results = result.get("candidate_results")
+            if isinstance(candidate_results, Sequence) and not isinstance(
+                candidate_results, (str, bytes, bytearray)
+            ):
+                predecessor_candidate_id = next(
+                    (
+                        str(candidate.get("candidate_id", "")).strip()
+                        for candidate in candidate_results
+                        if isinstance(candidate, Mapping)
+                        and str(candidate.get("candidate_id", "")).strip()
+                    ),
+                    "",
+                )
+            predecessor_observation_intent_id = ""
+            lifecycle_loader = getattr(self.store, "load_candidate_lifecycle", None)
+            if predecessor_candidate_id and callable(lifecycle_loader):
+                try:
+                    lifecycle = lifecycle_loader(predecessor_candidate_id)
+                except (TypeError, ValueError, RuntimeError):
+                    lifecycle = None
+                if isinstance(lifecycle, Mapping):
+                    lifecycle_payload = lifecycle.get("payload")
+                    if isinstance(lifecycle_payload, Mapping):
+                        predecessor_observation_intent_id = str(
+                            lifecycle_payload.get("paper_observation_intent_id", "")
+                        ).strip()
+            if predecessor_candidate_id and not predecessor_observation_intent_id:
+                for intent in ForwardTestRegistry(self.store).list_observation_intents():
+                    config = intent.config if isinstance(intent.config, Mapping) else {}
+                    if str(config.get("candidate_id", "")).strip() == predecessor_candidate_id:
+                        predecessor_observation_intent_id = str(
+                            intent.experiment_id
+                        ).strip()
+                        break
+            handoff = {
+                "version": "predeclared-observation-v1",
+                "predecessor_queue_id": previous.item_id,
+                "predecessor_dedupe_key": previous.dedupe_key,
+                "predecessor_status": previous.status.value,
+                "predecessor_last_error": previous.last_error,
+                "predecessor_candidate_id": predecessor_candidate_id or None,
+                "predecessor_observation_intent_id": (
+                    predecessor_observation_intent_id or None
+                ),
+                "predecessor_profitability_inherited": False,
+                "predecessor_allocation_authority_inherited": False,
+            }
+            existing = existing_successors.get(
+                (previous.item_id, str(handoff["version"]))
+            )
+            if existing is not None:
+                successors.append(existing)
+                continue
+            successor_proposal = dict(previous.payload)
+            successor_proposal["observation_handoff"] = handoff
+            successor_proposal["predeclared_successor"] = True
+            try:
+                successors.extend(
+                    self.enqueue_predeclared_starting_set(
+                        successor_proposal,
+                        strategies=(strategy,),
+                        priority=0,
+                        available_at=now,
+                    )
+                )
+            except (AutonomousResearchError, ResearchBusPermissionError, TypeError, ValueError, RuntimeError):
+                continue
+        if callable(state_setter):
+            next_state = {
+                "schema_version": "autonomous-predeclared-successor-v1",
+                "updated_at": ensure_utc(now).isoformat(),
+                "cursor": (
+                    {
+                        "priority": int(getattr(last_scanned, "priority", 0)),
+                        "created_at": (
+                            last_scanned.created_at.isoformat()
+                            if isinstance(last_scanned.created_at, datetime)
+                            else str(last_scanned.created_at or "")
+                        ),
+                        "item_id": last_scanned.item_id,
+                    }
+                    if last_scanned is not None
+                    else None
+                ),
+            }
+            try:
+                state_setter(_PREDECLARED_SUCCESSOR_STATE_NAME, next_state)
+            except (TypeError, ValueError, RuntimeError):
+                pass
+        return tuple([*queued, *successors])
 
     def __init__(
         self,
@@ -15823,6 +16158,13 @@ class AutonomousResearchProcessor:
 
     def _process_hypothesis(self, item: ResearchQueueItem, now: datetime) -> Mapping[str, Any]:
         proposal = _normalize_hypothesis_payload(item.payload, item)
+        predeclared_starting_set = bool(item.payload.get("predeclared_starting_set"))
+        predeclared_handoff = item.payload.get("observation_handoff")
+        predeclared_handoff = (
+            dict(predeclared_handoff)
+            if isinstance(predeclared_handoff, Mapping)
+            else {}
+        )
         generated_scope_binding: tuple[str | None, str | None, str | None, str | None, str | None, str | None] | None = None
         generated_provenance = _generated_queue_provenance(proposal)
         generated_kind_hint = bool(proposal.get("predeclared_starting_set")) or (
@@ -15989,7 +16331,12 @@ class AutonomousResearchProcessor:
         # Freeze every schema-valid bounded strategy and persist its paper
         # observation intent before loading or judging historical evidence.
         for parameters in variants:
-            candidate_id = _candidate_id(plan, parameters, generation=0)
+            candidate_id = _candidate_id(
+                plan,
+                parameters,
+                generation=0,
+                observation_handoff=predeclared_handoff,
+            )
             strategy = _strategy_with_operational_overlay(
                 plan,
                 plan.strategy_for(parameters, candidate_id),
@@ -16002,6 +16349,8 @@ class AutonomousResearchProcessor:
                 trial_index=len(prepared),
                 trial_count=len(variants),
                 now=now,
+                predeclared_starting_set=predeclared_starting_set,
+                predeclared_handoff=predeclared_handoff,
             )
             prepared.append(
                 {
@@ -16115,6 +16464,17 @@ class AutonomousResearchProcessor:
                     }
                 )
             summary = self._hypothesis_result(plan, results, (), split_counts=split_counts)
+            if predeclared_starting_set:
+                summary = {
+                    **dict(summary),
+                    "accepted": True,
+                    "status": "DEFERRED",
+                    "queue_outcome": "OBSERVATION_DEFERRED",
+                    "deferred_reason": "INSUFFICIENT_DATA",
+                    "paper_observation_intent": True,
+                    "research_only": True,
+                    "paper_only": True,
+                }
             self.store.save_experiment_plan(
                 plan.plan_id,
                 plan.as_dict(),
@@ -16231,6 +16591,17 @@ class AutonomousResearchProcessor:
             else self._generate_mutations(plan, prepared, validation_scores, now, lineage=())
         )
         summary = self._hypothesis_result(plan, results, mutations, split_counts=split_counts)
+        if predeclared_starting_set and insufficient_data:
+            summary = {
+                **dict(summary),
+                "accepted": True,
+                "status": "DEFERRED",
+                "queue_outcome": "OBSERVATION_DEFERRED",
+                "deferred_reason": "INSUFFICIENT_DATA",
+                "paper_observation_intent": True,
+                "research_only": True,
+                "paper_only": True,
+            }
         self.store.save_experiment_plan(
             plan.plan_id,
             plan.as_dict(),
@@ -16247,6 +16618,185 @@ class AutonomousResearchProcessor:
         )
         return summary
 
+    def _persist_predeclared_observation_lineage(
+        self,
+        plan: ExperimentPlan,
+        candidate_id: str,
+        strategy: StrategyDefinition,
+        *,
+        dataset_attestation: Mapping[str, Any] | None,
+        now: datetime,
+        handoff: Mapping[str, Any] | None = None,
+    ) -> Mapping[str, Any]:
+        """Persist the normalized paper lineage before historical qualification.
+
+        A starter hypothesis is allowed to defer on an immature historical
+        split.  Its immutable strategy/trial/enrollment must still exist so
+        current-market observations can accumulate without re-running or
+        rebinding the starter proposal.
+        """
+        strategy_document = strategy.to_dict()
+        scope_binding = _scope_binding(plan)
+        strategy_hash = _rolling_hash(strategy_document)
+        scope = dict(scope_binding["market_scope"])
+        setup = {
+            "schema_version": "observation-setup-v1",
+            "execution_scope": "OBSERVATION",
+            "paper_only": True,
+            "research_only": True,
+            "allocation_active": False,
+            "canary_armed": False,
+            "market_scope_mode": str(scope.get("mode", "")).strip().upper(),
+            "strategy_family": str(strategy_document.get("family", "")).strip(),
+        }
+        setup_hash = _rolling_hash(setup)
+        identity = {
+            "candidate_id": candidate_id,
+            "strategy_hash": strategy_hash,
+            "scope_hash": scope_binding["market_scope_hash"],
+            "scope_version": scope_binding["market_scope_version"],
+            "plan_hash": plan.plan_hash,
+        }
+        strategy_version_id = "strategy-version-" + _rolling_hash(identity).removeprefix("sha256:")[:40]
+        trial_id = "research-trial-" + _rolling_hash(
+            {"strategy_version_id": strategy_version_id, "candidate_id": candidate_id}
+        ).removeprefix("sha256:")[:40]
+        model_document = plan.model_for()
+        model_document = dict(model_document) if isinstance(model_document, Mapping) else None
+        provenance = _rolling_provenance_bound(
+            {
+                "source": "predeclared_starting_set",
+                "rolling_research": True,
+                "research_mode": "ROLLING_RESEARCH",
+                "candidate_id": candidate_id,
+                "source_candidate_id": candidate_id,
+                "plan_id": plan.plan_id,
+                "plan_hash": plan.plan_hash,
+                "hypothesis_id": plan.hypothesis_id,
+                "dataset_id": plan.dataset_id,
+                "dataset_version": plan.dataset_version,
+                "dataset_attestation": dataset_attestation,
+                "market_scope": scope,
+                "market_scope_hash": scope_binding["market_scope_hash"],
+                "market_scope_version": scope_binding["market_scope_version"],
+                "historical_qualification": "PENDING",
+                "predecessor_profitability_inherited": False,
+                "live_eligibility_inherited": False,
+                "paper_only": True,
+                "allocation_active": False,
+                **(dict(handoff) if isinstance(handoff, Mapping) else {}),
+                "predecessor_live_eligibility_inherited": False,
+            }
+        )
+        strategy_record = {
+            "strategy_version_id": strategy_version_id,
+            "strategy_id": strategy.id,
+            "version": str(strategy.version),
+            "code_hash": strategy_hash,
+            "strategy_hash": strategy_hash,
+            "config_hash": setup_hash,
+            "created_at": now.isoformat(),
+            "strategy_document": strategy_document,
+            "canonical_strategy": strategy_document,
+            "model_document": model_document,
+            "candidate_id": candidate_id,
+            "provenance": provenance,
+            "observation_only_lineage": True,
+            "selection_excluded": True,
+            "execution_scope": "OBSERVATION",
+            "research_only": True,
+            "paper_only": True,
+            "allocation_active": False,
+            "canary_armed": False,
+            "operational_setup": setup,
+            "operational_setup_hash": setup_hash,
+            **scope_binding,
+            "dataset_id": plan.dataset_id,
+            "dataset_version": plan.dataset_version,
+            "plan_id": plan.plan_id,
+            "plan_hash": plan.plan_hash,
+            "hypothesis_id": plan.hypothesis_id,
+            "observation_handoff": (
+                dict(handoff) if isinstance(handoff, Mapping) else {}
+            ),
+        }
+        strategy_saver = getattr(self.store, "save_strategy_version", None)
+        if callable(strategy_saver):
+            strategy_saver(strategy_record)
+        trial = {
+            "research_trial_id": trial_id,
+            "trial_id": trial_id,
+            "strategy_version_id": strategy_version_id,
+            "candidate_id": candidate_id,
+            "status": "SCHEDULED",
+            "trial_kind": "PREDECLARED_OBSERVATION",
+            "strategy_hash": strategy_hash,
+            "created_at": now.isoformat(),
+            "rolling_research": True,
+            "execution_scope": "OBSERVATION",
+            "research_only": True,
+            "paper_only": True,
+            "allocation_active": False,
+            "canary_armed": False,
+            "observation_only_lineage": True,
+            "selection_excluded": True,
+            "operational_setup": setup,
+            "operational_setup_hash": setup_hash,
+            "strategy_document": strategy_document,
+            "model_document": model_document,
+            "provenance": provenance,
+            "observation_handoff": (
+                dict(handoff) if isinstance(handoff, Mapping) else {}
+            ),
+            **scope_binding,
+        }
+        trial_saver = getattr(self.store, "save_research_trial", None)
+        if callable(trial_saver):
+            trial_saver(trial)
+        enrollment_id = "rolling-enrollment-" + _rolling_hash(
+            {
+                "candidate_id": candidate_id,
+                "strategy_version_id": strategy_version_id,
+                "research_trial_id": trial_id,
+                "validation_version": _ROLLING_ENROLLMENT_VALIDATION_VERSION,
+            }
+        ).removeprefix("sha256:")[:48]
+        enrollment_saver = getattr(self.store, "save_rolling_enrollment", None)
+        if callable(enrollment_saver):
+            enrollment_saver(
+                {
+                    "enrollment_id": enrollment_id,
+                    "candidate_id": candidate_id,
+                    "strategy_version_id": strategy_version_id,
+                    "research_trial_id": trial_id,
+                    "status": "ACCEPTED",
+                    "reason": "PREDECLARED_OBSERVATION_DEFERRED",
+                    "validation_version": _ROLLING_ENROLLMENT_VALIDATION_VERSION,
+                    "provenance": {
+                        **dict(provenance),
+                        "enrollment_id": enrollment_id,
+                        "strategy_version_id": strategy_version_id,
+                        "research_trial_id": trial_id,
+                        "observation_only_lineage": True,
+                        "predecessor_profitability_inherited": False,
+                        "live_eligibility_inherited": False,
+                    },
+                    "created_at": now.isoformat(),
+                }
+            )
+        return {
+            "strategy_version_id": strategy_version_id,
+            "research_trial_id": trial_id,
+            "enrollment_id": enrollment_id,
+            "strategy_hash": strategy_hash,
+            "operational_setup_hash": setup_hash,
+            "operational_setup": setup,
+            "observation_handoff": (
+                dict(handoff) if isinstance(handoff, Mapping) else {}
+            ),
+            "observation_only_lineage": True,
+        }
+
     def _initialize_candidate(
         self,
         plan: ExperimentPlan,
@@ -16257,6 +16807,8 @@ class AutonomousResearchProcessor:
         trial_index: int,
         trial_count: int,
         now: datetime,
+        predeclared_starting_set: bool = False,
+        predeclared_handoff: Mapping[str, Any] | None = None,
     ) -> Mapping[str, Any]:
         dataset_attestation = (
             self._dataset_attestation(plan, strict=False)
@@ -16280,6 +16832,18 @@ class AutonomousResearchProcessor:
         self.lifecycle.register_idea(candidate_id, payload)
         self._reserve_candidate(plan, candidate_id, now)
         self.store.save_strategy_if_absent(strategy.id, strategy.to_dict())
+        lineage = (
+            self._persist_predeclared_observation_lineage(
+                plan,
+                candidate_id,
+                strategy,
+                dataset_attestation=dataset_attestation,
+                now=now,
+                handoff=predeclared_handoff,
+            )
+            if predeclared_starting_set and plan.market_type is MarketType.PREDICTION
+            else {}
+        )
         self.store.save_experiment_if_absent(
             candidate_id,
             {
@@ -16290,6 +16854,19 @@ class AutonomousResearchProcessor:
                 "plan_id": plan.plan_id,
                 "plan_hash": plan.plan_hash,
                 **_scope_binding(plan),
+                **(
+                    {
+                        "strategy_version_id": lineage["strategy_version_id"],
+                        "research_trial_id": lineage["research_trial_id"],
+                        "enrollment_id": lineage["enrollment_id"],
+                        "rolling_research": True,
+                        "execution_scope": "OBSERVATION",
+                        "allocation_active": False,
+                        "canary_armed": False,
+                    }
+                    if lineage
+                    else {}
+                ),
                 "dataset_id": plan.dataset_id,
                 "dataset_version": plan.dataset_version,
                 "variant": dict(parameters),
@@ -16314,10 +16891,16 @@ class AutonomousResearchProcessor:
                 strategy,
                 now,
                 dataset_attestation=dataset_attestation,
+                lineage=lineage,
             )
             if plan.market_type is MarketType.PREDICTION
             else None
         )
+        return {
+            "candidate_id": candidate_id,
+            "intent": intent,
+            **dict(lineage),
+        }
 
     def _register_schema_observation_intent(
         self,
@@ -16327,6 +16910,7 @@ class AutonomousResearchProcessor:
         now: datetime,
         *,
         dataset_attestation: Mapping[str, Any] | None = None,
+        lineage: Mapping[str, Any] | None = None,
     ) -> Any:
         model_document = plan.model_for() or {"type": "deterministic"}
         setup_fields: dict[str, Any] = {}
@@ -16384,6 +16968,24 @@ class AutonomousResearchProcessor:
                 },
             }
         )
+        if isinstance(lineage, Mapping) and lineage:
+            config.update(
+                {
+                    "strategy_version_id": lineage.get("strategy_version_id"),
+                    "research_trial_id": lineage.get("research_trial_id"),
+                    "enrollment_id": lineage.get("enrollment_id"),
+                    "rolling_research": True,
+                    "operational_setup_hash": lineage.get("operational_setup_hash"),
+                    "observation_only_lineage": bool(
+                        lineage.get("observation_only_lineage", True)
+                    ),
+                    "observation_handoff": (
+                        dict(lineage.get("observation_handoff", {}))
+                        if isinstance(lineage.get("observation_handoff"), Mapping)
+                        else {}
+                    ),
+                }
+            )
         intent = ForwardTestRegistry(self.store).register_observation_intent(
             strategy=strategy.to_dict(),
             model=dict(model_document),
@@ -16407,6 +17009,28 @@ class AutonomousResearchProcessor:
                     "paper_only": True,
                     "research_only": True,
                     "historical_qualification": "PENDING",
+                    **(
+                        {
+                            "strategy_version_id": lineage.get("strategy_version_id"),
+                            "research_trial_id": lineage.get("research_trial_id"),
+                            "enrollment_id": lineage.get("enrollment_id"),
+                            "execution_scope": "OBSERVATION",
+                            "allocation_active": False,
+                            "canary_armed": False,
+                            "observation_only_lineage": bool(
+                                lineage.get("observation_only_lineage", True)
+                            ),
+                            "observation_handoff": (
+                                dict(lineage.get("observation_handoff", {}))
+                                if isinstance(
+                                    lineage.get("observation_handoff"), Mapping
+                                )
+                                else {}
+                            ),
+                        }
+                        if isinstance(lineage, Mapping) and lineage
+                        else {}
+                    ),
                     **(
                         {"dataset_attestation": dict(dataset_attestation)}
                         if dataset_attestation is not None
@@ -19669,14 +20293,37 @@ def _legacy_recovery_key(
         "frozen_hash": frozen_hash,
         "record": record,
     }
-    return "legacy-scope-recovery:" + hashlib.sha256(
-        _canonical_binding(material).encode("utf-8")
-    ).hexdigest()[:32]
-
-
-def _candidate_id(plan: ExperimentPlan, parameters: Mapping[str, Any], *, generation: int) -> str:
+    return (
+        "legacy-scope-recovery:"
+        + hashlib.sha256(_canonical_binding(material).encode("utf-8")).hexdigest()[:32]
+    )
+def _candidate_id(
+    plan: ExperimentPlan,
+    parameters: Mapping[str, Any],
+    *,
+    generation: int,
+    observation_handoff: Mapping[str, Any] | None = None,
+) -> str:
+    material: dict[str, Any] = {
+        "plan_id": plan.plan_id,
+        "plan_hash": plan.plan_hash,
+        "parameters": dict(parameters),
+        "generation": generation,
+    }
+    if isinstance(observation_handoff, Mapping) and observation_handoff:
+        # Successor identity is distinct from the immutable predecessor while
+        # retaining only bounded queue lineage in the candidate hash.
+        material["observation_handoff"] = {
+            "version": str(observation_handoff.get("version", "")).strip(),
+            "predecessor_queue_id": str(
+                observation_handoff.get("predecessor_queue_id", "")
+            ).strip(),
+            "predecessor_dedupe_key": str(
+                observation_handoff.get("predecessor_dedupe_key", "")
+            ).strip(),
+        }
     token = json.dumps(
-        {"plan_id": plan.plan_id, "plan_hash": plan.plan_hash, "parameters": dict(parameters), "generation": generation},
+        material,
         sort_keys=True,
         separators=(",", ":"),
         allow_nan=False,
@@ -19933,6 +20580,9 @@ def _bounded_queue_result(value: Mapping[str, Any]) -> dict[str, Any]:
     # Keep the long-standing public summary fields even when newer bounded
     # split/accounting fields fill the first 32 compact slots.
     for key in (
+        "status",
+        "queue_outcome",
+        "deferred_reason",
         "data_quality",
         "paper_only",
         "research_only",

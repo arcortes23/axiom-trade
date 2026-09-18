@@ -1243,16 +1243,40 @@ class PolymarketResearchOrchestrationTests(unittest.TestCase):
             cycle = processor.process_pending(now=T0)
             self.assertEqual(cycle.claimed, 1)
             # The fixture intentionally has too few qualifying trades for the
-            # starter's research gate; marker validation must still succeed
-            # and leave the candidate schema-valid with an explicit
-            # insufficiency result rather than PROCESSING_FAILED.
-            self.assertEqual(cycle.rejected, 1)
+            # starter's research gate.  The immutable observation handoff
+            # remains durable and deferred instead of terminally rejected.
+            self.assertEqual(cycle.completed, 1)
+            self.assertEqual(cycle.rejected, 0)
             self.assertEqual(cycle.failed, 0)
+            self.assertTrue(cycle.results[0]["accepted"])
+            self.assertEqual(cycle.results[0]["status"], "DEFERRED")
+            self.assertEqual(
+                cycle.results[0]["queue_outcome"],
+                "OBSERVATION_DEFERRED",
+            )
             self.assertEqual(
                 cycle.results[0]["candidate_results"][0]["stage"],
                 CandidateStage.SCHEMA_VALIDATED.value,
             )
             self.assertEqual(cycle.results[0]["reason_code"], "INSUFFICIENT_DATA")
+            versions = store.list_strategy_versions(limit=10)
+            trials = store.list_research_trials(limit=10)
+            enrollments = store.list_rolling_enrollments(limit=10)
+            self.assertEqual(len(versions), 1)
+            self.assertEqual(len(trials), 1)
+            self.assertEqual(len(enrollments), 1)
+            self.assertEqual(
+                versions[0]["strategy_version_id"],
+                trials[0]["strategy_version_id"],
+            )
+            self.assertEqual(
+                versions[0]["strategy_version_id"],
+                enrollments[0]["strategy_version_id"],
+            )
+            self.assertEqual(
+                len(ForwardTestRegistry(store).list_observation_intents()),
+                1,
+            )
 
     def test_generated_queue_rejects_catalog_with_explicit_missing_ranges(self) -> None:
         with AxiomStore(":memory:") as store:
