@@ -7764,15 +7764,23 @@ class AutonomousResearchProcessor:
             if stage not in {"SCHEMA_VALIDATED", "PAPER_FORWARD", "PAPER_PROMOTABLE"}:
                 continue
             try:
+                current_intent_id = str(getattr(intent, "experiment_id", "")).strip()
                 existing_successor = any(
-                    isinstance(existing.config, Mapping)
+                    str(getattr(existing, "experiment_id", "")).strip()
+                    and str(getattr(existing, "experiment_id", "")).strip() != current_intent_id
+                    and isinstance(existing.config, Mapping)
                     and _binding_value(existing.config.get("candidate_id")) == candidate_id
+                    and (
+                        existing.config.get("observation_capture_only") is True
+                        or existing.config.get("canonical_operational_setup_required") is True
+                    )
                     and isinstance(existing.config.get("observation_handoff"), Mapping)
                     and _binding_value(
                         existing.config["observation_handoff"].get(
                             "predecessor_observation_intent_id"
                         )
                     )
+                    == current_intent_id
                     for existing in scanned
                 )
             except (sqlite3.Error, AttributeError, TypeError, ValueError, RuntimeError):
@@ -7868,11 +7876,20 @@ class AutonomousResearchProcessor:
                 resolved_at = parse_timestamp(proof.get("resolved_at"))
                 if resolved_at is None:
                     raise ValueError("CURRENT_SCOPE_PROOF_TIMESTAMP_MISSING")
-                freshness_value = config.get("scope_resolution_freshness_sla_seconds")
+                if "scope_resolution_freshness_sla_seconds" in config:
+                    freshness_value = config.get(
+                        "scope_resolution_freshness_sla_seconds"
+                    )
+                else:
+                    freshness_value = getattr(
+                        getattr(self, "config", None),
+                        "scope_resolution_freshness_sla_seconds",
+                        None,
+                    )
+                    if freshness_value is None:
+                        freshness_value = config.get("freshness_sla_seconds", 3600.0)
                 if freshness_value is None and capture_only:
                     raise ValueError("CURRENT_SCOPE_PROOF_SLA_UNAVAILABLE")
-                if freshness_value is None:
-                    freshness_value = config.get("freshness_sla_seconds", 3600.0)
                 try:
                     freshness = float(freshness_value)
                 except (TypeError, ValueError, OverflowError):
