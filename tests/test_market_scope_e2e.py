@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
+import json
 import unittest
 from typing import Mapping
 from unittest.mock import patch
@@ -710,6 +711,25 @@ class MarketScopeEndToEndTests(unittest.TestCase):
                     trial_count=1,
                     now=T0,
                 )
+                legacy_payload = dict(predecessor.payload)
+                legacy_provenance = legacy_payload.get("provenance")
+                if isinstance(legacy_provenance, Mapping):
+                    legacy_provenance = dict(legacy_provenance)
+                    legacy_provenance.pop("internal", None)
+                    if legacy_provenance:
+                        legacy_payload["provenance"] = legacy_provenance
+                    else:
+                        legacy_payload.pop("provenance", None)
+                legacy_payload["source"] = "axiom-autonomous-predeclared"
+                store.connection.execute(
+                    "UPDATE research_queue SET payload_json=?, dedupe_key=? WHERE item_id=?",
+                    (
+                        json.dumps(legacy_payload, sort_keys=True, separators=(",", ":")),
+                        f"predeclared:{legacy_payload['proposal_id']}",
+                        predecessor.item_id,
+                    ),
+                )
+                store.connection.commit()
                 claimed = bus.claim(f"legacy-predeclared-{index}", now=T0)
                 self.assertIsNotNone(claimed)
                 assert claimed is not None
@@ -730,6 +750,62 @@ class MarketScopeEndToEndTests(unittest.TestCase):
                     now=T0,
                 )
 
+            forged_cases = (
+                ("source", "user-authored"),
+                ("dedupe", "not-predeclared"),
+                ("reason", "axiom-autonomous-predeclared"),
+            )
+            for index, (kind, source) in enumerate(forged_cases):
+                forged_payload = dict(predecessors[0].payload)
+                forged_payload["proposal_id"] = f"forged-predeclared-{kind}"
+                forged_provenance = forged_payload.get("provenance")
+                if isinstance(forged_provenance, Mapping):
+                    forged_provenance = dict(forged_provenance)
+                    forged_provenance.pop("internal", None)
+                    if forged_provenance:
+                        forged_payload["provenance"] = forged_provenance
+                    else:
+                        forged_payload.pop("provenance", None)
+                forged_payload["source"] = source
+                dedupe_prefix = (
+                    "predeclared"
+                    if kind != "dedupe"
+                    else "not-predeclared"
+                )
+                forged_item = bus.submit_hypothesis(
+                    forged_payload,
+                    dedupe_key=f"{dedupe_prefix}:{forged_payload['proposal_id']}",
+                    available_at=T0,
+                )
+                forged_claim = bus.claim(f"forged-predeclared-{index}", now=T0)
+                self.assertIsNotNone(forged_claim)
+                assert forged_claim is not None
+                forged_reason = (
+                    "wrong reason"
+                    if kind == "reason"
+                    else "at least three chronological observations are required"
+                )
+                forged_completed = bus.complete(
+                    forged_claim.item_id,
+                    result={
+                        "candidate_results": [
+                            {
+                                "candidate_id": f"forged-candidate-{kind}",
+                                "reason_code": "INSUFFICIENT_DATA",
+                                "reason": forged_reason,
+                            }
+                        ]
+                    },
+                    status=ResearchQueueStatus.REJECTED,
+                    error="at least three chronological observations are required",
+                    worker=f"forged-predeclared-{index}",
+                    now=T0,
+                )
+                self.assertEqual(forged_completed.status, ResearchQueueStatus.REJECTED)
+            self.assertEqual(
+                len(store.list_research_items(status="REJECTED", limit=20)),
+                6,
+            )
             with patch.object(store, "list_dataset_catalog", return_value=[]):
                 successors = processor._enqueue_predeclared_from_persisted_scope(T0)
             self.assertEqual(len(successors), 3)
@@ -740,7 +816,7 @@ class MarketScopeEndToEndTests(unittest.TestCase):
                 )
             )
             rows = store.list_research_items(limit=20)
-            self.assertEqual(len(rows), 6)
+            self.assertEqual(len(rows), 9)
             self.assertEqual(
                 len(
                     [
@@ -751,6 +827,17 @@ class MarketScopeEndToEndTests(unittest.TestCase):
                     ]
                 ),
                 3,
+            )
+
+            pending_successors = store.list_research_items(status="PENDING", limit=20)
+            self.assertEqual(len(pending_successors), 3)
+            self.assertTrue(
+                all(
+                    isinstance(row.get("payload"), Mapping)
+                    and row["payload"].get("observation_handoff")
+                    for row in pending_successors
+                ),
+                repr(pending_successors),
             )
             cycle = processor.process_pending(worker="legacy-successors", now=T0)
             self.assertEqual(cycle.claimed, 3, repr(cycle))

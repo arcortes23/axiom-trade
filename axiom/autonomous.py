@@ -3777,7 +3777,13 @@ def _mark_generated_queue_payload(
 ) -> dict[str, Any]:
     """Attach a self-authenticating marker to worker-generated proposals."""
     clean = dict(payload)
-    provenance = dict(clean.get("provenance")) if isinstance(clean.get("provenance"), Mapping) else {}
+    provenance = (
+        dict(clean.get("provenance"))
+        if isinstance(clean.get("provenance"), Mapping)
+        else {}
+    )
+    if not provenance:
+        clean.pop("provenance", None)
     provenance["internal"] = {
         "schema": _GENERATED_QUEUE_PROVENANCE_SCHEMA,
         "generated": True,
@@ -4331,20 +4337,10 @@ class AutonomousResearchProcessor:
                 payload = previous.payload
                 if (
                     previous.item_type != "hypothesis"
+                    or previous.status is not ResearchQueueStatus.REJECTED
                     or not bool(payload.get("predeclared_starting_set"))
                     or str(previous.last_error or "").strip().casefold()
                     != "at least three chronological observations are required"
-                ):
-                    return False
-                internal = _generated_queue_provenance(payload)
-                if not isinstance(internal, Mapping):
-                    return False
-                if (
-                    internal.get("generated") is not True
-                    or str(internal.get("kind", "")).strip()
-                    != "predeclared_starting_set"
-                    or str(internal.get("proposal_identity", "")).strip()
-                    != _proposal_identity(payload)
                 ):
                     return False
                 result = previous.result if isinstance(previous.result, Mapping) else {}
@@ -4353,15 +4349,75 @@ class AutonomousResearchProcessor:
                     candidates, (str, bytes, bytearray)
                 ):
                     return False
-                return any(
+                if not any(
                     isinstance(candidate, Mapping)
                     and str(candidate.get("reason_code", "")).strip().upper()
                     == "INSUFFICIENT_DATA"
                     and str(candidate.get("reason", "")).strip().casefold()
                     == "at least three chronological observations are required"
                     for candidate in candidates
-                )
+                ):
+                    return False
+                internal = _generated_queue_provenance(payload)
+                if isinstance(internal, Mapping):
+                    return (
+                        internal.get("generated") is True
+                        and str(internal.get("kind", "")).strip()
+                        == "predeclared_starting_set"
+                        and str(internal.get("proposal_identity", "")).strip()
+                        == _proposal_identity(payload)
+                    )
 
+                if str(payload.get("source", "")).strip() != (
+                    "axiom-autonomous-predeclared"
+                ):
+                    return False
+                proposal_id = str(
+                    payload.get("proposal_id", payload.get("hypothesis_id", ""))
+                ).strip()
+                dedupe_key = str(previous.dedupe_key or "").strip()
+                if (
+                    not proposal_id
+                    or not dedupe_key.startswith("predeclared:")
+                    or dedupe_key.removeprefix("predeclared:") != proposal_id
+                ):
+                    return False
+                plan_document = payload.get("experiment_plan")
+                if not isinstance(plan_document, Mapping):
+                    return False
+                try:
+                    plan = ExperimentPlan.from_proposal(payload)
+                except (ExperimentPlanError, TypeError, ValueError, RuntimeError):
+                    return False
+                if plan.market_type is not MarketType.PREDICTION:
+                    return False
+                template = str(
+                    plan_document.get("template", payload.get("template", ""))
+                ).strip().lower()
+                parameters = plan_document.get(
+                    "parameters", payload.get("parameters", {})
+                )
+                if not template or not isinstance(parameters, Mapping):
+                    return False
+                for starter in PREDECLARED_STRATEGY_STARTING_SET:
+                    if str(starter.get("template", "")).strip().lower() != template:
+                        continue
+                    expected = starter.get("parameters", {})
+                    if not isinstance(expected, Mapping) or set(parameters) != set(expected):
+                        continue
+                    def parameter_matches(value: Any, expected_value: Any) -> bool:
+                        if isinstance(expected_value, (list, tuple, set, frozenset)):
+                            if isinstance(value, (list, tuple, set, frozenset)):
+                                return len(value) == 1 and next(iter(value)) in expected_value
+                            return value in expected_value
+                        return value == expected_value
+
+                    if all(
+                        parameter in expected
+                        and parameter_matches(parameter_value, expected[parameter])
+                        for parameter, parameter_value in parameters.items()
+                    ):
+                        return True
 
             state_loader = getattr(self.store, "get_scheduler_state", None)
             state_setter = getattr(self.store, "set_scheduler_state", None)
