@@ -92,6 +92,37 @@ class MarketScopeResolutionTests(unittest.TestCase):
         deferred = resolve_market_scope("deferred-state", {"market_scope": policy}, [missing_state], resolved_at=T0)
         self.assertEqual(deferred.status, DEFERRED)
         self.assertIn(deferred.deferred_markets[0].reason, {"ACCEPTING_ORDERS_UNKNOWN", "ORDER_BOOK_UNKNOWN"})
+    def test_lifecycle_only_terminal_records_exclude_without_token_mapping(self) -> None:
+        policy = {"schema_version": "1", "mode": "EXACT_MARKETS", "market_ids": ["m1"]}
+        cases = (
+            ("closed", {"active": None, "open": None, "closed": True, "accepting_orders": True}, "MARKET_CLOSED"),
+            ("resolved", {"active": None, "open": None, "closed": False, "resolved": True}, "RESOLVED_MARKET"),
+            ("not-accepting", {"active": None, "open": None, "closed": None, "accepting_orders": False}, "ACCEPTING_ORDERS_FALSE"),
+            ("inactive", {"active": False, "open": False, "closed": None, "accepting_orders": True}, "INACTIVE_MARKET"),
+        )
+        for label, lifecycle, reason in cases:
+            with self.subTest(label=label):
+                record = market("m1")
+                record.update(lifecycle)
+                record.pop("yes_token_id")
+                record.pop("no_token_id")
+                result = resolve_market_scope(label, {"market_scope": policy}, [record], resolved_at=T0)
+                self.assertEqual(result.status, ZERO_MATCHES)
+                self.assertEqual(result.excluded_markets[0].reason, reason)
+
+        open_record = market("m1")
+        open_record.pop("yes_token_id")
+        open_record.pop("no_token_id")
+        deferred = resolve_market_scope("open-tokenless", {"market_scope": policy}, [open_record], resolved_at=T0)
+        self.assertEqual(deferred.status, DEFERRED)
+        self.assertEqual(deferred.deferred_markets[0].reason, "MISSING_MARKET_IDENTITY")
+
+        mismatched = market("other")
+        mismatched.pop("yes_token_id")
+        mismatched.pop("no_token_id")
+        identity_deferred = resolve_market_scope("identity-mismatch", {"market_scope": policy}, [mismatched], resolved_at=T0)
+        self.assertEqual(identity_deferred.status, DEFERRED)
+        self.assertEqual(identity_deferred.deferred_markets[0].reason, "NOT_OBSERVED")
 
     def test_exact_ids_also_require_every_policy_constraint(self) -> None:
         policy = {

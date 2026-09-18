@@ -532,6 +532,44 @@ def _record_payload(record: Mapping[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _minimal_current_identity(raw: Mapping[str, Any], expected_market_id: str) -> bool:
+    market_id = _text(_nested(raw, "market_id", "id", "market"))
+    condition_id = _text(_nested(raw, "condition_id", "conditionId", "condition"))
+    return market_id == expected_market_id and bool(condition_id)
+
+
+def _lifecycle_terminal_reason(raw: Mapping[str, Any], now: datetime) -> str | None:
+    """Return the authoritative exclusion reason from explicit lifecycle facts."""
+    archived = _bool(_nested(raw, "archived"), None)
+    closed = _bool(_nested(raw, "closed"), None)
+    active = _bool(_nested(raw, "active"), None)
+    open_state = _bool(_nested(raw, "open"), None)
+    accepting = _bool(_nested(raw, "accepting_orders", "acceptingOrders"), None)
+    resolved = _bool(_nested(raw, "resolved", "is_resolved", "isResolved"), None)
+    settlement = _text(
+        _nested(raw, "settlement", "outcome", "resolution_status", "resolutionStatus")
+    ).casefold()
+    if archived:
+        return "MARKET_CLOSED"
+    if closed is True:
+        return "MARKET_CLOSED"
+    if active is False or open_state is False:
+        return "INACTIVE_MARKET"
+    if resolved is True or settlement in {
+        "resolved",
+        "resolved_yes",
+        "resolved_no",
+        "void",
+        "closed",
+        "expired",
+    }:
+        return "RESOLVED_MARKET"
+    if accepting is False:
+        return "ACCEPTING_ORDERS_FALSE"
+    expiry = parse_timestamp(_nested(raw, "expiry", "end_date", "endDate"))
+    if expiry is not None and expiry <= now:
+        return "MARKET_EXPIRED"
+    return None
 def _current_market(record: Any) -> tuple[CurrentMarket | None, dict[str, Any], str | None]:
     if isinstance(record, CurrentMarket):
         raw = record.as_dict()
@@ -614,26 +652,15 @@ def _current_eligibility(raw: Mapping[str, Any], now: datetime) -> tuple[str, st
 
     active = _bool(_nested(raw, "active"), None)
     open_state = _bool(_nested(raw, "open"), None)
-    archived = _bool(_nested(raw, "archived"), None)
     closed = _bool(_nested(raw, "closed"), None)
-    settlement = _text(_nested(raw, "settlement", "outcome", "resolution_status")).casefold()
-    resolved_flag = _bool(_nested(raw, "resolved", "is_resolved"), None)
     accepting = _bool(_nested(raw, "accepting_orders", "acceptingOrders"), None)
+    terminal_reason = _lifecycle_terminal_reason(raw, now)
+    if terminal_reason is not None:
+        return "exclude", terminal_reason
 
     # Explicit terminal facts are authoritative even when a provider omits
     # active/open state from a lifecycle-only response.  Do not infer active
     # state; only defer when these terminal facts are absent or unknown.
-    if archived:
-        return "exclude", "MARKET_CLOSED"
-    if closed is True:
-        return "exclude", "MARKET_CLOSED"
-    if active is False or open_state is False:
-        return "exclude", "INACTIVE_MARKET"
-    if resolved_flag is True or settlement in {"resolved_yes", "resolved_no", "void", "closed", "expired"}:
-        return "exclude", "RESOLVED_MARKET"
-    if accepting is False:
-        return "exclude", "ACCEPTING_ORDERS_FALSE"
-
     if active is None and open_state is None:
         return "defer", "ACTIVE_UNKNOWN"
     if active is None:
@@ -644,12 +671,8 @@ def _current_eligibility(raw: Mapping[str, Any], now: datetime) -> tuple[str, st
         return "exclude", "INACTIVE_MARKET"
     if closed is None:
         return "defer", "CLOSED_UNKNOWN"
-    if closed:
-        return "exclude", "MARKET_CLOSED"
     if accepting is None:
         return "defer", "ACCEPTING_ORDERS_UNKNOWN"
-    if not accepting:
-        return "exclude", "ACCEPTING_ORDERS_FALSE"
     book = _bool(
         _nested(raw, "order_book_available", "book_available", "bookAvailable", "enable_order_book", "enableOrderBook", "book"),
         None,
@@ -857,7 +880,21 @@ def resolve_market_scope(
                 continue
             current, raw, malformed = item
             if malformed or current is None:
-                deferred.append(MarketScopeDisposition(market_id, malformed or "MISSING_MARKET_IDENTITY"))
+                terminal_reason = (
+                    _lifecycle_terminal_reason(raw, stamp)
+                    if _minimal_current_identity(raw, market_id)
+                    else None
+                )
+                if terminal_reason is not None:
+                    excluded.append(
+                        MarketScopeDisposition(
+                            market_id,
+                            terminal_reason,
+                            metadata=_suitability_metadata(raw),
+                        )
+                    )
+                else:
+                    deferred.append(MarketScopeDisposition(market_id, malformed or "MISSING_MARKET_IDENTITY"))
                 continue
             action, eligibility_reason = _current_eligibility(raw, stamp)
             if action == "defer":
@@ -902,7 +939,21 @@ def resolve_market_scope(
                 excluded.append(MarketScopeDisposition(market_id, "HISTORICAL_CONSTITUENT"))
                 continue
             if malformed or current is None:
-                deferred.append(MarketScopeDisposition(market_id, malformed or "MISSING_MARKET_IDENTITY"))
+                terminal_reason = (
+                    _lifecycle_terminal_reason(raw, stamp)
+                    if _minimal_current_identity(raw, market_id)
+                    else None
+                )
+                if terminal_reason is not None:
+                    excluded.append(
+                        MarketScopeDisposition(
+                            market_id,
+                            terminal_reason,
+                            metadata=_suitability_metadata(raw),
+                        )
+                    )
+                else:
+                    deferred.append(MarketScopeDisposition(market_id, malformed or "MISSING_MARKET_IDENTITY"))
                 continue
             action, eligibility_reason = _current_eligibility(raw, stamp)
             if action == "defer":
