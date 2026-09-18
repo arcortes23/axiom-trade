@@ -474,6 +474,8 @@ class PolymarketCollector:
         self._scope_refreshed_snapshots: dict[str, PredictionMarketSnapshot] = {}
         self._scope_resolution_deferred_candidate_ids: tuple[str, ...] = ()
         self._observation_materialization_deferred_candidate_ids: tuple[str, ...] = ()
+        self._observation_materialization_cursor = 0
+        self._observation_materialization_turn = 0
         # Resolutions produced for this cycle are the only authority passed to
         # observation-intent materialization; callers cannot supply market ids
         self._provider_executor_lock = threading.Lock()
@@ -693,6 +695,19 @@ class PolymarketCollector:
             for item in root_state.get("observation_materialization_deferred_candidate_ids", ())
             if str(item).strip()
         )[:_MAX_SCOPE_RESOLUTION_CANDIDATES]
+        try:
+            self._observation_materialization_cursor = max(
+                0,
+                int(root_state.get("observation_materialization_cursor", 0)),
+            )
+        except (TypeError, ValueError, OverflowError):
+            self._observation_materialization_cursor = 0
+        try:
+            self._observation_materialization_turn = int(
+                root_state.get("observation_materialization_turn", 0)
+            ) % 2
+        except (TypeError, ValueError, OverflowError):
+            self._observation_materialization_turn = 0
         configured_values = tuple(dict.fromkeys([*configured, *rolling_non_exact_ids]))
 
         primary_candidate_ids = list(dict.fromkeys([
@@ -1410,6 +1425,13 @@ class PolymarketCollector:
                 "observation_materialization_deferred_candidate_ids": list(
                     self._observation_materialization_deferred_candidate_ids
                 )[:_MAX_SCOPE_RESOLUTION_CANDIDATES],
+                "observation_materialization_cursor": max(
+                    0,
+                    int(self._observation_materialization_cursor),
+                ),
+                "observation_materialization_turn": int(
+                    self._observation_materialization_turn
+                ) % 2,
                 "suitable_market_scheduled": list(discovery_scheduled),
                 "suitable_market_deferred": list(suitable_deferred),
                 "discovery_exclusions": [dict(item) for item in discovery_exclusions],
@@ -2009,12 +2031,19 @@ class PolymarketCollector:
         *,
         scope_resolutions: Mapping[str, Any] | None = None,
     ) -> None:
-        if not candidate_ids:
-            self._observation_materialization_deferred_candidate_ids = ()
-            return
         registry = ForwardTestRegistry(self.store)
         intents = registry.list_observation_intents()
         superseded_candidates, superseded_intents = self._observation_superseded_ids(intents)
+        prior_deferred = list(dict.fromkeys(
+            candidate_id
+            for candidate_id in self._observation_materialization_deferred_candidate_ids
+            if candidate_id not in superseded_candidates
+        ))
+        current_ids = list(dict.fromkeys(
+            str(item).strip()
+            for item in candidate_ids
+            if str(item).strip() and str(item).strip() not in superseded_candidates
+        ))
         by_candidate = {
             str(spec.config.get("candidate_id", "")).strip(): spec
             for spec in intents
@@ -2024,33 +2053,66 @@ class PolymarketCollector:
             not in superseded_candidates
             and str(spec.experiment_id).strip() not in superseded_intents
         }
-        ordered_ids = list(dict.fromkeys([
-            *self._observation_materialization_deferred_candidate_ids,
-            *(str(item).strip() for item in candidate_ids if str(item).strip()),
-        ]))
-        ordered_ids = [
+        if not prior_deferred and not current_ids:
+            self._observation_materialization_deferred_candidate_ids = ()
+            self._observation_materialization_cursor = 0
+            self._observation_materialization_turn = 0
+            return
+
+        if prior_deferred:
+            cursor = self._observation_materialization_cursor % len(prior_deferred)
+            deferred_order = prior_deferred[cursor:] + prior_deferred[:cursor]
+        else:
+            deferred_order = []
+        deferred_set = set(prior_deferred)
+        pending_current_ids = [
             candidate_id
-            for candidate_id in ordered_ids
-            if candidate_id not in superseded_candidates
+            for candidate_id in current_ids
+            if (
+                candidate_id not in deferred_set
+                and candidate_id in by_candidate
+                and registry.get("forward-" + candidate_id) is None
+                and any(
+                    str(item).strip()
+                    for item in candidate_markets.get(candidate_id, ())
+                )
+            )
         ]
-        deferred_ids: list[str] = []
-        for index, candidate_id in enumerate(ordered_ids):
+        turn = self._observation_materialization_turn % 2
+        ordered: list[tuple[int, str]] = []
+        for offset in range(max(len(deferred_order), len(pending_current_ids))):
+            for group in (turn, 1 - turn):
+                values = deferred_order if group == 0 else pending_current_ids
+                if offset < len(values):
+                    ordered.append((group, values[offset]))
+
+        deferred_consumed: set[str] = set()
+        deferred_retries: list[str] = []
+        current_retries: list[str] = []
+        blocked = False
+        blocked_group: int | None = None
+        blocked_index = 0
+        for index, (group, candidate_id) in enumerate(ordered):
             if not self._scope_pipeline_budget_available():
-                deferred_ids = ordered_ids[index:][:_MAX_SCOPE_RESOLUTION_CANDIDATES]
+                blocked = True
+                blocked_group = group
+                blocked_index = index
                 break
             markets = tuple(
                 str(item).strip()
                 for item in candidate_markets.get(candidate_id, ())
                 if str(item).strip()
             )
-            if not markets:
-                continue
-            intent = by_candidate.get(str(candidate_id).strip())
-            if intent is None:
+            intent = by_candidate.get(candidate_id)
+            if not markets or intent is None:
+                if group == 0:
+                    deferred_consumed.add(candidate_id)
                 continue
             # Later ticks refresh current scope authority, not the immutable
             # experiment or its original registration timestamp.
             if registry.get("forward-" + candidate_id) is not None:
+                if group == 0:
+                    deferred_consumed.add(candidate_id)
                 continue
             try:
                 registry.materialize_observation_intent(
@@ -2061,10 +2123,46 @@ class PolymarketCollector:
                     candidate_id=candidate_id,
                     scope_resolution=(scope_resolutions or {}).get(candidate_id),
                 )
+                if group == 0:
+                    deferred_consumed.add(candidate_id)
             except (TypeError, ValueError):
                 counters["errors"] += 1
+                if group == 0:
+                    deferred_retries.append(candidate_id)
+                else:
+                    current_retries.append(candidate_id)
+        deferred_next = [
+            candidate_id
+            for candidate_id in deferred_order
+            if candidate_id not in deferred_consumed
+            and candidate_id not in deferred_retries
+        ]
+        self._observation_materialization_deferred_candidate_ids = tuple(
+            dict.fromkeys([
+                *deferred_next,
+                *deferred_retries,
+                *current_retries,
+            ])
+        )[:_MAX_SCOPE_RESOLUTION_CANDIDATES]
+        self._observation_materialization_cursor = 0
+        if blocked:
+            if blocked_index == 0:
+                other_group = 1 - (blocked_group or 0)
+                has_other_group = bool(
+                    deferred_order if other_group == 0 else pending_current_ids
+                )
+                self._observation_materialization_turn = (
+                    other_group if has_other_group else (blocked_group or 0)
+                )
+            elif blocked_index < len(ordered):
+                self._observation_materialization_turn = ordered[blocked_index][0]
+            else:
+                self._observation_materialization_turn = 1 - (blocked_group or 0)
+        elif self._observation_materialization_deferred_candidate_ids:
+            self._observation_materialization_turn = 0
+        else:
+            self._observation_materialization_turn = 1
 
-        self._observation_materialization_deferred_candidate_ids = tuple(deferred_ids)
     def _isolated_worker_providers(self) -> list[Any]:
         if self.config.max_concurrency <= 1:
             return []

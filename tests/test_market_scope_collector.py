@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import json
@@ -9,6 +10,8 @@ import time
 import sqlite3
 
 import unittest
+
+from unittest.mock import patch
 
 from axiom.collector import (
     CollectorConfig,
@@ -3818,6 +3821,118 @@ class MarketScopeCollectorTests(unittest.TestCase):
         self.assertEqual(second_calls[0], rolling_id)
         self.assertIn(target_id, collector._scope_authority_market_ids)
         collector.close()
+    def test_observation_materialization_interleaves_deferred_and_current_work(self) -> None:
+        deferred_ids = tuple(f"observation-deferred-{index:03d}" for index in range(140))
+        deferred_arrivals = tuple(f"observation-arrival-{index:03d}" for index in range(6))
+        current_tail_ids = tuple(f"observation-current-{index:03d}" for index in range(6))
+        expected_ids = (*deferred_ids, *deferred_arrivals, *current_tail_ids)
+        specs = tuple(
+            SimpleNamespace(
+                experiment_id=f"observation-intent-{candidate_id}",
+                config={"candidate_id": candidate_id, "observation_intent": True},
+            )
+            for candidate_id in expected_ids
+        )
+
+        class RecordingRegistry:
+            materialized: set[str] = set()
+            materialization_attempts: list[str] = []
+
+            def __init__(self, _store):
+                pass
+
+            def list_observation_intents(self):
+                return specs
+
+            def get(self, experiment_id):
+                candidate_id = str(experiment_id).removeprefix("forward-")
+                return object() if candidate_id in self.materialized else None
+
+            def materialize_observation_intent(self, _intent, **kwargs):
+                candidate_id = str(kwargs["candidate_id"])
+                self.materialization_attempts.append(candidate_id)
+                self.materialized.add(candidate_id)
+                return object()
+
+        class TinyBudgetCollector(_ScopeCollector):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self._materialization_budget_calls = 0
+
+            def _scope_pipeline_budget_available(self):
+                self._materialization_budget_calls += 1
+                return self._materialization_budget_calls <= 1
+
+        store = _ScopeStore({})
+        candidate_markets = {
+            candidate_id: (f"market-{candidate_id}",)
+            for candidate_id in expected_ids
+        }
+        collector_config = CollectorConfig(
+            max_markets=1,
+            discovery_budget_per_cycle=1,
+            max_attempts=1,
+            backoff_initial_seconds=0,
+            jitter_seconds=0,
+        )
+        with patch("axiom.collector.ForwardTestRegistry", RecordingRegistry):
+            collector = TinyBudgetCollector(
+                _RecordingProvider(()),
+                store,
+                collector_config,
+                candidate_ids=expected_ids,
+                clock=lambda: T0,
+                sleep=lambda _seconds: None,
+            )
+            collector._observation_materialization_deferred_candidate_ids = deferred_ids
+            for cycle in range((len(deferred_ids) + len(deferred_arrivals)) * 2 + len(current_tail_ids)):
+                if cycle < len(deferred_arrivals):
+                    collector._observation_materialization_deferred_candidate_ids = (
+                        *collector._observation_materialization_deferred_candidate_ids,
+                        deferred_arrivals[cycle],
+                    )
+                current_ids = (
+                    *deferred_ids,
+                    *deferred_arrivals[: min(cycle + 1, len(deferred_arrivals))],
+                    *current_tail_ids[: min(cycle + 1, len(current_tail_ids))],
+                )
+                collector._materialization_budget_calls = 0
+                collector._materialize_observation_intents(
+                    T0 + timedelta(minutes=cycle),
+                    current_ids,
+                    candidate_markets,
+                    {"errors": 0},
+                )
+                store.states["polymarket"] = {
+                    "observation_materialization_deferred_candidate_ids": list(
+                        collector._observation_materialization_deferred_candidate_ids
+                    ),
+                    "observation_materialization_cursor": collector._observation_materialization_cursor,
+                    "observation_materialization_turn": collector._observation_materialization_turn,
+                }
+                if cycle == 3:
+                    collector.close()
+                    collector = TinyBudgetCollector(
+                        _RecordingProvider(()),
+                        store,
+                        collector_config,
+                        candidate_ids=expected_ids,
+                        clock=lambda: T0,
+                        sleep=lambda _seconds: None,
+                    )
+
+            self.assertEqual(set(RecordingRegistry.materialization_attempts), set(expected_ids))
+            self.assertEqual(len(RecordingRegistry.materialization_attempts), len(expected_ids))
+            self.assertLess(
+                RecordingRegistry.materialization_attempts.index(current_tail_ids[0]),
+                len(deferred_ids),
+            )
+            self.assertLessEqual(
+                len(collector._observation_materialization_deferred_candidate_ids),
+                256,
+            )
+            collector.close()
+
     def test_truncated_scope_candidates_preserve_existing_deferred_queue(self) -> None:
         current_ids = tuple(f"current-{index:04d}" for index in range(1001))
         deferred_ids = ("deferred-0000", "deferred-0001")
