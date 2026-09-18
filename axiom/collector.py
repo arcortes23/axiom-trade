@@ -2066,8 +2066,14 @@ class PolymarketCollector:
     ) -> tuple[set[str], set[str]]:
         superseded_candidates: set[str] = set()
         superseded_intents: set[str] = set()
+        explicit_superseded: set[str] = set()
         for spec in intents:
             config = spec.config if isinstance(spec.config, Mapping) else {}
+            explicit = config.get("superseded_observation_intent_ids", ())
+            if isinstance(explicit, (list, tuple, set, frozenset)):
+                values = {str(item).strip() for item in explicit if str(item).strip()}
+                explicit_superseded.update(values)
+                superseded_intents.update(values)
             handoff = config.get("observation_handoff")
             if not isinstance(handoff, Mapping):
                 continue
@@ -2099,6 +2105,40 @@ class PolymarketCollector:
             if superseded_intent_ids is None
             else superseded_intent_ids
         )
+        linked_intent_ids: set[str] = set()
+        lifecycle_loader = getattr(self.store, "load_candidate_lifecycle", None)
+        if callable(lifecycle_loader):
+            for spec in intents:
+                config = spec.config if isinstance(spec.config, Mapping) else {}
+                if config.get("observation_intent") is not True:
+                    continue
+                candidate_id = str(config.get("candidate_id", "")).strip()
+                if not candidate_id:
+                    continue
+                try:
+                    lifecycle = lifecycle_loader(candidate_id)
+                except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+                    continue
+                payload = (
+                    lifecycle.get("payload")
+                    if isinstance(lifecycle, Mapping)
+                    else None
+                )
+                stage = str(
+                    getattr(lifecycle.get("stage"), "value", lifecycle.get("stage"))
+                    if isinstance(lifecycle, Mapping)
+                    else ""
+                ).strip().upper()
+                intent_id = str(
+                    payload.get("paper_observation_intent_id", "")
+                    if isinstance(payload, Mapping)
+                    else ""
+                ).strip()
+                if (
+                    stage in {"SCHEMA_VALIDATED", "PAPER_FORWARD", "PAPER_PROMOTABLE"}
+                    and intent_id
+                ):
+                    linked_intent_ids.add(intent_id)
         result: list[str] = []
         for spec in intents:
             config = spec.config if isinstance(spec.config, Mapping) else {}
@@ -2107,6 +2147,10 @@ class PolymarketCollector:
                 candidate_id
                 and candidate_id not in superseded_candidate_ids
                 and str(spec.experiment_id).strip() not in superseded_intent_ids
+                and (
+                    config.get("observation_intent") is not True
+                    or str(spec.experiment_id).strip() in linked_intent_ids
+                )
             ):
                 result.append(candidate_id)
         return list(dict.fromkeys(result))

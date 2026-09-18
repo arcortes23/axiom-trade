@@ -31,6 +31,7 @@ from .forward import (
     _operational_setup_for_strategy,
     _operational_setup_hash,
     _prediction_strategy_model_required,
+    _semantic_scope_resolution,
 )
 from .director import compact_report, validate_hermes_proposal
 from .domain import Fill, MarketType, ResearchQuality, SettlementState, ensure_utc, parse_timestamp, utc_now
@@ -7812,6 +7813,66 @@ class AutonomousResearchProcessor:
                     "PAPER_PROMOTABLE",
                 }:
                     continue
+            if (
+                config.get("canonical_operational_setup_required") is True
+                and config.get("observation_capture_only") is not True
+                and isinstance(config.get("observation_handoff"), Mapping)
+            ):
+                try:
+                    setup = config.get("operational_setup")
+                    setup_hash = _binding_value(config.get("operational_setup_hash"))
+                    linked_spec = next(
+                        (
+                            candidate
+                            for candidate in registry.list()
+                            if (
+                                isinstance(
+                                    getattr(candidate, "config", None), Mapping
+                                )
+                                and candidate.config.get("market_authority_required")
+                                is True
+                                and _binding_value(candidate.config.get("candidate_id"))
+                                == candidate_id
+                                and _binding_value(candidate.experiment_id)
+                                == _binding_value(
+                                    (
+                                        lifecycle.get("payload", {})
+                                        if isinstance(lifecycle, Mapping)
+                                        else {}
+                                    ).get("forward_test_id")
+                                )
+                                and bool(candidate.allowed_markets)
+                            )
+                        ),
+                        None,
+                    )
+                    lifecycle_payload = (
+                        lifecycle.get("payload")
+                        if isinstance(lifecycle, Mapping)
+                        else None
+                    )
+                    if (
+                        isinstance(setup, Mapping)
+                        and setup_hash
+                        and _operational_setup_hash(setup) == setup_hash
+                        and linked_spec is not None
+                        and isinstance(lifecycle_payload, Mapping)
+                        and _binding_value(
+                            lifecycle_payload.get("paper_observation_intent_id")
+                        )
+                        == str(getattr(intent, "experiment_id", "")).strip()
+                        and _binding_value(lifecycle_payload.get("forward_test_id"))
+                        == str(linked_spec.experiment_id).strip()
+                    ):
+                        continue
+                except (
+                    AttributeError,
+                    KeyError,
+                    TypeError,
+                    ValueError,
+                    RuntimeError,
+                ):
+                    pass
             try:
                 current_intent_id = str(getattr(intent, "experiment_id", "")).strip()
 
@@ -7901,10 +7962,28 @@ class AutonomousResearchProcessor:
                         if not math.isfinite(strict_sla) or strict_sla <= 0:
                             return False
                         proof = existing_config.get("scope_resolution")
-                        if not isinstance(proof, Mapping):
-                            return False
+                        lifecycle_payload_for_check = (
+                            lifecycle.get("payload")
+                            if isinstance(lifecycle, Mapping)
+                            else None
+                        )
+                        lifecycle_proof_for_check = (
+                            lifecycle_payload_for_check.get(
+                                "scope_resolution",
+                                lifecycle_payload_for_check.get(
+                                    "market_scope_resolution"
+                                ),
+                            )
+                            if isinstance(lifecycle_payload_for_check, Mapping)
+                            else None
+                        )
                         if (
-                            str(proof.get("status", "")).strip().upper() != "MATCHED"
+                            not isinstance(proof, Mapping)
+                            or not isinstance(lifecycle_proof_for_check, Mapping)
+                            or _semantic_scope_resolution(lifecycle_proof_for_check)
+                            != _semantic_scope_resolution(proof)
+                            or str(proof.get("status", "")).strip().upper()
+                            != "MATCHED"
                             or _binding_value(proof.get("candidate_id"))
                             != candidate_id
                             or _binding_value(proof.get("scope_hash"))
@@ -7913,7 +7992,9 @@ class AutonomousResearchProcessor:
                             != source_policy.scope_version
                         ):
                             return False
-                        resolved_at = parse_timestamp(proof.get("resolved_at"))
+                        resolved_at = parse_timestamp(
+                            lifecycle_proof_for_check.get("resolved_at")
+                        )
                         if (
                             resolved_at is None
                             or (ensure_utc(now) - ensure_utc(resolved_at)).total_seconds()
@@ -8048,12 +8129,40 @@ class AutonomousResearchProcessor:
                         )
                         if (
                             not isinstance(lifecycle_proof, Mapping)
-                            or _canonical_binding(lifecycle_proof)
-                            != _canonical_binding(
+                            or _semantic_scope_resolution(lifecycle_proof)
+                            != _semantic_scope_resolution(
                                 existing_config.get("scope_resolution", {})
                             )
                         ):
                             continue
+                        proof_loader = getattr(
+                            self.store, "load_market_scope_resolution", None
+                        )
+                        if callable(proof_loader):
+                            try:
+                                current_proof = proof_loader(
+                                    candidate_id,
+                                    scope_hash=source_policy.scope_hash,
+                                    scope_version=source_policy.scope_version,
+                                )
+                            except TypeError:
+                                current_proof = proof_loader(candidate_id)
+                            if hasattr(current_proof, "as_dict") and callable(
+                                current_proof.as_dict
+                            ):
+                                current_proof = current_proof.as_dict()
+                            if isinstance(current_proof, Mapping):
+                                if (
+                                    _semantic_scope_resolution(current_proof)
+                                    != _semantic_scope_resolution(lifecycle_proof)
+                                    or str(
+                                        current_proof.get("resolved_at", "")
+                                    ).strip()
+                                    != str(
+                                        lifecycle_proof.get("resolved_at", "")
+                                    ).strip()
+                                ):
+                                    return False
                         return True
                     return False
 
@@ -8612,6 +8721,8 @@ class AutonomousResearchProcessor:
         model_document, model_resolution = self._resolve_rolling_model(strategy)
         config["model_document"] = dict(model_document)
         config["model_resolution"] = dict(model_resolution)
+        if isinstance(scope_resolution, Mapping):
+            config["scope_resolution"] = _semantic_scope_resolution(scope_resolution)
         expected_config = _canonical_forward_config(config)
         expected_strategy_hash = _content_hash(
             _normalized_strategy_document(strategy_document)
@@ -8631,15 +8742,23 @@ class AutonomousResearchProcessor:
                 and str(existing.model_hash).strip() == expected_model_hash
                 and isinstance(existing_config.get("observation_handoff"), Mapping)
             ):
+                identity_ignored = {
+                    "observation_handoff",
+                    "observation_intent_id",
+                    "paper_observation_intent_id",
+                    "strategy_document",
+                    "scope_resolution",
+                    "superseded_observation_intent_ids",
+                }
                 existing_base = {
                     key: value
                     for key, value in existing_config.items()
-                    if key != "observation_handoff"
+                    if key not in identity_ignored
                 }
                 expected_base = {
                     key: value
                     for key, value in expected_config.items()
-                    if key != "observation_handoff"
+                    if key not in identity_ignored
                 }
                 if _canonical_binding(existing_base) == _canonical_binding(expected_base):
                     intent = existing
@@ -8675,6 +8794,34 @@ class AutonomousResearchProcessor:
                 "predecessor_profitability_inherited": False,
                 "predecessor_allocation_authority_inherited": False,
             }
+            sibling_ids = sorted(
+                {
+                    str(existing.experiment_id).strip()
+                    for existing in registry.list_observation_intents()
+                    if str(existing.experiment_id).strip()
+                    and _binding_value(
+                        (
+                            existing.config
+                            if isinstance(existing.config, Mapping)
+                            else {}
+                        ).get("candidate_id")
+                    )
+                    == candidate_id
+                    and _binding_value(
+                        (
+                            (
+                                existing.config
+                                if isinstance(existing.config, Mapping)
+                                else {}
+                            ).get("observation_handoff")
+                            or {}
+                        ).get("predecessor_observation_intent_id")
+                    )
+                    == str(stale_intent.experiment_id).strip()
+                }
+            )
+            if sibling_ids:
+                config["superseded_observation_intent_ids"] = sibling_ids
             expected_config = _canonical_forward_config(config)
             for existing in registry.list_observation_intents():
                 existing_config = existing.config if isinstance(existing.config, Mapping) else {}
@@ -8997,6 +9144,62 @@ class AutonomousResearchProcessor:
                     specs = []
             except Exception as exc:
                 raise ValueError("PAPER_REGISTRY_UNAVAILABLE") from exc
+            superseded_spec_ids: set[str] = set()
+            linked_forward_ids: set[str] = set()
+            linked_intent_ids: set[str] = set()
+            lifecycle_loader = getattr(self.store, "load_candidate_lifecycle", None)
+            for candidate_spec in specs:
+                candidate_config = (
+                    candidate_spec.get("config")
+                    if isinstance(candidate_spec.get("config"), Mapping)
+                    else {}
+                )
+                superseded_spec_ids.update(
+                    str(item).strip()
+                    for item in candidate_config.get(
+                        "superseded_observation_intent_ids", ()
+                    )
+                    if str(item).strip()
+                )
+                handoff = candidate_config.get("observation_handoff")
+                if isinstance(handoff, Mapping):
+                    predecessor = _binding_value(
+                        handoff.get("predecessor_observation_intent_id")
+                        or handoff.get("predecessor_forward_test_id")
+                    )
+                    if predecessor:
+                        superseded_spec_ids.add(predecessor)
+                if candidate_config.get("observation_intent") is not True:
+                    continue
+                candidate_id = _binding_value(candidate_config.get("candidate_id"))
+                if not candidate_id or not callable(lifecycle_loader):
+                    continue
+                try:
+                    lifecycle = lifecycle_loader(candidate_id)
+                except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+                    continue
+                payload = (
+                    lifecycle.get("payload")
+                    if isinstance(lifecycle, Mapping)
+                    else None
+                )
+                stage = str(
+                    getattr(lifecycle.get("stage"), "value", lifecycle.get("stage"))
+                    if isinstance(lifecycle, Mapping)
+                    else ""
+                ).strip().upper()
+                if stage not in {"SCHEMA_VALIDATED", "PAPER_FORWARD", "PAPER_PROMOTABLE"}:
+                    continue
+                if not isinstance(payload, Mapping):
+                    continue
+                forward_id = _binding_value(payload.get("forward_test_id"))
+                intent_id = _binding_value(
+                    payload.get("paper_observation_intent_id")
+                )
+                if forward_id:
+                    linked_forward_ids.add(forward_id)
+                if intent_id:
+                    linked_intent_ids.add(intent_id)
             matched_spec = False
             pending_intent = False
             for spec in specs:
@@ -9027,6 +9230,13 @@ class AutonomousResearchProcessor:
                 is_unmaterialized_intent = (
                     is_observation_intent and not is_materialized_intent
                 )
+                if is_observation_intent and experiment_id in superseded_spec_ids:
+                    continue
+                if is_materialized_intent and (
+                    experiment_id not in linked_forward_ids
+                    and experiment_id not in linked_intent_ids
+                ):
+                    continue
                 source_strategy_hash = _binding_value(
                     config.get("source_strategy_hash")
                 ) or spec_strategy_hash

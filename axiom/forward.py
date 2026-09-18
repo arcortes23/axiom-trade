@@ -445,6 +445,34 @@ def _scope_resolution_mapping(value: Any) -> Mapping[str, Any] | None:
             return None
         return resolved if isinstance(resolved, Mapping) else None
     return None
+_SCOPE_PROOF_VOLATILE_KEYS = frozenset(
+    {
+        "resolved_at",
+        "resolution_id",
+        "resolution_timestamp",
+        "request_id",
+        "query_id",
+        "observed_at",
+        "created_at",
+        "updated_at",
+    }
+)
+
+
+def _semantic_scope_resolution(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep authority/disposition identity while dropping refresh metadata."""
+    def clean(item: Any) -> Any:
+        if isinstance(item, Mapping):
+            return {
+                str(key): clean(child)
+                for key, child in item.items()
+                if str(key).strip().lower() not in _SCOPE_PROOF_VOLATILE_KEYS
+            }
+        if isinstance(item, (list, tuple)):
+            return [clean(child) for child in item]
+        return item
+
+    return clean(value)
 
 
 def _scope_resolution_market_ids(value: Mapping[str, Any]) -> tuple[str, ...]:
@@ -732,10 +760,18 @@ class ForwardTestRegistry:
             scope=scope,
             market_scope=market_scope,
         )
+        if scope_resolution is not None:
+            proof = _scope_resolution_mapping(scope_resolution)
+            if proof is None:
+                raise ValueError("scope_resolution must be a mapping or immutable resolution")
+            intent_config.setdefault(
+                "scope_resolution",
+                _semantic_scope_resolution(proof),
+            )
+        # Legacy intents historically carried candidate identity only in
+        # their deterministic experiment id; do not rewrite their frozen
+        # config on an idempotent retry.
         if not rolling and "candidate_id" not in config:
-            # Legacy intents historically carried candidate identity only in
-            # their deterministic experiment id; do not rewrite their frozen
-            # config on an idempotent retry.
             intent_config.pop("candidate_id", None)
         intent_config["observation_intent"] = True
         intent_config["market_authority_required"] = False
@@ -756,11 +792,6 @@ class ForwardTestRegistry:
         elif isinstance(normalized_model, Mapping):
             intent_config["model_document"] = dict(normalized_model)
         _frozen_runtime_documents(strategy, model, intent_config)
-        if scope_resolution is not None:
-            proof = _scope_resolution_mapping(scope_resolution)
-            if proof is None:
-                raise ValueError("scope_resolution must be a mapping or immutable resolution")
-            intent_config.setdefault("scope_resolution", dict(proof))
         # Hash the supplied runtime objects after validating them against the
         # immutable documents carried by the intent config.  The strategy
         # hash must be computed before identity material is assembled; older
@@ -777,6 +808,7 @@ class ForwardTestRegistry:
         # participate in its own rolling digest.
         identity_config.pop("observation_intent_id", None)
         identity_config.pop("paper_observation_intent_id", None)
+        identity_config.pop("superseded_observation_intent_ids", None)
         computed_model_hash = _content_hash(normalized_model)
         normalized_risk_limits = dict(risk_limits or {})
         identity_material = {

@@ -4961,26 +4961,87 @@ class ResearchNode:
         paper_store = self._paper_store or self.store
         registry = ForwardTestRegistry(paper_store)
         registry_rows = list(registry.list())
-        superseded_ids = {
-            str(
+        linked_forward_ids: set[str] = set()
+        linked_intent_ids: set[str] = set()
+        lifecycle_loader = getattr(paper_store, "load_candidate_lifecycle", None)
+        if callable(lifecycle_loader):
+            for spec in registry_rows:
+                config = spec.config if isinstance(spec.config, Mapping) else {}
+                if not (
+                    config.get("observation_intent") is True
+                    or isinstance(config.get("observation_handoff"), Mapping)
+                ):
+                    continue
+                candidate_id = str(config.get("candidate_id", "")).strip()
+                if not candidate_id:
+                    continue
+                try:
+                    lifecycle = lifecycle_loader(candidate_id)
+                except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+                    continue
+                payload = (
+                    lifecycle.get("payload")
+                    if isinstance(lifecycle, Mapping)
+                    else None
+                )
+                stage = str(
+                    getattr(lifecycle.get("stage"), "value", lifecycle.get("stage"))
+                    if isinstance(lifecycle, Mapping)
+                    else ""
+                ).strip().upper()
+                if stage not in {"SCHEMA_VALIDATED", "PAPER_FORWARD", "PAPER_PROMOTABLE"}:
+                    continue
+                if not isinstance(payload, Mapping):
+                    continue
+                forward_id = str(payload.get("forward_test_id", "")).strip()
+                intent_id = str(payload.get("paper_observation_intent_id", "")).strip()
+                if forward_id:
+                    linked_forward_ids.add(forward_id)
+                if intent_id:
+                    linked_intent_ids.add(intent_id)
+        superseded_ids: set[str] = set()
+        for spec in registry_rows:
+            config = spec.config if isinstance(spec.config, Mapping) else {}
+            explicit = {
+                str(item).strip()
+                for item in config.get("superseded_observation_intent_ids", ())
+                if str(item).strip()
+            }
+            superseded_ids.update(explicit)
+            handoff = config.get("observation_handoff")
+            if not isinstance(handoff, Mapping):
+                continue
+            predecessor = str(
                 handoff.get("predecessor_observation_intent_id")
                 or handoff.get("predecessor_forward_test_id")
                 or ""
             ).strip()
-            for spec in registry_rows
-            if isinstance(spec.config, Mapping)
-            and isinstance((handoff := spec.config.get("observation_handoff")), Mapping)
-            and str(
-                handoff.get("predecessor_observation_intent_id")
-                or handoff.get("predecessor_forward_test_id")
-                or ""
-            ).strip()
-        }
+            if predecessor:
+                superseded_ids.add(predecessor)
         specs = sorted(
             (
                 spec
                 for spec in registry_rows
                 if spec.experiment_id not in superseded_ids
+                and (
+                    not (
+                        (
+                            spec.config
+                            if isinstance(spec.config, Mapping)
+                            else {}
+                        ).get("observation_intent") is True
+                        or isinstance(
+                            (
+                                spec.config
+                                if isinstance(spec.config, Mapping)
+                                else {}
+                            ).get("observation_handoff"),
+                            Mapping,
+                        )
+                    )
+                    or spec.experiment_id in linked_forward_ids
+                    or spec.experiment_id in linked_intent_ids
+                )
                 and not bool(
                     (spec.config if isinstance(spec.config, Mapping) else {}).get(
                         "historical_replay"

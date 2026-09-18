@@ -1693,6 +1693,15 @@ class TestRollingPortfolio(unittest.TestCase):
             def list_paper_bet_ledger(self, experiment_id: str, *, limit: int = 1000):
                 self.ledger_calls.append(experiment_id)
                 return []
+            def load_candidate_lifecycle(self, candidate_id: str):
+                return {
+                    "stage": "PAPER_FORWARD",
+                    "payload": {
+                        "candidate_id": candidate_id,
+                        "paper_observation_intent_id": "observation-intent-alpha",
+                        "forward_test_id": "forward-alpha",
+                    },
+                }
 
         processor = AutonomousResearchProcessor.__new__(AutonomousResearchProcessor)
         store = PaperStore()

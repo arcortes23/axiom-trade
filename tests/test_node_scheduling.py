@@ -1252,10 +1252,13 @@ class SchedulerScaleTests(unittest.TestCase):
                 self.assertTrue(collector_threads)
                 self.assertTrue(producer_threads)
                 self.assertTrue(producer_threads.isdisjoint(collector_threads))
-                collection_span = collector.calls[-1][1] - collector.calls[0][0]
-                paper_span = paper_finished[0] - paper_started[0]
-                self.assertGreater(paper_span, 0.1)
-                self.assertLess(collection_span, paper_span)
+                paper_window_start = paper_started[0]
+                paper_window_end = paper_finished[0]
+                overlapping_collections = sum(
+                    start < paper_window_end and end > paper_window_start
+                    for start, end in collector.calls
+                )
+                self.assertGreaterEqual(overlapping_collections, 2)
                 self.assertEqual(store.get_collector_state("polymarket")["markets_seen"], 100)
 
                 store.connection.set_authorizer(authorize_canary_selection)
@@ -2610,8 +2613,22 @@ class MutationSchedulingTests(unittest.TestCase):
                     lifecycle_after_migration["payload"]["scope_resolution"],
                     proof.as_dict(),
                 )
+                refreshed_proof = resolve_market_scope(
+                    candidate_id,
+                    {"market_scope": policy.as_dict()},
+                    [current_market],
+                    resolved_at=T0 + timedelta(minutes=1),
+                )
+                store.save_market_scope_resolution(refreshed_proof)
                 second_refresh = processor.refresh_rolling_evidence(T0 + timedelta(minutes=1))
                 self.assertIsInstance(second_refresh, Mapping)
+                refreshed_lifecycle = store.load_candidate_lifecycle(candidate_id)
+                self.assertIsNotNone(refreshed_lifecycle)
+                assert refreshed_lifecycle is not None
+                self.assertEqual(
+                    refreshed_lifecycle["payload"]["scope_resolution"],
+                    refreshed_proof.as_dict(),
+                )
                 migrated_rows_after_restart = [
                     item
                     for item in ForwardTestRegistry(store).list_observation_intents()
