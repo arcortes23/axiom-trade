@@ -2631,6 +2631,14 @@ class PolymarketCollector:
             self._observation_materialization_turn = 1
         return ready_ids
 
+    @staticmethod
+    def _scope_proof_semantic_payload(value: Mapping[str, Any]) -> Mapping[str, Any]:
+        return {
+            key: item
+            for key, item in value.items()
+            if key not in {"resolved_at", "resolution_id"}
+        }
+
     def _observation_handoff_payload_matches(
         self,
         candidate_id: str,
@@ -2719,11 +2727,18 @@ class PolymarketCollector:
             return False
         lifecycle_scope_resolution = payload.get("scope_resolution")
         lifecycle_market_scope_resolution = payload.get("market_scope_resolution")
+        if (
+            not isinstance(lifecycle_scope_resolution, Mapping)
+            or not isinstance(lifecycle_market_scope_resolution, Mapping)
+        ):
+            return False
+        lifecycle_authority = self._scope_proof_semantic_payload(lifecycle_scope_resolution)
+        current_authority = self._scope_proof_semantic_payload(proof)
         return (
-            isinstance(lifecycle_scope_resolution, Mapping)
-            and isinstance(lifecycle_market_scope_resolution, Mapping)
-            and _stable_payload(lifecycle_scope_resolution) == _stable_payload(proof)
-            and _stable_payload(lifecycle_market_scope_resolution) == _stable_payload(proof)
+            _stable_payload(lifecycle_authority) == _stable_payload(current_authority)
+            and _stable_payload(
+                self._scope_proof_semantic_payload(lifecycle_market_scope_resolution)
+            ) == _stable_payload(current_authority)
         )
 
     def _validated_observation_handoff_ids(
@@ -2731,6 +2746,8 @@ class PolymarketCollector:
         candidate_ids: Sequence[str],
         candidate_markets: Mapping[str, Sequence[str]],
         scope_resolutions: Mapping[str, Any],
+        *,
+        allow_schema: bool = False,
     ) -> set[str]:
         loader = getattr(self.store, "load_candidate_lifecycle", None)
         if not callable(loader):
@@ -2765,6 +2782,29 @@ class PolymarketCollector:
             if not isinstance(lifecycle, Mapping):
                 continue
             payload = lifecycle.get("payload")
+            stage = str(lifecycle.get("stage", "")).strip().upper()
+            proof = scope_resolutions.get(candidate_id)
+            if allow_schema and stage == CandidateStage.SCHEMA_VALIDATED.value:
+                config = intent.config if isinstance(intent.config, Mapping) else {}
+                current_ids = tuple(
+                    str(item).strip()
+                    for item in candidate_markets.get(candidate_id, ())
+                    if str(item).strip()
+                )
+                matched_ids = self._scope_result_market_ids(proof)
+                if (
+                    isinstance(payload, Mapping)
+                    and isinstance(proof, Mapping)
+                    and str(config.get("market_scope_hash", "")).strip()
+                    == str(proof.get("scope_hash", "")).strip()
+                    and str(config.get("market_scope_version", "")).strip()
+                    == str(proof.get("scope_version", "")).strip()
+                    and str(proof.get("candidate_id", "")).strip() == candidate_id
+                    and str(proof.get("status", "")).strip().upper() == "MATCHED"
+                    and tuple(matched_ids) == current_ids
+                ):
+                    ready.add(candidate_id)
+                continue
             forward_test_id = (
                 str(payload.get("forward_test_id", "")).strip()
                 if isinstance(payload, Mapping)
@@ -2956,6 +2996,7 @@ class PolymarketCollector:
                 preloaded_scope_ids,
                 preloaded_scope_markets,
                 preloaded_scope_resolutions,
+                allow_schema=True,
             )
             if (
                 preloaded_handoff_ids

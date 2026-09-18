@@ -3948,6 +3948,111 @@ class MarketScopeCollectorTests(unittest.TestCase):
         self.assertTrue(collector._cycle_deadline_exhausted)
         collector.close()
 
+    def test_three_schema_handoffs_preload_before_slow_inventory_and_refresh_semantically(self) -> None:
+        candidate_ids = tuple(f"slow-batch-{index}" for index in range(3))
+        market_ids = tuple(f"slow-batch-market-{index}" for index in range(3))
+        store = _ScopeStore({})
+        for candidate_id, market_id in zip(candidate_ids, market_ids):
+            policy = normalize_market_scope(
+                {
+                    **normalize_market_scope(
+                        market_ids=[market_id],
+                        target_instrument="POLYMARKET",
+                    ).as_dict(),
+                    "provenance": "canonical",
+                }
+            )
+            config = {
+                "candidate_id": candidate_id,
+                "observation_intent": True,
+                "observation_only_lineage": True,
+                "strategy_document": {
+                    "version": 1,
+                    "market_type": "prediction",
+                    "family": "momentum",
+                    "parameters": {"lookback": 1},
+                    "probability_model": "market-history",
+                },
+                "model_document": {"model_required": False},
+                "execution": "paper_only",
+                "market_scope": policy.as_dict(),
+                "market_scope_hash": policy.scope_hash,
+                "market_scope_version": policy.scope_version,
+                "plan_hash": "sha256:slow-plan-" + candidate_id,
+                "dataset_selector": {"dataset_id": "slow-history", "dataset_version": "v1"},
+                "dataset_attestation": {
+                    "dataset_id": "slow-history",
+                    "dataset_version": "v1",
+                    "source_type": "HISTORICAL",
+                },
+            }
+            intent = ForwardTestSpec(
+                "observation-intent-" + candidate_id,
+                "sha256:slow-strategy-" + candidate_id,
+                "sha256:slow-model-" + candidate_id,
+                config,
+                T0,
+                1_000.0,
+                (),
+                {},
+            )
+            store.forward_tests[intent.experiment_id] = intent.as_record()
+            store.documents[candidate_id] = {
+                "candidate_id": candidate_id,
+                "stage": CandidateStage.SCHEMA_VALIDATED.value,
+                "payload": {
+                    **config,
+                    "schema_valid": True,
+                    "paper_observation_intent": True,
+                    "paper_observation_intent_id": intent.experiment_id,
+                    "paper_only": True,
+                    "research_only": True,
+                    "experiment_plan": {
+                        "market_scope": policy.as_dict(),
+                        "market_scope_hash": policy.scope_hash,
+                        "market_scope_version": policy.scope_version,
+                        "plan_hash": config["plan_hash"],
+                        "dataset_selector": config["dataset_selector"],
+                    },
+                },
+            }
+            store.resolutions.append(
+                {
+                    "candidate_id": candidate_id,
+                    "scope_hash": policy.scope_hash,
+                    "scope_version": policy.scope_version,
+                    "resolved_at": T0.isoformat(),
+                    "status": "MATCHED",
+                    "reason": "MATCHED",
+                    "matched_markets": [{"market_id": market_id}],
+                    "excluded_markets": [],
+                    "deferred_markets": [],
+                }
+            )
+
+        class SlowBroadProvider(_RecordingProvider):
+            def market_page(self, **_kwargs):
+                raise AssertionError("broad inventory must not run before handoff preload")
+
+        provider = SlowBroadProvider(tuple(market(market_id) for market_id in market_ids))
+        collector = self._collector(provider, store, (), max_markets=3)
+        first = collector.collect_once(now=T0)
+        self.assertEqual(first.paper_forward_scheduled, market_ids)
+        self.assertGreaterEqual(first.markets_attempted, 3)
+        self.assertGreaterEqual(first.snapshots_inserted, 3)
+        self.assertTrue(
+            all(
+                store.load_candidate_lifecycle(candidate_id)["stage"]
+                == CandidateStage.PAPER_FORWARD.value
+                for candidate_id in candidate_ids
+            )
+        )
+        for proof in store.resolutions:
+            proof["resolved_at"] = (T0 + timedelta(seconds=30)).isoformat()
+        second = collector.collect_once(now=T0 + timedelta(seconds=30))
+        self.assertEqual(second.paper_forward_scheduled, market_ids)
+        collector.close()
+
     def test_observation_materialization_advances_schema_lifecycle_and_restarts_idempotently(self) -> None:
         candidate_id = "observation-lifecycle-candidate"
         market_id = "observation-lifecycle-market"
@@ -4114,6 +4219,7 @@ class MarketScopeCollectorTests(unittest.TestCase):
         lifecycle_before_failed_reconcile = dict(store.load_candidate_lifecycle(candidate_id)["payload"])
         refreshed_proof = dict(store.resolutions[-1].as_dict())
         refreshed_proof["resolved_at"] = (T0 + timedelta(seconds=30)).isoformat()
+        refreshed_proof["reason"] = "AUTHORITY_CHANGED"
         store.resolutions.append(refreshed_proof)
         store.fail_lifecycle = True
         failed_reconcile_collector = self._collector(
