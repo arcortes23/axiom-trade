@@ -36,6 +36,7 @@ from .forward import (
     _content_hash,
     _operational_setup_hash,
 )
+from .experiment_plan import normalize_market_scope
 from .opportunity import scan_opportunities
 from .paper import CryptoPaperTrader
 from .paper_engine import (
@@ -911,6 +912,12 @@ class ResearchNode:
                 max_experiments_per_day=config.max_experiments_per_day,
                 mutation_enabled=config.mutation_enabled,
                 promotion_criteria=config.promotion_criteria,
+                scope_resolution_freshness_sla_seconds=min(
+                    float(config.freshness_sla_seconds)
+                    if config.freshness_sla_seconds is not None
+                    else float(config.interval_seconds),
+                    float(config.interval_seconds),
+                ),
             ),
             clock=clock,
         )
@@ -4917,18 +4924,51 @@ class ResearchNode:
     def _run_paper_workers_locked(self) -> dict[str, Any]:
         paper_store = self._paper_store or self.store
         registry = ForwardTestRegistry(paper_store)
+        registry_rows = list(registry.list())
+        superseded_ids = {
+            str(
+                handoff.get("predecessor_observation_intent_id")
+                or handoff.get("predecessor_forward_test_id")
+                or ""
+            ).strip()
+            for spec in registry_rows
+            if isinstance(spec.config, Mapping)
+            and isinstance((handoff := spec.config.get("observation_handoff")), Mapping)
+            and str(
+                handoff.get("predecessor_observation_intent_id")
+                or handoff.get("predecessor_forward_test_id")
+                or ""
+            ).strip()
+        }
         specs = sorted(
             (
                 spec
-                for spec in registry.list()
-                if not bool((spec.config if isinstance(spec.config, Mapping) else {}).get("historical_replay"))
+                for spec in registry_rows
+                if spec.experiment_id not in superseded_ids
+                and not bool(
+                    (spec.config if isinstance(spec.config, Mapping) else {}).get(
+                        "historical_replay"
+                    )
+                )
                 and not (
-                    bool((spec.config if isinstance(spec.config, Mapping) else {}).get("observation_intent"))
+                    bool(
+                        (spec.config if isinstance(spec.config, Mapping) else {}).get(
+                            "observation_intent"
+                        )
+                    )
                     and not spec.allowed_markets
                 )
                 and not (
-                    bool((spec.config if isinstance(spec.config, Mapping) else {}).get("shadow_assessment"))
-                    or bool((spec.config if isinstance(spec.config, Mapping) else {}).get("shadow_only"))
+                    bool(
+                        (spec.config if isinstance(spec.config, Mapping) else {}).get(
+                            "shadow_assessment"
+                        )
+                    )
+                    or bool(
+                        (spec.config if isinstance(spec.config, Mapping) else {}).get(
+                            "shadow_only"
+                        )
+                    )
                 )
             ),
             key=lambda spec: (spec.start_timestamp, spec.experiment_id),
@@ -5037,6 +5077,15 @@ class ResearchNode:
                         "reason_code": str(result.get("reason_code") or result["blocker"]),
                         "retryable": False,
                     }
+                )
+            elif (
+                str(result.get("status") or "").upper() == "DEGRADED"
+                and result.get("retryable") is True
+            ):
+                stats["failed_candidates"] += 1
+                stats["failed_candidate_ids"].append(spec.experiment_id)
+                stats["errors"].append(
+                    str(result.get("error") or result.get("blocker") or "paper worker degraded")
                 )
             elif "error" not in result:
                 stats["successful_candidates"] += 1
@@ -5408,6 +5457,527 @@ class ResearchNode:
                         nested_rules.setdefault(canonical, None)
                 observation[f"{outcome}_market_rules"] = nested_rules
 
+    def _legacy_observation_only_mode(self, spec: Any) -> bool:
+        """Authorize evidence-only processing for an immutable legacy handoff."""
+        config = spec.config if isinstance(getattr(spec, "config", None), Mapping) else {}
+        bool_config = {
+            "observation_capture_only": True,
+            "observation_intent": True,
+            "observation_only_lineage": True,
+            "paper_only": True,
+            "market_authority_required": True,
+        }
+        if (
+            any(
+                type(config.get(name)) is not bool or config.get(name) is not expected
+                for name, expected in bool_config.items()
+            )
+            or "operational_setup" in config
+            or "operational_setup_hash" in config
+        ):
+            return False
+        candidate_id = str(config.get("candidate_id", "")).strip()
+        loader = getattr(self.store, "load_candidate_lifecycle", None)
+        if not candidate_id or not callable(loader):
+            return False
+        try:
+            lifecycle = loader(candidate_id)
+        except Exception:
+            return False
+        if not isinstance(lifecycle, Mapping):
+            return False
+        payload = lifecycle.get("payload")
+        if not isinstance(payload, Mapping):
+            return False
+        for name, expected in {
+            "paper_observation_intent": True,
+            "paper_only": True,
+            "research_only": True,
+            "selection_excluded": True,
+            "allocation_active": False,
+            "canary_armed": False,
+        }.items():
+            if type(payload.get(name)) is not bool or payload.get(name) is not expected:
+                return False
+        return (
+            type(payload.get("observation_only_lineage")) is bool
+            and payload.get("observation_only_lineage") is True
+            and type(payload.get("execution_scope")) is str
+            and payload.get("execution_scope") == "OBSERVATION"
+        )
+    def _persist_legacy_capture_evaluation(
+        self,
+        spec: Any,
+        *,
+        store: AxiomStore,
+        now: datetime,
+        status: str,
+        reason: str,
+        observation_records: Sequence[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        """Persist one idempotent canonical evaluation and its next schedule."""
+        config = spec.config if isinstance(getattr(spec, "config", None), Mapping) else {}
+        strategy_document = config.get("strategy_document")
+        strategy_version = str(
+            config.get("strategy_version")
+            or config.get("strategy_version_id")
+            or "legacy-observation-capture-v1"
+        ).strip()
+        trial_id = str(
+            config.get("research_trial_id")
+            or config.get("trial_id")
+            or config.get("candidate_id")
+            or ""
+        ).strip()
+        enrollment_id = str(
+            config.get("observation_intent_id")
+            or config.get("paper_observation_intent_id")
+            or spec.experiment_id
+        ).strip()
+        records = [
+            {
+                "observation_id": str(item.get("observation_id", "")).strip(),
+                "timestamp": str(item.get("timestamp", "")).strip(),
+                "market_id": str(item.get("market_id", "")).strip(),
+            }
+            for item in observation_records
+            if str(item.get("observation_id", "")).strip()
+        ]
+        records = records[:3]
+        evidence_identity = {
+            "spec_id": str(spec.experiment_id),
+            "strategy_hash": str(spec.strategy_hash),
+            "strategy_version": strategy_version,
+            "trial_id": trial_id,
+            "enrollment_id": enrollment_id,
+            "observations": records,
+        }
+        evaluation_id = (
+            "capture-evaluation-"
+            + _rolling_hash(evidence_identity).removeprefix("sha256:")[:40]
+        )
+        schedule_seconds = config.get(
+            "observation_interval_seconds",
+            getattr(self.config, "shadow_interval", 300.0),
+        )
+        try:
+            schedule_seconds = max(1.0, float(schedule_seconds))
+        except (TypeError, ValueError, OverflowError):
+            schedule_seconds = 300.0
+        next_at = ensure_utc(now) + timedelta(seconds=schedule_seconds)
+        try:
+            existing_state = store.load_paper_state(spec.experiment_id) or {}
+        except Exception as exc:
+            return {
+                "evaluation_id": evaluation_id,
+                "persisted": False,
+                "persistence_error": str(exc)[:160] or "CAPTURE_STATE_LOAD_FAILED",
+                "next_evaluation_at": next_at.isoformat(),
+            }
+        state_payload = existing_state.get("state", {})
+        state_payload = dict(state_payload) if isinstance(state_payload, Mapping) else {}
+        evaluations = state_payload.get("canonical_capture_evaluations", {})
+        evaluations = dict(evaluations) if isinstance(evaluations, Mapping) else {}
+        if evaluation_id not in evaluations:
+            evaluations[evaluation_id] = {
+                "evaluation_kind": (
+                    "OBSERVATION_ONLY_DECLINE"
+                    if status == "DECLINED"
+                    else "OBSERVATION_ONLY_PROGRESS"
+                ),
+                "evaluation_version": "legacy-observation-capture:v1",
+                "evaluation_run_id": evaluation_id,
+                "strategy_version_id": strategy_version,
+                "strategy_hash": str(spec.strategy_hash),
+                "strategy_document": (
+                    dict(strategy_document)
+                    if isinstance(strategy_document, Mapping)
+                    else None
+                ),
+                "research_trial_id": trial_id,
+                "enrollment_id": enrollment_id,
+                "spec_identity": {
+                    "experiment_id": str(spec.experiment_id),
+                    "candidate_id": str(config.get("candidate_id", "")).strip(),
+                    "model_hash": str(spec.model_hash),
+                },
+                "observation_ids": [item["observation_id"] for item in records],
+                "observation_timestamps": [item["timestamp"] for item in records],
+                "market_ids": [item["market_id"] for item in records],
+                "outcome": status,
+                "reason": reason,
+                "accepted": False,
+                "promotable": False,
+                "selection_excluded": True,
+                "accounting": {
+                    "accounting_available": False,
+                    "accounting_complete": False,
+                    "accounting_not_applicable": True,
+                    "allocation_active": False,
+                    "fills": 0,
+                    "execution_events": 0,
+                    "realized_pnl": None,
+                    "unrealized_pnl": None,
+                    "fees": None,
+                    "costs": None,
+                    "net_result": None,
+                },
+                "evaluated_at": ensure_utc(now).isoformat(),
+                "next_evaluation_at": next_at.isoformat(),
+            }
+        state_payload["canonical_capture_evaluations"] = evaluations
+        state_payload["canonical_capture_schedule"] = {
+            "status": status,
+            "next_action": "schedule_research",
+            "next_evaluation_at": next_at.isoformat(),
+            "allocation_active": False,
+            "updated_at": ensure_utc(now).isoformat(),
+        }
+        try:
+            store.save_paper_state(
+                spec.experiment_id,
+                state_payload,
+                timestamp=ensure_utc(now),
+            )
+        except Exception as exc:
+            return {
+                "evaluation_id": evaluation_id,
+                "persisted": False,
+                "persistence_error": str(exc)[:160],
+                "next_evaluation_at": next_at.isoformat(),
+            }
+        return {
+            "evaluation_id": evaluation_id,
+            "persisted": True,
+            "next_evaluation_at": next_at.isoformat(),
+        }
+
+    def _capture_legacy_observations(
+        self,
+        spec: Any,
+        observations: Sequence[Mapping[str, Any]],
+        *,
+        store: AxiomStore,
+        now: datetime,
+    ) -> dict[str, Any]:
+        """Persist authenticated legacy evidence without constructing a trader."""
+        config = spec.config if isinstance(getattr(spec, "config", None), Mapping) else {}
+        canonical_marker = config.get("canonical_operational_setup_required")
+        if (
+            (
+                "canonical_operational_setup_required" in config
+                and (
+                    type(canonical_marker) is not bool
+                    or canonical_marker is True
+                )
+            )
+            or "operational_setup" in config
+            or "operational_setup_hash" in config
+        ):
+            return {
+                "status": "BLOCKED",
+                "blocker": "CAPTURE_SAFETY_INVALID",
+                "retryable": False,
+                "experiment_id": spec.experiment_id,
+            }
+        candidate_id = str(config.get("candidate_id", "")).strip()
+        allowed = tuple(dict.fromkeys(str(item).strip() for item in spec.allowed_markets if str(item).strip()))
+        bound_market = str(config.get("capture_market_id", "")).strip()
+        if not bound_market:
+            bound_market = sorted(allowed)[0] if allowed else ""
+        if bound_market not in allowed:
+            return {
+                "status": "BLOCKED",
+                "blocker": "CAPTURE_MARKET_BINDING_INVALID",
+                "retryable": False,
+                "experiment_id": spec.experiment_id,
+            }
+        lifecycle_loader = getattr(self.store, "load_candidate_lifecycle", None)
+        proof_loader = getattr(self.store, "load_market_scope_resolution", None)
+        stage_error = "OBSERVATION_AUTHORITY_UNAVAILABLE"
+        try:
+            lifecycle = lifecycle_loader(candidate_id) if callable(lifecycle_loader) else None
+            payload = lifecycle.get("payload") if isinstance(lifecycle, Mapping) else None
+            stage = str(
+                getattr(lifecycle.get("stage"), "value", lifecycle.get("stage"))
+                if isinstance(lifecycle, Mapping)
+                else ""
+            ).strip().upper()
+            if stage not in {"SCHEMA_VALIDATED", "PAPER_FORWARD", "PAPER_PROMOTABLE"}:
+                raise ValueError("OBSERVATION_LIFECYCLE_STAGE_INVALID")
+            if (
+                not isinstance(payload, Mapping)
+                or str(payload.get("candidate_id", "")).strip() != candidate_id
+                or str(payload.get("forward_test_id", "")).strip() != str(spec.experiment_id)
+                or str(payload.get("paper_observation_intent_id", "")).strip()
+                != str(spec.experiment_id)
+            ):
+                raise ValueError("OBSERVATION_LIFECYCLE_IDENTITY_MISMATCH")
+            if not allowed:
+                raise ValueError("OBSERVATION_MARKET_SCOPE_EMPTY")
+            scope_source = config.get("market_scope", config.get("scope", {}))
+            policy = normalize_market_scope(scope_source)
+            if (
+                str(payload.get("scope_hash", "")).strip() != policy.scope_hash
+                or str(payload.get("scope_version", "")).strip() != policy.scope_version
+            ):
+                raise ValueError("OBSERVATION_LIFECYCLE_SCOPE_MISMATCH")
+            proof = (
+                proof_loader(
+                    candidate_id,
+                    scope_hash=policy.scope_hash,
+                    scope_version=policy.scope_version,
+                )
+                if callable(proof_loader)
+                else None
+            )
+            if hasattr(proof, "as_dict") and callable(proof.as_dict):
+                proof = proof.as_dict()
+            if not isinstance(proof, Mapping):
+                raise ValueError("CURRENT_SCOPE_PROOF_UNAVAILABLE")
+            if str(proof.get("status", "")).strip().upper() != "MATCHED":
+                raise ValueError("CURRENT_SCOPE_PROOF_NOT_MATCHED")
+            if str(proof.get("candidate_id", "")).strip() != candidate_id:
+                raise ValueError("CURRENT_SCOPE_PROOF_CANDIDATE_MISMATCH")
+            if str(proof.get("scope_hash", "")).strip() != policy.scope_hash:
+                raise ValueError("CURRENT_SCOPE_PROOF_HASH_MISMATCH")
+            if str(proof.get("scope_version", "")).strip() != policy.scope_version:
+                raise ValueError("CURRENT_SCOPE_PROOF_VERSION_MISMATCH")
+            resolved_at = parse_timestamp(proof.get("resolved_at"))
+            authoritative_sla = config.get("scope_resolution_freshness_sla_seconds")
+            node_sla = config.get("freshness_sla_seconds")
+            try:
+                freshness = float(authoritative_sla)
+                if not math.isfinite(freshness) or freshness <= 0:
+                    raise ValueError
+                if node_sla is not None:
+                    node_bound = float(node_sla)
+                    if not math.isfinite(node_bound) or node_bound <= 0:
+                        raise ValueError
+                    freshness = min(freshness, node_bound)
+            except (TypeError, ValueError, OverflowError):
+                raise ValueError("CURRENT_SCOPE_PROOF_SLA_UNAVAILABLE") from None
+            if (
+                resolved_at is None
+                or (ensure_utc(now) - ensure_utc(resolved_at)).total_seconds() < 0
+                or (ensure_utc(now) - ensure_utc(resolved_at)).total_seconds() > freshness
+            ):
+                raise ValueError("CURRENT_SCOPE_PROOF_STALE")
+            matched = proof.get("matched_markets", ())
+            matched_ids = tuple(
+                str(item.get("market_id", "")).strip()
+                if isinstance(item, Mapping)
+                else str(item).strip()
+                for item in (matched if isinstance(matched, (list, tuple)) else ())
+            )
+            if not matched_ids or len(set(matched_ids)) != len(matched_ids) or set(matched_ids) != set(allowed):
+                raise ValueError("CURRENT_SCOPE_PROOF_MARKETS_MISMATCH")
+            if proof.get("deferred_markets") or set(matched_ids).intersection(
+                str(item.get("market_id", "")).strip()
+                if isinstance(item, Mapping)
+                else str(item).strip()
+                for item in (proof.get("excluded_markets", ()) or ())
+            ):
+                raise ValueError("CURRENT_SCOPE_PROOF_INCOMPLETE")
+        except Exception as exc:
+            stage_error = str(exc)[:160] or stage_error
+            return {
+                "status": "BLOCKED",
+                "blocker": stage_error,
+                "retryable": False,
+                "experiment_id": spec.experiment_id,
+                "observations_seen": len(observations),
+                "observations_processed": 0,
+                "fills_inserted": 0,
+                "execution_events": 0,
+                "errors": [stage_error],
+                "next_action": "retry_current_market_scope",
+            }
+        processed = 0
+        skipped = 0
+        seen: set[str] = set()
+        for raw in sorted(
+            observations,
+            key=lambda item: (
+                parse_timestamp(item.get("timestamp", item.get("observed_at"))) or ensure_utc(now),
+                str(item.get("market_id", "")),
+                str(item.get("source_snapshot_id", "")),
+            ),
+        ):
+            market_id = str(raw.get("market_id", "")).strip()
+            stamp = parse_timestamp(raw.get("timestamp", raw.get("observed_at")))
+            source_timestamp = parse_timestamp(raw.get("source_timestamp")) or stamp
+            source_id = str(raw.get("source_snapshot_id", "")).strip()
+            if (
+                market_id != bound_market
+                or not market_id
+                or market_id not in allowed
+                or stamp is None
+                or source_timestamp is None
+                or stamp < spec.registration_timestamp
+                or stamp > ensure_utc(now)
+                or source_timestamp > stamp
+            ):
+                skipped += 1
+                continue
+            observation_id = "capture-" + _rolling_hash(
+                {
+                    "experiment_id": spec.experiment_id,
+                    "market_id": market_id,
+                    "source_timestamp": source_timestamp.isoformat(),
+                    "source_snapshot_id": source_id,
+                }
+            )
+            if observation_id in seen:
+                skipped += 1
+                continue
+            seen.add(observation_id)
+            payload = dict(raw)
+            payload["source_type"] = "FORWARD_COLLECTED"
+            try:
+                inserted = store.save_paper_observation(
+                    observation_id,
+                    spec.experiment_id,
+                    market_id,
+                    stamp,
+                    payload,
+                )
+            except Exception:
+                skipped += 1
+                continue
+            if inserted:
+                processed += 1
+            else:
+                skipped += 1
+        persisted_records: list[dict[str, Any]] = []
+        lister = getattr(store, "list_paper_observations", None)
+        if callable(lister):
+            try:
+                persisted_rows = lister(spec.experiment_id, limit=None)
+            except Exception:
+                persisted_rows = ()
+            by_source: dict[str, dict[str, Any]] = {}
+            for row in persisted_rows:
+                if (
+                    not isinstance(row, Mapping)
+                    or str(row.get("market_id", "")).strip() != bound_market
+                ):
+                    continue
+                payload = row.get("payload")
+                source_timestamp = (
+                    payload.get("source_timestamp")
+                    if isinstance(payload, Mapping)
+                    else None
+                )
+                source_stamp = parse_timestamp(source_timestamp) or parse_timestamp(row.get("timestamp"))
+                source_id = (
+                    str(payload.get("source_snapshot_id", "")).strip()
+                    if isinstance(payload, Mapping)
+                    else ""
+                )
+                if source_stamp is None or not source_id:
+                    continue
+                identity = (
+                    bound_market,
+                    source_id,
+                    source_stamp.isoformat(),
+                )
+                by_source.setdefault(
+                    identity,
+                    {
+                        "observation_id": str(row.get("observation_id", "")).strip(),
+                        "timestamp": source_stamp.isoformat(),
+                        "market_id": bound_market,
+                    },
+                )
+            ordered = sorted(
+                by_source.values(),
+                key=lambda item: (item["timestamp"], item["observation_id"]),
+            )
+            persisted_records = []
+            last_timestamp: str | None = None
+            for item in ordered:
+                if item["timestamp"] == last_timestamp:
+                    continue
+                persisted_records.append(item)
+                last_timestamp = item["timestamp"]
+                if len(persisted_records) >= 3:
+                    break
+        strategy_document = config.get("strategy_document")
+        family = (
+            str(strategy_document.get("family", "")).strip().lower()
+            if isinstance(strategy_document, Mapping)
+            else ""
+        )
+        if family == "probability_mispricing":
+            reason = "ZERO_EDGE_CONTROL"
+        elif family in {"momentum", "mean_reversion"}:
+            reason = "OPERATIONAL_SETUP_UNDERDETERMINED"
+        else:
+            return {
+                "status": "BLOCKED",
+                "blocker": "CAPTURE_STRATEGY_FAMILY_UNSUPPORTED",
+                "retryable": False,
+                "experiment_id": spec.experiment_id,
+            }
+        status = "DECLINED" if len(persisted_records) >= 3 else "OBSERVING"
+        evaluation = {
+            "status": status,
+            "reason": reason if status == "DECLINED" else "MINIMUM_OBSERVATIONS_PENDING",
+            "observations": len(persisted_records),
+            "evaluation_kind": "OBSERVATION_ONLY_DECLINE" if status == "DECLINED" else "OBSERVATION_ONLY_PROGRESS",
+            "accepted": False,
+            "promotable": False,
+            "selection_excluded": True,
+            "allocation_active": False,
+        }
+        persistence = self._persist_legacy_capture_evaluation(
+            spec,
+            store=store,
+            now=now,
+            status=status,
+            reason=reason if status == "DECLINED" else "MINIMUM_OBSERVATIONS_PENDING",
+            observation_records=persisted_records,
+        )
+        if not persistence.get("persisted"):
+            return {
+                "status": "DEGRADED",
+                "retryable": True,
+                "blocker": "CAPTURE_EVALUATION_PERSISTENCE_FAILED",
+                "experiment_id": spec.experiment_id,
+                "observations_processed": len(persisted_records),
+                "errors": [
+                    persistence.get(
+                        "persistence_error",
+                        "CAPTURE_EVALUATION_PERSISTENCE_FAILED",
+                    )
+                ],
+                "error": persistence.get(
+                    "persistence_error",
+                    "CAPTURE_EVALUATION_PERSISTENCE_FAILED",
+                ),
+                "evaluation_persistence": persistence,
+            }
+        return {
+            "status": status,
+            "experiment_id": spec.experiment_id,
+            "observations_seen": len(observations),
+            "observations_processed": len(persisted_records),
+            "observations_skipped": skipped,
+            "fills_inserted": 0,
+            "settlements": 0,
+            "execution_events": 0,
+            "errors": [reason] if status == "DECLINED" else [],
+            "evaluation": evaluation,
+            "evaluation_persistence": persistence,
+            "schedule": {
+                "next_action": "schedule_research",
+                "allocation_active": False,
+                "next_evaluation_at": persistence.get("next_evaluation_at"),
+            },
+        }
+
+
     def _paper_binding_blocked_result(
         self,
         spec: Any,
@@ -5482,7 +6052,72 @@ class ResearchNode:
             heartbeat_at=started,
         )
         try:
-            runtime = self._operational_paper_runtime(spec, observed_at=started)
+            initial_config = spec.config if isinstance(spec.config, Mapping) else {}
+
+            def blocked_result(blocker: str) -> dict[str, Any]:
+                blocked = {
+                    "status": "BLOCKED",
+                    "blocker": blocker,
+                    "retryable": False,
+                    "experiment_id": spec.experiment_id,
+                    "paper_only": True,
+                    "live_execution": False,
+                }
+                self.store.save_worker_state(
+                    worker_name,
+                    "idle",
+                    {"pid": os.getpid(), **blocked},
+                    started_at=started,
+                    heartbeat_at=ensure_utc(self.clock()),
+                )
+                return blocked
+
+            capture_marker_present = "observation_capture_only" in initial_config
+            capture_marker = initial_config.get("observation_capture_only")
+            if capture_marker_present and type(capture_marker) is not bool:
+                return blocked_result("CAPTURE_SAFETY_INVALID")
+            canonical_marker_present = "canonical_operational_setup_required" in initial_config
+            canonical_marker = initial_config.get("canonical_operational_setup_required")
+            if canonical_marker_present and type(canonical_marker) is not bool:
+                return blocked_result("CANONICAL_OPERATIONAL_SETUP_MARKER_INVALID")
+            canonical_operational = canonical_marker is True
+            if canonical_operational and capture_marker is True:
+                return blocked_result("CAPTURE_SAFETY_INVALID")
+            if canonical_operational:
+                setup = initial_config.get("operational_setup")
+                setup_hash = str(initial_config.get("operational_setup_hash", "") or "").strip()
+                if not isinstance(setup, Mapping) or not setup_hash:
+                    return blocked_result("OPERATIONAL_SETUP_INVALID")
+                try:
+                    setup_hash_matches = _operational_setup_hash(setup) == setup_hash
+                except Exception:
+                    setup_hash_matches = False
+                if not setup_hash_matches:
+                    return blocked_result("OPERATIONAL_SETUP_HASH_MISMATCH")
+            has_operational_setup = isinstance(
+                initial_config.get("operational_setup"), Mapping
+            )
+            legacy_lineage_marker = (
+                not canonical_operational
+                and not has_operational_setup
+                and (
+                    "observation_only_lineage" in initial_config
+                    or "observation_intent" in initial_config
+                    or "operational_setup" in initial_config
+                    or "operational_setup_hash" in initial_config
+                    or str(initial_config.get("execution_scope", "")).strip().upper() == "OBSERVATION"
+                )
+            )
+            observation_only = self._legacy_observation_only_mode(spec)
+            if capture_marker is True and not observation_only:
+                return blocked_result("CAPTURE_SAFETY_INVALID")
+            if legacy_lineage_marker and not observation_only:
+                return blocked_result("MIGRATION_REQUIRED")
+            runtime = (
+                None
+                if observation_only
+                else self._operational_paper_runtime(spec, observed_at=started)
+            )
             if runtime is not None and "blocker" in runtime:
                 return self._operational_paper_blocked_result(
                     spec,
@@ -5496,16 +6131,17 @@ class ResearchNode:
             operational_settings = (
                 runtime.get("identity") if isinstance(runtime, Mapping) else None
             )
-            blocked_result = self._paper_binding_blocked_result(
-                spec,
-                worker_name=worker_name,
-                started=started,
-                paper_store=paper_store,
-                operational_policy=operational_policy,
-                operational_settings=operational_settings,
-            )
-            if blocked_result is not None:
-                return blocked_result
+            if not observation_only:
+                blocked_result = self._paper_binding_blocked_result(
+                    spec,
+                    worker_name=worker_name,
+                    started=started,
+                    paper_store=paper_store,
+                    operational_policy=operational_policy,
+                    operational_settings=operational_settings,
+                )
+                if blocked_result is not None:
+                    return blocked_result
             config = spec.config if isinstance(spec.config, Mapping) else {}
             strategy_document = config.get("strategy_document")
             model_document = config.get("model_document")
@@ -5550,7 +6186,14 @@ class ResearchNode:
             model = _PersistedProbabilityModel(model_document)
             market_limit = self.config.max_markets if self.config.max_markets is not None else 1000
             market_ids = tuple(spec.allowed_markets)[:market_limit]
-            if not market_ids:
+            if observation_only:
+                bound_market = str(initial_config.get("capture_market_id", "")).strip()
+                if not bound_market:
+                    bound_market = sorted(set(market_ids))[0] if market_ids else ""
+                if not bound_market or bound_market not in market_ids:
+                    raise ValueError("CAPTURE_MARKET_BINDING_INVALID")
+                market_ids = (bound_market,)
+            elif not market_ids:
                 market_ids = tuple(paper_store.tracked_polymarket_markets(active_only=False, limit=market_limit))
             state_record = paper_store.load_paper_state(spec.experiment_id) or {}
             state_payload = state_record.get("state", {})
@@ -5590,10 +6233,17 @@ class ResearchNode:
                     break
                 rows = paper_store.load_polymarket_snapshots(
                     market_id,
-                    source_start=cursors.get(str(market_id), spec.registration_timestamp),
+                    source_start=(
+                        None
+                        if observation_only
+                        else cursors.get(str(market_id), spec.registration_timestamp)
+                    ),
                     source_end=started,
-                    source_after=source_cursors.get(str(market_id)),
-                    limit=min(512, observation_limit - len(observations)),
+                    source_after=(
+                        None if observation_only else source_cursors.get(str(market_id))
+                    ),
+                    latest=observation_only,
+                    limit=1 if observation_only else min(512, observation_limit - len(observations)),
                 )
                 for row in rows:
                     payload = row.get("payload")
@@ -5601,7 +6251,10 @@ class ResearchNode:
                         continue
                     observation = dict(payload.get("snapshot", payload))
                     observation.setdefault("market_id", market_id)
-                    observation.setdefault("timestamp", row.get("source_timestamp") or row.get("observed_at"))
+                    observation.setdefault(
+                        "timestamp",
+                        row.get("source_timestamp") or row.get("observed_at"),
+                    )
                     observation["source_snapshot_id"] = row.get("snapshot_id")
                     observation["source_timestamp"] = row.get("source_timestamp")
                     for key in ("yes_order_book", "no_order_book", "available_at"):
@@ -5616,7 +6269,11 @@ class ResearchNode:
                     if opportunity_records:
                         observation["opportunities"] = opportunity_records
                         yes_opportunity = next(
-                            (item for item in opportunity_records if str(item.get("outcome", "")).lower() == "yes"),
+                            (
+                                item
+                                for item in opportunity_records
+                                if str(item.get("outcome", "")).lower() == "yes"
+                            ),
                             opportunity_records[0],
                         )
                         for key in (
@@ -5636,17 +6293,25 @@ class ResearchNode:
                     observations.append(observation)
                     if len(observations) >= observation_limit:
                         break
-            cycle = run_forward_paper(
-                spec,
-                store=paper_store,
-                strategy=strategy,
-                model=model,
-                observations=observations,
-                operational_policy=operational_policy,
-                operational_settings=operational_settings,
-                now=started,
+            cycle_payload = (
+                self._capture_legacy_observations(
+                    spec,
+                    observations,
+                    store=paper_store,
+                    now=started,
+                )
+                if observation_only
+                else run_forward_paper(
+                    spec,
+                    store=paper_store,
+                    strategy=strategy,
+                    model=model,
+                    observations=observations,
+                    operational_policy=operational_policy,
+                    operational_settings=operational_settings,
+                    now=started,
+                ).as_record()
             )
-            cycle_payload = cycle.as_record()
             self.store.save_worker_state(
                 worker_name,
                 "idle",

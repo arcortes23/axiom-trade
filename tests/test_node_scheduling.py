@@ -11,9 +11,14 @@ import unittest
 import sqlite3
 from unittest.mock import Mock, patch
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Mapping
 
-from axiom.autonomous import AutonomousResearchProcessor, _rolling_hash
+from axiom.autonomous import (
+    AutonomousResearchConfig,
+    AutonomousResearchProcessor,
+    _rolling_hash,
+)
 from axiom.canary_settings import CanarySettingsService
 from axiom.collector import CollectionCycle, CollectorConfig, PolymarketCollector
 from axiom.data import InMemoryPredictionProvider
@@ -1880,6 +1885,121 @@ class MutationSchedulingTests(unittest.TestCase):
                     if row["worker_name"] == f"paper:{successor.experiment_id}"
                 )
                 self.assertEqual(worker["status"], "idle")
+    def test_capture_successor_rejects_authority_and_preserves_predecessor_hash(self) -> None:
+        class WorkerStore:
+            def __init__(self) -> None:
+                self.states: list[dict[str, Any]] = []
+
+            def save_worker_state(self, *args: Any, **kwargs: Any) -> None:
+                self.states.append({"args": args, "kwargs": kwargs})
+
+        worker_store = WorkerStore()
+        worker_node = ResearchNode.__new__(ResearchNode)
+        worker_node.store = worker_store
+        worker_node._paper_store = None
+        worker_node.clock = lambda: T0
+        for config, blocker in (
+            (
+                {
+                    "observation_capture_only": True,
+                    "canonical_operational_setup_required": True,
+                },
+                "CAPTURE_SAFETY_INVALID",
+            ),
+            (
+                {
+                    "observation_capture_only": True,
+                    "canonical_operational_setup_required": "true",
+                },
+                "CANONICAL_OPERATIONAL_SETUP_MARKER_INVALID",
+            ),
+            ({"operational_setup_hash": "sha256:legacy"}, "MIGRATION_REQUIRED"),
+        ):
+            result = worker_node._run_single_paper_worker(
+                SimpleNamespace(
+                    experiment_id="capture-authority-" + blocker,
+                    config=config,
+                    allowed_markets=("capture-market",),
+                )
+            )
+            self.assertEqual(result["status"], "BLOCKED")
+            self.assertEqual(result["blocker"], blocker)
+
+        strategy_document = {
+            "version": 1,
+            "market_type": "prediction",
+            "family": "momentum",
+            "parameters": {"lookback": 1, "threshold": 0.05},
+            "probability_model": "market-history",
+            "resolution_aware": True,
+            "resolution_inputs": ["market_history"],
+        }
+        policy = normalize_market_scope(
+            market_ids=["capture-market"],
+            target_instrument="POLYMARKET",
+        )
+        current_market = {
+            "market_id": "capture-market",
+            "condition_id": "condition-capture-market",
+            "yes_token_id": "yes-capture-market",
+            "no_token_id": "no-capture-market",
+            "metadata_provenance": {"source_type": "CURRENT"},
+            "source_type": "CURRENT",
+            "provider": "polymarket",
+            "venue": "POLYMARKET",
+            "instrument": "POLYMARKET",
+            "active": True,
+            "closed": False,
+            "settlement": "OPEN",
+            "enable_order_book": True,
+            "accepting_orders": True,
+        }
+        with AxiomStore(":memory:") as store:
+            proof = resolve_market_scope(
+                "capture-authority",
+                {"market_scope": policy.as_dict()},
+                [current_market],
+                resolved_at=T0,
+            )
+            processor = AutonomousResearchProcessor(
+                store,
+                config=AutonomousResearchConfig(
+                    scope_resolution_freshness_sla_seconds=60
+                ),
+                clock=lambda: T0,
+            )
+            processor._ensure_rolling_paper_observation(
+                {
+                    "candidate_id": "capture-authority",
+                    "strategy_version_id": "capture-version",
+                    "research_trial_id": "capture-trial",
+                    "strategy_hash": _content_hash(
+                        _normalized_strategy_document(strategy_document)
+                    ),
+                    "strategy_document": strategy_document,
+                    "model_document": {"model_required": False},
+                    "market_scope": policy.as_dict(),
+                    "scope_resolution": proof.as_dict(),
+                    "observation_capture_only": True,
+                    "operational_setup_hash": "sha256:legacy",
+                },
+                T0,
+                market_ids=("capture-market",),
+            )
+            successors = [
+                item
+                for item in ForwardTestRegistry(store).list()
+                if item.allowed_markets
+            ]
+            self.assertEqual(len(successors), 1)
+            successor_config = successors[0].config
+            self.assertNotIn("operational_setup", successor_config)
+            self.assertNotIn("operational_setup_hash", successor_config)
+            self.assertEqual(
+                successor_config["predecessor_operational_setup_hash"],
+                "sha256:legacy",
+            )
+
 
     def test_rolling_hash_only_successor_migrates_immutable_rows(self) -> None:
         candidate_id = "rolling-hash-only-successor"

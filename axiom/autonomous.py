@@ -3215,6 +3215,7 @@ def _rolling_source_binding(record: Mapping[str, Any]) -> dict[str, Any]:
         "dataset_boundary",
         "operational_setup",
         "operational_setup_hash",
+        "predecessor_operational_setup_hash",
         "market_scope",
         "market_scope_hash",
         "market_scope_version",
@@ -3930,6 +3931,7 @@ class AutonomousResearchConfig:
     max_experiments_per_day: int = 250
     mutation_enabled: bool = True
     promotion_criteria: PromotionCriteria = field(default_factory=PromotionCriteria)
+    scope_resolution_freshness_sla_seconds: float | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -3956,6 +3958,11 @@ class AutonomousResearchConfig:
             raise ValueError("mutation_enabled must be boolean")
         if not isinstance(self.promotion_criteria, PromotionCriteria):
             raise ValueError("promotion_criteria must be PromotionCriteria")
+        if self.scope_resolution_freshness_sla_seconds is not None:
+            freshness = float(self.scope_resolution_freshness_sla_seconds)
+            if not math.isfinite(freshness) or freshness <= 0:
+                raise ValueError("scope_resolution_freshness_sla_seconds must be finite and positive")
+            object.__setattr__(self, "scope_resolution_freshness_sla_seconds", freshness)
 
 
 @dataclass(frozen=True, slots=True)
@@ -7735,6 +7742,8 @@ class AutonomousResearchProcessor:
             if not isinstance(config, Mapping):
                 continue
             config = dict(config)
+            if config.get("observation_capture_only") is True:
+                continue
             candidate_id = _binding_value(config.get("candidate_id"))
             strategy_document = config.get("strategy_document", config.get("strategy"))
             if not candidate_id or not isinstance(strategy_document, Mapping):
@@ -7755,27 +7764,62 @@ class AutonomousResearchProcessor:
             if stage not in {"SCHEMA_VALIDATED", "PAPER_FORWARD", "PAPER_PROMOTABLE"}:
                 continue
             try:
+                existing_successor = any(
+                    isinstance(existing.config, Mapping)
+                    and _binding_value(existing.config.get("candidate_id")) == candidate_id
+                    and isinstance(existing.config.get("observation_handoff"), Mapping)
+                    and _binding_value(
+                        existing.config["observation_handoff"].get(
+                            "predecessor_observation_intent_id"
+                        )
+                    )
+                    for existing in scanned
+                )
+            except (sqlite3.Error, AttributeError, TypeError, ValueError, RuntimeError):
+                existing_successor = False
+            if existing_successor:
+                continue
+            try:
                 derived_setup = _operational_setup_for_strategy(strategy_document, config)
             except (sqlite3.Error, AttributeError, KeyError, TypeError, ValueError, RuntimeError) as exc:
                 failures.append(
                     {"experiment_id": str(getattr(intent, "experiment_id", "")), "reason": str(exc)[:160]}
                 )
                 continue
-            if derived_setup is None:
-                continue
-            try:
-                existing_setup = config.get("operational_setup")
-                existing_hash = str(config.get("operational_setup_hash", "") or "").strip()
-                unchanged_setup = (
-                    isinstance(existing_setup, Mapping)
-                    and existing_hash == _operational_setup_hash(existing_setup)
-                    and _canonical_binding(existing_setup) == _canonical_binding(derived_setup)
-                )
-            except (sqlite3.Error, AttributeError, KeyError, TypeError, ValueError, RuntimeError) as exc:
-                failures.append(
-                    {"experiment_id": str(getattr(intent, "experiment_id", "")), "reason": str(exc)[:160]}
-                )
-                continue
+            capture_only = derived_setup is None
+            if capture_only:
+                family = str(strategy_document.get("family", "")).strip().lower()
+                parameters = strategy_document.get("parameters")
+                if not isinstance(parameters, Mapping):
+                    continue
+                try:
+                    lookback = parameters.get("lookback")
+                    threshold = float(parameters.get("threshold"))
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if family in {"momentum", "mean_reversion"}:
+                    capture_only = type(lookback) is int and lookback == 1 and threshold == 0.05
+                elif family == "probability_mispricing":
+                    capture_only = threshold == 0.05
+                else:
+                    capture_only = False
+                if not capture_only:
+                    continue
+            unchanged_setup = False
+            if not capture_only:
+                try:
+                    existing_setup = config.get("operational_setup")
+                    existing_hash = str(config.get("operational_setup_hash", "") or "").strip()
+                    unchanged_setup = (
+                        isinstance(existing_setup, Mapping)
+                        and existing_hash == _operational_setup_hash(existing_setup)
+                        and _canonical_binding(existing_setup) == _canonical_binding(derived_setup)
+                    )
+                except (sqlite3.Error, AttributeError, KeyError, TypeError, ValueError, RuntimeError) as exc:
+                    failures.append(
+                        {"experiment_id": str(getattr(intent, "experiment_id", "")), "reason": str(exc)[:160]}
+                    )
+                    continue
             if unchanged_setup:
                 continue
             scope = config.get("market_scope", config.get("scope", {}))
@@ -7824,11 +7868,15 @@ class AutonomousResearchProcessor:
                 resolved_at = parse_timestamp(proof.get("resolved_at"))
                 if resolved_at is None:
                     raise ValueError("CURRENT_SCOPE_PROOF_TIMESTAMP_MISSING")
-                freshness_value = config.get(
-                    "scope_resolution_freshness_sla_seconds",
-                    config.get("freshness_sla_seconds", 3600.0),
-                )
-                freshness = float(freshness_value)
+                freshness_value = config.get("scope_resolution_freshness_sla_seconds")
+                if freshness_value is None and capture_only:
+                    raise ValueError("CURRENT_SCOPE_PROOF_SLA_UNAVAILABLE")
+                if freshness_value is None:
+                    freshness_value = config.get("freshness_sla_seconds", 3600.0)
+                try:
+                    freshness = float(freshness_value)
+                except (TypeError, ValueError, OverflowError):
+                    raise ValueError("CURRENT_SCOPE_PROOF_SLA_UNAVAILABLE") from None
                 age = (ensure_utc(now) - ensure_utc(resolved_at)).total_seconds()
                 if not math.isfinite(freshness) or freshness <= 0 or age < 0 or age > freshness:
                     raise ValueError("CURRENT_SCOPE_PROOF_STALE")
@@ -7884,10 +7932,20 @@ class AutonomousResearchProcessor:
                     ),
                     "strategy_version_id": _binding_value(config.get("strategy_version_id")),
                     "research_trial_id": _binding_value(config.get("research_trial_id")),
-                    "operational_setup": dict(derived_setup),
-                    "operational_setup_hash": _operational_setup_hash(derived_setup),
                     "scope_resolution": dict(proof),
+                    "observation_capture_only": capture_only,
                 }
+                if capture_only:
+                    predecessor_setup_hash = str(
+                        strategy.get("operational_setup_hash", "") or ""
+                    ).strip()
+                    strategy.pop("operational_setup", None)
+                    strategy.pop("operational_setup_hash", None)
+                    if predecessor_setup_hash:
+                        strategy["predecessor_operational_setup_hash"] = predecessor_setup_hash
+                else:
+                    strategy["operational_setup"] = dict(derived_setup)
+                    strategy["operational_setup_hash"] = _operational_setup_hash(derived_setup)
                 if not strategy["strategy_hash"]:
                     strategy["strategy_hash"] = str(getattr(intent, "strategy_hash", "")).strip()
             except (sqlite3.Error, AttributeError, KeyError, TypeError, ValueError, RuntimeError) as exc:
@@ -7981,10 +8039,39 @@ class AutonomousResearchProcessor:
             )
             if value not in (None, "")
         }
+        marker_value = strategy.get("observation_capture_only")
+        if "observation_capture_only" in strategy and type(marker_value) is not bool:
+            raise ValueError("OBSERVATION_CAPTURE_MARKER_INVALID")
+        capture_only = marker_value is True
+        capture_market_id = (
+            sorted({str(value).strip() for value in market_ids if str(value).strip()})[0]
+            if capture_only and market_ids
+            else None
+        )
+        if "scope_resolution_freshness_sla_seconds" in strategy:
+            scope_sla = strategy.get("scope_resolution_freshness_sla_seconds")
+        else:
+            scope_sla = getattr(
+                self.config,
+                "scope_resolution_freshness_sla_seconds",
+                None,
+            )
+        if scope_sla is None and isinstance(scope_resolution, Mapping):
+            scope_sla = scope_resolution.get(
+                "scope_resolution_freshness_sla_seconds",
+                scope_resolution.get("freshness_sla_seconds"),
+            )
+        if capture_only:
+            try:
+                scope_sla = float(scope_sla)
+            except (TypeError, ValueError, OverflowError):
+                raise ValueError("CURRENT_SCOPE_PROOF_SLA_UNAVAILABLE") from None
+            if not math.isfinite(scope_sla) or scope_sla <= 0:
+                raise ValueError("CURRENT_SCOPE_PROOF_SLA_UNAVAILABLE")
         config = {
             "observation_intent": True,
             "observation_only_lineage": True,
-            "market_authority_required": False,
+            "market_authority_required": capture_only,
             "candidate_id": candidate_id,
             "strategy_version_id": strategy_version_id,
             "research_trial_id": trial_id,
@@ -8004,18 +8091,52 @@ class AutonomousResearchProcessor:
             "dataset_boundary": source_binding.get("dataset_boundary"),
             "rolling_research": True,
             "research_mode": "ROLLING_RESEARCH",
+            "capture_market_id": capture_market_id,
+            "scope_resolution_freshness_sla_seconds": scope_sla,
             "paper_only": True,
+            "observation_capture_only": capture_only,
+            "execution_scope": "OBSERVATION" if capture_only else None,
+            "research_only": True if capture_only else None,
+            "selection_excluded": True if capture_only else None,
+            "allocation_active": False if capture_only else None,
+            "canary_armed": False if capture_only else None,
         }
-        if isinstance(scope_resolution, Mapping):
-            config["scope_resolution"] = dict(scope_resolution)
+        if capture_only:
+            for safety_key in (
+                "execution_scope",
+                "research_only",
+                "selection_excluded",
+                "allocation_active",
+                "canary_armed",
+            ):
+                config.pop(safety_key, None)
+        if not strategy.get("observation_capture_only"):
+            for safety_key in (
+                "execution_scope",
+                "research_only",
+                "selection_excluded",
+                "allocation_active",
+                "canary_armed",
+                "scope_resolution_freshness_sla_seconds",
+                "capture_market_id",
+            ):
+                config.pop(safety_key, None)
         for name in ("experiment_plan", "plan", "forward_config"):
             value = strategy.get(name)
             if isinstance(value, Mapping):
                 config[name] = dict(value)
         declared_setup = source_binding.get("operational_setup")
         declared_setup_hash = str(
-            source_binding.get("operational_setup_hash", "") or ""
+            source_binding.get("operational_setup_hash")
+            or source_binding.get("predecessor_operational_setup_hash")
+            or ""
         ).strip()
+        capture_only = marker_value is True
+        if capture_only:
+            if declared_setup_hash:
+                config["predecessor_operational_setup_hash"] = declared_setup_hash
+            declared_setup = None
+            declared_setup_hash = ""
         if declared_setup not in (None, ""):
             if not isinstance(declared_setup, Mapping):
                 raise ValueError("OPERATIONAL_SETUP_INVALID")
@@ -8023,27 +8144,31 @@ class AutonomousResearchProcessor:
         if declared_setup_hash:
             config["operational_setup_hash"] = declared_setup_hash
         derived_setup = _operational_setup_for_strategy(strategy_document, config)
-        if derived_setup is not None:
-            config["canonical_operational_setup_required"] = True
-        supplied_setup = config.get("operational_setup")
-        if derived_setup is None and supplied_setup is not None:
-            raise ValueError("OPERATIONAL_SETUP_UNSUPPORTED")
-        if supplied_setup is None:
+        if capture_only:
+            config.pop("operational_setup", None)
+            config.pop("operational_setup_hash", None)
+            supplied_setup = None
+        else:
             if derived_setup is not None:
+                config["canonical_operational_setup_required"] = True
+            supplied_setup = config.get("operational_setup")
+            if derived_setup is None and supplied_setup is not None:
+                raise ValueError("OPERATIONAL_SETUP_UNSUPPORTED")
+            if supplied_setup is None and derived_setup is not None:
                 supplied_setup = derived_setup
                 config["operational_setup"] = dict(derived_setup)
-        elif (
-            derived_setup is not None
-            and _canonical_binding(supplied_setup) != _canonical_binding(derived_setup)
-        ):
-            raise ValueError("OPERATIONAL_SETUP_MISMATCH")
-        if isinstance(supplied_setup, Mapping):
-            canonical_setup_hash = _operational_setup_hash(supplied_setup)
-            if declared_setup_hash and declared_setup_hash != canonical_setup_hash:
-                raise ValueError("OPERATIONAL_SETUP_HASH_MISMATCH")
-            config["operational_setup_hash"] = canonical_setup_hash
-        elif declared_setup_hash:
-            raise ValueError("OPERATIONAL_SETUP_MISSING")
+            elif (
+                derived_setup is not None
+                and _canonical_binding(supplied_setup) != _canonical_binding(derived_setup)
+            ):
+                raise ValueError("OPERATIONAL_SETUP_MISMATCH")
+            if isinstance(supplied_setup, Mapping):
+                canonical_setup_hash = _operational_setup_hash(supplied_setup)
+                if declared_setup_hash and declared_setup_hash != canonical_setup_hash:
+                    raise ValueError("OPERATIONAL_SETUP_HASH_MISMATCH")
+                config["operational_setup_hash"] = canonical_setup_hash
+            elif declared_setup_hash:
+                raise ValueError("OPERATIONAL_SETUP_MISSING")
         model_document, model_resolution = self._resolve_rolling_model(strategy)
         config["model_document"] = dict(model_document)
         config["model_resolution"] = dict(model_resolution)
@@ -8100,7 +8225,11 @@ class AutonomousResearchProcessor:
             # repaired intent to it so active discovery suppresses only the
             # stale intent (the candidate identity remains eligible).
             config["observation_handoff"] = {
-                "version": "operational-setup-repair-v1",
+                "version": (
+                    "observation-capture-v1"
+                    if capture_only
+                    else "operational-setup-repair-v1"
+                ),
                 "predecessor_candidate_id": None,
                 "predecessor_observation_intent_id": stale_intent.experiment_id,
                 "predecessor_profitability_inherited": False,
@@ -8493,6 +8622,75 @@ class AutonomousResearchProcessor:
                     pending_intent = True
                     continue
                 matched_spec = True
+                row_binding = {
+                    **source_binding,
+                    "experiment_id": experiment_id,
+                }
+                if config.get("observation_capture_only") is True:
+                    observation_loader = getattr(self.store, "list_paper_observations", None)
+                    capture_market_id = _binding_value(config.get("capture_market_id"))
+                    configured_markets = {
+                        _binding_value(item)
+                        for item in allowed_markets
+                        if _binding_value(item)
+                    }
+                    if (
+                        not callable(observation_loader)
+                        or not capture_market_id
+                        or capture_market_id not in configured_markets
+                    ):
+                        continue
+                    try:
+                        observation_values = observation_loader(
+                            experiment_id,
+                            limit=_MAX_ROLLING_SOURCE_ROWS,
+                        )
+                    except Exception as exc:
+                        raise ValueError("PAPER_OBSERVATION_SOURCE_UNAVAILABLE") from exc
+                    for item_index, item in enumerate(observation_values or ()):
+                        if item_index >= _MAX_ROLLING_SOURCE_ROWS or not isinstance(item, Mapping):
+                            break
+                        if _binding_value(item.get("market_id")) != capture_market_id:
+                            continue
+                        payload = item.get("payload")
+                        if not isinstance(payload, Mapping):
+                            continue
+                        source_id = _binding_value(payload.get("source_snapshot_id"))
+                        source_timestamp = _rolling_row_time(
+                            {"timestamp": payload.get("source_timestamp", item.get("timestamp"))}
+                        )
+                        observed_timestamp = _rolling_row_time(
+                            {"timestamp": item.get("timestamp")}
+                        )
+                        if (
+                            not source_id
+                            or source_timestamp is None
+                            or observed_timestamp is None
+                            or source_timestamp > observed_timestamp
+                        ):
+                            continue
+                        row = dict(payload)
+                        row.update(
+                            {
+                                "observation_id": item.get("observation_id"),
+                                "experiment_id": experiment_id,
+                                "market_id": capture_market_id,
+                                "timestamp": item.get("timestamp"),
+                                "source_snapshot_id": source_id,
+                                "source_timestamp": source_timestamp,
+                                "strategy_hash": strategy_hash,
+                                "source_strategy_hash": spec_strategy_hash,
+                                "rolling_strategy_hash": strategy_hash,
+                                "paper_observation_capture": True,
+                                "evaluation_kind": "OBSERVATION_ONLY_DECLINE",
+                                "accepted": False,
+                                "promotable": False,
+                                "selection_excluded": True,
+                                "allocation_active": False,
+                            }
+                        )
+                        rows.append(_rolling_inject_source_binding(row, row_binding))
+                    continue
                 loader = getattr(self.store, "list_paper_bet_ledger", None)
                 if not callable(loader):
                     continue
@@ -8748,6 +8946,63 @@ class AutonomousResearchProcessor:
             )
         )
         return normalized[-_MAX_ROLLING_SOURCE_ROWS:]
+
+    def _rolling_capture_decline_evaluation(
+        self,
+        strategy: Mapping[str, Any],
+        rows: Sequence[Mapping[str, Any]],
+    ) -> Mapping[str, Any]:
+        """Build observation-only progress without invoking strategy research."""
+        strategy_document = strategy.get("strategy_document", {})
+        family = (
+            str(strategy_document.get("family", "")).strip().lower()
+            if isinstance(strategy_document, Mapping)
+            else ""
+        )
+        observations = [
+            row for row in rows
+            if isinstance(row, Mapping)
+            and row.get("paper_observation_capture") is True
+        ]
+        complete = len(observations) >= 3
+        reason = (
+            (
+                "ZERO_EDGE_CONTROL"
+                if family == "probability_mispricing"
+                else "OPERATIONAL_SETUP_UNDERDETERMINED"
+            )
+            if complete
+            else "INSUFFICIENT_OBSERVATIONS"
+        )
+        return {
+            "evaluation_kind": (
+                "OBSERVATION_ONLY_DECLINE"
+                if complete
+                else "OBSERVATION_ONLY_PROGRESS"
+            ),
+            "evaluation_version": "legacy-observation-capture:v1",
+            "evaluation_run_id": "capture-refresh-" + _rolling_hash(
+                {
+                    "strategy_version_id": strategy.get("strategy_version_id"),
+                    "observation_ids": [row.get("observation_id") for row in observations],
+                }
+            ).removeprefix("sha256:")[:40],
+            "selection_excluded": True,
+            "accepted": False,
+            "promotable": False,
+            "reason": reason,
+            "observations": len(observations),
+            "evaluator_invoked": False,
+            "evaluator_completed": False,
+            "portfolio_accounting": {
+                "accounting_available": False,
+                "accounting_complete": False,
+                "accounting_not_applicable": True,
+                "allocation_active": False,
+                "fills": 0,
+                "execution_events": 0,
+            },
+        }
 
     def _rolling_canonical_evaluation(
         self,
@@ -9482,7 +9737,12 @@ class AutonomousResearchProcessor:
         canonical_required = requested_source in {"HISTORICAL", "REPLAY", "LIVE"}
         # PAPER is the sole exact-account-ledger source.  Every other source,
         # including unbound LIVE price-proxy rows, is evaluated canonically.
-        actual_ledger = requested_source == "PAPER"
+        capture_source = any(
+            isinstance(row, Mapping)
+            and row.get("paper_observation_capture") is True
+            for row in rows
+        )
+        actual_ledger = requested_source == "PAPER" and not capture_source
         if evaluation is None and canonical_required:
             evaluation = self._rolling_canonical_evaluation(
                 strategy, rows, requested_source
@@ -11029,11 +11289,20 @@ class AutonomousResearchProcessor:
                             for row in bounded_rows
                         )
                     )
+                    capture_source = any(
+                        isinstance(row, Mapping)
+                        and row.get("paper_observation_capture") is True
+                        for row in bounded_rows
+                    )
                     evaluation = (
-                        None
-                        if replay_book_blocked
-                        else self._rolling_canonical_evaluation(
-                            strategy, bounded_rows, source
+                        self._rolling_capture_decline_evaluation(strategy, bounded_rows)
+                        if capture_source
+                        else (
+                            None
+                            if replay_book_blocked
+                            else self._rolling_canonical_evaluation(
+                                strategy, bounded_rows, source
+                            )
                         )
                     )
                     recorded_book = any(
@@ -11042,8 +11311,12 @@ class AutonomousResearchProcessor:
                         if isinstance(row, Mapping)
                         for name in ("order_book", "yes_order_book", "no_order_book")
                     )
-                    canonical_required = source in {"HISTORICAL", "REPLAY"} or (
-                        source == "LIVE" and recorded_book
+                    canonical_required = (
+                        not capture_source
+                        and (
+                            source in {"HISTORICAL", "REPLAY"}
+                            or (source == "LIVE" and recorded_book)
+                        )
                     )
                     canonical_reason: str | None = None
                     if canonical_required:
