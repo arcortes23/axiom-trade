@@ -9,10 +9,12 @@ import math
 import re
 from types import MappingProxyType
 from typing import Any, Mapping, Sequence
-
 from .domain import ResearchQuality, ensure_utc, parse_timestamp, utc_now
-from .research_bus import ResearchBusPermissionError, _validate_payload
-from .storage import AxiomStore
+from .research_bus import (
+    ResearchBusPermissionError,
+    _is_forbidden_field,
+    _validate_payload,
+)
 from .risk import RiskLimits
 from .strategy.dsl import PREDICTION_FAMILIES
 from .strategy.signals import _prediction_requires_model
@@ -471,8 +473,85 @@ def _semantic_scope_resolution(value: Mapping[str, Any]) -> dict[str, Any]:
         if isinstance(item, (list, tuple)):
             return [clean(child) for child in item]
         return item
-
     return clean(value)
+
+
+_SCOPE_PROOF_PRIVATE_MARKET_METADATA_KEYS = frozenset(
+    {
+        "clob_token_id",
+        "clob_token_ids",
+        "intended_token",
+        "no_token_id",
+        "token_id",
+        "yes_token_id",
+    }
+)
+
+
+def _public_scope_resolution(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Project resolver proof into a safe immutable forward-config document.
+
+    The persisted resolver row remains the authority and retains its complete
+    market metadata.  Forward configs carry the public disposition evidence,
+    while private/execution fields are omitted before the research-bus
+    validator sees the document.
+    """
+    normalized_value = {"scope_resolution": dict(value)}
+    _normalize_inventory_binding(normalized_value)
+    value = normalized_value["scope_resolution"]
+
+    def clean(
+        item: Any,
+        *,
+        excluded_market: bool = False,
+        excluded_metadata: bool = False,
+    ) -> Any:
+        if isinstance(item, Mapping):
+            result: dict[str, Any] = {}
+            for key, child in item.items():
+                name = str(key)
+                normalized = re.sub(
+                    r"(?<=[a-z0-9])(?=[A-Z])",
+                    "_",
+                    name,
+                )
+                normalized = re.sub(
+                    r"[^A-Za-z0-9]+",
+                    "_",
+                    normalized,
+                ).strip("_").lower()
+                if _is_forbidden_field(name):
+                    continue
+                if (
+                    excluded_metadata
+                    and normalized in _SCOPE_PROOF_PRIVATE_MARKET_METADATA_KEYS
+                ):
+                    continue
+                result[name] = clean(
+                    child,
+                    excluded_market=(
+                        excluded_market or normalized == "excluded_markets"
+                    ),
+                    excluded_metadata=(
+                        excluded_metadata
+                        or (excluded_market and normalized == "metadata")
+                    ),
+                )
+            return result
+        if isinstance(item, (list, tuple)):
+            return [
+                clean(
+                    child,
+                    excluded_market=excluded_market,
+                    excluded_metadata=excluded_metadata,
+                )
+                for child in item
+            ]
+        return item
+
+    projected = clean(value)
+    return projected if isinstance(projected, dict) else {}
+
 
 
 def _scope_resolution_market_ids(value: Mapping[str, Any]) -> tuple[str, ...]:

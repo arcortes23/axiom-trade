@@ -2281,7 +2281,24 @@ class MutationSchedulingTests(unittest.TestCase):
                     {"market_scope": policy.as_dict()},
                     replacement_markets,
                     resolved_at=T0 + timedelta(milliseconds=23),
-                )
+                ).as_dict()
+                proof_b["excluded_markets"] = [
+                    {
+                        "market_id": "rolling-worker-expired",
+                        "reason": "MARKET_EXPIRED",
+                        "detail": "",
+                        "metadata": {
+                            "action": "SUITABLE",
+                            "category": "SUITABLE_MARKET",
+                            "intended_token": "yes",
+                            "token_id": "rolling-worker-private-token",
+                            "resolver": "inspect_market_depth",
+                            "observed_at": (
+                                T0 + timedelta(milliseconds=23)
+                            ).isoformat(),
+                        },
+                    }
+                ]
                 original_loader = store.load_market_scope_resolution
                 proof_persisted_during_load = [False]
 
@@ -2432,6 +2449,29 @@ class MutationSchedulingTests(unittest.TestCase):
                     and item.config.get("market_authority_required") is True
                     and tuple(item.allowed_markets) == tuple(sorted(replacement_market_ids))
                 )
+                persisted_proof = store.load_market_scope_resolution(candidate_id)
+                self.assertIsNotNone(persisted_proof)
+                assert persisted_proof is not None
+                persisted_proof_mapping = persisted_proof.as_dict()
+                self.assertEqual(persisted_proof_mapping, proof_b)
+                persisted_excluded = persisted_proof_mapping["excluded_markets"][0]
+                self.assertEqual(
+                    persisted_excluded["metadata"]["intended_token"],
+                    "yes",
+                )
+                self.assertEqual(
+                    persisted_excluded["metadata"]["token_id"],
+                    "rolling-worker-private-token",
+                )
+                public_proof = replacement_forward.config["scope_resolution"]
+                self.assertEqual(public_proof["resolved_at"], proof_b["resolved_at"])
+                self.assertEqual(
+                    tuple(item["market_id"] for item in public_proof["matched_markets"]),
+                    tuple(sorted(replacement_market_ids)),
+                )
+                public_excluded = public_proof["excluded_markets"][0]
+                self.assertNotIn("intended_token", public_excluded["metadata"])
+                self.assertNotIn("token_id", public_excluded["metadata"])
                 stale_forward_config = dict(replacement_forward.config)
                 stale_forward_config["observation_intent_id"] = migrated[0].experiment_id
                 stale_forward_config["paper_observation_intent_id"] = migrated[0].experiment_id
@@ -3450,6 +3490,27 @@ class MutationSchedulingTests(unittest.TestCase):
                             [market],
                             resolved_at=T0,
                         )
+                        proof_mapping = proof.as_dict()
+                        provenance = dict(proof_mapping["provenance"])
+                        current_market_set = dict(provenance["current_market_set"])
+                        inventory_digest = current_market_set.pop("inventory_digest")
+                        current_market_set["order_token"] = inventory_digest
+                        provenance["current_market_set"] = current_market_set
+                        proof_mapping["provenance"] = provenance
+                        proof_mapping["excluded_markets"] = [
+                            {
+                                "market_id": f"{market_id}-expired",
+                                "reason": "MARKET_EXPIRED",
+                                "detail": "",
+                                "metadata": {
+                                    "action": "SUITABLE",
+                                    "category": "SUITABLE_MARKET",
+                                    "intended_token": "yes",
+                                    "token_id": f"private-token-{family}",
+                                    "resolver": "inspect_market_depth",
+                                },
+                            }
+                        ]
                         processor = AutonomousResearchProcessor(
                             store,
                             config=AutonomousResearchConfig(
@@ -3457,7 +3518,7 @@ class MutationSchedulingTests(unittest.TestCase):
                             ),
                             clock=lambda: T0,
                         )
-                        store.save_market_scope_resolution(proof)
+                        store.save_market_scope_resolution(proof_mapping)
                         source = {
                             "candidate_id": candidate_id,
                             "strategy_version_id": f"{candidate_id}-version",
@@ -3468,7 +3529,6 @@ class MutationSchedulingTests(unittest.TestCase):
                             "strategy_document": strategy_document,
                             "model_document": model,
                             "market_scope": policy.as_dict(),
-                            "scope_resolution": proof.as_dict(),
                             "scope_resolution_freshness_sla_seconds": 60,
                         }
                         if explicit_capture:
@@ -3498,6 +3558,56 @@ class MutationSchedulingTests(unittest.TestCase):
                         self.assertNotIn("operational_setup_hash", config)
                         self.assertNotIn("canonical_operational_setup_required", config)
                         self.assertEqual(config.get("capture_market_id"), market_id)
+                        public_proof = config["scope_resolution"]
+                        self.assertEqual(
+                            public_proof["resolved_at"],
+                            proof_mapping["resolved_at"],
+                        )
+                        self.assertEqual(
+                            tuple(
+                                item["market_id"]
+                                for item in public_proof["matched_markets"]
+                            ),
+                            (market_id,),
+                        )
+                        public_excluded = public_proof["excluded_markets"][0]
+                        self.assertNotIn(
+                            "intended_token",
+                            public_excluded["metadata"],
+                        )
+                        self.assertNotIn("token_id", public_excluded["metadata"])
+                        self.assertEqual(
+                            public_proof["provenance"]["current_market_set"][
+                                "inventory_digest"
+                            ],
+                            inventory_digest,
+                        )
+                        self.assertNotIn(
+                            "order_token",
+                            public_proof["provenance"]["current_market_set"],
+                        )
+                        raw_proof = store.load_market_scope_resolution(candidate_id)
+                        self.assertIsNotNone(raw_proof)
+                        assert raw_proof is not None
+                        raw_proof_mapping = raw_proof.as_dict()
+                        self.assertEqual(
+                            raw_proof_mapping["candidate_id"],
+                            proof_mapping["candidate_id"],
+                        )
+                        self.assertEqual(
+                            raw_proof_mapping["matched_markets"],
+                            proof_mapping["matched_markets"],
+                        )
+                        self.assertEqual(
+                            raw_proof_mapping["excluded_markets"],
+                            proof_mapping["excluded_markets"],
+                        )
+                        self.assertEqual(
+                            raw_proof_mapping["provenance"]["current_market_set"][
+                                "inventory_digest"
+                            ],
+                            inventory_digest,
+                        )
                         lifecycle_payload = {
                             "candidate_id": candidate_id,
                             "paper_observation_intent": True,
@@ -3512,13 +3622,12 @@ class MutationSchedulingTests(unittest.TestCase):
                             "selection_excluded": True,
                             "allocation_active": False,
                             "canary_armed": False,
-                            "allowed_markets": [market_id],
+                            "scope_resolution": proof_mapping,
+                            "market_scope_resolution": proof_mapping,
                             "current_market_ids": [market_id],
                             "resolved_market_ids": [market_id],
                             "scope_hash": policy.scope_hash,
                             "scope_version": policy.scope_version,
-                            "scope_resolution": proof.as_dict(),
-                            "market_scope_resolution": proof.as_dict(),
                         }
                         store.save_candidate_lifecycle(
                             candidate_id,

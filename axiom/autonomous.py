@@ -31,6 +31,8 @@ from .forward import (
     _operational_setup_for_strategy,
     _operational_setup_hash,
     _prediction_strategy_model_required,
+    _public_scope_resolution,
+    _scope_resolution_mapping,
     _semantic_scope_resolution,
 )
 from .director import compact_report, validate_hermes_proposal
@@ -8711,6 +8713,9 @@ class AutonomousResearchProcessor:
                         scope_resolution = loader(candidate_id)
                 except (TypeError, ValueError, AttributeError):
                     scope_resolution = None
+        scope_resolution_mapping = _scope_resolution_mapping(scope_resolution)
+        if scope_resolution_mapping is not None:
+            scope_resolution = scope_resolution_mapping
         selector = {
             key: value
             for key, value in (
@@ -8862,7 +8867,7 @@ class AutonomousResearchProcessor:
         config["model_document"] = dict(model_document)
         config["model_resolution"] = dict(model_resolution)
         if isinstance(scope_resolution, Mapping):
-            config["scope_resolution"] = _semantic_scope_resolution(scope_resolution)
+            config["scope_resolution"] = _public_scope_resolution(scope_resolution)
         expected_config = _canonical_forward_config(config)
         expected_strategy_hash = _content_hash(
             _normalized_strategy_document(strategy_document)
