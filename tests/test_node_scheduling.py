@@ -962,6 +962,81 @@ class NodeIdentityPersistenceTests(unittest.TestCase):
 
 
 class ExploratoryRollingProgressionTests(unittest.TestCase):
+
+    def test_production_node_bootstraps_before_rolling_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = str(Path(directory) / "production-node-bootstrap.sqlite")
+            with AxiomStore(db) as store:
+                CanarySettingsService(store, clock=lambda: T0).snapshot(now=T0)
+                node = ResearchNode(
+                    NodeConfig(
+                        db,
+                        mutation_enabled=False,
+                        crypto_enabled=False,
+                        execution_profile=PRODUCTION_EXECUTION_PROFILE,
+                        system_bootstrap_enabled=True,
+                    ),
+                    provider=InMemoryPredictionProvider([]),
+                    store=store,
+                    clock=lambda: T0,
+                )
+                active = store.get_operator_config(
+                    "rolling_admission_policy_active",
+                    None,
+                )
+                self.assertEqual(
+                    active["system_bootstrap_id"],
+                    "system:polymarket-exploratory-live",
+                )
+                store.set_operator_config("rolling_admission_policy_active", None)
+                before = store.research_queue_stats()
+                blocked = node.research_processor.refresh_rolling_evidence(T0)
+                self.assertEqual(
+                    blocked["blocker"],
+                    "ROLLING_POLICY_BOOTSTRAP_ACTIVE_REQUIRED",
+                )
+                self.assertEqual(store.research_queue_stats(), before)
+
+    def test_production_node_persists_bootstrap_drift_blocker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = str(Path(directory) / "production-node-bootstrap-drift.sqlite")
+            with AxiomStore(db) as store:
+                CanarySettingsService(store, clock=lambda: T0).snapshot(now=T0)
+                store.set_operator_config(
+                    "rolling_exploratory_operating_policy",
+                    {"policy_id": "drifted"},
+                )
+                node = ResearchNode(
+                    NodeConfig(
+                        db,
+                        mutation_enabled=False,
+                        crypto_enabled=False,
+                        execution_profile=PRODUCTION_EXECUTION_PROFILE,
+                        system_bootstrap_enabled=True,
+                    ),
+                    provider=InMemoryPredictionProvider([]),
+                    store=store,
+                    clock=lambda: T0,
+                )
+                self.assertEqual(
+                    store.get_operator_config(
+                        "rolling_exploratory_bootstrap_required",
+                        False,
+                    ),
+                    True,
+                )
+                self.assertEqual(
+                    store.get_operator_config(
+                        "rolling_exploratory_bootstrap_blocker",
+                        None,
+                    ),
+                    "ROLLING_POLICY_BOOTSTRAP_DRIFT",
+                )
+                before = store.research_queue_stats()
+                blocked = node.research_processor.refresh_rolling_evidence(T0)
+                self.assertEqual(blocked["status"], "BLOCKED")
+                self.assertEqual(blocked["blocker"], "ROLLING_POLICY_BOOTSTRAP_DRIFT")
+                self.assertEqual(store.research_queue_stats(), before)
     def _processor(self, db: str, store: AxiomStore) -> AutonomousResearchProcessor:
         node = ResearchNode(
             NodeConfig(

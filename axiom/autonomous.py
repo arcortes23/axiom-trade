@@ -61,12 +61,17 @@ from .strategy import StrategyDefinition, load_strategy
 from .rolling_portfolio import (
     RollingAdmissionPolicy,
     RollingEvidence,
+    RollingPolicyBootstrapError,
     RollingSelection,
+    SYSTEM_EXPLORATORY_ADMISSION_ID,
+    SYSTEM_EXPLORATORY_ADMISSION_VERSION,
     _latest_windows,
     _plain as _rolling_plain,
+    _system_bootstrap_hash,
     default_rolling_admission_policy,
     evaluate_rolling_selection,
     REASON_EXTERNAL_OBLIGATIONS_EXCEED_BUDGET,
+    validate_system_exploratory_admission_policy,
 )
 from .strategy.signals import evaluate_model_document_probability
 from .experiment_plan import AUTONOMOUS_BUDGET_ID, ExperimentPlan, ExperimentPlanError, MAX_PLAN_VARIANTS, normalize_market_scope
@@ -3952,6 +3957,93 @@ def _legacy_dataset_selector_conflict(document: Mapping[str, Any]) -> str | None
         ):
             return "DATASET_VERSION_ALIAS"
     return None
+
+def bootstrap_system_exploratory_admission_policy(
+    store: Any,
+    *,
+    ensure_operating: Callable[[datetime], Mapping[str, Any]],
+    risk_binding_loader: Callable[[], Mapping[str, Any]],
+    now: datetime,
+) -> dict[str, Any]:
+    """Atomically establish the exact disarmed system rolling envelope."""
+    get_config = getattr(store, "get_operator_config", None)
+    saver = getattr(store, "save_admission_policy", None)
+    transaction = getattr(store, "transaction", None)
+    set_config = getattr(store, "set_operator_config", None)
+    set_job = getattr(store, "set_operator_job", None)
+    if not all(callable(item) for item in (get_config, saver, transaction, set_config, set_job)):
+        raise RollingPolicyBootstrapError("ROLLING_POLICY_TRANSACTION_UNAVAILABLE")
+    set_config("rolling_exploratory_bootstrap_required", True)
+    ensure_operating(now)
+    operating = get_config("rolling_exploratory_operating_policy", None)
+    if not isinstance(operating, Mapping):
+        raise RollingPolicyBootstrapError("ROLLING_POLICY_BOOTSTRAP_REQUIRED")
+    operating = dict(operating)
+    binding = dict(risk_binding_loader())
+    try:
+        validate_system_exploratory_admission_policy(
+            None,
+            operating,
+            binding,
+            require_active=False,
+        )
+    except RollingPolicyBootstrapError:
+        raise
+    policy_document = default_rolling_admission_policy().as_dict()
+    active_template: dict[str, Any] = {
+        "policy": policy_document,
+        "policy_id": policy_document["policy_id"],
+        "version": policy_document["version"],
+        "policy_version": policy_document["version"],
+        "config_hash": policy_document["config_hash"],
+        "operating_policy": operating,
+        "exploratory_policy": operating,
+        "system_bootstrap_id": SYSTEM_EXPLORATORY_ADMISSION_ID,
+        "system_bootstrap_version": SYSTEM_EXPLORATORY_ADMISSION_VERSION,
+        **binding,
+        "status": "ACTIVE",
+        "paper_only": True,
+        "live_execution": False,
+        "allocation_active": False,
+        "canary_armed": False,
+    }
+    active_template["system_bootstrap_hash"] = _system_bootstrap_hash(
+        active_template,
+        excluded=frozenset({"activated_at", "activated_by", "system_bootstrap_hash"}),
+    )
+
+    def validate_active(value: Any, current_binding: Mapping[str, Any]) -> dict[str, Any]:
+        return validate_system_exploratory_admission_policy(
+            value,
+            operating,
+            current_binding,
+        ) or {}
+
+    current = get_config("rolling_admission_policy_active", None)
+    if isinstance(current, Mapping) and current:
+        return validate_active(current, binding)
+    if current not in (None, {}):
+        raise RollingPolicyBootstrapError("ROLLING_POLICY_BOOTSTRAP_DRIFT")
+    saver(policy_document)
+    active = dict(active_template)
+    active["activated_at"] = now.isoformat()
+    active["activated_by"] = "system:bootstrap"
+    with transaction(immediate=True):
+        current = get_config("rolling_admission_policy_active", None)
+        if current not in (None, {}):
+            return validate_active(current, dict(risk_binding_loader()))
+        current_binding = dict(risk_binding_loader())
+        if any(
+            str(current_binding.get(key, "")).strip()
+            != str(binding.get(key, "")).strip()
+            for key in ("risk_config_id", "risk_config_generation", "risk_config_hash")
+        ):
+            raise RollingPolicyBootstrapError("ROLLING_POLICY_BOOTSTRAP_RISK_DRIFT")
+        set_config("rolling_admission_policy_active", active)
+        set_job("rolling_admission_policy_active", "ACTIVE", active, resumable=True)
+    return active
+
+
 class AutonomousResearchError(ValueError):
     """A deterministic, auditable queue rejection or unsupported operation."""
 
@@ -12334,9 +12426,37 @@ class AutonomousResearchProcessor:
         *,
         skip_observation_setup_migration: bool = False,
     ) -> Mapping[str, Any]:
-        """Materialize bounded, source-separated rolling evidence and schedule retries."""
         current = ensure_utc(now or self.clock())
+        config_loader = getattr(self.store, "get_operator_config", None)
+        try:
+            bootstrap_required = (
+                callable(config_loader)
+                and config_loader("rolling_exploratory_bootstrap_required", False) is True
+            )
+        except (TypeError, ValueError, RuntimeError):
+            bootstrap_required = True
         bootstrap = self._ensure_exploratory_live_bootstrap(current)
+        try:
+            policy = self._rolling_policy()
+        except (TypeError, ValueError, KeyError):
+            policy = default_rolling_admission_policy()
+        if bootstrap_required:
+            blocker = self._rolling_bootstrap_blocker(policy)
+            if blocker is not None:
+                return {
+                    "status": "BLOCKED",
+                    "blocker": blocker,
+                    "bootstrap": dict(bootstrap),
+                    "paper_only": True,
+                    "live_execution": False,
+                    "queue_item_id": None,
+                    "pending": [],
+                    "pending_total": 0,
+                    "evidence_windows": [],
+                    "evidence_windows_total": 0,
+                    "observations": [],
+                    "observations_total": 0,
+                }
         migrated_observations = (
             ()
             if skip_observation_setup_migration
@@ -13214,6 +13334,33 @@ class AutonomousResearchProcessor:
             "global_budget": str(policy.global_budget),
         }
 
+    def _rolling_bootstrap_blocker(
+        self,
+        policy: RollingAdmissionPolicy,
+    ) -> str | None:
+        loader = getattr(self.store, "get_operator_config", None)
+        if not callable(loader):
+            return None
+        try:
+            bootstrap_required = loader("rolling_exploratory_bootstrap_required", False) is True
+        except (TypeError, ValueError, RuntimeError):
+            bootstrap_required = True
+        operating = loader("rolling_exploratory_operating_policy", None)
+        if operating is None:
+            return "ROLLING_POLICY_BOOTSTRAP_REQUIRED" if bootstrap_required else None
+        if not bootstrap_required:
+            return None
+        active = loader("rolling_admission_policy_active", None)
+        try:
+            validate_system_exploratory_admission_policy(
+                active if isinstance(active, Mapping) else None,
+                operating if isinstance(operating, Mapping) else operating,
+                self._rolling_risk_binding(policy),
+            )
+        except RollingPolicyBootstrapError as exc:
+            return exc.code
+        return None
+
     def _rolling_policy(self) -> RollingAdmissionPolicy:
         default = default_rolling_admission_policy()
         active_payload = None
@@ -13282,6 +13429,15 @@ class AutonomousResearchProcessor:
             requested_now,
             skip_observation_setup_migration=skip_observation_setup_migration,
         )
+        if str(refreshed.get("status") or "").upper() == "BLOCKED":
+            return {
+                **dict(refreshed),
+                "review_status": "BLOCKED",
+                "selection": None,
+                "proposal": None,
+                "paper_only": True,
+                "live_execution": False,
+            }
         policy = self._rolling_policy()
         previous = self.active_portfolio_selection()
         review_state_loader = getattr(self.store, "load_portfolio_review_state", None)

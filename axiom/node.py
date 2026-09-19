@@ -52,12 +52,14 @@ from .autonomous import (
     AutonomousResearchProcessor,
     CAMPAIGN_PROTOCOL_V1_ID,
     CAMPAIGN_PROTOCOL_V2_ID,
+    bootstrap_system_exploratory_admission_policy,
     _rolling_hash,
 )
 from .research_bus import DurableResearchBus
 from .lifecycle import PromotionCriteria
 from .strategy import evaluate_signal_record, load_strategy
 from .auto_canary import AutonomousCanaryWorker
+from .rolling_portfolio import RollingPolicyBootstrapError
 from .canary import CanaryBlocked, CanaryService
 from .canary_settings import CanarySettingsService
 from .shadow import (
@@ -403,8 +405,9 @@ class NodeConfig:
     promotion_criteria: PromotionCriteria = field(default_factory=PromotionCriteria)
     crypto_symbol: str = "BTC/USDT"
     crypto_enabled: bool = True
-    auto_canary_interval_seconds: float = 60.0
     execution_profile: str | None = None
+    system_bootstrap_enabled: bool = False
+    auto_canary_interval_seconds: float = 60.0
     max_log_bytes: int = 5_000_000
     backup_count: int = 3
     revision: str | None = None
@@ -799,6 +802,11 @@ class ResearchNode:
         self.opportunity_model = opportunity_model
         self.sleep = sleep
         self.clock = clock
+        self._rolling_settings = CanarySettingsService(
+            self.store,
+            clock=clock,
+            initialize=False,
+        )
         self._logger: logging.Logger | None = None
         self._handler: RotatingFileHandler | None = None
         self.stop_event = threading.Event()
@@ -927,6 +935,50 @@ class ResearchNode:
             ),
             clock=clock,
         )
+        self._rolling_bootstrap_error: str | None = None
+        if (
+            config.system_bootstrap_enabled
+            and self.execution_profile == PRODUCTION_EXECUTION_PROFILE
+        ):
+            try:
+                bootstrap_system_exploratory_admission_policy(
+                    self.store,
+                    ensure_operating=self.research_processor._ensure_exploratory_live_bootstrap,
+                    risk_binding_loader=self._rolling_risk_binding,
+                    now=ensure_utc(clock()),
+                )
+                self.store.set_operator_config("rolling_exploratory_bootstrap_blocker", None)
+            except RollingPolicyBootstrapError as exc:
+                self._rolling_bootstrap_error = exc.code
+                self.store.set_operator_config(
+                    "rolling_exploratory_bootstrap_blocker",
+                    exc.code,
+                )
+
+    def _rolling_risk_binding(self) -> dict[str, Any]:
+        snapshot = self._rolling_settings.snapshot(now=ensure_utc(self.clock()))
+        active = snapshot.get("active") if isinstance(snapshot, Mapping) else {}
+        active = active if isinstance(active, Mapping) else {}
+        config_id = str(
+            snapshot.get("config_id") or active.get("config_id") or ""
+        ).strip()
+        config_hash = str(
+            snapshot.get("config_hash") or active.get("config_hash") or ""
+        ).strip()
+        try:
+            generation = int(snapshot.get("generation") or active.get("generation") or 0)
+        except (TypeError, ValueError):
+            generation = 0
+        if not config_id or not config_hash or generation <= 0:
+            raise RollingPolicyBootstrapError("ACTIVE_RISK_CONFIG_REQUIRED")
+        return {
+            "risk_config_id": config_id,
+            "risk_config_generation": generation,
+            "risk_config_hash": config_hash,
+            "active_risk_config_id": config_id,
+            "active_risk_config_generation": generation,
+            "active_risk_config_hash": config_hash,
+        }
 
     def _shadow_evidence_template(self) -> dict[str, Any]:
         return {

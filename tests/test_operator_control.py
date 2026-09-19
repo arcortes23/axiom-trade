@@ -16,6 +16,7 @@ from urllib.request import Request, urlopen
 from types import SimpleNamespace
 
 from axiom import node as node_module
+from axiom.autonomous import AutonomousResearchProcessor
 from axiom.canary import CanaryBlocked, CanaryService, CredentialStore, credential_fingerprint
 from axiom.canary_positions import RECOVERY_ACTION, RECOVERY_ATTACHED, RECOVERY_CONFIRMATION
 from axiom.dashboard import DashboardData, DashboardServer, _DashboardHandler
@@ -300,7 +301,7 @@ class OperatorControlTests(unittest.TestCase):
         self.addCleanup(self._production_profile.stop)
         self.db = str(Path(self.tempdir.name) / "operator.sqlite")
         self.store = AxiomStore(self.db)
-        self.control = OperatorControlPlane(self.store)
+        self.control = OperatorControlPlane(self.store, system_bootstrap_enabled=True)
         self.server = DashboardServer(
             port=0,
             data=DashboardData(store=self.store, control=self.control),
@@ -3221,6 +3222,173 @@ class OperatorControlTests(unittest.TestCase):
             self.store.get_operator_config("canary_selection_binding", None)
         )
 
+
+    def test_system_bootstrap_activates_exact_exploratory_policy_idempotently(self) -> None:
+        active = self.store.get_operator_config("rolling_admission_policy_active", None)
+        self.assertIsInstance(active, dict)
+        assert isinstance(active, dict)
+        self.assertEqual(active["system_bootstrap_id"], "system:polymarket-exploratory-live")
+        self.assertEqual(active["system_bootstrap_version"], "exploratory-live-bootstrap-v1")
+        self.assertTrue(active["paper_only"])
+        self.assertFalse(active["live_execution"])
+        self.assertFalse(active["allocation_active"])
+        self.assertFalse(active["canary_armed"])
+        operating = active["operating_policy"]
+        self.assertEqual(operating["policy_id"], "polymarket-exploratory-live")
+        self.assertEqual(operating["version"], "exploratory-live-v1")
+        self.assertEqual(operating["pool_cap"], 10)
+        self.assertEqual(operating["target_members"], {"minimum": 1, "maximum": 3})
+        self.assertEqual(operating["paper_only"], True)
+        self.assertEqual(operating["allocation_active"], False)
+        self.assertEqual(operating["canary_armed"], False)
+        before_job = self.store.get_operator_job("rolling_admission_policy_active")
+        restarted = OperatorControlPlane(self.store)
+        self.assertEqual(
+            restarted.store.get_operator_config("rolling_admission_policy_active", None),
+            active,
+        )
+        self.assertEqual(
+            restarted.store.get_operator_job("rolling_admission_policy_active"),
+            before_job,
+        )
+
+    def test_system_bootstrap_rejects_altered_exploratory_hash(self) -> None:
+        operating = dict(
+            self.store.get_operator_config("rolling_exploratory_operating_policy", {})
+        )
+        operating["config_hash"] = "sha256:altered"
+        self.store.set_operator_config("rolling_exploratory_operating_policy", operating)
+        with self.assertRaisesRegex(
+            OperatorControlError, "ROLLING_POLICY_BOOTSTRAP_HASH_MISMATCH"
+        ):
+            self.control._bootstrap_system_exploratory_admission_policy()
+        self.assertEqual(
+            self.store.get_operator_config("rolling_admission_policy_active", None)[
+                "system_bootstrap_id"
+            ],
+            "system:polymarket-exploratory-live",
+        )
+
+    def test_system_bootstrap_rejects_risk_drift_and_live_flags(self) -> None:
+        active = dict(self.store.get_operator_config("rolling_admission_policy_active", {}))
+        active["risk_config_hash"] = "sha256:drift"
+        self.store.set_operator_config("rolling_admission_policy_active", active)
+        with self.assertRaisesRegex(
+            OperatorControlError, "ROLLING_POLICY_BOOTSTRAP_RISK_DRIFT"
+        ):
+            self.control._bootstrap_system_exploratory_admission_policy()
+        active["risk_config_hash"] = self.control.risk_settings_snapshot()["config_hash"]
+        active["live_execution"] = True
+        self.store.set_operator_config("rolling_admission_policy_active", active)
+        with self.assertRaisesRegex(
+            OperatorControlError, "ROLLING_POLICY_BOOTSTRAP_DRIFT"
+        ):
+            self.control._bootstrap_system_exploratory_admission_policy()
+
+    def test_system_bootstrap_rejects_arbitrary_policy_and_preserves_review(self) -> None:
+        review = {
+            "policy_id": "arbitrary-reviewed-policy",
+            "version": "v1",
+            "config_hash": "sha256:arbitrary",
+            "status": "REVIEWED",
+        }
+        self.store.set_operator_config("rolling_admission_policy_review", review)
+        active = dict(self.store.get_operator_config("rolling_admission_policy_active", {}))
+        active["policy_id"] = "arbitrary-reviewed-policy"
+        self.store.set_operator_config("rolling_admission_policy_active", active)
+        with self.assertRaisesRegex(
+            OperatorControlError, "ROLLING_POLICY_BOOTSTRAP_DRIFT"
+        ):
+            self.control._bootstrap_system_exploratory_admission_policy()
+        self.assertEqual(
+            self.store.get_operator_config("rolling_admission_policy_review", None),
+            review,
+        )
+
+    def test_system_bootstrap_ctor_blocker_is_visible_in_status(self) -> None:
+        active = dict(self.store.get_operator_config("rolling_admission_policy_active", {}))
+        active["live_execution"] = True
+        self.store.set_operator_config("rolling_admission_policy_active", active)
+        blocked = OperatorControlPlane(self.store, system_bootstrap_enabled=True)
+        state = blocked.rolling_portfolio_state()
+        self.assertEqual(state["status"], "BLOCKED")
+        self.assertIn("ROLLING_POLICY_BOOTSTRAP_DRIFT", state["blockers"])
+
+    def test_system_bootstrap_rejects_stale_risk_binding_inside_transaction(self) -> None:
+        self.store.set_operator_config("rolling_admission_policy_active", None)
+        initial = self.control._rolling_risk_binding()
+        changed = dict(initial)
+        changed["risk_config_generation"] = int(initial["risk_config_generation"]) + 1
+        with patch.object(
+            self.control,
+            "_rolling_risk_binding",
+            side_effect=[initial, changed],
+        ):
+            with self.assertRaisesRegex(
+                OperatorControlError, "ROLLING_POLICY_BOOTSTRAP_RISK_DRIFT"
+            ):
+                self.control._bootstrap_system_exploratory_admission_policy()
+        self.assertIsNone(
+            self.store.get_operator_config("rolling_admission_policy_active", None)
+        )
+
+    def test_rolling_worker_blocks_without_exact_active_bootstrap_envelope(self) -> None:
+        active = dict(self.store.get_operator_config("rolling_admission_policy_active", {}))
+        self.store.set_operator_config("rolling_admission_policy_active", None)
+        processor = AutonomousResearchProcessor(self.store, clock=lambda: datetime(2026, 1, 2, tzinfo=timezone.utc))
+        before = self.store.research_queue_stats()
+        blocked = processor.refresh_rolling_evidence(datetime(2026, 1, 2, tzinfo=timezone.utc))
+        after = self.store.research_queue_stats()
+        self.assertEqual(blocked["status"], "BLOCKED")
+        self.assertEqual(blocked["blocker"], "ROLLING_POLICY_BOOTSTRAP_ACTIVE_REQUIRED")
+        self.assertEqual(after, before)
+        self.store.set_operator_config("rolling_admission_policy_active", active)
+        self.assertIsNone(
+            processor._rolling_bootstrap_blocker(processor._rolling_policy())
+        )
+
+    def test_rolling_worker_blocks_when_bootstrap_config_is_missing(self) -> None:
+        self.store.set_operator_config("rolling_exploratory_operating_policy", None)
+        self.store.set_operator_config("rolling_admission_policy_active", None)
+        processor = AutonomousResearchProcessor(self.store, clock=lambda: datetime(2026, 1, 2, tzinfo=timezone.utc))
+        before = self.store.research_queue_stats()
+        with patch.object(
+            processor,
+            "_ensure_exploratory_live_bootstrap",
+            return_value={"status": "DEFERRED"},
+        ):
+            blocked = processor.refresh_rolling_evidence(datetime(2026, 1, 2, tzinfo=timezone.utc))
+        self.assertEqual(blocked["status"], "BLOCKED")
+        self.assertEqual(blocked["blocker"], "ROLLING_POLICY_BOOTSTRAP_REQUIRED")
+        self.assertEqual(self.store.research_queue_stats(), before)
+
+    def test_system_bootstrap_rejects_generic_review_activation(self) -> None:
+        reviewed = self.control.review_rolling_admission_policy(
+            {"global_budget": "1.00"},
+            actor="reviewer",
+        )
+        draft = reviewed["draft"]
+        active_before = dict(
+            self.store.get_operator_config("rolling_admission_policy_active", {})
+        )
+        with self.assertRaisesRegex(
+            OperatorControlError,
+            "ROLLING_POLICY_BOOTSTRAP_MANUAL_ACTIVATION_BLOCKED",
+        ):
+            self.control.activate_rolling_admission_policy(
+                draft["policy_id"],
+                draft["version"],
+            )
+        with self.assertRaisesRegex(
+            OperatorControlError,
+            "ROLLING_POLICY_BOOTSTRAP_MANUAL_ACTIVATION_BLOCKED",
+        ):
+            self.control.activate_rolling_admission_policy(
+                "rolling-default",
+                "v1",
+            )
+        active = self.store.get_operator_config("rolling_admission_policy_active", {})
+        self.assertEqual(active, active_before)
 
     def test_startup_reconciles_crash_after_canary_sync_idempotently(self) -> None:
         context, _ = self._seed_proposed_selection()
