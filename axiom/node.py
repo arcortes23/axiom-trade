@@ -3900,7 +3900,24 @@ class ResearchNode:
         if opportunity_result is False:
             errors.append("opportunity pipeline completed with degraded output")
         self.bus.resume_expired(now=ensure_utc(self.clock()))
-        paper_stats = self._run_paper_workers()
+        migration_candidate_ids = tuple(
+            dict.fromkeys(
+                str(item.get("candidate_id", "")).strip()
+                for item in (
+                    observation_migrations
+                    if isinstance(observation_migrations, (list, tuple))
+                    else ()
+                )
+                if isinstance(item, Mapping)
+                and str(item.get("candidate_id", "")).strip()
+            )
+        )
+        if migration_candidate_ids:
+            paper_stats = self._run_paper_workers(
+                migration_candidate_ids=migration_candidate_ids
+            )
+        else:
+            paper_stats = self._run_paper_workers()
         if isinstance(paper_stats, Mapping):
             processed = int(paper_stats.get("processed_candidates", 0) or 0)
             successful = int(paper_stats.get("successful_candidates", processed) or 0)
@@ -4956,7 +4973,11 @@ class ResearchNode:
             self._log(logging.ERROR, "opportunity pipeline failed: %s", exc)
             return False
 
-    def _run_paper_workers(self) -> dict[str, Any]:
+    def _run_paper_workers(
+        self,
+        *,
+        migration_candidate_ids: Sequence[str] = (),
+    ) -> dict[str, Any]:
         if not self._paper_scheduler_lock.acquire(blocking=False):
             return {
                 "candidate_count": 0,
@@ -4974,19 +4995,33 @@ class ResearchNode:
                 with AxiomStore(db_path) as paper_store:
                     self._paper_store = paper_store
                     try:
-                        return self._run_paper_workers_locked()
+                        return self._run_paper_workers_locked(
+                            migration_candidate_ids=migration_candidate_ids,
+                        )
                     finally:
                         self._paper_store = None
-            return self._run_paper_workers_locked()
+            return self._run_paper_workers_locked(
+                migration_candidate_ids=migration_candidate_ids,
+            )
         finally:
             self._paper_scheduler_lock.release()
 
-    def _run_paper_workers_locked(self) -> dict[str, Any]:
+    def _run_paper_workers_locked(
+        self,
+        *,
+        migration_candidate_ids: Sequence[str] = (),
+    ) -> dict[str, Any]:
         paper_store = self._paper_store or self.store
         registry = ForwardTestRegistry(paper_store)
         registry_rows = list(registry.list())
         linked_forward_ids: set[str] = set()
         linked_intent_ids: set[str] = set()
+        linked_forward_by_candidate: dict[str, str] = {}
+        migration_ids = {
+            str(item).strip()
+            for item in migration_candidate_ids
+            if str(item).strip()
+        }
         lifecycle_loader = getattr(paper_store, "load_candidate_lifecycle", None)
         if callable(lifecycle_loader):
             for spec in registry_rows:
@@ -5021,6 +5056,8 @@ class ResearchNode:
                 intent_id = str(payload.get("paper_observation_intent_id", "")).strip()
                 if forward_id:
                     linked_forward_ids.add(forward_id)
+                    if candidate_id in migration_ids:
+                        linked_forward_by_candidate[candidate_id] = forward_id
                 if intent_id:
                     linked_intent_ids.add(intent_id)
         superseded_ids: set[str] = set()
@@ -5094,6 +5131,18 @@ class ResearchNode:
             ),
             key=lambda spec: (spec.start_timestamp, spec.experiment_id),
         )
+        priority_forward_ids = {
+            forward_id
+            for candidate_id, forward_id in linked_forward_by_candidate.items()
+            if candidate_id in migration_ids
+            and any(
+                spec.experiment_id == forward_id
+                and isinstance(spec.config, Mapping)
+                and spec.config.get("observation_capture_only") is True
+                and isinstance(spec.config.get("observation_handoff"), Mapping)
+                for spec in specs
+            )
+        }
         scheduler_name = "paper-engine"
         state = self.store.get_scheduler_state(scheduler_name) or {}
         if not specs:
@@ -5132,8 +5181,31 @@ class ResearchNode:
             if matching is not None:
                 cursor = (matching + 1) % len(specs)
         limit = min(self.config.paper_candidates_per_cycle, len(specs))
-        selected = tuple(specs[(cursor + offset) % len(specs)] for offset in range(limit))
-        next_cursor = (cursor + limit) % len(specs)
+        priority_specs = tuple(
+            spec for spec in specs if spec.experiment_id in priority_forward_ids
+        )
+        normal_available = len(specs) - len(priority_specs)
+        priority_slots = min(
+            len(priority_specs),
+            limit if normal_available == 0 else max(0, limit - 1),
+        )
+        selected_priority = priority_specs[:priority_slots]
+        normal_budget = limit - len(selected_priority)
+        normal_selected: list[Any] = []
+        scan_cursor = cursor
+        scanned = 0
+        while len(normal_selected) < normal_budget and scanned < len(specs):
+            candidate = specs[scan_cursor]
+            if candidate.experiment_id not in priority_forward_ids:
+                normal_selected.append(candidate)
+            scan_cursor = (scan_cursor + 1) % len(specs)
+            scanned += 1
+        selected = tuple((*selected_priority, *normal_selected))
+        next_cursor = (
+            scan_cursor
+            if priority_forward_ids
+            else (cursor + limit) % len(specs)
+        )
         stats: dict[str, Any] = {
             "candidate_count": len(specs),
             "processed_candidates": len(selected),

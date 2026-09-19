@@ -1385,6 +1385,239 @@ class MutationSchedulingTests(unittest.TestCase):
                     auto_state["payload"]["blocker"],
                     "AUTONOMOUS_CANARY_DISABLED",
                 )
+    def test_migration_capture_successors_use_same_cycle_fast_lane(self) -> None:
+        strategy = {
+            "version": 1,
+            "market_type": "prediction",
+            "family": "momentum",
+            "parameters": {"lookback": 1, "threshold": 0.05},
+        }
+        model = {"model_required": False}
+        base = T0
+        with tempfile.TemporaryDirectory() as directory:
+            db = str(Path(directory) / "capture-fast-lane.sqlite")
+            with AxiomStore(db) as store:
+                registry = ForwardTestRegistry(store)
+                normal_ids: list[str] = []
+                for index in range(50):
+                    experiment_id = f"normal-{index:02d}"
+                    registry.freeze(
+                        strategy=strategy,
+                        model=model,
+                        config={"execution": "paper_only", "live_execution": False},
+                        start_timestamp=base + timedelta(seconds=index),
+                        allowed_markets=("normal-market",),
+                        experiment_id=experiment_id,
+                    )
+                    normal_ids.append(experiment_id)
+
+                target_ids: list[str] = []
+                stale_ids: list[str] = []
+                capture_markets: dict[str, str] = {}
+                for index in range(3):
+                    candidate_id = f"capture-candidate-{index}"
+                    intent_id = f"capture-intent-{index}"
+                    stale_id = f"stale-intent-{index}"
+                    target_id = f"capture-successor-{index}"
+                    capture_market = f"capture-market-{index}"
+                    capture_markets[candidate_id] = capture_market
+                    stale_ids.append(stale_id)
+                    registry.freeze(
+                        strategy=strategy,
+                        model=model,
+                        config={
+                            "candidate_id": candidate_id,
+                            "observation_intent": True,
+                            "observation_capture_only": True,
+                            "observation_handoff": {
+                                "predecessor_observation_intent_id": f"old-intent-{index}",
+                            },
+                            "capture_market_id": capture_market,
+                            "paper_observation_intent_id": intent_id,
+                            "superseded_observation_intent_ids": [stale_id],
+                        },
+                        start_timestamp=base + timedelta(hours=1),
+                        allowed_markets=(capture_market,),
+                        experiment_id=target_id,
+                    )
+                    registry.freeze(
+                        strategy=strategy,
+                        model=model,
+                        config={
+                            "candidate_id": candidate_id,
+                            "observation_intent": True,
+                            "observation_capture_only": True,
+                            "observation_handoff": {
+                                "predecessor_observation_intent_id": f"old-intent-{index}",
+                            },
+                            "capture_market_id": capture_market,
+                            "paper_observation_intent_id": stale_id,
+                        },
+                        start_timestamp=base + timedelta(hours=1),
+                        allowed_markets=(capture_market,),
+                        experiment_id=stale_id,
+                    )
+                    target_ids.append(target_id)
+                    store.save_candidate_lifecycle(
+                        candidate_id,
+                        CandidateStage.IDEA.value,
+                        {"candidate_id": candidate_id},
+                        timestamp=base,
+                    )
+                    store.save_candidate_lifecycle(
+                        candidate_id,
+                        CandidateStage.PAPER_FORWARD.value,
+                        {
+                            "candidate_id": candidate_id,
+                            "paper_observation_intent_id": intent_id,
+                            "forward_test_id": target_id,
+                            "observation_capture_only": True,
+                        },
+                        from_stage=CandidateStage.IDEA.value,
+                        reason="capture successor linked",
+                        timestamp=base,
+                    )
+
+                node = ResearchNode(
+                    NodeConfig(
+                        db,
+                        paper_candidates_per_cycle=4,
+                        crypto_enabled=False,
+                    ),
+                    provider=InMemoryPredictionProvider([]),
+                    store=store,
+                )
+                processed: list[str] = []
+
+                def paper_worker(spec: Any) -> Mapping[str, Any]:
+                    processed.append(spec.experiment_id)
+                    return {
+                        "status": "SUCCESS",
+                        "observations_processed": 0,
+                        "fills_inserted": 0,
+                    }
+
+                node._run_single_paper_worker = paper_worker  # type: ignore[method-assign]
+                node._run_crypto_paper = lambda: None
+                node._run_opportunity_pipeline = lambda: True
+                node._run_research_queue = lambda: {}
+                node.research_processor.reevaluate_forward_candidates = lambda now: None
+                node.research_processor._migrate_observation_setup_intents = (
+                    lambda now: tuple(
+                        {"candidate_id": f"capture-candidate-{index}"}
+                        for index in range(3)
+                    )
+                )
+                store.set_scheduler_state(
+                    "paper-engine",
+                    {
+                        "cursor": 17,
+                        "last_candidate_id": normal_ids[16],
+                    },
+                )
+                first = node._run_research_cycle()
+                self.assertEqual(
+                    first["paper"]["processed_candidate_ids"],
+                    [*target_ids, normal_ids[17]],
+                )
+                self.assertTrue(
+                    all(
+                        store.load_candidate_lifecycle(
+                            f"capture-candidate-{index}"
+                        )["payload"]["forward_test_id"]
+                        == target_ids[index]
+                        for index in range(3)
+                    )
+                )
+                self.assertTrue(
+                    all(
+                        capture_markets[f"capture-candidate-{index}"]
+                        in ForwardTestRegistry(store).get(target_ids[index]).allowed_markets
+                        for index in range(3)
+                    )
+                )
+                self.assertTrue(set(stale_ids).isdisjoint(processed))
+
+                processed.clear()
+                second = node._run_paper_workers()
+                self.assertEqual(
+                    second["processed_candidate_ids"],
+                    normal_ids[18:22],
+                )
+                self.assertTrue(set(target_ids).isdisjoint(processed))
+                self.assertTrue(set(stale_ids).isdisjoint(processed))
+                self.assertEqual(
+                    store.get_scheduler_state("paper-engine")["cursor"],
+                    22,
+                )
+
+    def test_capture_fast_lane_limit_one_without_normal_slot(self) -> None:
+        strategy = {
+            "version": 1,
+            "market_type": "prediction",
+            "family": "momentum",
+            "parameters": {"lookback": 1, "threshold": 0.05},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            db = str(Path(directory) / "capture-fast-lane-limit-one.sqlite")
+            with AxiomStore(db) as store:
+                registry = ForwardTestRegistry(store)
+                target_id = "capture-limit-one-successor"
+                candidate_id = "capture-limit-one-candidate"
+                registry.freeze(
+                    strategy=strategy,
+                    model={"model_required": False},
+                    config={
+                        "candidate_id": candidate_id,
+                        "observation_intent": True,
+                        "observation_capture_only": True,
+                        "observation_handoff": {
+                            "predecessor_observation_intent_id": "capture-limit-one-old",
+                        },
+                        "capture_market_id": "capture-limit-one-market",
+                        "paper_observation_intent_id": "capture-limit-one-intent",
+                    },
+                    start_timestamp=T0,
+                    allowed_markets=("capture-limit-one-market",),
+                    experiment_id=target_id,
+                )
+                store.save_candidate_lifecycle(
+                    candidate_id,
+                    CandidateStage.IDEA.value,
+                    {"candidate_id": candidate_id},
+                    timestamp=T0,
+                )
+                store.save_candidate_lifecycle(
+                    candidate_id,
+                    CandidateStage.PAPER_FORWARD.value,
+                    {
+                        "candidate_id": candidate_id,
+                        "paper_observation_intent_id": "capture-limit-one-intent",
+                        "forward_test_id": target_id,
+                    },
+                    from_stage=CandidateStage.IDEA.value,
+                    reason="capture successor linked",
+                    timestamp=T0,
+                )
+                node = ResearchNode(
+                    NodeConfig(
+                        db,
+                        paper_candidates_per_cycle=1,
+                        crypto_enabled=False,
+                    ),
+                    provider=InMemoryPredictionProvider([]),
+                    store=store,
+                )
+                node._run_single_paper_worker = lambda spec: {  # type: ignore[method-assign]
+                    "status": "SUCCESS",
+                    "observations_processed": 0,
+                    "fills_inserted": 0,
+                }
+                stats = node._run_paper_workers(
+                    migration_candidate_ids=(candidate_id,)
+                )
+                self.assertEqual(stats["processed_candidate_ids"], [target_id])
+
     def test_rolling_tick_reviews_new_enrollment_before_daily_due_once(self) -> None:
         class StopAfterOneWait(threading.Event):
             def wait(self, timeout: float | None = None) -> bool:
@@ -3017,7 +3250,10 @@ class MutationSchedulingTests(unittest.TestCase):
                 processor._migrate_observation_setup_intents(T0)
                 paper_calls: list[str] = []
 
-                def paper_workers() -> Mapping[str, Any]:
+                def paper_workers(
+                    *,
+                    migration_candidate_ids: tuple[str, ...] = (),
+                ) -> Mapping[str, Any]:
                     lifecycle = store.load_candidate_lifecycle(candidate_id)
                     linked_forward = (
                         lifecycle["payload"]["forward_test_id"]
