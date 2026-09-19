@@ -3098,7 +3098,7 @@ class OperatorControlTests(unittest.TestCase):
                     actor="test-operator",
                 )
         self.assertEqual(self.store.load_current_portfolio_selection(), before)
-    def test_prepared_successor_keeps_identity_through_activation_and_restart(self) -> None:
+    def test_prepared_successor_keeps_identity_until_reconciliation(self) -> None:
         context, _ = self._seed_proposed_selection()
         predecessor = self.store.load_current_portfolio_selection()
         assert predecessor is not None
@@ -3128,9 +3128,11 @@ class OperatorControlTests(unittest.TestCase):
         self.assertEqual(current["members"][0]["allocation"], "1.00")
         self.assertTrue(current["members"][0]["allocation_active"])
         self.assertFalse(current["paper_only"])
-        restarted = OperatorControlPlane(self.store)
-        restored = restarted.store.load_current_portfolio_selection()
-        self.assertEqual(restored, current)
+        self.assertIsNotNone(
+            self.store.get_operator_config(
+                "canary_selection_binding_rollback", None
+            )
+        )
 
     def test_prepared_activation_rejects_fresh_obligation_change(self) -> None:
         context, _ = self._seed_proposed_selection()
@@ -3219,6 +3221,48 @@ class OperatorControlTests(unittest.TestCase):
             self.store.get_operator_config("canary_selection_binding", None)
         )
 
+
+    def test_startup_reconciles_crash_after_canary_sync_idempotently(self) -> None:
+        context, _ = self._seed_proposed_selection()
+        prepared = self.control._prepare_reviewed_proposed_selection()
+        assert prepared is not None
+        activated = self.control._activate_reviewed_proposed_selection(
+            context={
+                **context,
+                "selection_id": prepared["selection_id"],
+                "selection_hash": prepared["selection_hash"],
+            },
+            authorization={"authorization_id": "auth-crash"},
+            actor="test-operator",
+        )
+        self.assertIsInstance(activated, dict)
+        self.assertIsNotNone(
+            self.store.get_operator_config(
+                "canary_selection_binding_rollback", None
+            )
+        )
+        restarted = OperatorControlPlane(self.store)
+        recovered = restarted.store.load_current_portfolio_selection()
+        assert recovered is not None
+        self.assertEqual(recovered["selection_id"], prepared["selection_id"])
+        self.assertEqual(recovered["status"], "PAPER")
+        self.assertTrue(recovered["paper_only"])
+        self.assertFalse(recovered["allocation_active"])
+        self.assertIsNone(
+            self.store.get_operator_config(
+                "canary_selection_binding_rollback", None
+            )
+        )
+        self.assertIsNone(
+            self.store.connection.execute(
+                "SELECT candidate_id FROM canary_selection WHERE singleton=1"
+            ).fetchone()
+        )
+        repeated = OperatorControlPlane(self.store)
+        self.assertEqual(
+            repeated.store.load_current_portfolio_selection(),
+            recovered,
+        )
     def test_exploratory_live_review_confirm_success_merges_persisted_bindings(self) -> None:
         context, draft, review = self._exploratory_confirm_context()
         credentials = _configured_credentials()
