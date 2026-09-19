@@ -22,6 +22,32 @@ class CandidateStage(str, Enum):
     REJECTED = "REJECTED"
 
 
+_IMMUTABLE_HANDOFF_IDENTITY_FIELDS = (
+    "forward_test_id",
+    "paper_observation_intent_id",
+    "observation_intent_id",
+    "scope_hash",
+    "scope_version",
+    "market_scope_hash",
+    "market_scope_version",
+)
+
+
+def immutable_handoff_identity(payload: Mapping[str, Any] | None) -> dict[str, str]:
+    """Project the lifecycle fields that evidence must never rebind."""
+    if not isinstance(payload, Mapping):
+        return {}
+    identity: dict[str, str] = {}
+    for field in _IMMUTABLE_HANDOFF_IDENTITY_FIELDS:
+        value = payload.get(field)
+        if value in (None, "", {}, []):
+            continue
+        normalized = str(value).strip()
+        if normalized:
+            identity[field] = normalized
+    return identity
+
+
 _STAGE_ORDER = (
     CandidateStage.IDEA,
     CandidateStage.SCHEMA_VALIDATED,
@@ -541,9 +567,10 @@ class CandidateLifecycleManager:
         evidence: Mapping[str, Any],
         *,
         expected_stage: CandidateStage | str | None = None,
+        expected_handoff: Mapping[str, Any] | None = None,
         reason: str = "evidence updated",
     ) -> CandidateLifecycle:
-        """Persist additional evidence without changing the lifecycle stage."""
+        """Persist evidence without rebinding an immutable forward handoff."""
         current = self.get(candidate_id)
         if current is None:
             raise KeyError(candidate_id)
@@ -553,6 +580,11 @@ class CandidateLifecycleManager:
             expected = expected_stage.value if isinstance(expected_stage, CandidateStage) else str(expected_stage)
             if current.stage.value != expected:
                 raise RuntimeError(f"stale candidate lifecycle writer: expected {expected}, found {current.stage.value}")
+        if expected_handoff is not None:
+            expected_identity = immutable_handoff_identity(expected_handoff)
+            current_identity = immutable_handoff_identity(current.payload)
+            if any(current_identity.get(field) != value for field, value in expected_identity.items()):
+                raise RuntimeError("stale candidate lifecycle writer: immutable handoff changed")
         body = dict(current.payload)
         body.update(dict(evidence))
         body.setdefault("candidate_id", str(candidate_id))

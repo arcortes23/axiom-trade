@@ -2460,6 +2460,158 @@ class MutationSchedulingTests(unittest.TestCase):
                 3,
             )
 
+    def test_stale_forward_evidence_cannot_revert_newer_successor(self) -> None:
+        candidate_id = "lifecycle-evidence-cas"
+        older_payload = {
+            "candidate_id": candidate_id,
+            "forward_test_id": "forward-older",
+            "paper_observation_intent_id": "intent-older",
+            "scope_hash": "scope-older",
+            "scope_version": "1",
+            "forward_evidence_identity": "evidence-older",
+        }
+        newer_payload = {
+            **older_payload,
+            "forward_test_id": "forward-newer",
+            "paper_observation_intent_id": "intent-newer",
+            "scope_hash": "scope-newer",
+            "forward_evidence_identity": "evidence-newer",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            db = str(Path(directory) / "lifecycle-evidence-cas.sqlite")
+            with AxiomStore(db) as store, AxiomStore(db) as successor_store:
+                store.save_candidate_lifecycle(
+                    candidate_id,
+                    CandidateStage.IDEA.value,
+                    {"candidate_id": candidate_id},
+                    timestamp=T0,
+                )
+                store.save_candidate_lifecycle(
+                    candidate_id,
+                    CandidateStage.SCHEMA_VALIDATED.value,
+                    {"candidate_id": candidate_id},
+                    from_stage=CandidateStage.IDEA.value,
+                    timestamp=T0,
+                )
+                store.save_candidate_lifecycle(
+                    candidate_id,
+                    CandidateStage.FROZEN.value,
+                    {"candidate_id": candidate_id},
+                    from_stage=CandidateStage.SCHEMA_VALIDATED.value,
+                    timestamp=T0,
+                )
+                store.save_candidate_lifecycle(
+                    candidate_id,
+                    CandidateStage.PAPER_FORWARD.value,
+                    older_payload,
+                    from_stage=CandidateStage.FROZEN.value,
+                    timestamp=T0,
+                )
+                processor = AutonomousResearchProcessor(store, clock=lambda: T0)
+                entered = threading.Event()
+                release = threading.Event()
+                stale_result: dict[str, Any] = {}
+
+                def stale_forward_evidence(
+                    _record: Mapping[str, Any],
+                    _now: datetime,
+                ) -> Mapping[str, Any]:
+                    entered.set()
+                    if not release.wait(timeout=5):
+                        raise AssertionError("stale evaluation barrier was not released")
+                    return {
+                        "forward_test_id": "forward-older",
+                        "paper_observation_intent_id": "intent-older",
+                        "scope_hash": "scope-older",
+                        "scope_version": "1",
+                        "forward_evidence_identity": "stale-evidence",
+                    }
+
+                processor._forward_evidence = stale_forward_evidence  # type: ignore[method-assign]
+
+                def run_stale_evaluation() -> None:
+                    try:
+                        processor._evaluate_forward_candidate(candidate_id, T0)
+                    except BaseException as exc:
+                        stale_result["error"] = exc
+
+                thread = threading.Thread(target=run_stale_evaluation)
+                thread.start()
+                self.assertTrue(entered.wait(timeout=5))
+                successor_store.save_candidate_lifecycle(
+                    candidate_id,
+                    CandidateStage.PAPER_FORWARD.value,
+                    newer_payload,
+                    from_stage=CandidateStage.PAPER_FORWARD.value,
+                    timestamp=T0 + timedelta(seconds=1),
+                    reason="newer observation successor",
+                )
+                release.set()
+                thread.join(timeout=5)
+                self.assertFalse(thread.is_alive())
+                self.assertIsInstance(stale_result.get("error"), RuntimeError)
+                self.assertIn(
+                    "immutable handoff changed",
+                    str(stale_result["error"]),
+                )
+                current = store.load_candidate_lifecycle(candidate_id)
+                self.assertIsNotNone(current)
+                assert current is not None
+                self.assertEqual(
+                    current["payload"]["forward_test_id"],
+                    "forward-newer",
+                )
+                self.assertEqual(
+                    current["payload"]["paper_observation_intent_id"],
+                    "intent-newer",
+                )
+
+                current_evidence = {
+                    "forward_test_id": "forward-newer",
+                    "paper_observation_intent_id": "intent-newer",
+                    "scope_hash": "scope-newer",
+                    "scope_version": "1",
+                    "forward_evidence_identity": "evidence-current",
+                }
+                processor._forward_evidence = (  # type: ignore[method-assign]
+                    lambda _record, _now: current_evidence
+                )
+                current_result = processor._evaluate_forward_candidate(
+                    candidate_id,
+                    T0 + timedelta(seconds=2),
+                )
+                self.assertIsNotNone(current_result)
+                assert current_result is not None
+                self.assertEqual(
+                    current_result.payload["forward_test_id"],
+                    "forward-newer",
+                )
+                events_after_current = len(
+                    store.list_candidate_lifecycle_events(candidate_id)
+                )
+
+                restarted = AutonomousResearchProcessor(
+                    successor_store,
+                    clock=lambda: T0 + timedelta(seconds=3),
+                )
+                restarted._forward_evidence = (  # type: ignore[method-assign]
+                    lambda _record, _now: current_evidence
+                )
+                restarted_result = restarted._evaluate_forward_candidate(
+                    candidate_id,
+                    T0 + timedelta(seconds=3),
+                )
+                self.assertIsNotNone(restarted_result)
+                assert restarted_result is not None
+                self.assertEqual(
+                    restarted_result.payload["forward_test_id"],
+                    "forward-newer",
+                )
+                self.assertEqual(
+                    len(successor_store.list_candidate_lifecycle_events(candidate_id)),
+                    events_after_current,
+                )
+
     def test_capture_successor_rejects_authority_and_preserves_predecessor_hash(self) -> None:
         class WorkerStore:
             def __init__(self) -> None:

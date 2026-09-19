@@ -2500,6 +2500,7 @@ class PolymarketCollector:
                     candidate_id,
                     evidence,
                     expected_stage=current.stage,
+                    expected_handoff=current.payload,
                     reason="observation materialization lifecycle reconciliation",
                 )
             return True

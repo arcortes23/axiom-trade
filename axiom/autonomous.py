@@ -17689,6 +17689,11 @@ class AutonomousResearchProcessor:
                             candidate_id,
                             evidence,
                             expected_stage=CandidateStage.PAPER_FORWARD,
+                            expected_handoff=(
+                                record.get("payload")
+                                if isinstance(record.get("payload"), Mapping)
+                                else None
+                            ),
                             reason="forward paper evidence update",
                         )
                     reasons = self.config.promotion_criteria.evaluate({**existing, **evidence})
@@ -18986,6 +18991,7 @@ class AutonomousResearchProcessor:
             candidate_id,
             evidence,
             expected_stage=CandidateStage.PAPER_FORWARD,
+            expected_handoff=candidate.payload,
             reason="bound paper result evaluated from persisted observations",
         )
         self._evaluate_forward_candidate(candidate_id, now)
@@ -21777,13 +21783,18 @@ class AutonomousResearchProcessor:
         # decimal meaning or dropping sparse fields.
         canonical_evidence = _rolling_plain(evidence)
         return dict(canonical_evidence)
-
     def _evaluate_forward_candidate(self, candidate_id: str, now: datetime) -> CandidateLifecycle | None:
         record = self.lifecycle.get(candidate_id)
         if record is None or record.stage is not CandidateStage.PAPER_FORWARD:
             return record
         evidence = self._forward_evidence(record.as_record(), now)
-        updated = self.lifecycle.record_evidence(candidate_id, evidence, expected_stage=CandidateStage.PAPER_FORWARD, reason="forward result evaluation")
+        updated = self.lifecycle.record_evidence(
+            candidate_id,
+            evidence,
+            expected_stage=CandidateStage.PAPER_FORWARD,
+            expected_handoff=record.payload,
+            reason="forward result evaluation",
+        )
         reasons = self.config.promotion_criteria.evaluate({**updated.payload, **evidence})
         hard_reasons = self.config.promotion_criteria.hard_rejection_reasons(evidence)
         if hard_reasons:
