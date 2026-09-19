@@ -2075,6 +2075,12 @@ class MutationSchedulingTests(unittest.TestCase):
             replacement_market_id,
             "rolling-worker-replacement-2",
             "rolling-worker-replacement-3",
+            "rolling-worker-replacement-4",
+            "rolling-worker-replacement-5",
+            "rolling-worker-replacement-6",
+            "rolling-worker-replacement-7",
+            "rolling-worker-replacement-8",
+            "rolling-worker-replacement-9",
         )
         replacement_markets = [
             {
@@ -2209,7 +2215,7 @@ class MutationSchedulingTests(unittest.TestCase):
                         scope_resolution_freshness_sla_seconds=60,
                         observation_setup_migration_freshness_sla_seconds=300,
                     ),
-                    clock=lambda: T0,
+                    clock=lambda: T0 + timedelta(milliseconds=30),
                 )
                 migration_calls: list[datetime] = []
                 migrate = processor._migrate_observation_setup_intents
@@ -2274,10 +2280,20 @@ class MutationSchedulingTests(unittest.TestCase):
                     candidate_id,
                     {"market_scope": policy.as_dict()},
                     replacement_markets,
-                    resolved_at=T0,
+                    resolved_at=T0 + timedelta(milliseconds=23),
                 )
-                store.save_market_scope_resolution(proof_b)
+                original_loader = store.load_market_scope_resolution
+                proof_persisted_during_load = [False]
+
+                def load_current_proof(*args: Any, **kwargs: Any) -> Any:
+                    if not proof_persisted_during_load[0]:
+                        store.save_market_scope_resolution(proof_b)
+                        proof_persisted_during_load[0] = True
+                    return original_loader(*args, **kwargs)
+
+                store.load_market_scope_resolution = load_current_proof
                 processor._migrate_observation_setup_intents(T0)
+                self.assertTrue(proof_persisted_during_load[0])
                 capture_successors = [
                     item
                     for item in registry.list_observation_intents()
@@ -2374,7 +2390,7 @@ class MutationSchedulingTests(unittest.TestCase):
                         }
                     ],
                     store=store,
-                    now=T0,
+                    now=T0 + timedelta(milliseconds=30),
                 )
                 self.assertEqual(replacement_capture.get("status"), "OBSERVING")
                 worker = store.get_worker_state("rolling-portfolio")
@@ -2936,9 +2952,13 @@ class MutationSchedulingTests(unittest.TestCase):
                     "scope_hash": "scope-hash",
                     "scope_version": "scope-v1",
                     "resolved_at": (
-                        T0 - timedelta(hours=2)
-                        if self.proof_mode == "STALE"
-                        else T0
+                        T0 + timedelta(seconds=1)
+                        if self.proof_mode == "FUTURE"
+                        else (
+                            T0 - timedelta(hours=2)
+                            if self.proof_mode == "STALE"
+                            else T0
+                        )
                     ).isoformat(),
                     "status": "UNMATCHED" if self.proof_mode == "UNMATCHED" else "MATCHED",
                     "matched_markets": [{"market_id": "market-" + candidate_id}],
@@ -3000,7 +3020,7 @@ class MutationSchedulingTests(unittest.TestCase):
             self.assertIn("candidate-0005", created)
             self.assertGreaterEqual(len(third), 1)
             self.assertTrue(store.state["autonomous-observation-setup-migration"]["failures"] == [])
-            for mode in ("STALE", "UNMATCHED", "MISSING"):
+            for mode in ("STALE", "FUTURE", "UNMATCHED", "MISSING"):
                 store.proof_mode = mode
                 store.state["autonomous-observation-setup-migration"]["cursor"] = ""
                 before = len(created)

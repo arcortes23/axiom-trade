@@ -8343,7 +8343,15 @@ class AutonomousResearchProcessor:
                     freshness = float(freshness_value)
                 except (TypeError, ValueError, OverflowError):
                     raise ValueError("CURRENT_SCOPE_PROOF_SLA_UNAVAILABLE") from None
-                age = (ensure_utc(now) - ensure_utc(resolved_at)).total_seconds()
+                # ``now`` is the rolling tick's start timestamp.  A scope
+                # resolver may commit a newer proof while this migration is
+                # loading it, so freshness must use a post-load clock read.
+                # A proof still in the future relative to that read remains
+                # a genuine clock-skew failure.
+                clock = getattr(self, "clock", None)
+                clock_now = ensure_utc(clock() if callable(clock) else now)
+                freshness_now = max(ensure_utc(now), clock_now)
+                age = (freshness_now - ensure_utc(resolved_at)).total_seconds()
                 if not math.isfinite(freshness) or freshness <= 0 or age < 0 or age > freshness:
                     raise ValueError("CURRENT_SCOPE_PROOF_STALE")
 
