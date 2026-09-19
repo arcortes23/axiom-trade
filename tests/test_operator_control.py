@@ -3467,6 +3467,65 @@ class OperatorControlTests(unittest.TestCase):
         current = self.store.load_current_portfolio_selection()
         assert current is not None
         self.assertEqual(current["status"], "ACTIVE")
+
+    def test_startup_recovery_retains_marker_on_status_failure_then_clears_exact_live(self) -> None:
+        context, _ = self._seed_proposed_selection()
+        prepared = self.control._prepare_reviewed_proposed_selection()
+        assert prepared is not None
+        self.control._activate_reviewed_proposed_selection(
+            context={
+                **context,
+                "selection_id": prepared["selection_id"],
+                "selection_hash": prepared["selection_hash"],
+            },
+            authorization={"authorization_id": "auth-crash-live"},
+            actor="test-operator",
+        )
+        status_failure = Mock()
+        status_failure.authoritative_status.side_effect = RuntimeError("transient status")
+        with patch("axiom.operator.CanaryService", return_value=status_failure):
+            OperatorControlPlane(self.store)
+        status_failure.disarm.assert_not_called()
+        self.assertIsNotNone(
+            self.store.get_operator_config(
+                "canary_selection_binding_rollback", None
+            )
+        )
+        current = self.store.load_current_portfolio_selection()
+        assert current is not None
+        self.assertEqual(current["status"], "ACTIVE")
+        live_service = Mock()
+        live_service.authoritative_status.return_value = {
+            "micro_live_canary": "AUTONOMOUS_MICRO_LIVE",
+            "control_candidate": "candidate-proposed",
+            "selected_candidate": "candidate-proposed",
+        }
+        with patch("axiom.operator.CanaryService", return_value=live_service), patch.object(
+            self.store,
+            "load_active_execution_authorization",
+            return_value={
+                "authorization_id": "auth-crash-live",
+                "generation": 1,
+                "selection_id": prepared["selection_id"],
+                "selection_hash": prepared["selection_hash"],
+            },
+        ):
+            OperatorControlPlane(self.store)
+        live_service.disarm.assert_not_called()
+        self.assertIsNone(
+            self.store.get_operator_config(
+                "canary_selection_binding_rollback", None
+            )
+        )
+        self.assertEqual(
+            self.store.load_current_portfolio_selection()["status"],
+            "ACTIVE",
+        )
+        OperatorControlPlane(self.store)
+        self.assertEqual(
+            self.store.load_current_portfolio_selection()["status"],
+            "ACTIVE",
+        )
     def test_exploratory_live_confirmation_cannot_retain_stale_candidate(self) -> None:
         context, draft, review = self._exploratory_confirm_context()
 

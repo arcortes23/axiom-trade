@@ -2982,7 +2982,18 @@ class OperatorControlPlane:
             self._selection_reconciliation_error = "EXPLORATORY_LIVE_SELECTION_RECONCILIATION_REQUIRED"
             return False
         loader = getattr(self.store, "load_current_portfolio_selection", None)
-        current = loader() if callable(loader) else None
+        if not callable(loader):
+            self._selection_reconciliation_error = (
+                "EXPLORATORY_LIVE_SELECTION_RECONCILIATION_STATE_UNAVAILABLE"
+            )
+            return False
+        try:
+            current = loader()
+        except Exception:
+            self._selection_reconciliation_error = (
+                "EXPLORATORY_LIVE_SELECTION_RECONCILIATION_STATE_UNAVAILABLE"
+            )
+            return False
         active_view = (
             isinstance(current, Mapping)
             and str(current.get("selection_id") or current.get("portfolio_selection_id") or "").strip()
@@ -3007,7 +3018,13 @@ class OperatorControlPlane:
                     ),
                     "",
                 )
-        binding = getter("canary_selection_binding", None)
+        try:
+            binding = getter("canary_selection_binding", None)
+        except Exception:
+            self._selection_reconciliation_error = (
+                "EXPLORATORY_LIVE_SELECTION_RECONCILIATION_STATE_UNAVAILABLE"
+            )
+            return False
         binding_exact = (
             isinstance(binding, Mapping)
             and str(binding.get("candidate_id") or "").strip() == candidate_id
@@ -3015,8 +3032,11 @@ class OperatorControlPlane:
             and str(binding.get("selection_hash") or "").strip() == selection_hash
         )
         singleton_candidate = ""
+        singleton_read_error = False
         connection = getattr(self.store, "connection", None)
-        if connection is not None:
+        if connection is None:
+            singleton_read_error = True
+        else:
             try:
                 row = connection.execute(
                     "SELECT candidate_id FROM canary_selection WHERE singleton=1"
@@ -3027,18 +3047,35 @@ class OperatorControlPlane:
                     except (KeyError, TypeError):
                         singleton_candidate = str(row[0] or "").strip()
             except sqlite3.Error:
-                singleton_candidate = ""
+                singleton_read_error = True
         singleton_exact = singleton_candidate == candidate_id
-        state = ""
+        status_read_error = False
+        status: Mapping[str, Any] = {}
         try:
-            status = self._canary_service.authoritative_status()
-            state = str(status.get("micro_live_canary") or "").upper() if isinstance(status, Mapping) else ""
+            raw_status = self._canary_service.authoritative_status()
+            if not isinstance(raw_status, Mapping):
+                status_read_error = True
+            else:
+                status = raw_status
         except Exception:
-            state = ""
+            status_read_error = True
+        state = str(status.get("micro_live_canary") or "").upper()
+        if state not in {"DISABLED", "DISARMED", "KILLED", "ARMED", "AUTONOMOUS_MICRO_LIVE"}:
+            status_read_error = True
+        control_candidate = str(
+            status.get("control_candidate")
+            or status.get("selected_candidate")
+            or ""
+        ).strip()
+        if state in {"ARMED", "AUTONOMOUS_MICRO_LIVE"} and not control_candidate:
+            status_read_error = True
         mode = str(marker.get("authorization_mode") or "EXPLORATORY_MICRO_CANARY").strip()
         auth = None
+        auth_read_error = False
         auth_loader = getattr(self.store, "load_active_execution_authorization", None)
-        if callable(auth_loader):
+        if not callable(auth_loader):
+            auth_read_error = True
+        else:
             try:
                 auth = auth_loader(
                     mode=mode,
@@ -3047,19 +3084,18 @@ class OperatorControlPlane:
                     selection_hash=selection_hash,
                 )
             except Exception:
-                auth = None
-        auth_exact = isinstance(auth, Mapping)
-        control_candidate = ""
-        try:
-            control_status = self._canary_service.authoritative_status()
-            if isinstance(control_status, Mapping):
-                control_candidate = str(
-                    control_status.get("control_candidate")
-                    or control_status.get("selected_candidate")
-                    or ""
-                ).strip()
-        except Exception:
-            control_candidate = ""
+                auth_read_error = True
+        if singleton_read_error or status_read_error or auth_read_error:
+            self._selection_reconciliation_error = (
+                "EXPLORATORY_LIVE_SELECTION_RECONCILIATION_STATE_UNAVAILABLE"
+            )
+            return False
+        auth_exact = (
+            isinstance(auth, Mapping)
+            and bool(str(auth.get("authorization_id") or auth.get("id") or "").strip())
+            and str(auth.get("selection_id") or "").strip() == selection_id
+            and str(auth.get("selection_hash") or "").strip() == selection_hash
+        )
         singleton_target = singleton_candidate == candidate_id
         exact_live = (
             active_view
