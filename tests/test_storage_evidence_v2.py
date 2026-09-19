@@ -5,7 +5,8 @@ import json
 import unittest
 from unittest.mock import patch
 
-from axiom.storage import AxiomStore
+from axiom.storage import AxiomStore, _rolling_evidence_mapping_from_row
+from axiom.rolling_portfolio import RollingEvidence
 
 UTC = timezone.utc
 THROUGH = datetime(2026, 1, 31, 12, tzinfo=UTC)
@@ -455,6 +456,80 @@ class StorageEvidenceV2Tests(unittest.TestCase):
 
                 with self.assertRaisesRegex(ValueError, f"{field_name} conflicts"):
                     store.list_strategy_evidence_windows("storage-v2")
+
+    def test_hydration_normalizes_sql_evaluator_flags_and_preserves_null(self) -> None:
+        for raw_value, expected in ((0, False), (1, True), (None, None)):
+            with self.subTest(raw_value=raw_value), AxiomStore(":memory:") as store:
+                record = _evidence(
+                    evidence_window_id=f"window-sql-evaluator-normalized-{raw_value}",
+                    evaluator_invoked=expected,
+                    evaluator_completed=expected,
+                )
+                self._save(store, record)
+                store.connection.execute(
+                    "UPDATE strategy_evidence_windows "
+                    "SET evaluator_invoked=?,evaluator_completed=? "
+                    "WHERE evidence_window_id=?",
+                    (raw_value, raw_value, record["evidence_window_id"]),
+                )
+                store.connection.commit()
+                row = store.connection.execute(
+                    "SELECT * FROM strategy_evidence_windows "
+                    "WHERE evidence_window_id=?",
+                    (record["evidence_window_id"],),
+                ).fetchone()
+                self.assertIsNotNone(row)
+                assert row is not None
+                hydrated = _rolling_evidence_mapping_from_row(
+                    row,
+                    json.loads(row["payload_json"]),
+                )
+                evidence = RollingEvidence.from_mapping(hydrated)
+                self.assertIs(evidence.evaluator_invoked, expected)
+                self.assertIs(evidence.evaluator_completed, expected)
+                self.assertIs(
+                    hydrated.get("evaluation", {}).get("evaluator_invoked"),
+                    expected,
+                )
+                self.assertIs(
+                    hydrated.get("evaluation", {}).get("evaluator_completed"),
+                    expected,
+                )
+
+    def test_hydration_rejects_conflicting_root_and_nested_evaluator_flags(self) -> None:
+        with AxiomStore(":memory:") as store:
+            record = _evidence(evidence_window_id="window-root-nested-evaluator-conflict")
+            self._save(store, record)
+            row = store.connection.execute(
+                "SELECT payload_json FROM strategy_evidence_windows "
+                "WHERE evidence_window_id=?",
+                (record["evidence_window_id"],),
+            ).fetchone()
+            self.assertIsNotNone(row)
+            assert row is not None
+            payload = json.loads(row["payload_json"])
+            payload["evaluator_invoked"] = 0
+            store.connection.execute(
+                "UPDATE strategy_evidence_windows SET payload_json=? "
+                "WHERE evidence_window_id=?",
+                (
+                    json.dumps(payload, sort_keys=True, separators=(",", ":")),
+                    record["evidence_window_id"],
+                ),
+            )
+            store.connection.commit()
+            row = store.connection.execute(
+                "SELECT * FROM strategy_evidence_windows "
+                "WHERE evidence_window_id=?",
+                (record["evidence_window_id"],),
+            ).fetchone()
+            self.assertIsNotNone(row)
+            assert row is not None
+            with self.assertRaisesRegex(ValueError, "evaluator_invoked conflicts"):
+                _rolling_evidence_mapping_from_row(
+                    row,
+                    json.loads(row["payload_json"]),
+                )
 
     def test_hydration_rejects_sql_accounting_status_conflict(self) -> None:
         with AxiomStore(":memory:") as store:

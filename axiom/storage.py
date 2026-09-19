@@ -20442,7 +20442,7 @@ def _rolling_evidence_mapping_from_row(
             )
     for field_name in ("evaluator_invoked", "evaluator_completed"):
         if _rolling_contract_present(document, evaluation, field_name):
-            _rolling_contract_value(
+            evaluation[field_name] = _rolling_contract_value(
                 document,
                 evaluation,
                 field_name,
@@ -20479,6 +20479,37 @@ def _rolling_evidence_mapping_from_row(
             evaluation.get("evaluation_kind"),
             default="CANONICAL_SIMULATION",
         )
+    for field_name in ("evaluator_invoked", "evaluator_completed"):
+        json_present = _rolling_contract_present(document, evaluation, field_name)
+        json_value = (
+            _rolling_contract_value(
+                document,
+                evaluation,
+                field_name,
+                strict_null_conflict=True,
+            )
+            if json_present
+            else None
+        )
+        sql_present = field_name in row.keys()
+        sql_value = row[field_name] if sql_present else None
+        if sql_value is None:
+            if v2_provenance and json_present and json_value is not None:
+                raise ValueError(
+                    f"{field_name} conflicts between SQL and hydrated JSON projections"
+                )
+        else:
+            normalized_sql = _rolling_optional_boolean(sql_value, name=field_name)
+            if json_present and (
+                json_value is None or normalized_sql != json_value
+            ):
+                raise ValueError(
+                    f"{field_name} conflicts between SQL and hydrated JSON projections"
+                )
+            if not json_present:
+                json_value = normalized_sql
+        if json_present or json_value is not None:
+            evaluation[field_name] = json_value
     accounting_complete = document.get("accounting_complete")
     if accounting_complete is None:
         accounting_complete = portfolio.get("accounting_complete")
@@ -20582,6 +20613,8 @@ def _rolling_evidence_mapping_from_row(
         if value is None:
             value = evaluation.get(field_name)
         if value is not None:
+            if field_name in {"evaluator_invoked", "evaluator_completed"}:
+                value = _rolling_optional_boolean(value, name=field_name)
             document[field_name] = value
             evaluation = dict(evaluation)
             evaluation[field_name] = value
@@ -20889,12 +20922,23 @@ def _rolling_projection_mapping(
     merged = dict(canonical)
     for field_name, value in metric_projection.items():
         if field_name in merged:
+            left_value = merged[field_name]
+            right_value = value
+            if field_name in {
+                "evaluator_invoked",
+                "evaluator_completed",
+                "accounting_available",
+                "accounting_complete",
+                "accounting_partial",
+            }:
+                left_value = _rolling_optional_boolean(left_value, name=field_name)
+                right_value = _rolling_optional_boolean(right_value, name=field_name)
             values_equal = (
-                _rolling_numeric_values_equal(merged[field_name], value)
+                _rolling_numeric_values_equal(left_value, right_value)
                 if field_name in _ROLLING_NUMERIC_ALIAS_FIELDS
                 else _rolling_payload_equal(
-                    merged[field_name],
-                    value,
+                    left_value,
+                    right_value,
                     ignored=frozenset(),
                 )
             )
@@ -20902,6 +20946,7 @@ def _rolling_projection_mapping(
                 raise ValueError(
                     f"{projection_name} projections conflict for {field_name}"
                 )
+            value = right_value
         merged[field_name] = value
     return merged
 
@@ -20936,6 +20981,17 @@ def _rolling_contract_value(
         # A present null is an explicit unavailable value.  It must remain
         # authoritative instead of being resurrected by a legacy scalar.
         return None
+    if name in {
+        "evaluator_invoked",
+        "evaluator_completed",
+        "accounting_available",
+        "accounting_complete",
+        "accounting_partial",
+    }:
+        values = [
+            _rolling_optional_boolean(value, name=name)
+            for value in values
+        ]
     if len(values) > 1:
         equal = (
             all(_rolling_numeric_values_equal(values[0], value) for value in values[1:])
