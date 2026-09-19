@@ -2202,6 +2202,264 @@ class MutationSchedulingTests(unittest.TestCase):
                         scope_resolution=bad_proof.as_dict(),
                     )
 
+    def test_capture_scope_churn_keeps_bound_market_and_three_observation_integrity(self) -> None:
+        candidate_id = "capture-scope-churn"
+        experiment_id = "forward-capture-scope-churn"
+        intent_id = "observation-intent-capture-scope-churn"
+        bound_market = "3161879"
+        all_market_ids = (
+            bound_market,
+            "3161881",
+            "559688",
+            "559691",
+            "559692",
+        )
+        allowed_market_ids = all_market_ids[:3]
+        strategy_document = {
+            "version": 1,
+            "market_type": "prediction",
+            "family": "momentum",
+            "parameters": {"lookback": 1, "threshold": 0.05},
+            "probability_model": "market-history",
+            "resolution_aware": True,
+            "resolution_inputs": ["market_history"],
+        }
+        policy = normalize_market_scope(
+            {
+                **normalize_market_scope(
+                    target_instrument="POLYMARKET",
+                ).as_dict(),
+                "provenance": "canonical",
+            }
+        )
+
+        def market(market_id: str) -> dict[str, Any]:
+            return {
+                "market_id": market_id,
+                "condition_id": "condition-" + market_id,
+                "yes_token_id": "yes-" + market_id,
+                "no_token_id": "no-" + market_id,
+                "metadata_provenance": {"source_type": "CURRENT"},
+                "source_type": "CURRENT",
+                "provider": "polymarket",
+                "venue": "POLYMARKET",
+                "instrument": "POLYMARKET",
+                "active": True,
+                "closed": False,
+                "settlement": "OPEN",
+                "enable_order_book": True,
+                "accepting_orders": True,
+            }
+
+        config = {
+            "candidate_id": candidate_id,
+            "observation_intent_id": intent_id,
+            "paper_observation_intent_id": intent_id,
+            "observation_capture_only": True,
+            "observation_intent": True,
+            "observation_only_lineage": True,
+            "paper_only": True,
+            "market_authority_required": True,
+            "capture_market_id": bound_market,
+            "market_scope": policy.as_dict(),
+            "scope_resolution_freshness_sla_seconds": 600.0,
+            "strategy_version_id": "capture-scope-churn-version",
+            "research_trial_id": "capture-scope-churn-trial",
+            "strategy_document": strategy_document,
+        }
+        lifecycle_payload = {
+            "candidate_id": candidate_id,
+            "forward_test_id": experiment_id,
+            "paper_observation_intent_id": intent_id,
+            "paper_observation_intent": True,
+            "paper_only": True,
+            "research_only": True,
+            "selection_excluded": True,
+            "allocation_active": False,
+            "canary_armed": False,
+            "observation_only_lineage": True,
+            "execution_scope": "OBSERVATION",
+            "scope_hash": policy.scope_hash,
+            "scope_version": policy.scope_version,
+        }
+        spec = SimpleNamespace(
+            experiment_id=experiment_id,
+            config=config,
+            allowed_markets=allowed_market_ids,
+            registration_timestamp=T0,
+            strategy_hash="sha256:capture-scope-churn-strategy",
+            model_hash="sha256:capture-scope-churn-model",
+        )
+
+        with AxiomStore(":memory:") as store:
+            store.load_candidate_lifecycle = (  # type: ignore[method-assign]
+                lambda _candidate: {
+                    "stage": CandidateStage.PAPER_FORWARD.value,
+                    "payload": lifecycle_payload,
+                }
+            )
+            node = ResearchNode.__new__(ResearchNode)
+            node.store = store
+            node.config = SimpleNamespace(shadow_interval=60)
+
+            def proof_for(
+                matched_ids: tuple[str, ...],
+                resolved_at: datetime,
+            ) -> Any:
+                proof = resolve_market_scope(
+                    candidate_id,
+                    {"market_scope": policy.as_dict()},
+                    [market(market_id) for market_id in matched_ids],
+                    resolved_at=resolved_at,
+                )
+                store.save_market_scope_resolution(proof)
+                return proof
+
+            def capture(
+                proof: Any,
+                observed_at: datetime,
+                source_id: str,
+            ) -> dict[str, Any]:
+                return node._capture_legacy_observations(
+                    spec,
+                    [
+                        {
+                            "market_id": bound_market,
+                            "timestamp": observed_at,
+                            "source_timestamp": observed_at,
+                            "source_snapshot_id": source_id,
+                        }
+                    ],
+                    store=store,
+                    now=observed_at + timedelta(seconds=1),
+                )
+
+            first_proof = proof_for(all_market_ids, T0)
+            first = capture(first_proof, T0 + timedelta(minutes=1), "capture-1")
+            self.assertEqual(first["status"], "OBSERVING")
+            self.assertEqual(first["observations_processed"], 1)
+
+            second_proof = proof_for(
+                (bound_market, "559688", "559691", "559692"),
+                T0 + timedelta(minutes=2),
+            )
+            second = capture(
+                second_proof,
+                T0 + timedelta(minutes=3),
+                "capture-2",
+            )
+            self.assertEqual(second["status"], "OBSERVING", second)
+            self.assertEqual(second["observations_processed"], 2)
+
+            third_proof = proof_for(
+                (bound_market, "3161881", "559692"),
+                T0 + timedelta(minutes=4),
+            )
+            third = capture(
+                third_proof,
+                T0 + timedelta(minutes=5),
+                "capture-3",
+            )
+            self.assertEqual(third["status"], "DECLINED")
+            self.assertEqual(third["observations_processed"], 3)
+            records = store.list_paper_observations(experiment_id, limit=None)
+            self.assertEqual(len(records), 3)
+            self.assertEqual(
+                {record["market_id"] for record in records},
+                {bound_market},
+            )
+
+            removed_proof = proof_for(
+                ("3161881", "559688", "559691", "559692"),
+                T0 + timedelta(minutes=6),
+            )
+            removed = capture(
+                removed_proof,
+                T0 + timedelta(minutes=7),
+                "capture-4",
+            )
+            self.assertEqual(
+                removed["blocker"],
+                "CURRENT_SCOPE_PROOF_MARKETS_MISMATCH",
+            )
+            self.assertEqual(
+                len(store.list_paper_observations(experiment_id, limit=None)),
+                3,
+            )
+
+            excluded_proof = proof_for(all_market_ids, T0 + timedelta(minutes=8)).as_dict()
+            excluded_proof["excluded_markets"] = [{"market_id": bound_market}]
+            original_loader = store.load_market_scope_resolution
+            store.load_market_scope_resolution = (  # type: ignore[method-assign]
+                lambda *_args, **_kwargs: excluded_proof
+            )
+            excluded = capture(
+                excluded_proof,
+                T0 + timedelta(minutes=9),
+                "capture-5",
+            )
+            self.assertEqual(
+                excluded["blocker"],
+                "CURRENT_SCOPE_PROOF_INCOMPLETE",
+            )
+
+            deferred_proof = proof_for(all_market_ids, T0 + timedelta(minutes=10)).as_dict()
+            deferred_proof["deferred_markets"] = [{"market_id": bound_market}]
+            store.load_market_scope_resolution = (  # type: ignore[method-assign]
+                lambda *_args, **_kwargs: deferred_proof
+            )
+            deferred = capture(
+                deferred_proof,
+                T0 + timedelta(minutes=11),
+                "capture-6",
+            )
+            self.assertEqual(
+                deferred["blocker"],
+                "CURRENT_SCOPE_PROOF_INCOMPLETE",
+            )
+            store.load_market_scope_resolution = original_loader
+
+            state = store.load_paper_state(experiment_id)
+            self.assertIsNotNone(state)
+            assert state is not None
+            evaluations = state["state"]["canonical_capture_evaluations"]
+            self.assertEqual(len(evaluations), 3)
+            self.assertEqual(store.count_paper_fills(experiment_id), 0)
+            self.assertEqual(
+                store.list_paper_execution_events(experiment_id, limit=None),
+                [],
+            )
+
+            restarted = ResearchNode.__new__(ResearchNode)
+            restarted.store = store
+            restarted.config = SimpleNamespace(shadow_interval=60)
+            repeated = restarted._capture_legacy_observations(
+                spec,
+                [
+                    {
+                        "market_id": bound_market,
+                        "timestamp": T0 + timedelta(minutes=5),
+                        "source_timestamp": T0 + timedelta(minutes=5),
+                        "source_snapshot_id": "capture-3",
+                    }
+                ],
+                store=store,
+                now=T0 + timedelta(minutes=12),
+            )
+            self.assertEqual(repeated["status"], "DECLINED")
+            self.assertEqual(repeated["observations_processed"], 3)
+            restarted_state = store.load_paper_state(experiment_id)
+            self.assertIsNotNone(restarted_state)
+            assert restarted_state is not None
+            self.assertEqual(
+                len(restarted_state["state"]["canonical_capture_evaluations"]),
+                3,
+            )
+            self.assertEqual(
+                len(store.list_paper_observations(experiment_id, limit=None)),
+                3,
+            )
+
     def test_capture_successor_rejects_authority_and_preserves_predecessor_hash(self) -> None:
         class WorkerStore:
             def __init__(self) -> None:

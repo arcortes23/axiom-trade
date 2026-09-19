@@ -5898,14 +5898,37 @@ class ResearchNode:
                 else str(item).strip()
                 for item in (matched if isinstance(matched, (list, tuple)) else ())
             )
-            if not matched_ids or len(set(matched_ids)) != len(matched_ids) or set(matched_ids) != set(allowed):
+            matched_set = set(matched_ids)
+            capture_only_scope = config.get("observation_capture_only") is True
+            if (
+                not matched_ids
+                or len(matched_set) != len(matched_ids)
+                or (
+                    capture_only_scope
+                    and bound_market not in matched_set
+                )
+                or (
+                    not capture_only_scope
+                    and matched_set != set(allowed)
+                )
+            ):
                 raise ValueError("CURRENT_SCOPE_PROOF_MARKETS_MISMATCH")
-            if proof.get("deferred_markets") or set(matched_ids).intersection(
+            excluded_ids = {
                 str(item.get("market_id", "")).strip()
                 if isinstance(item, Mapping)
                 else str(item).strip()
                 for item in (proof.get("excluded_markets", ()) or ())
-            ):
+            }
+            deferred_ids = {
+                str(item.get("market_id", "")).strip()
+                if isinstance(item, Mapping)
+                else str(item).strip()
+                for item in (proof.get("deferred_markets", ()) or ())
+            }
+            if capture_only_scope:
+                if bound_market in excluded_ids or bound_market in deferred_ids:
+                    raise ValueError("CURRENT_SCOPE_PROOF_INCOMPLETE")
+            elif deferred_ids or matched_set.intersection(excluded_ids):
                 raise ValueError("CURRENT_SCOPE_PROOF_INCOMPLETE")
         except Exception as exc:
             stage_error = str(exc)[:160] or stage_error
