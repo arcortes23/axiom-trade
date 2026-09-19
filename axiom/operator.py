@@ -1598,6 +1598,8 @@ class OperatorControlPlane:
             initialize=False,
             settings=self.settings,
         )
+        self._selection_reconciliation_error: str | None = None
+        self._reconcile_pending_canary_selection_binding()
         self._research_processor = AutonomousResearchProcessor(self.store, clock=utc_now)
     def risk_settings_snapshot(self) -> dict[str, Any]:
         """Return the bounded persisted active/draft risk settings projection."""
@@ -2899,6 +2901,216 @@ class OperatorControlPlane:
             ),
         }
 
+    def _reset_prepared_selection_overlay(
+        self,
+        selection: Mapping[str, Any] | None,
+    ) -> None:
+        """Reset an interrupted active overlay to the immutable prepared view."""
+        if not isinstance(selection, Mapping):
+            return
+        setter = getattr(self.store, "set_operator_config", None)
+        if not callable(setter):
+            raise OperatorControlError("EXPLORATORY_LIVE_SELECTION_STORAGE_UNAVAILABLE")
+        raw_members = selection.get("members", selection.get("selected_members", ()))
+        if not isinstance(raw_members, (list, tuple)):
+            raise OperatorControlError("EXPLORATORY_LIVE_SELECTION_REQUIRED")
+        prepared_members: list[dict[str, Any]] = []
+        for raw_member in raw_members:
+            if not isinstance(raw_member, Mapping):
+                continue
+            item = dict(raw_member)
+            allocation = item.get("allocation")
+            if (
+                item.get("allocation_active") is True
+                and allocation not in (None, "", "0", 0)
+            ):
+                item["proposed_allocation"] = str(allocation)
+            item["status"] = "PAPER"
+            item["action"] = "OBSERVE"
+            item["paper_only"] = True
+            item["allocation_active"] = False
+            item["canary_armed"] = False
+            prepared_members.append(item)
+        selection_id = selection.get(
+            "selection_id", selection.get("portfolio_selection_id")
+        )
+        prepared_payload = {
+            "selection_id": selection_id,
+            "status": "PAPER",
+            "paper_only": True,
+            "allocation_active": False,
+            "canary_armed": False,
+            "k": 0,
+            "members": prepared_members,
+            "allocation_activation": {
+                "status": "PREPARED",
+                "rolled_back_at": utc_now().isoformat(),
+            },
+        }
+        setter("rolling_selection_activation", prepared_payload)
+        review_loader = getattr(self.store, "load_portfolio_review_state", None)
+        review_saver = getattr(self.store, "save_portfolio_review_state", None)
+        if callable(review_saver):
+            review = review_loader() if callable(review_loader) else None
+            review_payload = dict(review) if isinstance(review, Mapping) else {}
+            review_payload.update(
+                {
+                    "portfolio_selection_id": selection_id,
+                    "status": "PREPARED",
+                    "allocation_activation": prepared_payload["allocation_activation"],
+                    "updated_at": utc_now().isoformat(),
+                }
+            )
+            review_saver(review_payload)
+
+    def _reconcile_pending_canary_selection_binding(self) -> bool:
+        """Finish or roll back a crash-interrupted prepared activation."""
+        getter = getattr(self.store, "get_operator_config", None)
+        if not callable(getter):
+            return True
+        marker = getter("canary_selection_binding_rollback", None)
+        if marker in (None, {}):
+            return True
+        if not isinstance(marker, Mapping) or str(marker.get("status") or "").upper() != "PENDING":
+            self._selection_reconciliation_error = "EXPLORATORY_LIVE_SELECTION_RECONCILIATION_REQUIRED"
+            return False
+        selection_id = str(marker.get("selection_id") or "").strip()
+        selection_hash = str(marker.get("selection_hash") or "").strip()
+        candidate_id = str(marker.get("candidate_id") or "").strip()
+        binding_before = marker.get("binding")
+        if not selection_id or not selection_hash or not candidate_id or not isinstance(binding_before, Mapping):
+            self._selection_reconciliation_error = "EXPLORATORY_LIVE_SELECTION_RECONCILIATION_REQUIRED"
+            return False
+        loader = getattr(self.store, "load_current_portfolio_selection", None)
+        current = loader() if callable(loader) else None
+        active_view = (
+            isinstance(current, Mapping)
+            and str(current.get("selection_id") or current.get("portfolio_selection_id") or "").strip()
+            == selection_id
+            and str(current.get("selection_hash") or "").strip() == selection_hash
+            and str(current.get("status") or "").upper() == "ACTIVE"
+            and current.get("paper_only") is False
+            and current.get("allocation_active") is True
+            and current.get("canary_armed") is True
+        )
+        active_candidate = ""
+        if active_view:
+            members = current.get("members", ())
+            if isinstance(members, (list, tuple)):
+                active_candidate = next(
+                    (
+                        str(item.get("candidate_id") or "").strip()
+                        for item in members
+                        if isinstance(item, Mapping)
+                        and item.get("allocation_active") is True
+                        and str(item.get("candidate_id") or "").strip()
+                    ),
+                    "",
+                )
+        binding = getter("canary_selection_binding", None)
+        binding_exact = (
+            isinstance(binding, Mapping)
+            and str(binding.get("candidate_id") or "").strip() == candidate_id
+            and str(binding.get("selection_id") or "").strip() == selection_id
+            and str(binding.get("selection_hash") or "").strip() == selection_hash
+        )
+        singleton_candidate = ""
+        connection = getattr(self.store, "connection", None)
+        if connection is not None:
+            try:
+                row = connection.execute(
+                    "SELECT candidate_id FROM canary_selection WHERE singleton=1"
+                ).fetchone()
+                if row is not None:
+                    try:
+                        singleton_candidate = str(row["candidate_id"] or "").strip()
+                    except (KeyError, TypeError):
+                        singleton_candidate = str(row[0] or "").strip()
+            except sqlite3.Error:
+                singleton_candidate = ""
+        singleton_exact = singleton_candidate == candidate_id
+        state = ""
+        try:
+            status = self._canary_service.authoritative_status()
+            state = str(status.get("micro_live_canary") or "").upper() if isinstance(status, Mapping) else ""
+        except Exception:
+            state = ""
+        mode = str(marker.get("authorization_mode") or "EXPLORATORY_MICRO_CANARY").strip()
+        auth = None
+        auth_loader = getattr(self.store, "load_active_execution_authorization", None)
+        if callable(auth_loader):
+            try:
+                auth = auth_loader(
+                    mode=mode,
+                    now=utc_now(),
+                    selection_id=selection_id,
+                    selection_hash=selection_hash,
+                )
+            except Exception:
+                auth = None
+        auth_exact = isinstance(auth, Mapping)
+        control_candidate = ""
+        try:
+            control_status = self._canary_service.authoritative_status()
+            if isinstance(control_status, Mapping):
+                control_candidate = str(
+                    control_status.get("control_candidate")
+                    or control_status.get("selected_candidate")
+                    or ""
+                ).strip()
+        except Exception:
+            control_candidate = ""
+        exact_live = (
+            active_view
+            and active_candidate == candidate_id
+            and binding_exact
+            and singleton_exact
+            and state == "AUTONOMOUS_MICRO_LIVE"
+            and control_candidate == candidate_id
+            and auth_exact
+        )
+        if exact_live:
+            try:
+                self._clear_canary_selection_binding_rollback()
+                self._selection_reconciliation_error = None
+                return True
+            except Exception:
+                self._selection_reconciliation_error = "EXPLORATORY_LIVE_SELECTION_RECONCILIATION_REQUIRED"
+                return False
+        try:
+            if state in {"ARMED", "AUTONOMOUS_MICRO_LIVE"}:
+                self._canary_service.disarm()
+            if auth_exact:
+                self.revoke_execution_authorization(
+                    str(auth.get("authorization_id") or auth.get("id") or "").strip(),
+                    actor="operator-recovery",
+                    expected_generation=auth.get("generation"),
+                    reason="prepared_activation_recovery",
+                )
+            transaction_factory = getattr(self.store, "transaction", None)
+            if callable(transaction_factory):
+                try:
+                    transaction_context = transaction_factory(immediate=True)
+                except TypeError:
+                    transaction_context = transaction_factory()
+            else:
+                transaction_context = nullcontext()
+            with transaction_context:
+                self._reset_prepared_selection_overlay(current)
+                self._restore_canary_selection_binding(binding_before)
+                connection = getattr(self.store, "connection", None)
+                if connection is None:
+                    raise OperatorControlError("EXPLORATORY_LIVE_CANARY_SELECTION_REQUIRED")
+                connection.execute(
+                    "DELETE FROM operator_config WHERE config_key=?",
+                    ("canary_selection_binding_rollback",),
+                )
+            self._selection_reconciliation_error = None
+            return True
+        except Exception:
+            self._selection_reconciliation_error = "EXPLORATORY_LIVE_SELECTION_RECONCILIATION_REQUIRED"
+            return False
+
     def _capture_canary_selection_binding(self) -> dict[str, Any]:
         """Capture the singleton/config before a reviewed activation mutates it."""
         connection = getattr(self.store, "connection", None)
@@ -3124,6 +3336,11 @@ class OperatorControlPlane:
         """Build the final review disclosure without mutating state."""
         if values is not None and not isinstance(values, Mapping):
             raise OperatorControlError("EXPLORATORY_LIVE_VALUES_REQUIRED")
+        if not self._reconcile_pending_canary_selection_binding():
+            raise OperatorControlError(
+                self._selection_reconciliation_error
+                or "EXPLORATORY_LIVE_SELECTION_RECONCILIATION_REQUIRED"
+            )
         raw = dict(values or {})
         self._prepare_reviewed_proposed_selection()
         context = self._authorization_context()
@@ -3531,6 +3748,15 @@ class OperatorControlPlane:
                 "",
             )
             active_hash = _canary_authorization_current_selection_hash(current)
+            rollback_marker.update(
+                {
+                    "selection_hash": active_hash,
+                    "candidate_id": active_candidate,
+                }
+            )
+            rollback_marker["authorization_mode"] = str(
+                authorization.get("mode") or "EXPLORATORY_MICRO_CANARY"
+            ).strip()
             if not active_candidate:
                 raise OperatorControlError("EXPLORATORY_LIVE_CANDIDATE_REQUIRED")
             transaction_factory = getattr(self.store, "transaction", None)
@@ -3671,6 +3897,11 @@ class OperatorControlPlane:
         """Coordinate one reviewed authorization through arm and enable fences."""
         if values is not None and not isinstance(values, Mapping):
             raise OperatorControlError("EXPLORATORY_LIVE_VALUES_REQUIRED")
+        if not self._reconcile_pending_canary_selection_binding():
+            raise OperatorControlError(
+                self._selection_reconciliation_error
+                or "EXPLORATORY_LIVE_SELECTION_RECONCILIATION_REQUIRED"
+            )
         raw = dict(values or {})
         snapshot = self.execution_authorization_snapshot()
         active = snapshot.get("active")
@@ -4208,6 +4439,16 @@ class OperatorControlPlane:
 
     def rolling_portfolio_state(self) -> dict[str, Any]:
         """Return persisted rolling state without mutating read/status paths."""
+        if not self._reconcile_pending_canary_selection_binding():
+            return {
+                "status": "BLOCKED",
+                "blockers": [
+                    self._selection_reconciliation_error
+                    or "EXPLORATORY_LIVE_SELECTION_RECONCILIATION_REQUIRED"
+                ],
+                "paper_only": True,
+                "live_execution": False,
+            }
         state_loader = getattr(self.store, "load_portfolio_review_state", None)
         state = state_loader() if callable(state_loader) else None
         result = dict(state) if isinstance(state, Mapping) else {}
@@ -5688,6 +5929,16 @@ class OperatorControlPlane:
         }
 
     def status(self) -> dict[str, Any]:
+        if not self._reconcile_pending_canary_selection_binding():
+            return {
+                "status": "BLOCKED",
+                "blockers": [
+                    self._selection_reconciliation_error
+                    or "EXPLORATORY_LIVE_SELECTION_RECONCILIATION_REQUIRED"
+                ],
+                "paper_only": True,
+                "live_execution": False,
+            }
         hermes = self._hermes()
         workers = self.store.list_worker_states(limit=32)
         worker_map = {str(item.get("worker_name")): item for item in workers if isinstance(item, Mapping)}
