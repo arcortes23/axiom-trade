@@ -12910,7 +12910,7 @@ class AxiomStore:
         with self._lock:
             pointer = self._conn.execute(
                 "SELECT portfolio_selection_id FROM portfolio_current_selection "
-                "WHERE pointer_id='current'",
+                "WHERE pointer_id='current'"
             ).fetchone()
             if pointer is not None:
                 row = self._conn.execute(
@@ -12920,9 +12920,59 @@ class AxiomStore:
             else:
                 row = self._conn.execute(
                     "SELECT * FROM portfolio_selections "
-                    "ORDER BY committed_at DESC,rowid DESC LIMIT 1",
+                    "ORDER BY committed_at DESC,rowid DESC LIMIT 1"
                 ).fetchone()
-        return self._rolling_selection_record(row) if row is not None else None
+            if row is None:
+                return None
+            record = self._rolling_selection_record(row)
+            activation_row = self._conn.execute(
+                "SELECT value_json FROM operator_config "
+                "WHERE config_key='rolling_selection_activation'"
+            ).fetchone()
+        if activation_row is None:
+            return record
+        activation = _load(activation_row["value_json"])
+        if not isinstance(activation, Mapping):
+            return record
+        if str(activation.get("selection_id") or "").strip() != str(
+            record.get("selection_id") or record.get("portfolio_selection_id") or ""
+        ).strip():
+            return record
+        projected = dict(record)
+        for key in (
+            "status",
+            "paper_only",
+            "allocation_active",
+            "canary_armed",
+            "k",
+            "allocation_activation",
+        ):
+            if key in activation:
+                projected[key] = activation[key]
+        active_members = activation.get("members")
+        if isinstance(active_members, (list, tuple)):
+            by_strategy = {
+                str(item.get("strategy_version_id") or "").strip(): dict(item)
+                for item in active_members
+                if isinstance(item, Mapping)
+                and str(item.get("strategy_version_id") or "").strip()
+            }
+            raw_members = projected.get("members", projected.get("selected_members", ()))
+            if isinstance(raw_members, (list, tuple)):
+                projected["members"] = [
+                    {
+                        **dict(member),
+                        **(
+                            by_strategy.get(
+                                str(member.get("strategy_version_id") or "").strip(),
+                                {},
+                            )
+                        ),
+                    }
+                    for member in raw_members
+                    if isinstance(member, Mapping)
+                ]
+        return projected
 
     def list_portfolio_selections(self, *, limit: int | None = 100) -> list[dict[str, Any]]:
         limit_value = _rolling_limit(limit, default=100)

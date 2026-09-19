@@ -5011,6 +5011,106 @@ class ResearchNode:
         finally:
             self._paper_scheduler_lock.release()
 
+    def _refresh_rolling_observation_successors(
+        self,
+        registry: ForwardTestRegistry,
+        rows: Sequence[Any],
+        now: datetime,
+    ) -> None:
+        """Repair stale immutable paper bindings by registering a successor.
+
+        A binding mismatch is an identity change, not a retryable engine error.
+        The predecessor remains immutable and is superseded through the
+        existing observation-handoff lineage.
+        """
+        processor = getattr(self, "research_processor", None)
+        resolver = getattr(processor, "_rolling_current_market_bindings", None)
+        binder = getattr(processor, "_ensure_rolling_paper_observation", None)
+        if not callable(resolver) or not callable(binder):
+            return
+        for spec in tuple(rows)[:100]:
+            config = spec.config if isinstance(spec.config, Mapping) else {}
+            if not (
+                config.get("observation_intent") is True
+                or isinstance(config.get("observation_handoff"), Mapping)
+            ):
+                continue
+            candidate_id = str(config.get("candidate_id", "")).strip()
+            strategy_document = config.get("strategy_document")
+            if not candidate_id or not isinstance(strategy_document, Mapping):
+                continue
+            strategy = {
+                **dict(config),
+                "candidate_id": candidate_id,
+                "strategy_version_id": config.get("strategy_version_id"),
+                "research_trial_id": config.get("research_trial_id"),
+                "strategy_document": dict(strategy_document),
+                "strategy_hash": spec.strategy_hash,
+                "operational_setup": config.get("operational_setup"),
+                "operational_setup_hash": config.get("operational_setup_hash"),
+            }
+            try:
+                bindings = resolver(strategy, now)
+            except (AttributeError, TypeError, ValueError, RuntimeError):
+                continue
+            current_ids = tuple(
+                sorted(
+                    {
+                        str(item.get("market_id", "")).strip()
+                        for item in (bindings or ())
+                        if isinstance(item, Mapping)
+                        and str(item.get("market_id", "")).strip()
+                    }
+                )
+            )
+            if not current_ids:
+                continue
+            prior_ids = tuple(
+                sorted(
+                    {
+                        str(item).strip()
+                        for item in config.get("current_market_ids", ())
+                        if str(item).strip()
+                    }
+                )
+            )
+
+            def binding_signature(values: Any) -> tuple[tuple[str, ...], ...]:
+                if not isinstance(values, (list, tuple)):
+                    return ()
+                fields = (
+                    "market_id",
+                    "condition_id",
+                    "yes_token_id",
+                    "no_token_id",
+                    "outcome_token_id",
+                    "scope_resolution_id",
+                    "scope_hash",
+                    "scope_version",
+                    "book_depth",
+                )
+                return tuple(
+                    sorted(
+                        tuple(str(item.get(field, "")).strip() for field in fields)
+                        for item in values
+                        if isinstance(item, Mapping)
+                        and str(item.get("market_id", "")).strip()
+                    )
+                )
+
+            current_signature = binding_signature(bindings)
+            prior_signature = binding_signature(config.get("current_market_bindings"))
+            if (
+                tuple(spec.allowed_markets) == current_ids
+                and prior_ids == current_ids
+                and prior_signature == current_signature
+            ):
+                continue
+            try:
+                binder(strategy, now, market_ids=current_ids)
+            except (AttributeError, TypeError, ValueError, RuntimeError):
+                continue
+
     def _run_paper_workers_locked(
         self,
         *,
@@ -5018,6 +5118,12 @@ class ResearchNode:
     ) -> dict[str, Any]:
         paper_store = self._paper_store or self.store
         registry = ForwardTestRegistry(paper_store)
+        registry_rows = list(registry.list())
+        self._refresh_rolling_observation_successors(
+            registry,
+            registry_rows,
+            ensure_utc(self.clock()),
+        )
         registry_rows = list(registry.list())
         linked_forward_ids: set[str] = set()
         linked_intent_ids: set[str] = set()

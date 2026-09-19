@@ -239,6 +239,27 @@ def _canary_selection_member_is_funded(member: Mapping[str, Any]) -> bool:
     except (TypeError, ValueError, ArithmeticError):
         return False
     return allocation.is_finite() and allocation > 0
+
+def _canary_selection_member_is_proposed(member: Mapping[str, Any]) -> bool:
+    """Return whether a disarmed exploratory member has reviewed paper funding."""
+    if not isinstance(member, Mapping):
+        return False
+    status = str(member.get("status", member.get("stage", ""))).strip().upper()
+    if status not in {"PAPER", "RETAINED"}:
+        return False
+    policy = member.get("operating_policy", member.get("exploratory_policy"))
+    if not isinstance(policy, Mapping):
+        setup = member.get("operational_setup")
+        policy = setup.get("setup_policy") if isinstance(setup, Mapping) else None
+    if not isinstance(policy, Mapping) or str(policy.get("mode", "")).strip().upper() != "EXPLORATORY_LIVE":
+        return False
+    if member.get("paper_only") is not True or member.get("allocation_active") is not False:
+        return False
+    try:
+        allocation = Decimal(str(member.get("proposed_allocation") or "0"))
+    except (TypeError, ValueError, ArithmeticError):
+        return False
+    return allocation.is_finite() and allocation > 0
 _LEGACY_LINEAGE_TYPE = "LEGACY_FINITE_CAMPAIGN"
 _ROLLING_LINEAGE_TYPE = "ROLLING_PORTFOLIO"
 

@@ -36,7 +36,10 @@ from .domain import (
     utc_now,
 )
 from .storage import AxiomStore
-from .canary import _canary_selection_member_is_funded
+from .canary import (
+    _canary_selection_member_is_funded,
+    _canary_selection_member_is_proposed,
+)
 from .forward import ForwardTestRegistry, ForwardTestSpec
 from .lifecycle import CandidateLifecycleManager, CandidateStage
 _UNSET = object()
@@ -1773,12 +1776,15 @@ class PolymarketCollector:
             except (TypeError, ValueError, OverflowError):
                 self._rolling_scope_blocked = True
                 return []
-            funded_members = [
+            eligible_members = [
                 member
                 for member in members
-                if _canary_selection_member_is_funded(member)
+                if (
+                    _canary_selection_member_is_funded(member)
+                    or _canary_selection_member_is_proposed(member)
+                )
             ]
-            if len(funded_members) > target_maximum:
+            if len(eligible_members) > target_maximum:
                 self._rolling_scope_blocked = True
                 return []
             members = members[:10]

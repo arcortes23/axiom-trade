@@ -31,6 +31,7 @@ from axiom.ranker import CandidateCanaryRanker
 from axiom.experiment_plan import normalize_market_scope
 from axiom.market_scope import resolve_market_scope
 from axiom.storage import AxiomStore
+from axiom.rolling_portfolio import RollingAdmissionPolicy, RollingEvidence
 
 
 CONNECTIVITY_SECRET_VALUES = (
@@ -2942,6 +2943,281 @@ class OperatorControlTests(unittest.TestCase):
             "members": [{"candidate_id": "candidate-live"}],
         }
         return context, draft, review
+
+    def _seed_proposed_selection(self) -> tuple[dict[str, object], dict[str, object]]:
+        policy = RollingAdmissionPolicy(
+            policy_id="rolling-proposed",
+            version="v1",
+            global_budget=Decimal("3.00"),
+            max_members=3,
+            min_completed_outcomes=0,
+            min_reliability=Decimal("0"),
+        )
+        self.store.save_admission_policy(policy.as_dict())
+        policy_document = {
+            "policy_id": "polymarket-exploratory-live",
+            "version": "exploratory-live-v1",
+            "mode": "EXPLORATORY_LIVE",
+            "target_members": {"minimum": 1, "maximum": 3},
+            "paper_only": True,
+            "allocation_active": False,
+            "canary_armed": False,
+        }
+        selection = {
+            "portfolio_selection_id": "selection-proposed",
+            "selection_id": "selection-proposed",
+            "policy_id": policy.policy_id,
+            "policy_version": policy.version,
+            "risk_config_id": "risk-proposed",
+            "active_risk_config_id": "risk-proposed",
+            "risk_config_generation": 1,
+            "active_risk_config_generation": 1,
+            "risk_config_hash": "risk-hash",
+            "active_risk_config_hash": "risk-hash",
+            "global_budget": "3.00",
+            "selected_at": "2026-01-01T00:00:00+00:00",
+            "review_due_at": "2026-01-02T00:00:00+00:00",
+            "status": "PAPER",
+            "paper_only": True,
+            "operating_policy": policy_document,
+            "exploratory_policy": policy_document,
+        }
+        setup = {
+            "setup_id": "momentum:absolute-move-v1:L1:H1:exploratory-live-v1",
+            "setup_version": "exploratory-live-v1",
+            "setup_policy": policy_document,
+        }
+        member = {
+            "strategy_version_id": "strategy-proposed",
+            "research_trial_id": "trial-proposed",
+            "candidate_id": "candidate-proposed",
+            "evidence_window_id": "evidence-proposed",
+            "allocation": "0",
+            "proposed_allocation": "1.00",
+            "status": "PAPER",
+            "action": "OBSERVE",
+            "score": "1",
+            "reason": "ELIGIBLE",
+            "operational_setup": setup,
+            "operational_setup_hash": "setup-hash",
+            "paper_only": True,
+            "allocation_active": False,
+            "canary_armed": False,
+        }
+        self.store.save_strategy_version(
+            {
+                "strategy_version_id": "strategy-proposed",
+                "strategy_id": "strategy-proposed",
+                "version": "1",
+                "code_hash": "strategy-hash",
+                "config_hash": "strategy-config-hash",
+            }
+        )
+        self.store.save_research_trial(
+            {
+                "research_trial_id": "trial-proposed",
+                "strategy_version_id": "strategy-proposed",
+                "status": "PAPER_FORWARD",
+                "candidate_id": "candidate-proposed",
+            }
+        )
+        evidence = RollingEvidence(
+            strategy_version_id="strategy-proposed",
+            evidence_window_id="evidence-proposed",
+            candidate_id="candidate-proposed",
+            research_trial_id="trial-proposed",
+            available_from=datetime(2025, 12, 25, tzinfo=timezone.utc),
+            available_through=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            requested_days=7,
+            actual_coverage_seconds=Decimal("604800"),
+            observation_completeness=Decimal("1"),
+            source_class="HISTORICAL",
+            requested_source_class="HISTORICAL",
+            fee_assumption=Decimal("0"),
+            slippage_assumption=Decimal("0"),
+            allocated_capital_net_return=Decimal("1"),
+            realized_pnl=Decimal("1"),
+            unrealized_pnl=Decimal("0"),
+            fees=Decimal("0"),
+            costs=Decimal("0"),
+            drawdown=Decimal("0"),
+            completed_outcomes=12,
+            reliability=Decimal("0.9"),
+            execution_feasibility=True,
+            overlap_key="overlap:proposal",
+        ).as_dict()
+        evidence["execution_feasibility"] = "True"
+        evidence["evidence_digest"] = RollingEvidence.from_mapping(evidence).evidence_digest
+        self.store.save_strategy_evidence_window(evidence)
+        self.store.commit_portfolio_selection(selection, [member])
+        context = {
+            "selection_id": "selection-proposed",
+            "policy_id": policy.policy_id,
+            "policy_version": policy.version,
+            "policy_hash": policy.config_hash,
+            "active_settings_hash": "settings-hash",
+            "active_settings_generation": 1,
+        }
+        return context, member
+
+    def test_proposed_allocation_is_paper_before_confirm_and_active_after_restart(self) -> None:
+        context, _ = self._seed_proposed_selection()
+        before = self.store.load_current_portfolio_selection()
+        assert before is not None
+        self.assertEqual(before["members"][0]["allocation"], "0")
+        self.assertEqual(before["members"][0]["proposed_allocation"], "1.00")
+        activated = self.control._activate_reviewed_proposed_selection(
+            context=context,
+            authorization={"authorization_id": "auth-proposed"},
+            actor="test-operator",
+        )
+        self.assertIsNotNone(activated)
+        after = self.store.load_current_portfolio_selection()
+        assert after is not None
+        self.assertNotEqual(after["selection_id"], before["selection_id"])
+        self.assertEqual(after["members"][0]["allocation"], "1.00")
+        self.assertTrue(after["members"][0]["allocation_active"])
+        self.assertNotIn("proposed_allocation", after["members"][0])
+        restarted = OperatorControlPlane(self.store)
+        restarted_selection = restarted.store.load_current_portfolio_selection()
+        self.assertEqual(restarted_selection, after)
+
+    def test_proposed_allocation_commit_failure_leaves_paper_selection_unchanged(self) -> None:
+        context, _ = self._seed_proposed_selection()
+        before = self.store.load_current_portfolio_selection()
+        self.assertIsNotNone(before)
+        with patch.object(
+            self.store,
+            "commit_portfolio_selection",
+            side_effect=RuntimeError("activation commit failed"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "activation commit failed"):
+                self.control._activate_reviewed_proposed_selection(
+                    context=context,
+                    authorization={"authorization_id": "auth-proposed"},
+                    actor="test-operator",
+                )
+        self.assertEqual(self.store.load_current_portfolio_selection(), before)
+    def test_prepared_successor_keeps_identity_through_activation_and_restart(self) -> None:
+        context, _ = self._seed_proposed_selection()
+        predecessor = self.store.load_current_portfolio_selection()
+        assert predecessor is not None
+        prepared = self.control._prepare_reviewed_proposed_selection()
+        assert prepared is not None
+        self.assertNotEqual(prepared["selection_id"], predecessor["selection_id"])
+        self.assertEqual(prepared["members"][0]["allocation"], "1.00")
+        self.assertEqual(prepared["members"][0]["status"], "PAPER")
+        self.assertFalse(prepared["members"][0]["allocation_active"])
+        self.assertTrue(prepared["paper_only"])
+        prepared_context = dict(
+            context,
+            selection_id=prepared["selection_id"],
+            selection_hash=prepared["selection_hash"],
+        )
+        activated = self.control._activate_reviewed_proposed_selection(
+            context=prepared_context,
+            authorization={"authorization_id": "auth-prepared"},
+            actor="test-operator",
+        )
+        assert activated is not None
+        self.assertEqual(activated["selection_id"], prepared["selection_id"])
+        current = self.store.load_current_portfolio_selection()
+        assert current is not None
+        self.assertEqual(current["selection_id"], prepared["selection_id"])
+        self.assertEqual(current["selection_hash"], prepared["selection_hash"])
+        self.assertEqual(current["members"][0]["allocation"], "1.00")
+        self.assertTrue(current["members"][0]["allocation_active"])
+        self.assertFalse(current["paper_only"])
+        restarted = OperatorControlPlane(self.store)
+        restored = restarted.store.load_current_portfolio_selection()
+        self.assertEqual(restored, current)
+
+    def test_prepared_activation_rejects_fresh_obligation_change(self) -> None:
+        context, _ = self._seed_proposed_selection()
+        prepared = self.control._prepare_reviewed_proposed_selection()
+        assert prepared is not None
+        risk_snapshot = {
+            "risk_config_id": "risk-proposed",
+            "risk_config_generation": 1,
+            "risk_config_hash": "risk-hash",
+            "global_budget": "3.00",
+            "active_obligations": "0",
+            "uncovered_obligations": "0",
+            "external_obligations": "0",
+            "available_budget": "3.00",
+            "runtime_accounting_available": True,
+            "runtime_accounting_metadata": {"available": True},
+        }
+        prepared_with_risk = dict(prepared)
+        prepared_with_risk["proposed_allocation_risk_snapshot"] = risk_snapshot
+        prepared_with_risk["proposed_allocation_risk_digest"] = (
+            self.control._rolling_canonical_hash(risk_snapshot)
+        )
+        accounting = {
+            "rolling_global_reserved_usd": "2.00",
+            "rolling_strategy_reserved_usd": {"external-strategy": "2.00"},
+            "rolling_strategy_allocations": {},
+        }
+        with patch.object(
+            self.store,
+            "load_current_portfolio_selection",
+            return_value=prepared_with_risk,
+        ), patch.object(
+            self.control,
+            "risk_settings_snapshot",
+            return_value={
+                "config_id": "risk-proposed",
+                "generation": 1,
+                "config_hash": "risk-hash",
+            },
+        ), patch.object(
+            self.store,
+            "canary_risk_accounting",
+            return_value=accounting,
+        ):
+            with self.assertRaisesRegex(
+                OperatorControlError, "EXPLORATORY_LIVE_RISK_CAPACITY_CHANGED"
+            ):
+                self.control._activate_reviewed_proposed_selection(
+                    context={
+                        **context,
+                        "selection_id": prepared["selection_id"],
+                        "selection_hash": prepared["selection_hash"],
+                    },
+                    authorization={"authorization_id": "auth-obligation-change"},
+                    actor="test-operator",
+                )
+
+    def test_prepared_activation_rollback_restores_canary_singleton_and_binding(self) -> None:
+        context, _ = self._seed_proposed_selection()
+        prepared = self.control._prepare_reviewed_proposed_selection()
+        assert prepared is not None
+        activated = self.control._activate_reviewed_proposed_selection(
+            context={
+                **context,
+                "selection_id": prepared["selection_id"],
+                "selection_hash": prepared["selection_hash"],
+            },
+            authorization={"authorization_id": "auth-rollback"},
+            actor="test-operator",
+        )
+        self.assertIsInstance(activated, dict)
+        assert isinstance(activated, dict)
+        marker = self.store.get_operator_config(
+            "canary_selection_binding_rollback", None
+        )
+        self.assertIsInstance(marker, dict)
+        self.control._restore_canary_selection_binding(
+            activated["_canary_selection_binding_before"]
+        )
+        self.assertIsNone(
+            self.store.connection.execute(
+                "SELECT candidate_id FROM canary_selection WHERE singleton=1"
+            ).fetchone()
+        )
+        self.assertIsNone(
+            self.store.get_operator_config("canary_selection_binding", None)
+        )
 
     def test_exploratory_live_review_confirm_success_merges_persisted_bindings(self) -> None:
         context, draft, review = self._exploratory_confirm_context()
