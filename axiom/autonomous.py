@@ -80,6 +80,11 @@ _MAX_PREDECLARED_SUCCESSOR_SCAN = 512
 _MAX_OBSERVATION_SETUP_MIGRATION_SCAN = 512
 _MAX_ROLLING_STRATEGIES = 128
 _MAX_ROLLING_DISCOVERY_SCAN = 2_048
+_EXPLORATORY_POOL_CAP = 10
+_EXPLORATORY_MEMBER_MIN = 1
+_EXPLORATORY_MEMBER_MAX = 3
+_EXPLORATORY_MARKET_FRESHNESS_SECONDS = 900.0
+_EXPLORATORY_PAPER_ALLOCATION = Decimal("1.00")
 _ROLLING_DISCOVERY_PAGE = 64
 _ROLLING_MATURE_STAGES = frozenset({"FROZEN", "PAPER_FORWARD", "PAPER_PROMOTABLE"})
 _ROLLING_ENROLLMENT_MODES = frozenset({"RESEARCH", "OBSERVATION"})
@@ -8775,6 +8780,328 @@ class AutonomousResearchProcessor:
             except (sqlite3.Error, TypeError, ValueError, RuntimeError):
                 pass
         return tuple(migrated)
+    def _rolling_current_market_bindings(
+        self,
+        strategy: Mapping[str, Any],
+        now: datetime,
+    ) -> tuple[dict[str, Any], ...]:
+        """Return a bounded set of fresh, directly validated current markets.
+
+        Scope resolution is the policy authority; tracked metadata/snapshots
+        provide the independent public-market freshness and depth proof.  The
+        result is intentionally partial: one valid market is enough to keep a
+        paper observation moving, while stale or incomplete candidates are
+        excluded without rebinding a closed scope.
+        """
+        candidate_id = _binding_value(strategy.get("candidate_id"))
+        if not candidate_id:
+            return ()
+        loader = getattr(self.store, "load_market_scope_resolution", None)
+        if not callable(loader):
+            return ()
+        scope = _rolling_source_binding(strategy).get(
+            "market_scope",
+            _rolling_source_binding(strategy).get("scope", {}),
+        )
+        scope = scope if isinstance(scope, Mapping) else {}
+        try:
+            policy = normalize_market_scope(scope) if scope else None
+            resolution = (
+                loader(
+                    candidate_id,
+                    scope_hash=policy.scope_hash,
+                    scope_version=policy.scope_version,
+                )
+                if policy is not None
+                else loader(candidate_id)
+            )
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            try:
+                resolution = loader(candidate_id)
+            except (AttributeError, TypeError, ValueError, RuntimeError):
+                return ()
+        if resolution is None:
+            return ()
+        status = str(
+            getattr(resolution, "status", None)
+            if not isinstance(resolution, Mapping)
+            else resolution.get("status", "")
+        ).strip().upper()
+        if status not in {"MATCHED", "PARTIAL"}:
+            return ()
+        resolved_at = _rolling_timestamp(
+            getattr(resolution, "resolved_at", None)
+            if not isinstance(resolution, Mapping)
+            else resolution.get("resolved_at")
+        )
+        requested_scope_hash = (
+            policy.scope_hash if policy is not None else ""
+        )
+        requested_scope_version = (
+            policy.scope_version if policy is not None else ""
+        )
+        resolved_scope_hash = _binding_value(
+            resolution.get("scope_hash")
+            if isinstance(resolution, Mapping)
+            else getattr(resolution, "scope_hash", None)
+        )
+        resolved_scope_version = _binding_value(
+            resolution.get("scope_version")
+            if isinstance(resolution, Mapping)
+            else getattr(resolution, "scope_version", None)
+        )
+        resolution_policy = (
+            resolution.get("policy")
+            if isinstance(resolution, Mapping)
+            else getattr(resolution, "policy", None)
+        )
+        if isinstance(resolution_policy, Mapping):
+            nested_hash = _binding_value(
+                resolution_policy.get(
+                    "scope_hash",
+                    resolution_policy.get("market_scope_hash"),
+                )
+            )
+            nested_version = _binding_value(
+                resolution_policy.get(
+                    "scope_version",
+                    resolution_policy.get(
+                        "market_scope_version",
+                        resolution_policy.get("version"),
+                    ),
+                )
+            )
+            if (
+                (resolved_scope_hash and nested_hash and resolved_scope_hash != nested_hash)
+                or (
+                    resolved_scope_version
+                    and nested_version
+                    and resolved_scope_version != nested_version
+                )
+            ):
+                return ()
+            resolved_scope_hash = resolved_scope_hash or nested_hash
+            resolved_scope_version = resolved_scope_version or nested_version
+        if requested_scope_hash and resolved_scope_hash != requested_scope_hash:
+            return ()
+        if requested_scope_version and resolved_scope_version != requested_scope_version:
+            return ()
+        if (
+            requested_scope_hash
+            and requested_scope_version
+            and (not resolved_scope_hash or not resolved_scope_version)
+        ):
+            return ()
+        freshness = strategy.get(
+            "scope_resolution_freshness_sla_seconds",
+            _EXPLORATORY_MARKET_FRESHNESS_SECONDS,
+        )
+        try:
+            freshness = float(freshness)
+        except (TypeError, ValueError, OverflowError):
+            freshness = _EXPLORATORY_MARKET_FRESHNESS_SECONDS
+        if (
+            not math.isfinite(freshness)
+            or freshness <= 0
+            or resolved_at is None
+            or resolved_at > ensure_utc(now)
+            or (ensure_utc(now) - resolved_at).total_seconds() > freshness
+        ):
+            return ()
+        matched = (
+            resolution.get("matched_markets", ())
+            if isinstance(resolution, Mapping)
+            else getattr(resolution, "matched_markets", ())
+        )
+        if not isinstance(matched, (list, tuple)):
+            return ()
+        candidate_markets: list[dict[str, Any]] = []
+        for raw in matched[:_EXPLORATORY_POOL_CAP]:
+            if isinstance(raw, Mapping):
+                item = dict(raw)
+            else:
+                as_dict = getattr(raw, "as_dict", None)
+                item = dict(as_dict()) if callable(as_dict) else {}
+            market_id = _binding_value(item.get("market_id", item.get("id")))
+            yes_token = _binding_value(
+                item.get("yes_token_id", item.get("yesTokenId", item.get("yes_token")))
+            )
+            no_token = _binding_value(
+                item.get("no_token_id", item.get("noTokenId", item.get("no_token")))
+            )
+            if not market_id or not yes_token or not no_token:
+                continue
+            candidate_markets.append(
+                {
+                    "market_id": market_id,
+                    "condition_id": _binding_value(item.get("condition_id", item.get("condition"))),
+                    "yes_token_id": yes_token,
+                    "no_token_id": no_token,
+                    "scope_resolution_id": _binding_value(
+                        resolution.get("resolution_id")
+                        if isinstance(resolution, Mapping)
+                        else getattr(resolution, "resolution_id", None)
+                    ),
+                    "scope_hash": _binding_value(
+                        resolution.get("scope_hash")
+                        if isinstance(resolution, Mapping)
+                        else getattr(resolution, "scope_hash", None)
+                    ),
+                    "scope_version": _binding_value(
+                        resolution.get("scope_version")
+                        if isinstance(resolution, Mapping)
+                        else getattr(resolution, "scope_version", None)
+                    ),
+                }
+            )
+        if not candidate_markets:
+            return ()
+        tracked_loader = getattr(self.store, "tracked_polymarket_markets", None)
+        if not callable(tracked_loader):
+            return ()
+        market_ids = tuple(item["market_id"] for item in candidate_markets)
+        try:
+            tracked = tracked_loader(
+                active_only=True,
+                now=ensure_utc(now),
+                include_payload=True,
+                market_ids=market_ids,
+                limit=_EXPLORATORY_POOL_CAP,
+            )
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            return ()
+        tracked_by_id = {
+            _binding_value(item.get("market_id")): item
+            for item in (tracked or ())
+            if isinstance(item, Mapping) and _binding_value(item.get("market_id"))
+        }
+
+        def nested(source: Any, *names: str) -> Any:
+            if not isinstance(source, Mapping):
+                return None
+            for name in names:
+                value = source.get(name)
+                if value not in (None, ""):
+                    return value
+            for name in ("metadata", "snapshot", "payload", "extra"):
+                child = source.get(name)
+                if isinstance(child, Mapping):
+                    value = nested(child, *names)
+                    if value not in (None, ""):
+                        return value
+            return None
+        def token_from(source: Any, side: str) -> str | None:
+            if not isinstance(source, Mapping):
+                return None
+            direct_names = (
+                ("yes_token_id", "yesTokenId", "yes_token", "yes")
+                if side == "yes"
+                else ("no_token_id", "noTokenId", "no_token", "no")
+            )
+            direct = nested(source, *direct_names)
+            if direct not in (None, "") and not isinstance(direct, (Mapping, list, tuple)):
+                return _binding_value(direct)
+            for container_name in ("tokens", "outcomes", "outcome_tokens"):
+                container = source.get(container_name)
+                if isinstance(container, Mapping):
+                    value = container.get(side) or container.get(f"{side}_token_id")
+                    if value not in (None, "") and not isinstance(value, (Mapping, list, tuple)):
+                        return _binding_value(value)
+                    if isinstance(value, Mapping):
+                        token = nested(value, "token_id", "tokenId", "id")
+                        if token not in (None, ""):
+                            return _binding_value(token)
+                elif isinstance(container, (list, tuple)):
+                    for value in container:
+                        if not isinstance(value, Mapping):
+                            continue
+                        label = str(
+                            value.get("outcome", value.get("name", value.get("side", "")))
+                        ).strip().lower()
+                        if label != side:
+                            continue
+                        token = nested(value, "token_id", "tokenId", "id")
+                        if token not in (None, ""):
+                            return _binding_value(token)
+            return None
+
+
+        def has_depth(book: Any) -> bool:
+            if not isinstance(book, Mapping):
+                return False
+            sides: list[list[Any]] = []
+            for name in ("bids", "asks"):
+                rows = book.get(name)
+                if not isinstance(rows, (list, tuple)):
+                    return False
+                finite_rows = []
+                for row in rows:
+                    if isinstance(row, Mapping):
+                        price, size = row.get("price"), row.get("size", row.get("quantity"))
+                    elif isinstance(row, (list, tuple)) and len(row) >= 2:
+                        price, size = row[0], row[1]
+                    else:
+                        continue
+                    try:
+                        price_value, size_value = float(price), float(size)
+                    except (TypeError, ValueError, OverflowError):
+                        continue
+                    if math.isfinite(price_value) and math.isfinite(size_value) and size_value > 0:
+                        finite_rows.append(row)
+                sides.append(finite_rows)
+            return bool(sides[0] and sides[1])
+
+        valid: list[dict[str, Any]] = []
+        for item in candidate_markets:
+            tracked_item = tracked_by_id.get(item["market_id"])
+            if not isinstance(tracked_item, Mapping):
+                continue
+            observed_at = _rolling_timestamp(tracked_item.get("observed_at"))
+            if (
+                observed_at is None
+                or observed_at > ensure_utc(now)
+                or (ensure_utc(now) - observed_at).total_seconds() > freshness
+            ):
+                continue
+            payload = tracked_item.get("payload")
+            if not isinstance(payload, Mapping):
+                continue
+            metadata = nested(payload, "metadata") or {}
+            snapshot = nested(payload, "snapshot") or {}
+            if not isinstance(metadata, Mapping) or not isinstance(snapshot, Mapping):
+                continue
+            if _binding_value(nested(metadata, "market_id", "id")) not in {None, item["market_id"]}:
+                continue
+            tracked_yes = (
+                token_from(metadata, "yes")
+                or token_from(snapshot, "yes")
+                or token_from(payload, "yes")
+            )
+            tracked_no = (
+                token_from(metadata, "no")
+                or token_from(snapshot, "no")
+                or token_from(payload, "no")
+            )
+            if tracked_yes != item["yes_token_id"] or tracked_no != item["no_token_id"]:
+                continue
+            book = nested(snapshot, "order_book", "book") or nested(payload, "order_book", "book")
+            if not has_depth(book):
+                continue
+            if nested(snapshot, "enable_order_book", "enableOrderBook", "book_available") is False:
+                continue
+            if nested(metadata, "accepting_orders", "accepting-orders") is False:
+                continue
+            valid.append(
+                {
+                    **item,
+                    "book_depth": "SUITABLE",
+                    "outcome_token_id": item["yes_token_id"],
+                }
+            )
+            if len(valid) >= _EXPLORATORY_MEMBER_MAX:
+                break
+        return tuple(valid)
+
 
 
     def _ensure_rolling_paper_observation(
@@ -8850,6 +9177,39 @@ class AutonomousResearchProcessor:
                 }
             )
         )
+        setup_value = strategy.get("operational_setup")
+        setup_value = setup_value if isinstance(setup_value, Mapping) else {}
+        setup_policy = setup_value.get("setup_policy")
+        exploratory = (
+            _exploratory_live_requested(strategy)
+            or (
+                isinstance(setup_policy, Mapping)
+                and str(setup_policy.get("mode", "")).strip().upper()
+                == "EXPLORATORY_LIVE"
+            )
+        )
+        current_bindings = (
+            self._rolling_current_market_bindings(strategy, now)
+            if exploratory
+            else ()
+        )
+        valid_binding_ids = {
+            str(item.get("market_id", "")).strip()
+            for item in current_bindings
+            if isinstance(item, Mapping)
+        }
+        if exploratory and (
+            not current_market_ids
+            or not valid_binding_ids.intersection(current_market_ids)
+        ):
+            return {
+                "candidate_id": candidate_id,
+                "strategy_version_id": strategy_version_id,
+                "research_trial_id": trial_id,
+                "market_ids": [],
+                "status": "WAITING_FOR_DIRECT_CURRENT_MARKET",
+                "paper_only": True,
+            }
         supplied_capture_market = _binding_value(strategy.get("capture_market_id"))
         capture_market_id = (
             supplied_capture_market
@@ -8912,6 +9272,28 @@ class AutonomousResearchProcessor:
             "allocation_active": False if capture_only else None,
             "canary_armed": False if capture_only else None,
         }
+        if exploratory:
+            config["operating_policy"] = dict(EXPLORATORY_LIVE_POLICY)
+            config["current_market_bindings"] = [
+                dict(item)
+                for item in current_bindings
+                if isinstance(item, Mapping)
+                and str(item.get("market_id", "")).strip() in current_market_ids
+            ]
+            config["scope_selection_provenance"] = {
+                "candidate_id": candidate_id,
+                "scope_hash": (
+                    scope_resolution.get("scope_hash")
+                    if isinstance(scope_resolution, Mapping)
+                    else None
+                ),
+                "scope_version": (
+                    scope_resolution.get("scope_version")
+                    if isinstance(scope_resolution, Mapping)
+                    else None
+                ),
+                "bounded_pool_cap": _EXPLORATORY_POOL_CAP,
+            }
         if not capture_only:
             for safety_key in (
                 "execution_scope",
@@ -11598,6 +11980,7 @@ class AutonomousResearchProcessor:
                 "valid_input_rows",
                 default=valid_input_default,
             )
+
         except ValueError:
             count_error = count_error or "valid_input_rows"
             valid_input_rows = 0
@@ -11882,6 +12265,69 @@ class AutonomousResearchProcessor:
         record["evidence_digest"] = RollingEvidence.from_mapping(record).evidence_digest
         return record
 
+    def _ensure_exploratory_live_bootstrap(self, now: datetime) -> Mapping[str, Any]:
+        """Persist the disarmed paper operating policy exactly once.
+
+        This is an application-owned control record, not an execution
+        authorization.  It gives the rolling scheduler a stable versioned
+        policy/scope provenance while leaving account, venue, limits, and
+        order transport untouched.
+        """
+        policy_config_key = "rolling_exploratory_operating_policy"
+        scope_policy = {
+            "schema_version": "1",
+            "mode": "RULE_BASED_MARKETS",
+            "instrument": "POLYMARKET",
+            "market_ids": [],
+            "filters": {},
+            "provenance": "public-current-market",
+            "bounded_pool_cap": _EXPLORATORY_POOL_CAP,
+        }
+        desired = {
+            **dict(EXPLORATORY_LIVE_POLICY),
+            "scope": scope_policy,
+            "paper_only": True,
+            "allocation_active": False,
+            "canary_armed": False,
+            "created_by": "autonomous-rolling-scheduler",
+            "updated_at": ensure_utc(now).isoformat(),
+        }
+        desired["config_hash"] = _content_hash(
+            {
+                key: value
+                for key, value in desired.items()
+                if key not in {"updated_at", "config_hash"}
+            }
+        )
+        loader = getattr(self.store, "get_operator_config", None)
+        setter = getattr(self.store, "set_operator_config", None)
+        existing = None
+        if callable(loader):
+            try:
+                existing = loader(policy_config_key, None)
+            except (TypeError, ValueError, RuntimeError):
+                existing = None
+        if not isinstance(existing, Mapping) and callable(setter):
+            try:
+                setter(policy_config_key, desired)
+                existing = desired
+            except (TypeError, ValueError, RuntimeError):
+                existing = None
+        return {
+            "status": "PERSISTED" if isinstance(existing, Mapping) else "DEFERRED",
+            "policy_id": EXPLORATORY_LIVE_POLICY.get("policy_id"),
+            "policy_version": EXPLORATORY_LIVE_POLICY.get("version"),
+            "config_hash": (
+                existing.get("config_hash")
+                if isinstance(existing, Mapping)
+                else desired["config_hash"]
+            ),
+            "scope": dict(scope_policy),
+            "paper_only": True,
+            "allocation_active": False,
+            "canary_armed": False,
+        }
+
     def refresh_rolling_evidence(
         self,
         now: datetime | None = None,
@@ -11890,6 +12336,7 @@ class AutonomousResearchProcessor:
     ) -> Mapping[str, Any]:
         """Materialize bounded, source-separated rolling evidence and schedule retries."""
         current = ensure_utc(now or self.clock())
+        bootstrap = self._ensure_exploratory_live_bootstrap(current)
         migrated_observations = (
             ()
             if skip_observation_setup_migration
@@ -12105,7 +12552,6 @@ class AutonomousResearchProcessor:
                     work_payload(
                         strategy,
                         days,
-                        source,
                         status="BLOCKED",
                         reason=reason,
                         terminal=immutable,
@@ -12148,10 +12594,47 @@ class AutonomousResearchProcessor:
                 elif cache_key not in source_cache:
                     try:
                         if source == "PAPER":
-                            self._ensure_rolling_paper_observation(strategy, current)
-                        source_cache[cache_key] = self._rolling_source_rows(
-                            source_payload, source, current
-                        )
+                            current_bindings = self._rolling_current_market_bindings(
+                                strategy,
+                                current,
+                            )
+                            binding_result = self._ensure_rolling_paper_observation(
+                                strategy,
+                                current,
+                                market_ids=tuple(
+                                    item["market_id"]
+                                    for item in current_bindings
+                                    if isinstance(item, Mapping)
+                                    and str(item.get("market_id", "")).strip()
+                                ),
+                            )
+                            if (
+                                isinstance(binding_result, Mapping)
+                                and binding_result.get("status")
+                                == "WAITING_FOR_DIRECT_CURRENT_MARKET"
+                            ):
+                                source_cache[cache_key] = []
+                                add_pending(
+                                    work_payload(
+                                        strategy,
+                                        days,
+                                        source,
+                                        status="BLOCKED",
+                                        reason="WAITING_FOR_DIRECT_CURRENT_MARKET",
+                                        next_attempt_at=(
+                                            current + timedelta(minutes=5)
+                                        ).isoformat(),
+                                    )
+                                )
+                                rows = []
+                            else:
+                                source_cache[cache_key] = self._rolling_source_rows(
+                                    source_payload, source, current
+                                )
+                        else:
+                            source_cache[cache_key] = self._rolling_source_rows(
+                                source_payload, source, current
+                            )
                     except Exception as exc:
                         error = f"{type(exc).__name__}: {str(exc)[:256]}"
                         reason = _rolling_source_exception_reason(exc)
@@ -12669,6 +13152,7 @@ class AutonomousResearchProcessor:
             for item in blockers
             if isinstance(item, Mapping)
         ]
+        state["exploratory_live_bootstrap"] = dict(bootstrap)
         # ``set_operator_job`` is also consumed by Hermes adapters.  Bound the
         # final payload after cursor/counter details are attached, while the
         # explicit ``*_total`` counters retain exact work cardinality.
@@ -13080,9 +13564,27 @@ class AutonomousResearchProcessor:
         risk["available_budget"] = str(max(Decimal("0"), global_budget - uncovered_obligations))
         prior_event_history = (
             list(prior_state.get("event_history", []))
-            if isinstance(prior_state, Mapping) and isinstance(prior_state.get("event_history"), list)
+            if isinstance(prior_state, Mapping)
+            and isinstance(prior_state.get("event_history"), list)
             else []
         )
+        proposed_budget_remaining = max(
+            Decimal("0"),
+            _rolling_number(risk.get("available_budget")),
+        )
+        proposal_risk_snapshot = {
+            "risk_config_id": risk.get("risk_config_id"),
+            "risk_config_generation": risk.get("risk_config_generation"),
+            "risk_config_hash": risk.get("risk_config_hash"),
+            "global_budget": risk.get("global_budget"),
+            "active_obligations": risk.get("active_obligations"),
+            "uncovered_obligations": risk.get("uncovered_obligations"),
+            "external_obligations": risk.get("external_obligations"),
+            "available_budget": risk.get("available_budget"),
+            "runtime_accounting_available": risk.get("runtime_accounting_available"),
+            "runtime_accounting_metadata": risk.get("runtime_accounting_metadata"),
+        }
+        proposal_risk_digest = _rolling_hash(proposal_risk_snapshot)
         event_history = (
             prior_event_history
             + [{"at": current.isoformat(), "status": decision.status, "reasons": list(decision.reasons)}]
@@ -13092,6 +13594,91 @@ class AutonomousResearchProcessor:
             for member in decision.members
             if member.candidate_id and member.research_trial_id
         ]
+        evidence_by_strategy: dict[str, Mapping[str, Any]] = {}
+        for raw_evidence in evidence_rows:
+            if not isinstance(raw_evidence, Mapping):
+                continue
+            strategy_key = str(raw_evidence.get("strategy_version_id", "")).strip()
+            if strategy_key:
+                evidence_by_strategy[strategy_key] = raw_evidence
+        enriched_members: list[dict[str, Any]] = []
+        exploratory_member_count = 0
+        exploratory_proposal_count = 0
+        for member in members:
+            row = evidence_by_strategy.get(
+                str(member.get("strategy_version_id", "")).strip()
+            )
+            identity = row.get("operational_identity") if isinstance(row, Mapping) else None
+            identity = identity if isinstance(identity, Mapping) else {}
+            setup = identity.get("operational_setup")
+            if isinstance(setup, Mapping):
+                member["operational_setup"] = dict(setup)
+                member["operational_setup_hash"] = identity.get(
+                    "operational_setup_hash",
+                    _operational_setup_hash(setup),
+                )
+                member["setup_id"] = setup.get("setup_id")
+                member["setup_version"] = setup.get(
+                    "setup_version",
+                    setup.get("contract_version"),
+                )
+                setup_policy = setup.get("setup_policy")
+                if (
+                    isinstance(setup_policy, Mapping)
+                    and str(setup_policy.get("mode", "")).strip().upper()
+                    == "EXPLORATORY_LIVE"
+                ):
+                    exploratory_member_count += 1
+                    member["operating_policy"] = dict(setup_policy)
+                    member["paper_only"] = True
+                    member["allocation_active"] = False
+                    if (
+                        exploratory_proposal_count < _EXPLORATORY_MEMBER_MAX
+                        and proposed_budget_remaining >= _EXPLORATORY_PAPER_ALLOCATION
+                        and str(member.get("status", "")).strip().upper()
+                        in {"PAPER", "RETAINED"}
+                        and _rolling_number(member.get("allocation")) <= 0
+                    ):
+                        member["proposed_allocation"] = str(
+                            _EXPLORATORY_PAPER_ALLOCATION
+                        )
+                        proposed_budget_remaining -= _EXPLORATORY_PAPER_ALLOCATION
+                        exploratory_proposal_count += 1
+                    member["canary_armed"] = False
+                scope = setup.get("market_scope_policy")
+                if isinstance(scope, Mapping):
+                    member["scope"] = dict(scope)
+                    member["scope_hash"] = (
+                        scope.get("market_scope_hash") or scope.get("scope_hash")
+                    )
+                    member["scope_version"] = (
+                        scope.get("market_scope_version") or scope.get("scope_version")
+                    )
+            if isinstance(row, Mapping):
+                for key in (
+                    "candidate_id",
+                    "research_trial_id",
+                    "evidence_window_id",
+                    "evidence_digest",
+                ):
+                    if row.get(key) not in (None, ""):
+                        member.setdefault(key, row.get(key))
+            enriched_members.append(member)
+        members = enriched_members
+        proposed_allocation_total = sum(
+            (
+                _rolling_number(member.get("proposed_allocation"))
+                for member in members
+                if isinstance(member, Mapping)
+                and member.get("proposed_allocation") not in (None, "")
+            ),
+            Decimal("0"),
+        )
+        exploratory_policy = (
+            dict(EXPLORATORY_LIVE_POLICY)
+            if exploratory_member_count
+            else None
+        )
         # Removed members are not funded selection rows, but their immutable
         # identities must remain in the committed payload until the runtime
         # observes and completes the corresponding exit obligation.
@@ -13178,7 +13765,13 @@ class AutonomousResearchProcessor:
                 else None
             ),
             "paper_only": True,
+            "proposed_allocation_total": str(proposed_allocation_total),
+            "proposed_allocation_risk_snapshot": dict(proposal_risk_snapshot),
+            "proposed_allocation_risk_digest": proposal_risk_digest,
         }
+        if exploratory_policy is not None:
+            selection["operating_policy"] = dict(exploratory_policy)
+            selection["exploratory_policy"] = dict(exploratory_policy)
         members = [
             {
                 **member,
@@ -13202,6 +13795,9 @@ class AutonomousResearchProcessor:
             "runtime_active_obligations": risk["runtime_active_obligations"],
             "uncovered_obligations": risk["uncovered_obligations"],
             "external_obligations": risk["external_obligations"],
+            "proposed_allocation_total": str(proposed_allocation_total),
+            "proposed_allocation_risk_snapshot": dict(proposal_risk_snapshot),
+            "proposed_allocation_risk_digest": proposal_risk_digest,
             "available_budget": risk["available_budget"],
             "runtime_accounting_available": risk["runtime_accounting_available"],
             "runtime_accounting_metadata": risk["runtime_accounting_metadata"],
@@ -13291,6 +13887,16 @@ class AutonomousResearchProcessor:
                 else {}
             ),
             "policy": policy.as_dict(),
+            "active_policy_identity": {
+                "policy_id": policy.policy_id,
+                "policy_version": policy.version,
+                "config_hash": policy.config_hash,
+            },
+            **(
+                {"operating_policy": dict(exploratory_policy)}
+                if exploratory_policy is not None
+                else {}
+            ),
             "risk_binding": risk,
             "reasons": list(decision.reasons),
             "pending": refreshed.get("pending", []),
@@ -13344,6 +13950,33 @@ class AutonomousResearchProcessor:
                 and _rolling_number(member.get("allocation")) > 0
             ),
             "policy": policy.as_dict(),
+            "active_policy_identity": {
+                "policy_id": (
+                    current.get("policy_id", policy.policy_id)
+                    if isinstance(current, Mapping)
+                    else policy.policy_id
+                ),
+                "policy_version": (
+                    current.get("policy_version", policy.version)
+                    if isinstance(current, Mapping)
+                    else policy.version
+                ),
+                "config_hash": policy.config_hash,
+            },
+            **(
+                {
+                    "operating_policy": current.get(
+                        "operating_policy",
+                        current.get("exploratory_policy"),
+                    )
+                }
+                if isinstance(current, Mapping)
+                and isinstance(
+                    current.get("operating_policy", current.get("exploratory_policy")),
+                    Mapping,
+                )
+                else {}
+            ),
             "risk_binding": risk,
             "active_rows": members,
             "global_limits_usage": {

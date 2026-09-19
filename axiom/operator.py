@@ -6,8 +6,9 @@ persists every requested action as a bounded audit record.
 """
 from __future__ import annotations
 
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 import hashlib
 import ipaddress
 import json
@@ -33,7 +34,9 @@ from .canary import (
     PolymarketClobV2Venue,
     _canary_adverse_acknowledged,
     _canary_authorization_current_selection_hash,
+    _canary_canonical_selection_hash,
     _canary_selection_member_is_funded,
+    _canary_selection_member_is_proposed,
     credential_fingerprint,
 )
 from .canary_positions import (
@@ -1869,6 +1872,10 @@ class OperatorControlPlane:
             "scope_version": scope_version,
             "active_settings_hash": settings_hash,
             "active_settings_generation": settings_generation,
+            "proposed_allocation_total": selection.get("proposed_allocation_total"),
+            "proposed_allocation_risk_digest": selection.get(
+                "proposed_allocation_risk_digest"
+            ),
             "limits": limits,
             "selection": selection,
             "scope": scope,
@@ -2014,6 +2021,7 @@ class OperatorControlPlane:
         if values is not None and not isinstance(values, Mapping):
             raise OperatorControlError("EXECUTION_AUTHORIZATION_VALUES_REQUIRED")
         raw = dict(values or {})
+        context = self._authorization_context()
         allowed = {
             "purpose",
             "exact_strategy_versions",
@@ -2031,16 +2039,19 @@ class OperatorControlPlane:
             "active_settings_generation",
             "selection_id",
             "selection_hash",
+            "proposed_allocation_total",
+            "proposed_allocation_risk_digest",
             "actor_version",
         }
         unknown = set(raw) - allowed
         if unknown:
             raise OperatorControlError("UNSUPPORTED_EXECUTION_AUTHORIZATION_FIELDS")
-        context = self._authorization_context()
         for field, context_key in (
             ("scope_hash", "scope_hash"),
             ("scope_version", "scope_version"),
             ("active_settings_hash", "active_settings_hash"),
+            ("proposed_allocation_total", "proposed_allocation_total"),
+            ("proposed_allocation_risk_digest", "proposed_allocation_risk_digest"),
         ):
             if field not in raw:
                 continue
@@ -2258,6 +2269,12 @@ class OperatorControlPlane:
                 "actor_version": actor_version,
                 "status": "DRAFT",
                 "paper_only": True,
+                "proposed_allocation_total": context.get(
+                    "proposed_allocation_total"
+                ),
+                "proposed_allocation_risk_digest": context.get(
+                    "proposed_allocation_risk_digest"
+                ),
                 "live_execution": False,
             }
         )
@@ -2682,6 +2699,425 @@ class OperatorControlPlane:
             "blockers": list(dict.fromkeys(blockers)),
         }
 
+    def _prepare_reviewed_proposed_selection(self) -> Mapping[str, Any] | None:
+        """Materialize one immutable paper successor before authorization review."""
+        loader = getattr(self.store, "load_current_portfolio_selection", None)
+        committer = getattr(self.store, "commit_portfolio_selection", None)
+        if not callable(loader) or not callable(committer):
+            return None
+        current = loader()
+        if not isinstance(current, Mapping):
+            return None
+        activation = current.get("allocation_activation")
+        if (
+            isinstance(activation, Mapping)
+            and str(activation.get("status") or "").upper() == "PREPARED"
+        ):
+            return current
+        raw_members = current.get("members", current.get("selected_members", ()))
+        if not isinstance(raw_members, (list, tuple)):
+            return None
+        proposal_members = [
+            dict(member)
+            for member in raw_members
+            if isinstance(member, Mapping)
+            and _canary_selection_member_is_proposed(member)
+        ]
+        if not proposal_members:
+            return current
+        if len(proposal_members) > 3:
+            raise OperatorControlError("BOUNDED_ALLOCATION_REQUIRED")
+        proposal_digest = self._rolling_canonical_hash(
+            {
+                "predecessor": current.get("selection_id")
+                or current.get("portfolio_selection_id"),
+                "members": [
+                    {
+                        "strategy_version_id": item.get("strategy_version_id"),
+                        "candidate_id": item.get("candidate_id"),
+                        "proposed_allocation": item.get("proposed_allocation"),
+                    }
+                    for item in proposal_members
+                ],
+                "risk_digest": current.get("proposed_allocation_risk_digest"),
+            }
+        )
+        prepared_members: list[dict[str, Any]] = []
+        for raw in raw_members:
+            if not isinstance(raw, Mapping):
+                continue
+            item = dict(raw)
+            if _canary_selection_member_is_proposed(item):
+                item["allocation"] = str(item.get("proposed_allocation"))
+                item["status"] = "PAPER"
+                item["action"] = "OBSERVE"
+                item["allocation_active"] = False
+                item["paper_only"] = True
+                item["canary_armed"] = False
+            prepared_members.append(item)
+        prepared = dict(current)
+        predecessor_id = str(
+            current.get("selection_id") or current.get("portfolio_selection_id") or ""
+        ).strip()
+        prepared_id = (
+            "rolling-selection-prepared-"
+            + self._rolling_canonical_hash(
+                {"predecessor": predecessor_id, "proposal": proposal_digest}
+            )[:40]
+        )
+        prepared.update(
+            {
+                "selection_id": prepared_id,
+                "portfolio_selection_id": prepared_id,
+                "members": prepared_members,
+                "status": "PAPER",
+                "paper_only": True,
+                "allocation_active": False,
+                "canary_armed": False,
+                "k": 0,
+                "supersedes_portfolio_selection_id": predecessor_id,
+                "allocation_activation": {
+                    "status": "PREPARED",
+                    "proposal_digest": proposal_digest,
+                    "predecessor_selection_id": predecessor_id,
+                    "prepared_at": utc_now().isoformat(),
+                },
+            }
+        )
+        prepared["selection_hash"] = _canary_canonical_selection_hash(prepared)
+        transaction_factory = getattr(self.store, "transaction", None)
+        if callable(transaction_factory):
+            try:
+                transaction_context = transaction_factory(immediate=True)
+            except TypeError:
+                transaction_context = transaction_factory()
+            with transaction_context:
+                committed = committer(prepared, prepared_members)
+        else:
+            committed = committer(prepared, prepared_members)
+        return committed if isinstance(committed, Mapping) else prepared
+    def _fresh_proposed_risk_capacity(
+        self,
+        proposal_snapshot: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Recompute reviewed allocation capacity from current durable ledgers."""
+        accounting_loader = getattr(self.store, "canary_risk_accounting", None)
+        if not callable(accounting_loader):
+            raise OperatorControlError("EXPLORATORY_LIVE_RISK_BINDING_STALE")
+        try:
+            accounting = accounting_loader(now=utc_now())
+        except TypeError:
+            accounting = accounting_loader()
+        except Exception as exc:
+            raise OperatorControlError(
+                "EXPLORATORY_LIVE_RISK_BINDING_STALE"
+            ) from exc
+        if not isinstance(accounting, Mapping):
+            raise OperatorControlError("EXPLORATORY_LIVE_RISK_BINDING_STALE")
+        settings_snapshot = self.risk_settings_snapshot()
+        if not isinstance(settings_snapshot, Mapping):
+            raise OperatorControlError("EXPLORATORY_LIVE_RISK_BINDING_STALE")
+        expected_identity = {
+            "risk_config_id": proposal_snapshot.get("risk_config_id"),
+            "risk_config_generation": proposal_snapshot.get("risk_config_generation"),
+            "risk_config_hash": proposal_snapshot.get("risk_config_hash"),
+        }
+        current_identity = {
+            "risk_config_id": settings_snapshot.get(
+                "risk_config_id", settings_snapshot.get("config_id")
+            ),
+            "risk_config_generation": settings_snapshot.get(
+                "risk_config_generation", settings_snapshot.get("generation")
+            ),
+            "risk_config_hash": settings_snapshot.get(
+                "risk_config_hash", settings_snapshot.get("config_hash")
+            ),
+        }
+        for name, expected in expected_identity.items():
+            if expected in (None, ""):
+                continue
+            if str(current_identity.get(name) or "") != str(expected):
+                raise OperatorControlError("EXPLORATORY_LIVE_RISK_BINDING_STALE")
+        def decimal_value(value: Any, field: str) -> Decimal:
+            if isinstance(value, bool) or value in (None, ""):
+                raise OperatorControlError("EXPLORATORY_LIVE_RISK_BINDING_STALE")
+            try:
+                parsed = Decimal(str(value))
+            except (InvalidOperation, TypeError, ValueError):
+                raise OperatorControlError(
+                    "EXPLORATORY_LIVE_RISK_BINDING_STALE"
+                ) from None
+            if not parsed.is_finite() or parsed < 0:
+                raise OperatorControlError("EXPLORATORY_LIVE_RISK_BINDING_STALE")
+            return parsed
+        global_budget = decimal_value(
+            proposal_snapshot.get("global_budget"), "global_budget"
+        )
+        raw_global_reserved = accounting.get("rolling_global_reserved_usd")
+        global_reserved = decimal_value(raw_global_reserved, "rolling_global_reserved_usd")
+        raw_reserved = accounting.get("rolling_strategy_reserved_usd")
+        raw_allocations = accounting.get("rolling_strategy_allocations", {})
+        if not isinstance(raw_reserved, Mapping) or not isinstance(raw_allocations, Mapping):
+            raise OperatorControlError("EXPLORATORY_LIVE_RISK_BINDING_STALE")
+        reserved: dict[str, Decimal] = {}
+        allocations: dict[str, Decimal] = {}
+        for raw_id, raw_value in raw_reserved.items():
+            identifier = str(raw_id).strip()
+            if not identifier:
+                raise OperatorControlError("EXPLORATORY_LIVE_RISK_BINDING_STALE")
+            reserved[identifier] = decimal_value(raw_value, "rolling_strategy_reserved_usd")
+        for raw_id, raw_value in raw_allocations.items():
+            identifier = str(raw_id).strip()
+            if not identifier:
+                raise OperatorControlError("EXPLORATORY_LIVE_RISK_BINDING_STALE")
+            allocations[identifier] = decimal_value(raw_value, "rolling_strategy_allocations")
+        detail_total = sum(reserved.values(), Decimal("0"))
+        if detail_total != global_reserved:
+            raise OperatorControlError("EXPLORATORY_LIVE_RISK_BINDING_STALE")
+        uncovered = sum(
+            (
+                max(Decimal("0"), amount - allocations.get(identifier, Decimal("0")))
+                for identifier, amount in reserved.items()
+            ),
+            Decimal("0"),
+        )
+        active_obligations = max(global_reserved, detail_total)
+        available = max(Decimal("0"), global_budget - uncovered)
+        raw_available = accounting.get("available_budget")
+        if raw_available not in (None, ""):
+            reported_available = decimal_value(raw_available, "available_budget")
+            if reported_available != available:
+                raise OperatorControlError("EXPLORATORY_LIVE_RISK_BINDING_STALE")
+        return {
+            "global_budget": str(global_budget),
+            "active_obligations": str(active_obligations),
+            "uncovered_obligations": str(uncovered),
+            "external_obligations": str(uncovered),
+            "available_budget": str(available),
+            "runtime_accounting_available": accounting.get(
+                "runtime_accounting_available", True
+            ),
+        }
+
+    def _capture_canary_selection_binding(self) -> dict[str, Any]:
+        """Capture the singleton/config before a reviewed activation mutates it."""
+        connection = getattr(self.store, "connection", None)
+        if connection is None:
+            raise OperatorControlError("EXPLORATORY_LIVE_CANARY_SELECTION_REQUIRED")
+        table_present = False
+        row_present = False
+        candidate_id = ""
+        try:
+            table_present = (
+                connection.execute(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type='table' AND name='canary_selection'"
+                ).fetchone()
+                is not None
+            )
+            if table_present:
+                row = connection.execute(
+                    "SELECT candidate_id FROM canary_selection WHERE singleton=1"
+                ).fetchone()
+                row_present = row is not None
+                if row is not None:
+                    try:
+                        candidate_id = str(row["candidate_id"] or "").strip()
+                    except (KeyError, TypeError):
+                        candidate_id = str(row[0] or "").strip()
+        except sqlite3.Error as exc:
+            raise OperatorControlError(
+                "EXPLORATORY_LIVE_CANARY_SELECTION_REQUIRED"
+            ) from exc
+        missing = object()
+        getter = getattr(self.store, "get_operator_config", None)
+        prior_binding = (
+            getter("canary_selection_binding", missing)
+            if callable(getter)
+            else missing
+        )
+        return {
+            "table_present": table_present,
+            "row_present": row_present,
+            "candidate_id": candidate_id,
+            "binding_present": prior_binding is not missing,
+            "binding": (
+                dict(prior_binding)
+                if isinstance(prior_binding, Mapping)
+                else None
+            ),
+        }
+
+    def _restore_canary_selection_binding(self, snapshot: Mapping[str, Any]) -> None:
+        """Restore the exact pre-activation singleton and binding config."""
+        connection = getattr(self.store, "connection", None)
+        if connection is None:
+            raise OperatorControlError("EXPLORATORY_LIVE_CANARY_SELECTION_REQUIRED")
+        try:
+            transaction_factory = getattr(self.store, "transaction", None)
+            if callable(transaction_factory):
+                try:
+                    transaction_context = transaction_factory(immediate=True)
+                except TypeError:
+                    transaction_context = transaction_factory()
+            else:
+                transaction_context = nullcontext()
+            with transaction_context:
+                table_present = (
+                    connection.execute(
+                        "SELECT 1 FROM sqlite_master "
+                        "WHERE type='table' AND name='canary_selection'"
+                    ).fetchone()
+                    is not None
+                )
+                if table_present:
+                    if bool(snapshot.get("row_present")):
+                        candidate_id = str(snapshot.get("candidate_id") or "").strip() or None
+                        current = connection.execute(
+                            "SELECT singleton FROM canary_selection WHERE singleton=1"
+                        ).fetchone()
+                        if current is None:
+                            now = utc_now().isoformat()
+                            connection.execute(
+                                "INSERT INTO canary_selection("
+                                "singleton,ranking_run_id,candidate_id,rank,total_score,"
+                                "component_scores_json,evidence_versions_json,reason,selected_at"
+                                ") VALUES(1,?,?,?,?,?,?,?,?)",
+                                (
+                                    "restored",
+                                    candidate_id,
+                                    1,
+                                    0.0,
+                                    "{}",
+                                    "{}",
+                                    "restored pre-activation selection",
+                                    now,
+                                ),
+                            )
+                        else:
+                            connection.execute(
+                                "UPDATE canary_selection SET candidate_id=? WHERE singleton=1",
+                                (candidate_id,),
+                            )
+                    else:
+                        connection.execute(
+                            "DELETE FROM canary_selection WHERE singleton=1"
+                        )
+                binding_present = bool(snapshot.get("binding_present"))
+                if binding_present:
+                    setter = getattr(self.store, "set_operator_config", None)
+                    if not callable(setter):
+                        raise OperatorControlError(
+                            "EXPLORATORY_LIVE_CANARY_SELECTION_REQUIRED"
+                        )
+                    setter("canary_selection_binding", snapshot.get("binding"))
+                else:
+                    connection.execute(
+                        "DELETE FROM operator_config WHERE config_key=?",
+                        ("canary_selection_binding",),
+                    )
+        except OperatorControlError:
+            raise
+        except sqlite3.Error as exc:
+            raise OperatorControlError(
+                "EXPLORATORY_LIVE_CANARY_SELECTION_REQUIRED"
+            ) from exc
+
+    def _clear_canary_selection_binding_rollback(self) -> None:
+        connection = getattr(self.store, "connection", None)
+        if connection is None:
+            return
+        transaction_factory = getattr(self.store, "transaction", None)
+        if callable(transaction_factory):
+            try:
+                transaction_context = transaction_factory(immediate=True)
+            except TypeError:
+                transaction_context = transaction_factory()
+        else:
+            transaction_context = nullcontext()
+        with transaction_context:
+            connection.execute(
+                "DELETE FROM operator_config WHERE config_key=?",
+                ("canary_selection_binding_rollback",),
+            )
+
+    def _synchronize_canary_selection_binding(
+        self,
+        *,
+        candidate_id: str,
+        selection_id: str,
+        selection_hash: str,
+    ) -> None:
+        """Bind the shared canary singleton without replacing another winner."""
+        connection = getattr(self.store, "connection", None)
+        if connection is None:
+            raise OperatorControlError("EXPLORATORY_LIVE_CANARY_SELECTION_REQUIRED")
+        try:
+            row = connection.execute(
+                "SELECT candidate_id FROM canary_selection WHERE singleton=1"
+            ).fetchone()
+        except sqlite3.OperationalError as exc:
+            if "no such table" not in str(exc).lower():
+                raise OperatorControlError(
+                    "EXPLORATORY_LIVE_CANARY_SELECTION_REQUIRED"
+                ) from exc
+            try:
+                CanaryService(self.store, initialize=True, settings=self.settings)
+                row = connection.execute(
+                    "SELECT candidate_id FROM canary_selection WHERE singleton=1"
+                ).fetchone()
+            except Exception as init_exc:
+                raise OperatorControlError(
+                    "EXPLORATORY_LIVE_CANARY_SELECTION_REQUIRED"
+                ) from init_exc
+        except sqlite3.Error as exc:
+            raise OperatorControlError(
+                "EXPLORATORY_LIVE_CANARY_SELECTION_REQUIRED"
+            ) from exc
+        existing_candidate = ""
+        if row is not None:
+            try:
+                existing_candidate = str(row["candidate_id"] or "").strip()
+            except (KeyError, TypeError):
+                existing_candidate = str(row[0] or "").strip()
+            if existing_candidate and existing_candidate != candidate_id:
+                raise OperatorControlError("EXPLORATORY_LIVE_CANARY_SELECTION_CONFLICT")
+            if not existing_candidate:
+                connection.execute(
+                    "UPDATE canary_selection SET candidate_id=? WHERE singleton=1",
+                    (candidate_id,),
+                )
+        else:
+            now = utc_now().isoformat()
+            connection.execute(
+                "INSERT INTO canary_selection("
+                "singleton,ranking_run_id,candidate_id,rank,total_score,"
+                "component_scores_json,evidence_versions_json,reason,selected_at"
+                ") VALUES(1,?,?,?,?,?,?,?,?)",
+                (
+                    "portfolio:" + selection_id,
+                    candidate_id,
+                    1,
+                    0.0,
+                    "{}",
+                    "{}",
+                    "portfolio exploratory review",
+                    now,
+                ),
+            )
+        setter = getattr(self.store, "set_operator_config", None)
+        if callable(setter):
+            setter(
+                "canary_selection_binding",
+                {
+                    "candidate_id": candidate_id,
+                    "selection_id": selection_id,
+                    "selection_hash": selection_hash,
+                    "bound_at": utc_now().isoformat(),
+                },
+            )
+
+
     def exploratory_live_review_snapshot(
         self, values: Mapping[str, Any] | None = None
     ) -> dict[str, Any]:
@@ -2689,6 +3125,7 @@ class OperatorControlPlane:
         if values is not None and not isinstance(values, Mapping):
             raise OperatorControlError("EXPLORATORY_LIVE_VALUES_REQUIRED")
         raw = dict(values or {})
+        self._prepare_reviewed_proposed_selection()
         context = self._authorization_context()
         selection = context.get("selection")
         selection = dict(selection) if isinstance(selection, Mapping) else {}
@@ -2707,7 +3144,10 @@ class OperatorControlPlane:
             status = str(member.get("status") or member.get("stage") or "").upper()
             if bool(member.get("rejected")) or status == "REJECTED":
                 rejected.append(member)
-            elif _canary_selection_member_is_funded(member):
+            elif (
+                _canary_selection_member_is_funded(member)
+                or _canary_selection_member_is_proposed(member)
+            ):
                 funded.append(member)
         reviewed_candidate = str(raw.get("candidate_id") or "").strip()
         server_candidate = (
@@ -2867,6 +3307,12 @@ class OperatorControlPlane:
                 "policy_version": context.get("policy_version"),
                 "policy_hash": context.get("policy_hash"),
                 "setup_bindings": _safe_value(context.get("setup_bindings", [])),
+                "proposed_allocation_total": selection.get(
+                    "proposed_allocation_total"
+                ),
+                "proposed_allocation_risk_digest": selection.get(
+                    "proposed_allocation_risk_digest"
+                ),
             },
             "lifetime_budget": _safe_value(persisted_lifetime),
             "expires_at": persisted_expiry,
@@ -2876,6 +3322,12 @@ class OperatorControlPlane:
                 "buy_unknown_usd": authoritative_usage.get("buy_unknown_usd"),
                 "all_in_buy_reserved_usd": authoritative_usage.get("all_in_buy_reserved_usd"),
                 "reserved_exit_capacity": _safe_value(reserved_exit_capacity),
+                "proposed_allocation_total": selection.get(
+                    "proposed_allocation_total"
+                ),
+                "proposed_allocation_risk_digest": selection.get(
+                    "proposed_allocation_risk_digest"
+                ),
                 "equity_status": authoritative_usage.get("equity_status"),
             },
             "blockers": list(
@@ -2890,6 +3342,325 @@ class OperatorControlPlane:
                 )
             ),
         }
+
+    def _activate_reviewed_proposed_selection(
+        self,
+        *,
+        context: Mapping[str, Any],
+        authorization: Mapping[str, Any],
+        actor: str,
+    ) -> Mapping[str, Any] | None:
+        """Append the exact reviewed proposal as the active selection.
+
+        Selection rows are immutable.  Activation therefore commits one
+        successor pointer in the same store transaction after the canary has
+        passed all existing fences; failures leave the paper proposal intact.
+        """
+        loader = getattr(self.store, "load_current_portfolio_selection", None)
+        committer = getattr(self.store, "commit_portfolio_selection", None)
+        if not callable(loader) or not callable(committer):
+            raise OperatorControlError("EXPLORATORY_LIVE_SELECTION_STORAGE_UNAVAILABLE")
+        current = loader()
+        if current is None:
+            return None
+        if not isinstance(current, Mapping):
+            raise OperatorControlError("EXPLORATORY_LIVE_SELECTION_REQUIRED")
+        expected_selection = str(context.get("selection_id") or "").strip()
+        current_selection = str(
+            current.get("selection_id") or current.get("portfolio_selection_id") or ""
+        ).strip()
+        if expected_selection and current_selection != expected_selection:
+            raise OperatorControlError("EXPLORATORY_LIVE_AUTHORIZATION_BINDING_STALE")
+        raw_members = current.get("members", current.get("selected_members", ()))
+        if not isinstance(raw_members, (list, tuple)):
+            raise OperatorControlError("EXPLORATORY_LIVE_SELECTION_REQUIRED")
+        proposal_risk_snapshot = current.get("proposed_allocation_risk_snapshot")
+        proposal_risk_digest = str(
+            current.get("proposed_allocation_risk_digest") or ""
+        ).strip()
+        if proposal_risk_digest:
+            if not isinstance(proposal_risk_snapshot, Mapping):
+                raise OperatorControlError("EXPLORATORY_LIVE_RISK_BINDING_STALE")
+            if self._rolling_canonical_hash(proposal_risk_snapshot) != proposal_risk_digest:
+                raise OperatorControlError("EXPLORATORY_LIVE_RISK_BINDING_STALE")
+            expected_risk_digest = str(
+                context.get("proposed_allocation_risk_digest") or ""
+            ).strip()
+            if expected_risk_digest and expected_risk_digest != proposal_risk_digest:
+                raise OperatorControlError("EXPLORATORY_LIVE_RISK_BINDING_STALE")
+            try:
+                snapshot_capacity = Decimal(
+                    str(proposal_risk_snapshot.get("available_budget", "0"))
+                )
+            except (InvalidOperation, TypeError, ValueError):
+                raise OperatorControlError("EXPLORATORY_LIVE_RISK_BINDING_STALE") from None
+            if not snapshot_capacity.is_finite() or snapshot_capacity < 0:
+                raise OperatorControlError("EXPLORATORY_LIVE_RISK_BINDING_STALE")
+            fresh_capacity = self._fresh_proposed_risk_capacity(proposal_risk_snapshot)
+            for field in (
+                "global_budget",
+                "active_obligations",
+                "uncovered_obligations",
+                "external_obligations",
+                "available_budget",
+            ):
+                try:
+                    reviewed_value = Decimal(str(proposal_risk_snapshot.get(field)))
+                    current_value = Decimal(str(fresh_capacity.get(field)))
+                except (InvalidOperation, TypeError, ValueError):
+                    raise OperatorControlError(
+                        "EXPLORATORY_LIVE_RISK_BINDING_STALE"
+                    ) from None
+                if reviewed_value != current_value:
+                    raise OperatorControlError(
+                        "EXPLORATORY_LIVE_RISK_CAPACITY_CHANGED"
+                    )
+            if bool(
+                proposal_risk_snapshot.get("runtime_accounting_available", True)
+            ) != bool(fresh_capacity.get("runtime_accounting_available", True)):
+                raise OperatorControlError("EXPLORATORY_LIVE_RISK_BINDING_STALE")
+        else:
+            snapshot_capacity = None
+        proposal_members = [
+            dict(member)
+            for member in raw_members
+            if isinstance(member, Mapping)
+            and _canary_selection_member_is_proposed(member)
+        ]
+        if not proposal_members:
+            return current
+        if len(proposal_members) > 3:
+            raise OperatorControlError("BOUNDED_ALLOCATION_REQUIRED")
+        proposal_total = sum(
+            (
+                Decimal(
+                    self._authorization_decimal(
+                        member.get("proposed_allocation"),
+                        "proposed_allocation",
+                    )
+                )
+                for member in proposal_members
+            ),
+            Decimal("0"),
+        )
+        if proposal_total <= 0 or (
+            snapshot_capacity is not None and proposal_total > snapshot_capacity
+        ):
+            raise OperatorControlError("EXPLORATORY_LIVE_RISK_CAPACITY_CHANGED")
+        declared_total = current.get("proposed_allocation_total")
+        if declared_total not in (None, ""):
+            try:
+                if self._authorization_decimal(declared_total, "proposed_allocation_total") != proposal_total:
+                    raise OperatorControlError("EXPLORATORY_LIVE_RISK_BINDING_STALE")
+            except OperatorControlError:
+                raise
+        current_activation = current.get("allocation_activation")
+        if (
+            isinstance(current_activation, Mapping)
+            and str(current_activation.get("status") or "").upper() == "PREPARED"
+        ):
+            active_members: list[dict[str, Any]] = []
+            for member in raw_members:
+                if not isinstance(member, Mapping):
+                    continue
+                item = dict(member)
+                if _canary_selection_member_is_proposed(item):
+                    item.pop("proposed_allocation", None)
+                    item["allocation_active"] = True
+                    item["paper_only"] = False
+                    item["canary_armed"] = True
+                    item["status"] = "ACTIVE"
+                    item["action"] = "HOLD"
+                active_members.append(item)
+            activated_at = utc_now().isoformat()
+            activation = {
+                "status": "ACTIVE",
+                "actor": str(actor).strip() or "operator",
+                "authorization_id": authorization.get("authorization_id")
+                or authorization.get("id"),
+                "proposal_digest": current_activation.get("proposal_digest"),
+                "prepared_selection_id": current_selection,
+                "activated_at": activated_at,
+                "risk_digest": proposal_risk_digest,
+            }
+            setter = getattr(self.store, "set_operator_config", None)
+            if not callable(setter):
+                raise OperatorControlError("EXPLORATORY_LIVE_SELECTION_STORAGE_UNAVAILABLE")
+            activation_payload = {
+                "selection_id": current_selection,
+                "status": "ACTIVE",
+                "paper_only": False,
+                "allocation_active": True,
+                "canary_armed": True,
+                "k": sum(
+                    1
+                    for item in active_members
+                    if str(item.get("status") or "").upper() in {"ACTIVE", "REDUCE"}
+                    and Decimal(str(item.get("allocation") or "0")) > 0
+                ),
+                "members": active_members,
+                "allocation_activation": activation,
+            }
+            review_loader = getattr(self.store, "load_portfolio_review_state", None)
+            review_saver = getattr(self.store, "save_portfolio_review_state", None)
+            review = review_loader() if callable(review_loader) else None
+            review_payload = dict(review) if isinstance(review, Mapping) else {}
+            review_payload.update(
+                {
+                    "portfolio_selection_id": current_selection,
+                    "status": "ACTIVE",
+                    "allocation_activation": activation,
+                    "updated_at": activated_at,
+                }
+            )
+            binding_before = self._capture_canary_selection_binding()
+            rollback_marker = {
+                "status": "PENDING",
+                "selection_id": current_selection,
+                "binding": binding_before,
+                "created_at": activated_at,
+            }
+            active_candidate = next(
+                (
+                    str(item.get("candidate_id") or "").strip()
+                    for item in active_members
+                    if isinstance(item, Mapping)
+                    and str(item.get("candidate_id") or "").strip()
+                    and item.get("allocation_active") is True
+                ),
+                "",
+            )
+            active_hash = _canary_authorization_current_selection_hash(current)
+            if not active_candidate:
+                raise OperatorControlError("EXPLORATORY_LIVE_CANDIDATE_REQUIRED")
+            transaction_factory = getattr(self.store, "transaction", None)
+            if callable(transaction_factory):
+                try:
+                    transaction_context = transaction_factory(immediate=True)
+                except TypeError:
+                    transaction_context = transaction_factory()
+            else:
+                transaction_context = nullcontext()
+            with transaction_context:
+                setter("rolling_selection_activation", activation_payload)
+                if callable(review_saver):
+                    review_saver(review_payload)
+                setter("canary_selection_binding_rollback", rollback_marker)
+                self._synchronize_canary_selection_binding(
+                    candidate_id=active_candidate,
+                    selection_id=current_selection,
+                    selection_hash=active_hash,
+                )
+            active_view = dict(current)
+            active_view.update(activation_payload)
+            active_view["_canary_selection_binding_before"] = binding_before
+            return active_view
+        proposal_digest = self._rolling_canonical_hash(
+            {
+                "selection_id": current_selection,
+                "policy_id": context.get("policy_id"),
+                "policy_version": context.get("policy_version"),
+                "policy_hash": context.get("policy_hash"),
+                "active_settings_hash": context.get("active_settings_hash"),
+                "active_settings_generation": context.get("active_settings_generation"),
+                "members": [
+                    {
+                        "strategy_version_id": member.get("strategy_version_id"),
+                        "candidate_id": member.get("candidate_id"),
+                        "research_trial_id": member.get("research_trial_id"),
+                        "proposed_allocation": member.get("proposed_allocation"),
+                    }
+                    for member in proposal_members
+                ],
+            }
+        )
+        active_members: list[dict[str, Any]] = []
+        for member in raw_members:
+            if not isinstance(member, Mapping):
+                continue
+            item = dict(member)
+            if _canary_selection_member_is_proposed(item):
+                proposed = self._authorization_decimal(
+                    item.get("proposed_allocation"),
+                    "proposed_allocation",
+                )
+                item.pop("proposed_allocation", None)
+                item["allocation"] = proposed
+                item["allocation_active"] = True
+                item["paper_only"] = False
+                item["canary_armed"] = True
+                item["status"] = "ACTIVE"
+                item["action"] = "HOLD"
+            active_members.append(item)
+        activated_at = utc_now().isoformat()
+        successor = dict(current)
+        successor_id = (
+            "rolling-selection-active-"
+            + self._rolling_canonical_hash(
+                {"predecessor": current_selection, "proposal": proposal_digest}
+            )[:40]
+        )
+        successor.update(
+            {
+                "portfolio_selection_id": successor_id,
+                "selection_id": successor_id,
+                "members": active_members,
+                "status": "ACTIVE",
+                "paper_only": False,
+                "canary_armed": True,
+                "k": sum(
+                    1
+                    for member in active_members
+                    if str(member.get("status", "")).upper() in {"ACTIVE", "REDUCE"}
+                    and Decimal(str(member.get("allocation", "0"))) > 0
+                ),
+                "supersedes_portfolio_selection_id": current_selection,
+                "allocation_activation": {
+                    "status": "ACTIVE",
+                    "actor": str(actor).strip() or "operator",
+                    "authorization_id": authorization.get("authorization_id")
+                    or authorization.get("id"),
+                    "proposal_digest": proposal_digest,
+                    "activated_at": activated_at,
+                    "policy_id": context.get("policy_id"),
+                    "policy_version": context.get("policy_version"),
+                    "policy_hash": context.get("policy_hash"),
+                    "active_settings_hash": context.get("active_settings_hash"),
+                    "active_settings_generation": context.get(
+                        "active_settings_generation"
+                    ),
+                },
+                "selected_at": activated_at,
+                "review_due_at": activated_at,
+            }
+        )
+        review_loader = getattr(self.store, "load_portfolio_review_state", None)
+        review_saver = getattr(self.store, "save_portfolio_review_state", None)
+        review = review_loader() if callable(review_loader) else None
+        review_payload = dict(review) if isinstance(review, Mapping) else {}
+        review_payload.update(
+            {
+                "portfolio_selection_id": successor_id,
+                "status": "ACTIVE",
+                "updated_at": activated_at,
+                "allocation_activation": successor["allocation_activation"],
+            }
+        )
+        transaction_factory = getattr(self.store, "transaction", None)
+        if callable(transaction_factory):
+            try:
+                transaction_context = transaction_factory(immediate=True)
+            except TypeError:
+                transaction_context = transaction_factory()
+            with transaction_context:
+                committed = committer(successor, active_members)
+                if callable(review_saver):
+                    review_saver(review_payload)
+        else:
+            committed = committer(successor, active_members)
+            if callable(review_saver):
+                review_saver(review_payload)
+        return committed if isinstance(committed, Mapping) else successor
 
     def confirm_exploratory_live(
         self,
@@ -2958,13 +3729,32 @@ class OperatorControlPlane:
                 raise OperatorControlError("EXPLORATORY_LIVE_AUTHORIZATION_BINDING_STALE") from None
             if observed_encoded != expected_encoded:
                 raise OperatorControlError("EXPLORATORY_LIVE_AUTHORIZATION_BINDING_STALE")
-        expected_versions = {str(item).strip() for item in context.get("strategy_versions", ()) if str(item).strip()}
-        observed_versions = auth.get("exact_strategy_versions", auth.get("strategy_version_ids", ()))
+        expected_versions = {
+            str(item).strip()
+            for item in context.get("strategy_versions", ())
+            if str(item).strip()
+        }
+        observed_versions = auth.get(
+            "exact_strategy_versions", auth.get("strategy_version_ids", ())
+        )
         if isinstance(observed_versions, str):
             observed_versions = (observed_versions,)
-        if {str(item).strip() for item in (observed_versions or ()) if str(item).strip()} != expected_versions:
+        if (
+            {
+                str(item).strip()
+                for item in (observed_versions or ())
+                if str(item).strip()
+            }
+            != expected_versions
+        ):
             raise OperatorControlError("EXPLORATORY_LIVE_AUTHORIZATION_BINDING_STALE")
-        for field in ("scope_hash", "scope_version", "active_settings_hash"):
+        for field in (
+            "scope_hash",
+            "scope_version",
+            "active_settings_hash",
+            "proposed_allocation_total",
+            "proposed_allocation_risk_digest",
+        ):
             if str(auth.get(field) or "") != str(context.get(field) or ""):
                 raise OperatorControlError("EXPLORATORY_LIVE_AUTHORIZATION_BINDING_STALE")
         try:
@@ -3022,6 +3812,8 @@ class OperatorControlPlane:
                 "scope_version",
                 "active_settings_hash",
                 "active_settings_generation",
+                "proposed_allocation_total",
+                "proposed_allocation_risk_digest",
             ):
                 if _encoded(expected.get(field)) != _encoded(observed.get(field)):
                     return False
@@ -3051,11 +3843,10 @@ class OperatorControlPlane:
                 ).strip().upper()
                 if bool(member.get("rejected")) or status_value == "REJECTED":
                     continue
-                try:
-                    allocation_value = Decimal(str(member.get("allocation") or "0"))
-                except (ArithmeticError, TypeError, ValueError):
-                    allocation_value = Decimal("0")
-                if allocation_value.is_finite() and allocation_value > 0:
+                if (
+                    _canary_selection_member_is_funded(member)
+                    or _canary_selection_member_is_proposed(member)
+                ):
                     server_candidate_id = str(
                         member.get("candidate_id") or ""
                     ).strip()
@@ -3106,6 +3897,7 @@ class OperatorControlPlane:
 
         auth_id = str(auth.get("authorization_id") or auth.get("id") or "").strip()
         activated_generation = auth.get("generation")
+        active_selection: Mapping[str, Any] | None = None
         try:
             if status == "DRAFT":
                 activated = self.activate_execution_authorization(
@@ -3136,6 +3928,8 @@ class OperatorControlPlane:
                         "scope_version",
                         "active_settings_hash",
                         "active_settings_generation",
+                        "proposed_allocation_total",
+                        "proposed_allocation_risk_digest",
                     )
                 }
                 for field, expected in reviewed_bindings.items():
@@ -3253,6 +4047,13 @@ class OperatorControlPlane:
                     service.disarm()
                     armed_new = False
                     raise
+            active_selection = self._activate_reviewed_proposed_selection(
+                context=context,
+                authorization=auth,
+                actor=actor,
+            )
+            if active_selection is not None and not isinstance(active_selection, Mapping):
+                raise OperatorControlError("EXPLORATORY_LIVE_SELECTION_REQUIRED")
             enabled = service.enable_autonomous_micro_live(
                 venue="polymarket",
                 config_id=str(config_id),
@@ -3270,6 +4071,7 @@ class OperatorControlPlane:
                 service.disarm()
                 armed_new = False
                 raise
+            self._clear_canary_selection_binding_rollback()
             return {
                 "status": "AUTONOMOUS_MICRO_LIVE",
                 "authorization": _safe_value(auth),
@@ -3283,6 +4085,58 @@ class OperatorControlPlane:
             }
         except Exception as original_error:
             rollback_failures: list[str] = []
+            if isinstance(active_selection, Mapping):
+                binding_before = active_selection.get("_canary_selection_binding_before")
+                if isinstance(binding_before, Mapping):
+                    try:
+                        self._restore_canary_selection_binding(binding_before)
+                    except Exception as exc:
+                        rollback_failures.append(
+                            f"CANARY_SELECTION_ROLLBACK_FAILED:{type(exc).__name__}"
+                        )
+                setter = getattr(self.store, "set_operator_config", None)
+                if callable(setter):
+                    prepared_members = []
+                    for raw_member in active_selection.get("members", ()):
+                        if not isinstance(raw_member, Mapping):
+                            continue
+                        item = dict(raw_member)
+                        allocation = item.get("allocation")
+                        if (
+                            item.get("allocation_active") is True
+                            and allocation not in (None, "", "0", 0)
+                        ):
+                            item["proposed_allocation"] = str(allocation)
+                        item["status"] = "PAPER"
+                        item["action"] = "OBSERVE"
+                        item["paper_only"] = True
+                        item["allocation_active"] = False
+                        item["canary_armed"] = False
+                        prepared_members.append(item)
+                    try:
+                        setter(
+                            "rolling_selection_activation",
+                            {
+                                "selection_id": active_selection.get(
+                                    "selection_id",
+                                    active_selection.get("portfolio_selection_id"),
+                                ),
+                                "status": "PREPARED",
+                                "paper_only": True,
+                                "allocation_active": False,
+                                "canary_armed": False,
+                                "k": 0,
+                                "members": prepared_members,
+                                "allocation_activation": {
+                                    "status": "PREPARED",
+                                    "rolled_back_at": utc_now().isoformat(),
+                                },
+                            },
+                        )
+                    except Exception as exc:
+                        rollback_failures.append(
+                            f"SELECTION_ROLLBACK_FAILED:{type(exc).__name__}"
+                        )
             if service is not None and armed_new:
                 try:
                     service.disarm()

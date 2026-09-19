@@ -961,6 +961,356 @@ class NodeIdentityPersistenceTests(unittest.TestCase):
                     node._stop_heartbeat_watchdog()
 
 
+class ExploratoryRollingProgressionTests(unittest.TestCase):
+    def _processor(self, db: str, store: AxiomStore) -> AutonomousResearchProcessor:
+        node = ResearchNode(
+            NodeConfig(
+                db,
+                mutation_enabled=False,
+                crypto_enabled=False,
+                rolling_review_interval_seconds=86400,
+            ),
+            provider=InMemoryPredictionProvider([]),
+            store=store,
+            clock=lambda: T0,
+        )
+        return node.research_processor
+
+    def test_cold_start_bootstrap_is_restart_idempotent_without_timestamp_churn(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = str(Path(directory) / "exploratory-bootstrap.sqlite")
+            with AxiomStore(db) as store:
+                processor = self._processor(db, store)
+                first = processor._ensure_exploratory_live_bootstrap(T0)
+                persisted_first = store.get_operator_config(
+                    "rolling_exploratory_operating_policy",
+                    None,
+                )
+                second = processor._ensure_exploratory_live_bootstrap(
+                    T0 + timedelta(minutes=5)
+                )
+                persisted_second = store.get_operator_config(
+                    "rolling_exploratory_operating_policy",
+                    None,
+                )
+                self.assertEqual(first["status"], "PERSISTED")
+                self.assertEqual(second["status"], "PERSISTED")
+                self.assertEqual(persisted_first, persisted_second)
+                self.assertEqual(persisted_first["scope"]["bounded_pool_cap"], 10)
+                self.assertTrue(persisted_first["paper_only"])
+                self.assertFalse(persisted_first["allocation_active"])
+                self.assertFalse(persisted_first["canary_armed"])
+
+    def test_current_market_selection_is_bounded_and_accepts_partial_valid_pool(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = str(Path(directory) / "exploratory-current-markets.sqlite")
+            with AxiomStore(db) as store:
+                processor = self._processor(db, store)
+                market_ids = tuple(f"market-{index:02d}" for index in range(10))
+                resolution = {
+                    "status": "PARTIAL",
+                    "resolved_at": T0.isoformat(),
+                    "scope_hash": "scope-hash",
+                    "scope_version": "scope-v1",
+                    "matched_markets": [
+                        {
+                            "market_id": market_id,
+                            "condition_id": f"condition-{index:02d}",
+                            "yes_token_id": f"yes-{index:02d}",
+                            "no_token_id": f"no-{index:02d}",
+                        }
+                        for index, market_id in enumerate(market_ids)
+                    ],
+                }
+                store.load_market_scope_resolution = Mock(  # type: ignore[method-assign]
+                    return_value=resolution
+                )
+
+                def tracked_rows(*args: object, **kwargs: object) -> list[dict[str, object]]:
+                    selected = tuple(kwargs["market_ids"])  # type: ignore[arg-type]
+                    return [
+                        {
+                            "market_id": market_id,
+                            "observed_at": T0.isoformat(),
+                            "payload": {
+                                "metadata": {
+                                    "market_id": market_id,
+                                    "yes_token_id": f"yes-{int(market_id[-2:]):02d}",
+                                    "no_token_id": f"no-{int(market_id[-2:]):02d}",
+                                    "accepting_orders": True,
+                                },
+                                "snapshot": {
+                                    "enable_order_book": True,
+                                    "order_book": {
+                                        "bids": [{"price": "0.40", "size": "2"}],
+                                        "asks": [{"price": "0.60", "size": "2"}],
+                                    },
+                                },
+                            },
+                        }
+                        for market_id in selected[:4]
+                    ]
+
+                store.tracked_polymarket_markets = tracked_rows  # type: ignore[method-assign]
+                bindings = processor._rolling_current_market_bindings(
+                    {"candidate_id": "candidate-current"},
+                    T0,
+                )
+                self.assertEqual(len(bindings), 3)
+                self.assertEqual(
+                    [item["market_id"] for item in bindings],
+                    list(market_ids[:3]),
+                )
+                self.assertEqual(bindings[0]["book_depth"], "SUITABLE")
+
+    def test_paper_binding_keeps_canonical_setup_capture_and_model_resolution(self) -> None:
+        strategy_document = {
+            "version": 1,
+            "market_type": "prediction",
+            "family": "momentum",
+            "parameters": {
+                "lookback": 1,
+                "threshold": 0.05,
+                "entry_predicate": {
+                    "version": "absolute-move-v1",
+                    "minimum_move": 0.05,
+                    "units": "probability",
+                    "boundary": "inclusive",
+                },
+            },
+            "probability_model": "market-history",
+            "resolution_aware": True,
+            "resolution_inputs": ["market_history"],
+        }
+        strategy_hash = _content_hash(_normalized_strategy_document(strategy_document))
+        strategy = {
+            "candidate_id": "candidate-canonical",
+            "strategy_version_id": "sv-canonical",
+            "research_trial_id": "trial-canonical",
+            "strategy_hash": strategy_hash,
+            "strategy_document": strategy_document,
+            "model_required": False,
+            "scope": {
+                "schema_version": "1",
+                "mode": "EXACT_MARKETS",
+                "market_ids": ["market-canonical"],
+                "filters": {},
+            },
+            "observation_capture_only": False,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            db = str(Path(directory) / "exploratory-canonical-binding.sqlite")
+            with AxiomStore(db) as store:
+                processor = self._processor(db, store)
+                result = processor._ensure_rolling_paper_observation(
+                    strategy,
+                    T0,
+                    market_ids=("market-canonical",),
+                )
+                self.assertIsNotNone(result)
+                specs = ForwardTestRegistry(store).list()
+                materialized = [spec for spec in specs if spec.allowed_markets]
+                self.assertEqual(len(materialized), 1)
+                config = materialized[0].config
+                setup = config["operational_setup"]
+                self.assertTrue(str(setup["setup_id"]).startswith("momentum:"))
+                self.assertEqual(setup["required_observations"]["path_length"], 3)
+                self.assertFalse(setup["model_required"])
+                self.assertEqual(
+                    config["operational_setup_hash"],
+                    _operational_setup_hash(setup),
+                )
+                self.assertEqual(config["model_resolution"]["model_required"], False)
+                self.assertEqual(config["current_market_ids"], ("market-canonical",))
+
+    def test_capture_binding_persists_observation_only_contract(self) -> None:
+        strategy_document = {
+            "version": 1,
+            "market_type": "prediction",
+            "family": "momentum",
+            "parameters": {
+                "lookback": 1,
+                "threshold": 0.05,
+                "entry_predicate": {
+                    "version": "absolute-move-v1",
+                    "minimum_move": 0.05,
+                    "units": "probability",
+                    "boundary": "inclusive",
+                },
+            },
+            "probability_model": "market-history",
+            "resolution_aware": True,
+            "resolution_inputs": ["market_history"],
+        }
+        strategy = {
+            "candidate_id": "candidate-capture",
+            "strategy_version_id": "sv-capture",
+            "research_trial_id": "trial-capture",
+            "strategy_hash": _content_hash(_normalized_strategy_document(strategy_document)),
+            "strategy_document": strategy_document,
+            "model_required": False,
+            "observation_capture_only": True,
+            "scope_resolution_freshness_sla_seconds": 900,
+            "scope": {
+                "schema_version": "1",
+                "mode": "EXACT_MARKETS",
+                "market_ids": ["market-capture"],
+                "filters": {},
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            db = str(Path(directory) / "exploratory-capture-binding.sqlite")
+            with AxiomStore(db) as store:
+                processor = self._processor(db, store)
+                result = processor._ensure_rolling_paper_observation(
+                    strategy,
+                    T0,
+                    market_ids=("market-capture",),
+                )
+                self.assertIsNotNone(result)
+                specs = ForwardTestRegistry(store).list()
+                materialized = [spec for spec in specs if spec.allowed_markets]
+                self.assertEqual(len(materialized), 1)
+                config = materialized[0].config
+                self.assertTrue(config["observation_capture_only"])
+                self.assertEqual(config["execution_scope"], "OBSERVATION")
+                self.assertEqual(config["capture_market_id"], "market-capture")
+                self.assertFalse(config["allocation_active"])
+                self.assertNotIn("operational_setup", config)
+
+    def test_stale_observation_binding_requests_immutable_successor(self) -> None:
+        predecessor_config = {
+            "observation_intent": True,
+            "candidate_id": "candidate-stale",
+            "strategy_document": {"family": "momentum"},
+            "current_market_ids": ["market-old"],
+        }
+        predecessor = SimpleNamespace(
+            config=predecessor_config,
+            allowed_markets=("market-old",),
+            strategy_hash="sha256:stale",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            db = str(Path(directory) / "exploratory-successor.sqlite")
+            with AxiomStore(db) as store:
+                processor = self._processor(db, store)
+                processor._rolling_current_market_bindings = Mock(  # type: ignore[method-assign]
+                    return_value=({"market_id": "market-new"},)
+                )
+                successor = Mock()
+                processor._ensure_rolling_paper_observation = successor  # type: ignore[method-assign]
+                node = ResearchNode(
+                    NodeConfig(db, mutation_enabled=False, crypto_enabled=False),
+                    provider=InMemoryPredictionProvider([]),
+                    store=store,
+                    clock=lambda: T0,
+                )
+                node.research_processor = processor
+                node._refresh_rolling_observation_successors(
+                    ForwardTestRegistry(store),
+                    (predecessor,),
+                    T0,
+                )
+                successor.assert_called_once()
+                self.assertEqual(
+                    successor.call_args.kwargs["market_ids"],
+                    ("market-new",),
+                )
+                self.assertEqual(predecessor.config["current_market_ids"], ["market-old"])
+
+
+    def test_current_binding_signature_ignores_timestamp_only_refresh(self) -> None:
+        binding = {
+            "market_id": "market-stable",
+            "condition_id": "condition-stable",
+            "yes_token_id": "yes-stable",
+            "no_token_id": "no-stable",
+            "outcome_token_id": "yes-stable",
+            "scope_resolution_id": "resolution-stable",
+            "scope_hash": "scope-hash",
+            "scope_version": "scope-v1",
+            "book_depth": "SUITABLE",
+            "observed_at": T0.isoformat(),
+        }
+        predecessor_config = {
+            "observation_intent": True,
+            "candidate_id": "candidate-stable",
+            "strategy_document": {"family": "momentum"},
+            "current_market_ids": ["market-stable"],
+            "current_market_bindings": [binding],
+        }
+        predecessor = SimpleNamespace(
+            config=predecessor_config,
+            allowed_markets=("market-stable",),
+            strategy_hash="sha256:stable",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            db = str(Path(directory) / "exploratory-stable.sqlite")
+            with AxiomStore(db) as store:
+                processor = self._processor(db, store)
+                processor._rolling_current_market_bindings = Mock(
+                    return_value=({**binding, "observed_at": (T0 + timedelta(seconds=1)).isoformat()},)
+                )
+                processor._ensure_rolling_paper_observation = Mock()
+                node = ResearchNode(
+                    NodeConfig(db, mutation_enabled=False, crypto_enabled=False),
+                    provider=InMemoryPredictionProvider([]),
+                    store=store,
+                    clock=lambda: T0,
+                )
+                node.research_processor = processor
+                node._refresh_rolling_observation_successors(
+                    ForwardTestRegistry(store), (predecessor,), T0
+                )
+                processor._ensure_rolling_paper_observation.assert_not_called()
+
+    def test_current_binding_signature_changes_on_condition_or_depth(self) -> None:
+        binding = {
+            "market_id": "market-binding-change",
+            "condition_id": "condition-before",
+            "yes_token_id": "yes-before",
+            "no_token_id": "no-before",
+            "outcome_token_id": "yes-before",
+            "scope_resolution_id": "resolution-before",
+            "scope_hash": "scope-before",
+            "scope_version": "scope-v1",
+            "book_depth": "SUITABLE",
+        }
+        predecessor_config = {
+            "observation_intent": True,
+            "candidate_id": "candidate-binding-change",
+            "strategy_document": {"family": "momentum"},
+            "current_market_ids": ["market-binding-change"],
+            "current_market_bindings": [binding],
+        }
+        predecessor = SimpleNamespace(
+            config=predecessor_config,
+            allowed_markets=("market-binding-change",),
+            strategy_hash="sha256:binding-change",
+        )
+        changed = {
+            **binding,
+            "condition_id": "condition-after",
+            "book_depth": "INSUFFICIENT",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            db = str(Path(directory) / "exploratory-binding-change.sqlite")
+            with AxiomStore(db) as store:
+                processor = self._processor(db, store)
+                processor._rolling_current_market_bindings = Mock(return_value=(changed,))
+                processor._ensure_rolling_paper_observation = Mock()
+                node = ResearchNode(
+                    NodeConfig(db, mutation_enabled=False, crypto_enabled=False),
+                    provider=InMemoryPredictionProvider([]),
+                    store=store,
+                    clock=lambda: T0,
+                )
+                node.research_processor = processor
+                node._refresh_rolling_observation_successors(
+                    ForwardTestRegistry(store), (predecessor,), T0
+                )
+                processor._ensure_rolling_paper_observation.assert_called_once()
+
 class SchedulerScaleTests(unittest.TestCase):
     def test_independent_cadence_fairness_restart_and_wal_reads(self) -> None:
         strategy_document = {
