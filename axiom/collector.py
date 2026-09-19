@@ -36,6 +36,7 @@ from .domain import (
     utc_now,
 )
 from .storage import AxiomStore
+from .canary import _canary_selection_member_is_funded
 from .forward import ForwardTestRegistry, ForwardTestSpec
 from .lifecycle import CandidateLifecycleManager, CandidateStage
 _UNSET = object()
@@ -455,8 +456,11 @@ class PolymarketCollector:
         # selected member has no exact scope resolution, discovery must not
         # widen the cycle back to the public catalog.
         self._rolling_scope_blocked = False
+        self._rolling_scope_member_invalid = False
         self._rolling_scope_candidate_ids: tuple[str, ...] = ()
         self._rolling_scope_documents: dict[str, Mapping[str, Any]] = {}
+        self._rolling_scope_policy: Mapping[str, Any] = {}
+        self._rolling_background_discovery_enabled = False
         self._scope_authority_market_ids: set[str] = set()
 
         self._scope_direct_lookup_cursor = 0
@@ -996,15 +1000,23 @@ class PolymarketCollector:
         paper_scheduled = paper_markets[:remaining]
         remaining = max(0, remaining - len(paper_scheduled))
 
-        discovery_cursor = scope_cursor if scope_candidate_set else root_state.get(
-            "discovery_carry_cursor", 0
+        discovery_cursor = (
+            scope_cursor
+            if scope_candidate_set and not self._rolling_background_discovery_enabled
+            else root_state.get("discovery_carry_cursor", 0)
         )
         discovery_scheduled: list[str] = []
         discovered: dict[str, PredictionMarketSnapshot] = {}
         discovery_deferred: list[str] = []
+        raw_discovery_coverage = (
+            (self._discovery_continuation or {}).get("coverage_status")
+            if isinstance(self._discovery_continuation, Mapping)
+            else None
+        )
         discovery_coverage_status = (
-            str((self._discovery_continuation or {}).get("coverage_status", "")).upper()
-            or None
+            str(raw_discovery_coverage).strip().upper()
+            if raw_discovery_coverage not in (None, "")
+            else None
         )
         discovery_exclusions.extend(
             dict(item)
@@ -1021,8 +1033,12 @@ class PolymarketCollector:
         # widening into live collection authority.
         if (
             not configured
-            and not scope_candidate_set
+            and (
+                not scope_candidate_set
+                or self._rolling_background_discovery_enabled
+            )
             and not self._rolling_scope_blocked
+            and not self._rolling_scope_member_invalid
             and remaining > 0
             and self.config.discovery_budget_per_cycle > 0
         ):
@@ -1047,9 +1063,15 @@ class PolymarketCollector:
                     for identifier in deferred
                     if identifier not in known_candidate and identifier not in paper_markets
                 ]
+                raw_discovery_coverage = (
+                    (self._discovery_continuation or {}).get("coverage_status")
+                    if isinstance(self._discovery_continuation, Mapping)
+                    else None
+                )
                 discovery_coverage_status = (
-                    str((self._discovery_continuation or {}).get("coverage_status", "")).upper()
-                    or ("PARTIAL" if next_cursor is not None else "COMPLETE")
+                    str(raw_discovery_coverage).strip().upper()
+                    if raw_discovery_coverage not in (None, "")
+                    else ("PARTIAL" if next_cursor is not None else "COMPLETE")
                 )
                 discovery_cursor = next_cursor
             except Exception as exc:
@@ -1084,8 +1106,12 @@ class PolymarketCollector:
         )[-256:]
         if (
             not configured
-            and not scope_candidate_set
+            and (
+                not scope_candidate_set
+                or self._rolling_background_discovery_enabled
+            )
             and not self._rolling_scope_blocked
+            and not self._rolling_scope_member_invalid
             and remaining > len(discovery_scheduled)
         ):
             try:
@@ -1277,15 +1303,17 @@ class PolymarketCollector:
         )
         if capacity_reason is None and due_candidates and len(candidate_scheduled) < len(due_candidates):
             capacity_reason = "COLLECTOR_CAPACITY_INSUFFICIENT"
-        discovery_complete = (
-            None
-            if configured or scope_candidate_set
-            else (
+        if self._rolling_background_discovery_enabled:
+            discovery_coverage_status = discovery_coverage_status or "PARTIAL"
+            discovery_complete = discovery_coverage_status == "COMPLETE"
+        elif configured or scope_candidate_set:
+            discovery_complete = None
+        else:
+            discovery_complete = (
                 discovery_coverage_status == "COMPLETE"
                 if discovery_coverage_status is not None
                 else None
             )
-        )
         scope_continuation = (
             self._scope_inventory_continuation
             if isinstance(self._scope_inventory_continuation, Mapping)
@@ -1685,8 +1713,11 @@ class PolymarketCollector:
         blocks rolling discovery rather than widening into the public catalog.
         """
         self._rolling_scope_blocked = False
+        self._rolling_scope_member_invalid = False
         self._rolling_scope_candidate_ids = ()
         self._rolling_scope_documents = {}
+        self._rolling_scope_policy = {}
+        self._rolling_background_discovery_enabled = False
         superseded_candidate_ids, _ = self._superseded_observation_ids()
         selection_loader = getattr(self.store, "load_current_portfolio_selection", None)
 
@@ -1695,20 +1726,62 @@ class PolymarketCollector:
         try:
             selection = selection_loader()
         except Exception:
-            self._rolling_scope_blocked = True
             return []
         if selection is None:
             return []
         if not isinstance(selection, Mapping):
-            self._rolling_scope_blocked = True
             return []
+        policy_sources = (
+            selection.get("exploratory_policy"),
+            selection.get("operating_policy"),
+            selection.get("execution_policy"),
+            selection.get("setup_policy"),
+            selection.get("policy_mode"),
+        )
+        policy_value = next(
+            (value for value in policy_sources if value not in (None, "")),
+            None,
+        )
+        if isinstance(policy_value, Mapping):
+            policy_value = dict(policy_value)
+        else:
+            policy_value = {"mode": str(policy_value).strip().upper()} if policy_value else {}
+        if str(policy_value.get("mode", "")).strip().upper() == "EXPLORATORY_LIVE":
+            self._rolling_scope_policy = policy_value
+            self._rolling_background_discovery_enabled = True
         members = selection.get("members", selection.get("selected_members", ()))
         if not isinstance(members, (list, tuple)):
-            self._rolling_scope_blocked = True
+            if self._rolling_background_discovery_enabled:
+                self._rolling_scope_blocked = True
             return []
         if not members:
-            self._rolling_scope_blocked = True
+            if self._rolling_background_discovery_enabled:
+                self._rolling_scope_blocked = True
             return []
+        if self._rolling_background_discovery_enabled:
+            if len(members) > 10:
+                self._rolling_scope_blocked = True
+                return []
+            target_members = self._rolling_scope_policy.get("target_members")
+            target_maximum = (
+                target_members.get("maximum")
+                if isinstance(target_members, Mapping)
+                else None
+            )
+            try:
+                target_maximum = min(3, int(target_maximum or 3))
+            except (TypeError, ValueError, OverflowError):
+                self._rolling_scope_blocked = True
+                return []
+            funded_members = [
+                member
+                for member in members
+                if _canary_selection_member_is_funded(member)
+            ]
+            if len(funded_members) > target_maximum:
+                self._rolling_scope_blocked = True
+                return []
+            members = members[:10]
 
         def normalized_ids(value: Any) -> list[str]:
             if isinstance(value, str):
@@ -1784,16 +1857,14 @@ class PolymarketCollector:
         result: list[str] = []
         connection = getattr(self.store, "connection", None)
         execute = getattr(connection, "execute", None)
-        if not callable(execute):
-            self._rolling_scope_blocked = True
 
         for member in members:
             if not isinstance(member, Mapping):
-                self._rolling_scope_blocked = True
+                self._rolling_scope_member_invalid = True
                 continue
             strategy_version_id = str(member.get("strategy_version_id", "")).strip()
             if not strategy_version_id:
-                self._rolling_scope_blocked = True
+                self._rolling_scope_member_invalid = True
                 continue
             payload: Any = None
             if callable(execute):
@@ -1824,7 +1895,7 @@ class PolymarketCollector:
                 if payload is None and self._has_scope_material(member):
                     payload = member
             if not isinstance(payload, Mapping):
-                self._rolling_scope_blocked = True
+                self._rolling_scope_member_invalid = True
                 continue
 
 
@@ -1851,10 +1922,11 @@ class PolymarketCollector:
             ]
             candidate_ids = list(dict.fromkeys(candidate_values))
             if len(candidate_ids) > 1:
-                self._rolling_scope_blocked = True
+                self._rolling_scope_member_invalid = True
                 continue
             candidate_id = candidate_ids[0] if candidate_ids else None
             if candidate_id and candidate_id in superseded_candidate_ids:
+                self._rolling_scope_member_invalid = True
                 continue
             scope_documents: list[Mapping[str, Any]] = []
             legacy_ids: list[str] = []
@@ -1933,7 +2005,7 @@ class PolymarketCollector:
                 else:
                     member_scope_failed = True
             if member_scope_failed or (canonical_scope_seen and not member_ids):
-                self._rolling_scope_blocked = True
+                self._rolling_scope_member_invalid = True
                 continue
             if not canonical_scope_seen:
                 member_ids.extend(legacy_ids)
@@ -1948,6 +2020,10 @@ class PolymarketCollector:
                 ]))
                 self._rolling_scope_documents[candidate_id] = self._scope_document(payload)
             result.extend(member_ids)
+        if not self._rolling_background_discovery_enabled:
+            self._rolling_scope_member_invalid = False
+        elif not result:
+            self._rolling_scope_blocked = True
         return list(dict.fromkeys(result))[: self.config.max_markets]
 
 

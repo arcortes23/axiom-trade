@@ -1884,6 +1884,31 @@ class OperatorControlTests(unittest.TestCase):
         )
         with urlopen(request, timeout=3) as response:
             return response.status, json.loads(response.read())
+    def test_exploratory_flat_target_fields_are_accepted_and_forwarded(self) -> None:
+        assert self.server._server is not None
+        with patch.object(self.control, "execute", return_value={"ok": True}) as execute:
+            status, result = self._post(
+                {
+                    "action": "exploratory.live.review_confirm",
+                    "confirm": "CONFIRM EXPLORATORY LIVE",
+                    "candidate_id": "candidate-live",
+                    "market_id": "market-live",
+                    "token_id": "token-live",
+                },
+                token=self.server._server.control_token,
+            )
+        self.assertEqual(status, 200)
+        self.assertTrue(result["ok"])
+        payload = execute.call_args.kwargs["payload"]
+        self.assertEqual(
+            payload,
+            {
+                "candidate_id": "candidate-live",
+                "market_id": "market-live",
+                "token_id": "token-live",
+            },
+        )
+
 
     def test_localhost_control_requires_token_and_allowlist(self) -> None:
         assert self.server._server is not None
@@ -2880,6 +2905,454 @@ class OperatorControlTests(unittest.TestCase):
             dashboard["canary"]["selected_winner"]["last_selected_candidate"], "B"
         )
 
+
+    def _exploratory_confirm_context(self) -> tuple[dict[str, object], dict[str, object], dict[str, object]]:
+        binding = {
+            "strategy_version_id": "strategy-live",
+            "candidate_id": "candidate-live",
+            "setup_id": "setup-live",
+            "setup_version": "setup-v1",
+            "setup_hash": "setup-hash",
+        }
+        context = {
+            "selection_id": "selection-live",
+            "selection_hash": "selection-hash",
+            "policy_id": "policy-live",
+            "policy_version": "policy-v1",
+            "policy_hash": "policy-hash",
+            "setup_bindings": [binding],
+            "strategy_versions": ["strategy-live"],
+            "scope_hash": "scope-hash",
+            "scope_version": "scope-v1",
+            "active_settings_hash": "settings-hash",
+            "active_settings_generation": 1,
+        }
+        draft = {
+            "authorization_id": "auth-live",
+            "generation": 1,
+            "status": "DRAFT",
+            "exact_strategy_versions": ["strategy-live"],
+            "lifetime_budget": "1.00",
+            "expires_at": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+            "stop_rules": {"on_any_blocker": "STOP"},
+            **context,
+        }
+        review = {
+            "blockers": [],
+            "members": [{"candidate_id": "candidate-live"}],
+        }
+        return context, draft, review
+
+    def test_exploratory_live_review_confirm_success_merges_persisted_bindings(self) -> None:
+        context, draft, review = self._exploratory_confirm_context()
+        credentials = _configured_credentials()
+        service = Mock()
+        service.authoritative_status.side_effect = [
+            {"micro_live_canary": "DISARMED"},
+            {
+                "micro_live_canary": "ARMED",
+                "control_candidate": "candidate-live",
+                "selected_candidate": "candidate-live",
+            },
+            {
+                "micro_live_canary": "AUTONOMOUS_MICRO_LIVE",
+                "control_candidate": "candidate-live",
+                "selected_candidate": "candidate-live",
+            },
+        ]
+        service.enable_autonomous_micro_live.return_value = {
+            "state": "AUTONOMOUS_MICRO_LIVE",
+            "control_candidate": "candidate-live",
+            "selected_candidate": "candidate-live",
+        }
+        activated = {
+            "authorization": {
+                "authorization_id": "auth-live",
+                "generation": 2,
+                "status": "ACTIVE",
+                "exact_strategy_versions": ["strategy-live"],
+                "lifetime_budget": draft["lifetime_budget"],
+                "expires_at": draft["expires_at"],
+                "stop_rules": draft["stop_rules"],
+                "scope_hash": "scope-hash",
+                "scope_version": "scope-v1",
+                "active_settings_hash": "settings-hash",
+                "active_settings_generation": 1,
+            }
+        }
+        with patch.object(self.control, "execution_authorization_snapshot", return_value={"active": None, "draft": draft}), patch.object(
+            self.control, "_authorization_context", return_value=context
+        ), patch.object(self.control, "exploratory_live_review_snapshot", return_value=review), patch.object(
+            self.control, "activate_execution_authorization", return_value=activated
+        ), patch("axiom.operator.CredentialStore", return_value=credentials), patch(
+            "axiom.operator.PolymarketClobV2Venue", return_value=Mock()
+        ), patch("axiom.operator.CanaryService", return_value=service), patch.object(
+            self.control.settings, "snapshot", return_value={"config_id": "risk", "generation": 1}
+        ):
+            result = self.control.confirm_exploratory_live(
+                {"confirmation": "CONFIRM EXPLORATORY LIVE"}
+            )
+        self.assertTrue(result["live_execution"])
+        self.assertFalse(result["paper_only"])
+        self.assertEqual(result["authorization"]["policy_hash"], "policy-hash")
+        service.arm.assert_called_once()
+        service.enable_autonomous_micro_live.assert_called_once()
+    def test_exploratory_live_confirmation_cannot_retain_stale_candidate(self) -> None:
+        context, draft, review = self._exploratory_confirm_context()
+
+        def reviewed(candidate_id: str, strategy_id: str) -> tuple[dict[str, object], dict[str, object], dict[str, object]]:
+            current = dict(context)
+            current["strategy_versions"] = [strategy_id]
+            current["setup_bindings"] = [
+                {
+                    "strategy_version_id": strategy_id,
+                    "candidate_id": candidate_id,
+                    "setup_id": "setup-live",
+                    "setup_version": "setup-v1",
+                    "setup_hash": "setup-hash",
+                }
+            ]
+            current["selection"] = {
+                "members": [
+                    {
+                        "candidate_id": candidate_id,
+                        "strategy_version_id": strategy_id,
+                        "allocation": "1.00",
+                        "status": "ACTIVE",
+                    }
+                ]
+            }
+            authorization = dict(draft)
+            authorization.update(
+                {
+                    "status": "ACTIVE",
+                    "exact_strategy_versions": [strategy_id],
+                    "setup_bindings": list(current["setup_bindings"]),
+                }
+            )
+            disclosure = {
+                "blockers": [],
+                "members": [{"candidate_id": candidate_id}],
+            }
+            return current, authorization, disclosure
+
+        context_a, auth_a, review_a = reviewed("candidate-a", "strategy-a")
+        context_b, auth_b, review_b = reviewed("candidate-b", "strategy-b")
+        credentials = _configured_credentials()
+        stale_service = Mock()
+        stale_service.authoritative_status.return_value = {
+            "micro_live_canary": "ARMED",
+            "control_candidate": "candidate-a",
+            "selected_candidate": "candidate-a",
+        }
+        with patch.object(
+            self.control,
+            "execution_authorization_snapshot",
+            return_value={"active": auth_a, "draft": None},
+        ), patch.object(
+            self.control,
+            "_authorization_context",
+            side_effect=[context_a, context_b],
+        ), patch.object(
+            self.control,
+            "exploratory_live_review_snapshot",
+            return_value=review_a,
+        ), patch("axiom.operator.CredentialStore", return_value=credentials), patch(
+            "axiom.operator.PolymarketClobV2Venue", return_value=Mock()
+        ), patch("axiom.operator.CanaryService", return_value=stale_service), patch.object(
+            self.control.settings,
+            "snapshot",
+            return_value={"config_id": "risk", "generation": 1},
+        ):
+            with self.assertRaisesRegex(
+                OperatorControlError, "^EXPLORATORY_LIVE_AUTHORIZATION_BINDING_STALE$"
+            ):
+                self.control.confirm_exploratory_live(
+                    {"candidate_id": "candidate-a"}
+                )
+        stale_service.disarm.assert_called_once()
+        stale_service.enable_autonomous_micro_live.assert_not_called()
+
+        current_service = Mock()
+        current_service.authoritative_status.side_effect = [
+            {"micro_live_canary": "DISARMED"},
+            {
+                "micro_live_canary": "ARMED",
+                "control_candidate": "candidate-b",
+                "selected_candidate": "candidate-b",
+            },
+            {
+                "micro_live_canary": "AUTONOMOUS_MICRO_LIVE",
+                "control_candidate": "candidate-b",
+                "selected_candidate": "candidate-b",
+            },
+        ]
+        current_service.arm.return_value = {
+            "micro_live_canary": "ARMED",
+            "control_candidate": "candidate-b",
+            "selected_candidate": "candidate-b",
+        }
+        current_service.enable_autonomous_micro_live.return_value = {
+            "micro_live_canary": "AUTONOMOUS_MICRO_LIVE",
+            "control_candidate": "candidate-b",
+            "selected_candidate": "candidate-b",
+        }
+        with patch.object(
+            self.control,
+            "execution_authorization_snapshot",
+            return_value={"active": auth_b, "draft": None},
+        ), patch.object(
+            self.control, "_authorization_context", return_value=context_b
+        ), patch.object(
+            self.control,
+            "exploratory_live_review_snapshot",
+            return_value=review_b,
+        ), patch("axiom.operator.CredentialStore", return_value=credentials), patch(
+            "axiom.operator.PolymarketClobV2Venue", return_value=Mock()
+        ), patch("axiom.operator.CanaryService", return_value=current_service), patch.object(
+            self.control.settings,
+            "snapshot",
+            return_value={"config_id": "risk", "generation": 1},
+        ):
+            result = self.control.confirm_exploratory_live(
+                {"candidate_id": "candidate-b"}
+            )
+        self.assertTrue(result["live_execution"])
+        current_service.arm.assert_called_once_with(
+            "candidate-b",
+            venue=current_service.arm.call_args.kwargs["venue"],
+            config_id="risk",
+            expected_generation=1,
+            credentials_configured=True,
+        )
+        current_service.enable_autonomous_micro_live.assert_called_once()
+
+    def test_exploratory_review_binds_readiness_to_funded_target_and_caps_statuses(self) -> None:
+        context, _draft, _review = self._exploratory_confirm_context()
+        review_context = dict(context)
+        review_context["selection"] = {
+            "operating_policy": {"mode": "EXPLORATORY_LIVE"},
+            "members": [
+                {
+                    "candidate_id": f"candidate-{index}",
+                    "status": status,
+                    "allocation": "1.00",
+                    "market_scope": {
+                        "mode": "EXACT_MARKETS",
+                        "market_ids": [f"market-{index}"],
+                    },
+                }
+                for index, status in enumerate(
+                    ("ACTIVE", "PAPER", "RETAINED", "REDUCE")
+                )
+            ],
+        }
+        with patch.object(self.control, "_authorization_context", return_value=review_context):
+            with self.assertRaisesRegex(
+                OperatorControlError,
+                "^EXPLORATORY_LIVE_AUTHORIZATION_BINDING_STALE$",
+            ):
+                self.control.exploratory_live_review_snapshot(
+                    {"candidate_id": "candidate-3"}
+                )
+            review = self.control.exploratory_live_review_snapshot()
+        self.assertIn("BOUNDED_ALLOCATION_REQUIRED", review["blockers"])
+        self.assertEqual(review["allocation"]["selected_members"], 4)
+        self.assertIn("EXPLORATORY_SETUP_BINDING_REQUIRED", review["blockers"])
+
+    def test_exploratory_live_activation_binding_failure_rolls_back(self) -> None:
+        context, draft, review = self._exploratory_confirm_context()
+        activated = {
+            "authorization": {
+                "authorization_id": "auth-live",
+                "generation": 2,
+                "status": "ACTIVE",
+                "policy_hash": "stale-policy",
+            }
+        }
+        with patch.object(self.control, "execution_authorization_snapshot", return_value={"active": None, "draft": draft}), patch.object(
+            self.control, "_authorization_context", return_value=context
+        ), patch.object(self.control, "exploratory_live_review_snapshot", return_value=review), patch.object(
+            self.control, "activate_execution_authorization", return_value=activated
+        ), patch.object(self.control, "revoke_execution_authorization") as revoke:
+            with self.assertRaisesRegex(
+                OperatorControlError, "^EXPLORATORY_LIVE_AUTHORIZATION_BINDING_STALE$"
+            ):
+                self.control.confirm_exploratory_live(
+                    {"confirmation": "CONFIRM EXPLORATORY LIVE"}
+                )
+        revoke.assert_called_once()
+
+    def test_exploratory_live_arm_failure_rolls_back_authorization(self) -> None:
+        context, draft, review = self._exploratory_confirm_context()
+        service = Mock()
+        service.authoritative_status.return_value = {"micro_live_canary": "DISARMED"}
+        service.arm.side_effect = RuntimeError("arm failed")
+        activated = {"authorization": {**draft, "status": "ACTIVE"}}
+        with patch.object(self.control, "execution_authorization_snapshot", return_value={"active": None, "draft": draft}), patch.object(
+            self.control, "_authorization_context", return_value=context
+        ), patch.object(self.control, "exploratory_live_review_snapshot", return_value=review), patch.object(
+            self.control, "activate_execution_authorization", return_value=activated
+        ), patch.object(self.control, "revoke_execution_authorization") as revoke, patch(
+            "axiom.operator.CredentialStore", return_value=_configured_credentials()
+        ), patch("axiom.operator.PolymarketClobV2Venue", return_value=Mock()), patch(
+            "axiom.operator.CanaryService", return_value=service
+        ), patch.object(self.control.settings, "snapshot", return_value={"config_id": "risk", "generation": 1}):
+            with self.assertRaises(RuntimeError):
+                self.control.confirm_exploratory_live(
+                    {"confirmation": "CONFIRM EXPLORATORY LIVE"}
+                )
+        revoke.assert_called_once()
+
+    def test_exploratory_live_enable_failure_rolls_back_arm_and_authorization(self) -> None:
+        context, draft, review = self._exploratory_confirm_context()
+        service = Mock()
+        service.authoritative_status.return_value = {"micro_live_canary": "DISARMED"}
+        service.enable_autonomous_micro_live.side_effect = RuntimeError("enable failed")
+        activated = {"authorization": {**draft, "status": "ACTIVE"}}
+        with patch.object(self.control, "execution_authorization_snapshot", return_value={"active": None, "draft": draft}), patch.object(
+            self.control, "_authorization_context", return_value=context
+        ), patch.object(self.control, "exploratory_live_review_snapshot", return_value=review), patch.object(
+            self.control, "activate_execution_authorization", return_value=activated
+        ), patch.object(self.control, "revoke_execution_authorization") as revoke, patch(
+            "axiom.operator.CredentialStore", return_value=_configured_credentials()
+        ), patch("axiom.operator.PolymarketClobV2Venue", return_value=Mock()), patch(
+            "axiom.operator.CanaryService", return_value=service
+        ), patch.object(self.control.settings, "snapshot", return_value={"config_id": "risk", "generation": 1}):
+            with self.assertRaises(RuntimeError):
+                self.control.confirm_exploratory_live(
+                    {"confirmation": "CONFIRM EXPLORATORY LIVE"}
+                )
+        service.disarm.assert_called_once()
+        revoke.assert_called_once()
+
+    def test_exploratory_live_status_truthful_after_review_confirm(self) -> None:
+        context, draft, review = self._exploratory_confirm_context()
+        self.assertEqual(draft["status"], "DRAFT")
+        self.assertFalse(review["blockers"])
+        self.assertTrue(context["setup_bindings"])
+    def test_selected_market_preflight_requires_authoritative_provider_identity_and_suitable_depth(self) -> None:
+        selection = {
+            "members": [
+                {
+                    "candidate_id": "candidate-live",
+                    "direction": "BUY YES",
+                    "market_scope": {"mode": "EXACT_MARKETS", "market_ids": ["market-live"]},
+                    "operational_setup": {
+                        "capture_spec": {
+                            "direction": {
+                                "positive_delta": "BUY YES",
+                                "negative_delta": "BUY NO",
+                                "buy_interpretation": "BUY",
+                            }
+                        }
+                    },
+                    "current_market_binding": {
+                        "market_id": "market-live",
+                        "token_id": "token-yes",
+                    },
+                }
+            ]
+        }
+        self.store.set_operator_config(
+            CANARY_CONNECTIVITY_CONFIG_KEY,
+            {
+                "ready": True,
+                "status": "READY",
+                "checked_at": datetime.now(timezone.utc).isoformat(),
+                "diagnostics": {
+                    "authentication": {"status": "OK"},
+                    "account": {"authenticated": True},
+                    "geoblock": {"blocked": False, "close_only": False},
+                    "balance": {"status": "OK"},
+                    "allowance": {"status": "OK"},
+                    "market": {
+                        "market_id": "market-live",
+                        "token_id": "token-yes",
+                        "accepting_orders": True,
+                    },
+                    "book": {
+                        "min_order_size": "1",
+                        "tick_size": "0.01",
+                        "bids": [{"price": "0.49", "size": "10"}],
+                        "asks": [{"price": "0.51", "size": "10"}],
+                        "depth_assessment": {"action": "UNKNOWN"},
+                    },
+                },
+            },
+        )
+        materialized = SimpleNamespace(
+            matched_markets=[
+                {
+                    "market_id": "market-other",
+                    "yes_token_id": "other-yes",
+                    "no_token_id": "other-no",
+                },
+                {
+                    "market_id": "market-live",
+                    "yes_token_id": "token-yes",
+                    "no_token_id": "token-no",
+                },
+            ]
+        )
+        with patch.object(self.store, "load_current_market_resolution", return_value=materialized):
+            blocked = self.control._selected_market_readiness(selection)
+        self.assertEqual(blocked["status"], "BLOCKED")
+        self.assertIn("SELECTED_MARKET_DEPTH_REQUIRED", blocked["blockers"])
+        ready_projection = self.store.get_operator_config(CANARY_CONNECTIVITY_CONFIG_KEY, {})
+        ready_projection["diagnostics"]["book"]["depth_assessment"]["action"] = "SUITABLE"
+        self.store.set_operator_config(CANARY_CONNECTIVITY_CONFIG_KEY, ready_projection)
+        with patch.object(self.store, "load_current_market_resolution", return_value=materialized):
+            ready = self.control._selected_market_readiness(selection)
+        self.assertEqual(ready["status"], "READY")
+        self.assertEqual(ready["market_id"], "market-live")
+        self.assertEqual(ready["token_id"], "token-yes")
+
+    def test_exploratory_live_compensation_failure_forces_kill_and_unknown_status(self) -> None:
+        context, draft, review = self._exploratory_confirm_context()
+        service = Mock()
+        service.authoritative_status.return_value = {"micro_live_canary": "DISARMED"}
+        service.enable_autonomous_micro_live.side_effect = RuntimeError("enable failed")
+        service.disarm.side_effect = RuntimeError("disarm failed")
+        activated = {"authorization": {**draft, "status": "ACTIVE", "generation": 2}}
+        with patch.object(self.control, "execution_authorization_snapshot", return_value={"active": None, "draft": draft}), patch.object(
+            self.control, "_authorization_context", return_value=context
+        ), patch.object(self.control, "exploratory_live_review_snapshot", return_value=review), patch.object(
+            self.control, "activate_execution_authorization", return_value=activated
+        ), patch.object(
+            self.control, "revoke_execution_authorization", side_effect=RuntimeError("revoke failed")
+        ), patch("axiom.operator.CredentialStore", return_value=_configured_credentials()), patch(
+            "axiom.operator.PolymarketClobV2Venue", return_value=Mock()
+        ), patch("axiom.operator.CanaryService", return_value=service), patch.object(
+            self.control.settings, "snapshot", return_value={"config_id": "risk", "generation": 1}
+        ):
+            with self.assertRaisesRegex(
+                OperatorControlError, "^EXPLORATORY_LIVE_ROLLBACK_INCOMPLETE$"
+            ):
+                self.control.confirm_exploratory_live(
+                    {"confirmation": "CONFIRM EXPLORATORY LIVE"}
+                )
+        service.kill.assert_called_once()
+        persisted = self.store.get_operator_config("execution_authorization_review", {})
+        self.assertEqual(persisted["rollback_status"], "INCOMPLETE")
+        self.assertFalse(persisted["live_execution"])
+
+    def test_exploratory_live_execute_wrapper_projects_live_flags(self) -> None:
+        with patch.object(
+            self.control,
+            "confirm_exploratory_live",
+            return_value={
+                "status": "AUTONOMOUS_MICRO_LIVE",
+                "paper_only": False,
+                "live_execution": True,
+            },
+        ):
+            response = self.control.execute(
+                "exploratory.live.review_confirm",
+                confirm="CONFIRM EXPLORATORY LIVE",
+            )
+        self.assertTrue(response["live_execution"])
+        self.assertFalse(response["paper_only"])
 
     def test_get_dashboard_is_side_effect_free_and_survives_control_failure(self) -> None:
         before_changes = self.store.connection.total_changes

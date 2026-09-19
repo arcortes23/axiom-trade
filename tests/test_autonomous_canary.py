@@ -8,6 +8,7 @@ import os
 import threading
 import unittest
 from unittest.mock import Mock, patch
+from types import SimpleNamespace
 from typing import Mapping
 from axiom.auto_canary import AutonomousCanaryWorker
 from axiom.canary import (
@@ -30,7 +31,9 @@ from axiom.operator import (
 )
 from axiom.ranker import CandidateCanaryRanker
 from axiom.storage import AxiomStore
+from axiom.forward import EXPLORATORY_LIVE_POLICY
 from axiom.data_quality import PRICE_PROXY, TIMESTAMPED_DEPTH, evaluate_prediction_data_quality
+from axiom.collector import PolymarketCollector
 
 
 
@@ -251,6 +254,118 @@ def candidate_payload(
 
 
 class AutonomousWorkflowTests(unittest.TestCase):
+    def test_exploratory_live_policy_is_disarmed_by_default(self) -> None:
+        self.assertEqual(EXPLORATORY_LIVE_POLICY["mode"], "EXPLORATORY_LIVE")
+        self.assertLessEqual(EXPLORATORY_LIVE_POLICY["pool_cap"], 10)
+        self.assertEqual(EXPLORATORY_LIVE_POLICY["target_members"], {"minimum": 1, "maximum": 3})
+        self.assertTrue(EXPLORATORY_LIVE_POLICY["paper_only"])
+        self.assertFalse(EXPLORATORY_LIVE_POLICY["allocation_active"])
+        self.assertFalse(EXPLORATORY_LIVE_POLICY["canary_armed"])
+    @staticmethod
+    def _scope_collector(selection: Mapping[str, object]) -> PolymarketCollector:
+        collector = PolymarketCollector.__new__(PolymarketCollector)
+        collector.store = SimpleNamespace(
+            load_current_portfolio_selection=lambda: selection,
+            connection=None,
+        )
+        collector.config = SimpleNamespace(max_markets=10)
+        collector._discovery_continuation = {}
+        collector._superseded_observation_ids = lambda: (set(), ())
+        return collector
+
+    def test_malformed_selected_member_blocks_public_discovery_but_keeps_valid_scope(self):
+        selection = {
+            "operating_policy": dict(EXPLORATORY_LIVE_POLICY),
+            "members": [
+                {},
+                {
+                    "strategy_version_id": "strategy-valid",
+                    "candidate_id": "candidate-valid",
+                    "market_scope": {
+                        "mode": "EXACT_MARKETS",
+                        "market_ids": ["market-valid"],
+                    },
+                },
+            ],
+        }
+        collector = self._scope_collector(selection)
+        market_ids = collector._rolling_scope_market_ids()
+        self.assertEqual(market_ids, ["market-valid"])
+        self.assertTrue(collector._rolling_scope_member_invalid)
+
+    def test_empty_or_nonmapping_selection_blocks_public_discovery(self):
+        for selection in (
+            {"operating_policy": dict(EXPLORATORY_LIVE_POLICY)},
+            {"operating_policy": dict(EXPLORATORY_LIVE_POLICY), "members": []},
+            {"operating_policy": dict(EXPLORATORY_LIVE_POLICY), "members": None},
+        ):
+            collector = self._scope_collector(selection)
+            self.assertEqual(collector._rolling_scope_market_ids(), [])
+            self.assertTrue(collector._rolling_scope_blocked)
+    def test_exploratory_funded_member_limit_is_fail_closed(self):
+        statuses = ("ACTIVE", "PAPER", "RETAINED", "REDUCE")
+        selection = {
+            "operating_policy": dict(EXPLORATORY_LIVE_POLICY),
+            "members": [
+                {
+                    "strategy_version_id": f"strategy-{index}",
+                    "candidate_id": f"candidate-{index}",
+                    "status": statuses[index],
+                    "allocation": "1.00",
+                    "market_scope": {
+                        "mode": "EXACT_MARKETS",
+                        "market_ids": [f"market-{index}"],
+                    },
+                }
+                for index in range(4)
+            ],
+        }
+        collector = self._scope_collector(selection)
+        self.assertEqual(collector._rolling_scope_market_ids(), [])
+        self.assertTrue(collector._rolling_scope_blocked)
+    def test_exploratory_invalid_target_maximum_blocks_without_type_error(self):
+        policy = dict(EXPLORATORY_LIVE_POLICY)
+        policy["target_members"] = {"maximum": "not-an-integer"}
+        selection = {
+            "operating_policy": policy,
+            "members": [
+                {
+                    "strategy_version_id": "strategy-0",
+                    "candidate_id": "candidate-0",
+                    "status": "ACTIVE",
+                    "allocation": "1.00",
+                    "market_scope": {
+                        "mode": "EXACT_MARKETS",
+                        "market_ids": ["market-0"],
+                    },
+                }
+            ],
+        }
+        collector = self._scope_collector(selection)
+        self.assertEqual(collector._rolling_scope_market_ids(), [])
+        self.assertTrue(collector._rolling_scope_blocked)
+
+    def test_exploratory_setup_policy_alias_enables_bounded_discovery(self):
+        selection = {
+            "setup_policy": dict(EXPLORATORY_LIVE_POLICY),
+            "members": [
+                {
+                    "strategy_version_id": "strategy-0",
+                    "candidate_id": "candidate-0",
+                    "status": "ACTIVE",
+                    "allocation": "1.00",
+                    "market_scope": {
+                        "mode": "EXACT_MARKETS",
+                        "market_ids": ["market-0"],
+                    },
+                }
+            ],
+        }
+        collector = self._scope_collector(selection)
+        self.assertEqual(collector._rolling_scope_market_ids(), ["market-0"])
+        self.assertFalse(collector._rolling_scope_blocked)
+
+
     def setUp(self):
         # The release fixture is isolated by default; fake venue/control
         # coverage opts into the exact production profile explicitly.

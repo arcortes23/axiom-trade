@@ -2142,6 +2142,23 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
                 or {"type": "fixed_holding_period", "holding_period_seconds": 0}
             },
         )
+        member.update(
+            {
+                "setup_id": f"setup-{strategy_id}",
+                "setup_version": "setup-v1",
+                "setup_hash": f"setup-hash-{strategy_id}",
+                "operational_setup_hash": f"setup-hash-{strategy_id}",
+                "scope_hash": f"scope-hash-{strategy_id}",
+                "scope_version": "scope-v1",
+                "operational_setup": {
+                    "setup_id": f"setup-{strategy_id}",
+                    "setup_version": "setup-v1",
+                    "setup_hash": f"setup-hash-{strategy_id}",
+                    "scope_hash": f"scope-hash-{strategy_id}",
+                    "scope_version": "scope-v1",
+                },
+            }
+        )
         settings = self._activate_isolated_risk_settings(store)
         config = settings.snapshot(now=NOW)
         active_policy = {

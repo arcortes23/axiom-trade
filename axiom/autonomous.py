@@ -23,11 +23,15 @@ from .backtest import CryptoBacktester
 from .backtest.prediction import run_prediction_research_mode
 from .forward import (
     COMMON_PAPER_ASSUMPTIONS,
+    EXPLORATORY_LIVE_POLICY,
+    EXPLORATORY_LIVE_POLICY_VERSION,
+    EXPLORATORY_LIVE_SETUP_VERSION,
     ForwardTestRegistry,
     _ABSOLUTE_MOVE_PREDICATE,
     _canonical_forward_config,
     _content_hash,
     _normalized_strategy_document,
+    _exploratory_live_requested,
     _operational_setup_for_strategy,
     _operational_setup_hash,
     _prediction_strategy_model_required,
@@ -338,12 +342,18 @@ PREDECLARED_STRATEGY_STARTING_SET: tuple[Mapping[str, Any], ...] = (
     {
         "template": "momentum",
         "parameters": {"lookback": (1,), "threshold": (0.05,)},
-        "metadata": {"research_role": "PRICE_MOMENTUM_ASSESSMENT"},
+        "metadata": {
+            "research_role": "PRICE_MOMENTUM_ASSESSMENT",
+            "operating_policy": EXPLORATORY_LIVE_POLICY_VERSION,
+        },
     },
     {
         "template": "mean_reversion",
         "parameters": {"lookback": (1,), "threshold": (0.05,)},
-        "metadata": {"research_role": "PRICE_MEAN_REVERSION_ASSESSMENT"},
+        "metadata": {
+            "research_role": "PRICE_MEAN_REVERSION_ASSESSMENT",
+            "operating_policy": EXPLORATORY_LIVE_POLICY_VERSION,
+        },
     },
     {
         "template": "probability_mispricing",
@@ -798,15 +808,26 @@ def _operational_setup_fields(
     *,
     dataset_attestation: Mapping[str, Any] | None = None,
     dataset_boundary: Mapping[str, Any] | None = None,
+    include_live_extensions: bool = True,
 ) -> dict[str, Any]:
-    """Return setup material only for an explicit V2 operational plan."""
+    """Return setup material for an explicitly versioned operational plan."""
     if plan is None:
         return {}
     protocol = plan.campaign_protocol
-    if not (
+    protocol_v2 = (
         isinstance(protocol, Mapping)
         and str(protocol.get("schema_version", "")).strip() == CAMPAIGN_SCHEMA_V2
-    ):
+    )
+    try:
+        strategy_document = _normalized_strategy_document(strategy)
+    except Exception:
+        strategy_document = strategy
+    exploratory = bool(
+        include_live_extensions
+        and isinstance(strategy_document, Mapping)
+        and _exploratory_live_requested(strategy_document)
+    )
+    if not protocol_v2 and not exploratory:
         return {}
     config: dict[str, Any] = {}
     config.update(_scope_binding(plan))
@@ -832,12 +853,17 @@ def _operational_setup_fields(
         config["dataset_attestation"] = attestation_binding
     if boundary_binding is not None:
         config["dataset_boundary"] = boundary_binding
+    if exploratory:
+        config["operating_policy"] = dict(EXPLORATORY_LIVE_POLICY)
+    if not exploratory:
+        config["legacy_predeclared"] = True
     setup = _operational_setup_for_strategy(strategy, config)
     if setup is None:
         return {}
+    canonical_setup = _canonical_operational_document(setup)
     result = {
-        "operational_setup": _canonical_operational_document(setup),
-        "operational_setup_hash": _operational_setup_hash(setup),
+        "operational_setup": canonical_setup,
+        "operational_setup_hash": _operational_setup_hash(canonical_setup),
     }
     # Keep the exact immutable source bindings beside the setup.  Forward
     # registration recomputes the setup from this material and must see the
@@ -853,25 +879,35 @@ def _strategy_with_operational_overlay(
     plan: ExperimentPlan,
     strategy: StrategyDefinition,
 ) -> StrategyDefinition:
-    """Apply the fixed setup predicate only to an explicit V2 plan."""
+    """Attach the canonical directional predicate only for supported plans."""
     protocol = plan.campaign_protocol
-    if not (
+    protocol_v2 = (
         isinstance(protocol, Mapping)
         and str(protocol.get("schema_version", "")).strip() == CAMPAIGN_SCHEMA_V2
+    )
+    source = plan.strategy_document
+    source_parameters = source.get("parameters") if isinstance(source, Mapping) else None
+    predicate = (
+        source_parameters.get("entry_predicate")
+        if isinstance(source_parameters, Mapping)
+        else None
+    )
+    document = strategy.to_dict()
+    metadata = document.get("metadata")
+    exploratory = (
+        isinstance(metadata, Mapping)
+        and str(metadata.get("operating_policy", "")).strip()
+        == EXPLORATORY_LIVE_POLICY_VERSION
+    )
+    if not protocol_v2 and not exploratory:
+        return strategy
+    if predicate is None and exploratory:
+        predicate = _ABSOLUTE_MOVE_PREDICATE
+    if (
+        not isinstance(predicate, Mapping)
+        or _canonical_binding(predicate) != _canonical_binding(_ABSOLUTE_MOVE_PREDICATE)
     ):
         return strategy
-    source = plan.strategy_document
-    if not isinstance(source, Mapping):
-        return strategy
-    source_parameters = source.get("parameters")
-    if not isinstance(source_parameters, Mapping):
-        return strategy
-    predicate = source_parameters.get("entry_predicate")
-    if not isinstance(predicate, Mapping):
-        return strategy
-    if _canonical_binding(predicate) != _canonical_binding(_ABSOLUTE_MOVE_PREDICATE):
-        return strategy
-    document = strategy.to_dict()
     parameters = document.get("parameters")
     if not isinstance(parameters, Mapping) or "entry_predicate" in parameters:
         return strategy
@@ -6062,7 +6098,13 @@ class AutonomousResearchProcessor:
                 isinstance(item.get("operational_setup"), Mapping)
                 or item.get("operational_setup_hash") not in (None, "")
             )
-            setup = _operational_setup_for_strategy(document, source_fields) if explicit_setup else None
+            setup = (
+                _canonical_operational_document(
+                    _operational_setup_for_strategy(document, source_fields)
+                )
+                if explicit_setup
+                else None
+            )
             setup_fields = (
                 {
                     "operational_setup": setup,
@@ -9904,9 +9946,19 @@ class AutonomousResearchProcessor:
         if requested_source not in {"HISTORICAL", "REPLAY", "LIVE"}:
             return None
         strategy_document = strategy.get("strategy_document", strategy.get("canonical_strategy"))
+        operational_setup = strategy.get("operational_setup")
+        operational_setup = (
+            operational_setup if isinstance(operational_setup, Mapping) else {}
+        )
+        capture_spec = operational_setup.get("capture_spec")
+        capture_spec = capture_spec if isinstance(capture_spec, Mapping) else None
         declared_holding = strategy.get("holding_period")
         if declared_holding is None and isinstance(strategy_document, Mapping):
             declared_holding = strategy_document.get("holding_period")
+        if declared_holding is None:
+            required_observations = operational_setup.get("required_observations")
+            if isinstance(required_observations, Mapping):
+                declared_holding = required_observations.get("holding")
         try:
             holding_period = int(declared_holding or 1)
         except (TypeError, ValueError, OverflowError):
@@ -9927,6 +9979,18 @@ class AutonomousResearchProcessor:
                 ),
                 "holding_period": holding_period,
             }
+        elif declared_exit is None:
+            holding_semantics = operational_setup.get("holding_semantics")
+            if isinstance(holding_semantics, Mapping):
+                exit_policy = {
+                    "type": "fixed_holding_period",
+                    "holding_period": holding_semantics.get("count", holding_period),
+                }
+            else:
+                exit_policy = {
+                    "type": "fixed_holding_period",
+                    "holding_period": holding_period,
+                }
         else:
             exit_policy = str(declared_exit or "fixed_holding_period")
         observation_horizon = strategy.get("observation_horizon")
@@ -10561,6 +10625,14 @@ class AutonomousResearchProcessor:
             "portfolio_accounting": portfolio_accounting,
             "evaluation": evaluation,
             "operational_evidence": operational_evidence,
+            **(
+                {
+                    "operational_setup_hash": _operational_setup_hash(operational_setup),
+                    "capture_spec": dict(capture_spec),
+                }
+                if capture_spec is not None
+                else {}
+            ),
         }
         evaluation_run_id = run_identity(material)
         return {
@@ -10576,6 +10648,14 @@ class AutonomousResearchProcessor:
             "valid_input_rows": len(valid_rows),
             "evaluator_invoked": evaluation["evaluator_invoked"],
             "evaluator_completed": evaluation["evaluator_completed"],
+            **(
+                {
+                    "operational_setup_hash": _operational_setup_hash(operational_setup),
+                    "capture_spec": dict(capture_spec),
+                }
+                if capture_spec is not None
+                else {}
+            ),
             "evaluated_observations": evaluated_observations,
             "signal_count": signal_count,
             "diagnostic_summary_count": diagnostic_count,
@@ -14162,6 +14242,7 @@ class AutonomousResearchProcessor:
                     },
                 )
                 if setup is not None:
+                    setup = _canonical_operational_document(setup)
                     operational_setups[str(configuration.get("configuration_id", ""))] = {
                         "operational_setup": setup,
                         "operational_setup_hash": _operational_setup_hash(setup),
@@ -18286,17 +18367,29 @@ class AutonomousResearchProcessor:
         scope_binding = _scope_binding(plan)
         strategy_hash = _rolling_hash(strategy_document)
         scope = dict(scope_binding["market_scope"])
-        setup = {
-            "schema_version": "observation-setup-v1",
-            "execution_scope": "OBSERVATION",
-            "paper_only": True,
-            "research_only": True,
-            "allocation_active": False,
-            "canary_armed": False,
-            "market_scope_mode": str(scope.get("mode", "")).strip().upper(),
-            "strategy_family": str(strategy_document.get("family", "")).strip(),
+        setup_config: dict[str, Any] = {
+            **scope_binding,
+            "dataset_id": plan.dataset_id,
+            "dataset_version": plan.dataset_version,
+            "plan_id": plan.plan_id,
+            "plan_hash": plan.plan_hash,
+            "dataset_attestation": dataset_attestation,
+            "dataset_boundary": plan.dataset_boundary,
         }
-        setup_hash = _rolling_hash(setup)
+        setup_config["legacy_predeclared"] = True
+        setup = _operational_setup_for_strategy(strategy_document, setup_config)
+        if setup is None:
+            setup = {
+                "schema_version": "observation-setup-v1",
+                "paper_only": True,
+                "research_only": True,
+                "allocation_active": False,
+                "canary_armed": False,
+                "market_scope_mode": str(scope.get("mode", "")).strip().upper(),
+                "strategy_family": str(strategy_document.get("family", "")).strip(),
+            }
+        setup = _canonical_operational_document(setup)
+        setup_hash = _operational_setup_hash(setup)
         identity = {
             "candidate_id": candidate_id,
             "strategy_hash": strategy_hash,
@@ -18462,6 +18555,13 @@ class AutonomousResearchProcessor:
             if plan.market_type is MarketType.PREDICTION
             else None
         )
+        legacy_predeclared = bool(
+            predeclared_starting_set
+            or (
+                isinstance(plan.methodology, Mapping)
+                and plan.methodology.get("predeclared_starting_set") is True
+            )
+        )
         payload = self._candidate_payload(
             plan,
             candidate_id,
@@ -18471,6 +18571,7 @@ class AutonomousResearchProcessor:
             generation=0,
             lineage=(),
             dataset_attestation=dataset_attestation,
+            include_live_extensions=not legacy_predeclared,
         )
         # Register the worker-generated identity before any lifecycle
         # transition or observation intent is persisted.  The surrounding
@@ -18516,11 +18617,11 @@ class AutonomousResearchProcessor:
                 ),
                 "dataset_id": plan.dataset_id,
                 "dataset_version": plan.dataset_version,
-                "variant": dict(parameters),
                 **_operational_setup_fields(
                     strategy.to_dict(),
                     plan,
                     dataset_attestation=dataset_attestation,
+                    include_live_extensions=not legacy_predeclared,
                     dataset_boundary=plan.dataset_boundary,
                 ),
                 "trial_index": trial_index,
@@ -18561,6 +18662,10 @@ class AutonomousResearchProcessor:
     ) -> Any:
         model_document = plan.model_for() or {"type": "deterministic"}
         setup_fields: dict[str, Any] = {}
+        legacy_predeclared_plan = bool(
+            isinstance(plan.methodology, Mapping)
+            and plan.methodology.get("predeclared_starting_set") is True
+        )
         if plan.market_type is MarketType.CRYPTO_SPOT:
             config: dict[str, Any] = {"paper_only": True}
             risk_limits: Mapping[str, Any] = {"max_position_fraction": 0.0}
@@ -18579,6 +18684,7 @@ class AutonomousResearchProcessor:
                 plan,
                 dataset_attestation=dataset_attestation,
                 dataset_boundary=plan.dataset_boundary,
+                include_live_extensions=not (bool(lineage) or legacy_predeclared_plan),
             )
             if setup_fields:
                 model_document = {"model_required": False}
@@ -18631,8 +18737,29 @@ class AutonomousResearchProcessor:
                         if isinstance(lineage.get("observation_handoff"), Mapping)
                         else {}
                     ),
+                    "legacy_predeclared": True,
+                    **(
+                        {
+                            "dataset_attestation": _operational_attestation_binding(
+                                dataset_attestation
+                            )
+                        }
+                        if isinstance(dataset_attestation, Mapping)
+                        else {}
+                    ),
+                    **(
+                        {
+                            "dataset_boundary": _operational_boundary_binding(
+                                plan.dataset_boundary
+                            )
+                        }
+                        if isinstance(plan.dataset_boundary, Mapping)
+                        else {}
+                    ),
                 }
             )
+        if legacy_predeclared_plan and not lineage:
+            config["legacy_predeclared"] = True
         intent = ForwardTestRegistry(self.store).register_observation_intent(
             strategy=strategy.to_dict(),
             model=dict(model_document),
@@ -18674,6 +18801,7 @@ class AutonomousResearchProcessor:
                                 )
                                 else {}
                             ),
+                            "legacy_predeclared": True,
                         }
                         if isinstance(lineage, Mapping) and lineage
                         else {}
@@ -20919,7 +21047,6 @@ class AutonomousResearchProcessor:
                 else "EXPERIMENT_BUDGET_EXCEEDED"
             )
             raise AutonomousResearchError(reason, str(exc)) from exc
-
     def _candidate_payload(
         self,
         plan: ExperimentPlan,
@@ -20931,6 +21058,7 @@ class AutonomousResearchProcessor:
         generation: int,
         lineage: Sequence[str],
         dataset_attestation: Mapping[str, Any] | None = None,
+        include_live_extensions: bool = True,
     ) -> dict[str, Any]:
         return {
             "candidate_id": candidate_id,
@@ -20945,6 +21073,7 @@ class AutonomousResearchProcessor:
                 plan,
                 dataset_attestation=dataset_attestation,
                 dataset_boundary=plan.dataset_boundary,
+                include_live_extensions=include_live_extensions,
             ),
             "parameters": dict(parameters),
             "variant_id": variant_id,
@@ -20954,6 +21083,7 @@ class AutonomousResearchProcessor:
             "dataset_version": plan.dataset_version,
             "experiment_family": plan.experiment_family,
             "paper_only": True,
+            **({"legacy_predeclared": True} if not include_live_extensions else {}),
             "holdout_used": False,
         }
 

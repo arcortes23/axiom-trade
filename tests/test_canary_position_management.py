@@ -188,6 +188,10 @@ class OfflineOfficialVenue:
         raise AssertionError("production exits must use CanaryService._submit_position_order")
 
 class CanaryPositionManagementTests(unittest.TestCase):
+    def test_unknown_entry_status_is_non_resumable_without_reconciliation(self) -> None:
+        self.assertEqual(position_module._normalized_request_status("UNKNOWN"), "UNKNOWN")
+        self.assertIn("UNKNOWN", position_module.UNKNOWN_ENTRY_STATUSES)
+
     def setUp(self) -> None:
         # The release fixture is isolated by default; fake venue/control
         # coverage opts into the exact production profile explicitly.

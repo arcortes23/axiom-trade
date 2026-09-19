@@ -9860,6 +9860,8 @@ def _dashboard_html(
     <section id="view-canary" class="view"><article class="panel" style="border-color:var(--red)"><div class="section-title"><h2>REAL CANARY MONEY</h2><span class="badge bad">PRODUCTION LIVE TRADING: DISABLED</span></div><div id="canary-action-result" class="page-note"></div><div id="canary-readiness-snapshot"></div><div id="canary-controls"></div><div id="risk-settings"></div><div id="canary-connectivity"></div><div id="canary-summary"></div><div id="canary-trades" class="scroll"></div><p class="notice">Autonomous canary is independent from paper research. No secrets are stored or displayed. It remains prediction-only, bounded by active settings, and killable from this console.</p></article></section>
     <article id="canary-recovery-form" class="panel"><div class="section-title"><h2>UNKNOWN ENTRY RECOVERY</h2><span class="badge warn">READ-ONLY · PRODUCTION PROFILE</span></div><p class="page-note">Attach only an operator-supplied canonical exchange order ID. This does not post, retry, activate, or release an entry.</p><div class="three-col"><label>Event ID<input id="canary-recovery-event" autocomplete="off"></label><label>Signal ID<input id="canary-recovery-signal" autocomplete="off"></label><label>Canonical exchange order ID<input id="canary-recovery-order" autocomplete="off"></label></div><label>Exact confirmation<input id="canary-recovery-confirm" placeholder="RECOVER UNKNOWN ENTRY" autocomplete="off"></label><p class="page-note"><button id="canary-recovery-submit" class="link">Recover and reconcile</button> <span id="canary-recovery-result"></span></p></article>
     <article id="execution-authorization-panel" class="panel" style="border-color:var(--amber)"><div class="section-title"><h2>EXPLORATORY MICRO-CANARY AUTHORIZATION</h2><span class="badge warn">REVIEWED · DISARMED BY DEFAULT</span></div><div id="execution-auth-state" class="page-note">Loading authorization state…</div><pre id="execution-auth-details" class="scroll"></pre><div class="three-col"><label>Purpose<input id="execution-auth-purpose" value="Exploratory micro-canary review" maxlength="120" autocomplete="off"></label><label>Lifetime budget (USD)<input id="execution-auth-budget" value="10" inputmode="decimal" maxlength="16"></label><label>Expires at (UTC, optional)<input id="execution-auth-expires" placeholder="2025-01-01T00:00:00Z" maxlength="32" autocomplete="off"></label></div><label class="page-note"><input id="execution-auth-adverse-evidence" type="checkbox"> I acknowledge the adverse evidence; this review remains paper-only and disarmed.</label><p class="page-note">Review binds the current evidence-selected strategy versions, selection policy, risk settings, scope, and stop rules. The browser never accepts or asks for a private authorization ID.</p><p><button id="execution-auth-review" class="link">Review exploratory authorization</button> <button id="execution-auth-activate" class="link">Activate reviewed authorization</button> <button id="execution-auth-revoke" class="link">Revoke active authorization</button> <span id="execution-auth-result"></span></p></article>
+    <article id="exploratory-live-review-panel" class="panel" style="border-color:var(--red)"><div class="section-title"><h2>EXPLORATORY LIVE FINAL REVIEW</h2><span class="badge bad">PROFITABILITY UNPROVEN · DISARMED BY DEFAULT</span></div><p class="page-note">One confirmation coordinates the existing reviewed authorization, bounded allocation, arm, and autonomous-enable fences. It never submits an order.</p><div id="exploratory-live-review" class="scroll">Loading final review…</div><label>Exact confirmation<input id="exploratory-live-confirm" placeholder="CONFIRM EXPLORATORY LIVE" autocomplete="off"></label><button id="exploratory-live-confirm-action" type="button">Review and confirm EXPLORATORY LIVE</button><div id="exploratory-live-result" class="page-note"></div></article>
+    <p class="page-note">Review disclosure: setup entry predicate/direction/sizing/exit/lookback · bounded scope and ≤3 members · $1 all-in, $0.01 fee reserve, $5 gross daily, $5 aggregate exposure and independent open-cost · 3 positions · 5 submissions/day · $2 realized/equity stops · 100bp slippage · authoritative pending/UNKNOWN usage and reserved exit capacity · explicit finite lifetime budget and expiration · stop rules · trusted account/geoblock/balance/allowance · selected-market book/minimum/depth readiness. Optional 20 submissions/day remains reviewed-only and is never auto-set.</p>
     <section id="view-binance-canary" class="view binance-view"><article class="panel" style="border-color:var(--amber)"><div class="section-title"><h2>BINANCE SPOT CANARY</h2><span class="badge warn">DEVELOPMENT / PAPER|TESTNET</span></div><p class="page-note">Separate from the Polymarket canary. <strong>POLYMARKET TRANSPORT: DISABLED</strong> · Binance Spot only · no implicit control-plane construction.</p><div id="binance-action-result" class="page-note"></div><div id="binance-identity"></div><div id="binance-connectivity"></div><div id="binance-qualification"></div><div id="binance-risk"></div><div id="binance-controls"></div><div id="binance-records" class="scroll"></div><details><summary>Full Binance projection and identifiers</summary><pre id="binance-raw"></pre></details><p class="notice">Credentials are never displayed. Connectivity checks are read-only; order validation is an explicit test action. No browser action can place an order.</p></article></section>
     <div id="binance-testnet-static-labels" hidden>BINANCE SPOT TESTNET · TESTNET CONNECTIVITY · ORDER VALIDATION · TESTNET EXECUTION PROBE · AUTONOMOUS TESTNET · localhost</div>
   </main>
@@ -9879,7 +9881,7 @@ def _dashboard_html(
     function actionResultNode(action) { return $(isCanaryAction(action)?"canary-action-result":isRollingAction(action)?"rolling-action-result":"control-result"); }
     function actionResultMessage(action,message) { const node=actionResultNode(action); if(node)node.textContent=message||""; }
     async function controlPost(action,target="",confirmation="",extra={}) {
-      const payload={action,target,...(extra&&typeof extra==="object"?{payload:extra}: {})}; if(confirmation)payload.confirm=confirmation;
+      const payload={action,target}; if(extra&&typeof extra==="object"&&!Array.isArray(extra)&&Object.keys(extra).length)payload.payload=extra; if(confirmation)payload.confirm=confirmation;
       try {
         const response=await fetch("/api/control",{method:"POST",headers:{"Content-Type":"application/json","X-Axiom-Control-Token":controlToken},body:JSON.stringify(payload),cache:"no-store"});
         const result=await response.json();
@@ -10651,6 +10653,7 @@ def _dashboard_html(
         const response=await fetch("/api/operator",{cache:"no-store"});
         if(!response.ok)throw new Error(`HTTP ${response.status}`);
         const payload=await response.json();
+        const finalReview=$("exploratory-live-review"); if(finalReview&&payload.exploratory_live_review)finalReview.textContent=json(payload.exploratory_live_review);
         lastGood.controls=payload;
         renderExecutionAuthorization(payload);
       } catch(error) {
@@ -10679,6 +10682,14 @@ def _dashboard_html(
       const response=await controlPost(name,"",phrase,fencedPayload);
       if(result)result.textContent=response.ok?`${phrase} completed · ${response.result?.execution_authorization?.status||"updated"}`:`${phrase} blocked: ${response.reason||"CONTROL_FAILED"}`;
       await refreshExecutionAuthorization();
+    });
+    document.addEventListener("click",async event=>{
+      const button=event.target.closest?.("#exploratory-live-confirm-action"); if(!button)return;
+      const result=$("exploratory-live-result"), confirmation=$("exploratory-live-confirm")?.value.trim()||"";
+      const response=await controlPost("exploratory.live.review_confirm","",confirmation,{});
+      if(result)result.textContent=response.ok?"EXPLORATORY LIVE enabled after final review":"Final review blocked: "+(response.reason||"CONTROL_FAILED");
+      const review=$("exploratory-live-review");
+      if(review&&response.result?.exploratory_live)review.textContent=json(response.result.exploratory_live.review||response.result.exploratory_live);
     });
     refreshExecutionAuthorization();
     setInterval(refreshExecutionAuthorization,10000);
@@ -10882,6 +10893,9 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             "config_id",
             "expected_generation",
             "venue",
+            "market_id",
+            "token_id",
+            "candidate_id",
             *_ROLLING_REVIEW_HTTP_FIELDS,
             *_ROLLING_ACTIVATE_HTTP_FIELDS,
             *_EXECUTION_AUTHORIZATION_HTTP_FIELDS,
@@ -10921,6 +10935,11 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             "authorization.activate",
             "authorization.revoke",
         }
+        exploratory_live_actions = {
+            "exploratory.live.review_confirm",
+            "exploratory_live.review_confirm",
+            "canary.exploratory_live.review_confirm",
+        }
         flat_fields = {
             "values",
             "actor",
@@ -10928,7 +10947,9 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             "expected_generation",
             "venue",
         }
-        if action_name in rolling_review_actions:
+        if action_name in exploratory_live_actions:
+            flat_fields |= {"actor", "market_id", "token_id", "candidate_id"}
+        elif action_name in rolling_review_actions:
             flat_fields |= _ROLLING_REVIEW_HTTP_FIELDS
         elif action_name in rolling_activate_actions:
             flat_fields |= _ROLLING_ACTIVATE_HTTP_FIELDS
@@ -10953,6 +10974,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             *rolling_review_actions,
             *rolling_activate_actions,
             *execution_authorization_actions,
+            *exploratory_live_actions,
         }
         if action_payload and action_name not in payload_actions:
             self._send(400, {"error": "action does not accept a payload"})

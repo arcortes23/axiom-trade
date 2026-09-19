@@ -194,23 +194,88 @@ Historical research, forward evidence, paper signals, and simulated fills are
 not live execution evidence. A live fill is never promised by this guide; every
 order-capable path remains independently gated and fail-closed.
 
-## Execution admission and final POST fence
+## EXPLORATORY_LIVE bounded canary
 
-Every order-capable path requires a persisted, unexpired
-`EXPLORATORY_MICRO_CANARY` authorization bound to the active settings
-generation/hash and (for rolling selections) the exact portfolio selection.
-It also requires the current controller lease owner and generation. Those
-authority IDs are stored on the risk reservation, submission-attempt record,
-and exit request; any mismatch or missing binding fails closed.
+`EXPLORATORY_LIVE` is a bounded paper-to-live review policy, not an
+authorization by itself. Its discovery pool is capped at **10** members, and
+only **1–3 direct-valid members** may be enrolled. Every member must retain its
+immutable strategy version, canonical operational setup and hash, capture
+contract, evaluator contract, exact market scope, and current-market
+observation lineage. Capture and evaluation must use that same binding; current
+market data must never be backfilled into historical evidence.
 
-Immediately before the irreversible POST, the venue geoblock, authenticated
-account, selected token/asset identity, signer/funder/owner wallet bindings,
-and exchange spender/allowance identity are read again. A fully blocked
-geoblock blocks both directions. Official close-only mode blocks BUY and
-permits only an otherwise valid, owned managed SELL. Accepted, partial, and
-timeout responses remain durable intents until authoritative reconciliation;
-UNKNOWN is never blindly retried. A fake transport test cannot establish
-live execution or live-fill evidence.
+The only reviewable exception is profitability evidence: a complete reviewer
+disclosure may record profitability as unproven or not reached. This
+profitability-only exception never waives setup, observation, calibration,
+market, account, risk, or safety gates, and it never makes a paper result live
+evidence.
+
+## Current canary settings and finite authorization
+
+The active reviewed settings in this release are **$1.00 per all-in BUY**,
+**$0.01 fee reserve**, **$5.00 gross daily BUY**, **$5.00 aggregate open cost
+and exposure**, **3 open positions**, **5 submitted orders per day**, **100 bp
+maximum slippage**, and **$2.00 realized/equity entry-loss stops**. The
+frequently cited `$20` gross-daily / `$5` per-order values are not the active
+settings here and must not be presented as current configuration.
+
+Each authorization requires a finite lifetime budget, explicit stop rules, and
+an expiry. Missing, stale, expired, or mismatched lifetime, settings
+generation/hash, controller lease, scope, or selection bindings fail closed.
+The lifetime budget and expiry are separate from the daily BUY budget; neither
+is reset implicitly at midnight.
+
+## Strict admission and capture checks
+
+Before any order-capable action, the reviewed authorization must be bound to
+the exact current market and selected token, with a current readiness proof.
+The gate rechecks, fail-closed and independently:
+
+- exact market identity, condition, selected YES/NO token identity, and
+  strategy direction;
+- current market status, accepting-orders state, order-book availability,
+  selected-token depth, spread/slippage, and minimum depth;
+- authenticated account identity, signer/funder/owner wallet, balance,
+  allowance, and exchange spender identity;
+- venue geoblock and jurisdiction policy; a fully blocked geoblock blocks
+  both directions; and
+- the active settings generation/hash, controller lease owner/generation,
+  exact portfolio selection, risk reservation, and authorization expiry.
+
+The final POST fence repeats account, geoblock, market, token, allowance, and
+depth checks immediately before the irreversible request. Close-only mode
+blocks BUY and permits only an otherwise valid managed SELL. Accepted,
+partial, timeout, or unknown responses remain durable intents until
+authoritative reconciliation.
+
+## Restart, UNKNOWN, positions, and exits
+
+`UNKNOWN` is reserved capacity, not success or failure. Reconcile it by exact
+client order ID and authoritative venue state; never blindly retry after a
+crash or timeout. On restart, reload and revalidate the persisted
+authorization, settings hash/generation, controller lease, selection, scope,
+positions, and reservations rather than reconstructing authority from memory.
+
+Position duties are exact: track each managed market, token, strategy version,
+expected price, fee reserve, slippage, and remaining quantity. Exit duties
+remain available when a tighter entry budget blocks new BUYs; SELL reservations
+consume owned base inventory, exit requests stay durable until reconciled, and
+an exit never refills the BUY budget.
+
+## Final review action and gate state
+
+The single final action is `exploratory.live.review_confirm`. It must present
+complete disclosure of the strategy/setup and direction, capture/evaluator
+binding, 1–3 selected members, exact market and token, current readiness,
+account/geoblock/depth checks, active settings, lifetime budget and expiry,
+stop rules, positions, UNKNOWN usage, and exit capacity. It coordinates the
+existing reviewed fences; it does not submit an order.
+
+`exploratory.live.review_confirm` remains **unclicked**. Live submission is
+disabled until explicit user confirmation through the control-wired operator
+surface. This release makes no live-order or live-fill claim; paper,
+historical, simulated, and fake-transport evidence are not execution
+evidence. The isolated runtime remains `DISARMED`.
 
 ## Emergency rollback
 
@@ -222,33 +287,3 @@ activate it with the fresh generation/hash fence; this persists settings only
 and does not activate the isolated canary. Never delete history or manually
 release a reservation to make the dashboard appear clear; failed cleanup is an
 incident.
-
-## Release evidence and current gate state
-
-The release report is intentionally `IN_PROGRESS`. The bounded R15 smoke
-returned `NO_SUPPORTED_EDGE`: its supported-edge evaluator did not run because
-the bounded historical projection lacked sufficient chronological observations.
-That smoke used no credentials, submitted no orders, mutated no account, and
-did not access the live database.
-
-The isolated operator surface was served directly at port 8187. Its observed
-state had live trading disabled, paper risk active, and the Polymarket
-production transport disabled. Browser-daemon visual verification was
-unavailable, so the HTTP surface was checked directly and the isolated
-operator and child node were stopped. This is not live-order or live-fill
-evidence.
-
-The final financial review was clean for accepted-order accounting, exit
-timeouts, transition cleanup, canonical fill recovery, and mixed provisional
-surveillance fixes. The final isolation review was clean after execution
-profile binding. These reviews do not authorize activation, orders, deployment,
-or live-fill verification.
-
-The complete R21 suite recorded 1040 passed, 3 skipped, 342 subtests, 0 failed,
-and 221.985 seconds in
-`reports/polymarket_release_r21_junit.xml`. R21 is explicitly
-**pre-lifecycle-change** evidence. Because lifecycle code changed afterward,
-another complete post-lifecycle-change gate remains required; the R21 result
-must not be presented as the final gate. Until that gate passes, deployment
-remains `DISARMED`, `live_fills_verified` remains false, and no live activation,
-order, or fill claim is made.
