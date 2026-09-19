@@ -476,6 +476,11 @@ class PolymarketCollector:
         self._scope_refresh_attempted: set[str] = set()
         self._scope_refreshed_snapshots: dict[str, PredictionMarketSnapshot] = {}
         self._scope_resolution_deferred_candidate_ids: tuple[str, ...] = ()
+        self._scope_observation_refresh_candidate_ids: tuple[str, ...] = ()
+        self._scope_observation_refresh_cursor = 0
+        self._scope_observation_refresh_priority_ids: tuple[str, ...] = ()
+        self._scope_observation_refresh_attempted_ids: set[str] = set()
+        self._scope_observation_refresh_succeeded_ids: set[str] = set()
         self._observation_materialization_deferred_candidate_ids: tuple[str, ...] = ()
         self._observation_materialization_attempted_ids: set[str] = set()
         self._observation_materialization_completed_ids: set[str] = set()
@@ -669,6 +674,23 @@ class PolymarketCollector:
             )
         except (TypeError, ValueError, OverflowError):
             self._scope_resolution_deferred_cursor = 0
+        self._scope_observation_refresh_candidate_ids = tuple(
+            dict.fromkeys(
+                str(item).strip()
+                for item in root_state.get(
+                    "scope_observation_refresh_candidate_ids",
+                    (),
+                )
+                if str(item).strip()
+            )
+        )[:_MAX_SCOPE_RESOLUTION_CANDIDATES]
+        try:
+            self._scope_observation_refresh_cursor = max(
+                0,
+                int(root_state.get("scope_observation_refresh_cursor", 0)),
+            )
+        except (TypeError, ValueError, OverflowError):
+            self._scope_observation_refresh_cursor = 0
 
         self._discovery_continuation = (
             root_state.get("discovery_continuation")
@@ -689,6 +711,9 @@ class PolymarketCollector:
         rolling_non_exact_ids = tuple(
             item for item in rolling_scope_ids if item not in rolling_exact_scope_ids
         )
+        self._scope_observation_refresh_priority_ids = ()
+        self._scope_observation_refresh_attempted_ids = set()
+        self._scope_observation_refresh_succeeded_ids = set()
 
         configured = requested or self.config.market_ids
         self._scope_suitability_cache = {}
@@ -1496,6 +1521,13 @@ class PolymarketCollector:
                     0,
                     int(self._scope_resolution_candidate_cursor),
                 ),
+                "scope_observation_refresh_cursor": max(
+                    0,
+                    int(self._scope_observation_refresh_cursor),
+                ),
+                "scope_observation_refresh_candidate_ids": list(
+                    self._scope_observation_refresh_candidate_ids
+                )[:_MAX_SCOPE_RESOLUTION_CANDIDATES],
                 "scope_resolution_deferred_cursor": max(
                     0,
                     int(self._scope_resolution_deferred_cursor),
@@ -2629,6 +2661,266 @@ class PolymarketCollector:
             if candidate_id not in scope_candidate_ids:
                 scope_candidate_ids.append(candidate_id)
 
+    def _observation_scope_refresh_plan(
+        self,
+        observed_at: datetime,
+        current_candidate_ids: Sequence[str],
+    ) -> tuple[str, ...]:
+        """Queue only current, paper-observation bindings needing fresh proof."""
+        current_ids = list(dict.fromkeys(
+            str(item).strip() for item in current_candidate_ids if str(item).strip()
+        ))
+        if not current_ids:
+            self._scope_observation_refresh_candidate_ids = ()
+            self._scope_observation_refresh_cursor = 0
+            return ()
+        current_set = set(current_ids)
+        loader = getattr(self.store, "load_candidate_lifecycle", None)
+        proof_loader = getattr(self.store, "load_market_scope_resolution", None)
+        registry = ForwardTestRegistry(self.store)
+        try:
+            intents = registry.list_observation_intents()
+        except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+            preserved = tuple(
+                candidate_id
+                for candidate_id in self._scope_observation_refresh_candidate_ids
+                if candidate_id in current_set
+            )
+            self._scope_observation_refresh_candidate_ids = preserved
+            if preserved:
+                self._scope_observation_refresh_cursor %= len(preserved)
+            else:
+                self._scope_observation_refresh_cursor = 0
+            self._scope_observation_refresh_priority_ids = preserved
+            return preserved
+        if not isinstance(intents, (list, tuple)):
+            intents = ()
+        superseded_candidates, superseded_intents = self._observation_superseded_ids(intents)
+        fallback_freshness = self.config.freshness_sla_seconds or self.config.interval_seconds
+        try:
+            fallback_max_age = max(1.0, float(fallback_freshness))
+        except (TypeError, ValueError):
+            fallback_max_age = 60.0
+        stale_ids: list[str] = []
+        seen: set[str] = set()
+        observed = ensure_utc(observed_at)
+        for intent in intents:
+            config = getattr(intent, "config", None)
+            if not isinstance(config, Mapping) or config.get("observation_intent") is not True:
+                continue
+            if config.get("paper_only") is not True or config.get("research_only") is not True:
+                continue
+            if (
+                type(config.get("allocation_active")) is not bool
+                or config.get("allocation_active") is not False
+                or type(config.get("canary_armed")) is not bool
+                or config.get("canary_armed") is not False
+                or str(config.get("execution_scope", "")).strip().upper()
+                != "OBSERVATION"
+                or not (
+                    config.get("observation_only_lineage") is True
+                    or config.get("observation_capture_only") is True
+                )
+                or (
+                    str(config.get("paper_observation_intent_id", "")).strip()
+                    and str(config.get("paper_observation_intent_id", "")).strip()
+                    != str(getattr(intent, "experiment_id", "")).strip()
+                )
+            ):
+                continue
+            candidate_id = str(config.get("candidate_id", "")).strip()
+            intent_id = str(getattr(intent, "experiment_id", "")).strip()
+            if (
+                not candidate_id
+                or not intent_id
+                or candidate_id not in current_set
+                or candidate_id in superseded_candidates
+                or intent_id in superseded_intents
+                or candidate_id in seen
+                or not callable(loader)
+            ):
+                continue
+            try:
+                lifecycle = loader(candidate_id)
+            except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+                lifecycle = None
+            if not isinstance(lifecycle, Mapping):
+                continue
+            stage = str(lifecycle.get("stage", "")).strip().upper()
+            if stage not in {
+                CandidateStage.PAPER_FORWARD.value,
+                CandidateStage.PAPER_PROMOTABLE.value,
+            }:
+                continue
+            payload = lifecycle.get("payload")
+            if not isinstance(payload, Mapping):
+                continue
+            if str(payload.get("candidate_id", "")).strip() != candidate_id:
+                continue
+            required_safety = {
+                "paper_observation_intent": True,
+                "paper_only": True,
+                "research_only": True,
+                "allocation_active": False,
+                "canary_armed": False,
+            }
+            if str(payload.get("execution_scope", "")).strip().upper() != "OBSERVATION":
+                continue
+            if any(
+                type(payload.get(key)) is not type(expected)
+                or payload.get(key) != expected
+                for key, expected in required_safety.items()
+            ):
+                continue
+            if str(payload.get("paper_observation_intent_id", "")).strip() != intent_id:
+                continue
+            if (
+                type(payload.get("paper_forward_started")) is not bool
+                or payload.get("paper_forward_started") is not True
+                or type(payload.get("holdout_used")) is not bool
+                or payload.get("holdout_used") is not False
+                or type(payload.get("selection_excluded")) is not bool
+                or payload.get("selection_excluded") is not True
+                or not (
+                    payload.get("observation_only_lineage") is True
+                    or payload.get("observation_capture_only") is True
+                )
+            ):
+                continue
+            materialized_id = str(payload.get("forward_test_id", "")).strip()
+            if not materialized_id:
+                continue
+            try:
+                materialized = registry.get(materialized_id)
+            except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+                materialized = None
+            materialized_config = (
+                getattr(materialized, "config", None)
+                if materialized is not None
+                else None
+            )
+            if not isinstance(materialized_config, Mapping):
+                continue
+            if (
+                str(materialized_config.get("candidate_id", "")).strip() != candidate_id
+                or str(
+                    materialized_config.get("paper_observation_intent_id", "")
+                ).strip() != intent_id
+                or str(
+                    materialized_config.get(
+                        "market_scope_hash",
+                        materialized_config.get("scope_hash", ""),
+                    )
+                ).strip()
+                != str(config.get("market_scope_hash", config.get("scope_hash", ""))).strip()
+                or str(
+                    materialized_config.get(
+                        "market_scope_version",
+                        materialized_config.get("scope_version", ""),
+                    )
+                ).strip()
+                != str(
+                    config.get("market_scope_version", config.get("scope_version", ""))
+                ).strip()
+            ):
+                continue
+            payload_markets = {
+                str(item).strip()
+                for item in payload.get("allowed_markets", ())
+                if str(item).strip()
+            }
+            materialized_markets = {
+                str(item).strip()
+                for item in getattr(materialized, "allowed_markets", ())
+                if str(item).strip()
+            }
+            if not materialized_markets or payload_markets != materialized_markets:
+                continue
+            if not self._has_scope_material(payload):
+                continue
+            config_hash = str(
+                config.get("market_scope_hash", config.get("scope_hash", ""))
+            ).strip()
+            config_version = str(
+                config.get("market_scope_version", config.get("scope_version", ""))
+            ).strip()
+            payload_hash = str(
+                payload.get("market_scope_hash", payload.get("scope_hash", ""))
+            ).strip()
+            payload_version = str(
+                payload.get("market_scope_version", payload.get("scope_version", ""))
+            ).strip()
+            if (
+                not config_hash
+                or not config_version
+                or config_hash != payload_hash
+                or config_version != payload_version
+            ):
+                continue
+            proof: Any = None
+            if callable(proof_loader):
+                try:
+                    proof = proof_loader(
+                        candidate_id,
+                        scope_hash=config_hash,
+                        scope_version=config_version,
+                    )
+                except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+                    proof = None
+            if hasattr(proof, "as_dict") and callable(proof.as_dict):
+                try:
+                    proof = proof.as_dict()
+                except (AttributeError, TypeError, ValueError):
+                    proof = None
+            try:
+                max_age = max(
+                    1.0,
+                    float(
+                        config.get(
+                            "scope_resolution_freshness_sla_seconds",
+                            payload.get(
+                                "scope_resolution_freshness_sla_seconds",
+                                fallback_max_age,
+                            ),
+                        )
+                    ),
+                )
+            except (TypeError, ValueError):
+                max_age = fallback_max_age
+            fresh = False
+            if isinstance(proof, Mapping):
+                resolved_at = parse_timestamp(proof.get("resolved_at"))
+                fresh = (
+                    str(proof.get("candidate_id", "")).strip() == candidate_id
+                    and str(proof.get("scope_hash", "")).strip() == config_hash
+                    and str(
+                        proof.get("scope_version", proof.get("version", ""))
+                    ).strip() == config_version
+                    and str(proof.get("status", "")).strip().upper() == "MATCHED"
+                    and resolved_at is not None
+                    and 0 <= (
+                        observed - ensure_utc(resolved_at)
+                    ).total_seconds() <= max_age
+                )
+            if not fresh:
+                stale_ids.append(candidate_id)
+                seen.add(candidate_id)
+        prior = [
+            candidate_id
+            for candidate_id in self._scope_observation_refresh_candidate_ids
+            if candidate_id in stale_ids
+        ]
+        queue = list(dict.fromkeys([
+            *prior,
+            *(candidate_id for candidate_id in current_ids if candidate_id in stale_ids),
+        ]))[:_MAX_SCOPE_RESOLUTION_CANDIDATES]
+        self._scope_observation_refresh_candidate_ids = tuple(queue)
+        if queue:
+            self._scope_observation_refresh_cursor %= len(queue)
+        else:
+            self._scope_observation_refresh_cursor = 0
+        return tuple(queue)
+
 
     def _observation_handoff_proof_current(
         self,
@@ -3450,6 +3742,13 @@ class PolymarketCollector:
             for item in candidate_ids
             if str(item).strip()
         ))
+        refresh_candidates = list(
+            self._observation_scope_refresh_plan(
+                observed_at,
+                current_candidate_ids,
+            )
+        )
+        refresh_candidate_set = set(refresh_candidates)
         # A current, already validated observation handoff is allowed to
         # bypass broad inventory/suitability work.  The persisted proof is
         # exact and freshness-bounded; using it here preserves a downstream
@@ -3473,6 +3772,7 @@ class PolymarketCollector:
             )
             if (
                 preloaded_handoff_ids
+                and not refresh_candidates
                 and self._scope_handoff_fast_streak < _MAX_OBSERVATION_HANDOFF_FAST_CYCLES
             ):
                 ordered_handoff_ids = [
@@ -3559,6 +3859,7 @@ class PolymarketCollector:
             candidate_id
             for candidate_id in current_candidate_ids
             if candidate_id not in current_rolling_ids
+            and candidate_id not in refresh_candidate_set
         ]
         try:
             candidate_cursor = int(self._scope_resolution_candidate_cursor)
@@ -3568,6 +3869,15 @@ class PolymarketCollector:
         rotated_current_ids = (
             rotating_current_ids[candidate_cursor:]
             + rotating_current_ids[:candidate_cursor]
+        )
+        try:
+            refresh_cursor = int(self._scope_observation_refresh_cursor)
+        except (TypeError, ValueError, OverflowError):
+            refresh_cursor = 0
+        refresh_cursor %= len(refresh_candidates) if refresh_candidates else 1
+        rotated_refresh_candidates = (
+            refresh_candidates[refresh_cursor:]
+            + refresh_candidates[:refresh_cursor]
         )
         try:
             deferred_cursor = int(self._scope_resolution_deferred_cursor)
@@ -3598,12 +3908,21 @@ class PolymarketCollector:
             if deferred_reserve_id is not None
             else []
         )
-        # Reserve one resolver-document slot for persisted deferred work when
-        # noncritical current rotation could otherwise fill the cap forever.
+        # Reserve one resolver-document slot for persisted deferred work and
+        # one for normal current work whenever an observation refresh is
+        # active.  A refresh-only cycle may consume the whole bounded cap.
         reserve_deferred = (
             1
             if ordered_deferred_candidates
             and len(protected_current_ids) < _MAX_SCOPE_RESOLUTION_CANDIDATES
+            else 0
+        )
+        reserve_normal = (
+            1
+            if rotating_current_ids
+            and refresh_candidates
+            and len(protected_current_ids) + reserve_deferred
+            < _MAX_SCOPE_RESOLUTION_CANDIDATES
             else 0
         )
         rotating_capacity = max(
@@ -3612,15 +3931,28 @@ class PolymarketCollector:
             - len(protected_current_ids)
             - reserve_deferred,
         )
-        rotating_prefix_count = min(len(rotated_current_ids), rotating_capacity)
+        refresh_prefix_count = min(
+            len(rotated_refresh_candidates),
+            max(0, rotating_capacity - reserve_normal),
+        )
+        rotating_prefix_count = min(
+            len(rotated_current_ids),
+            max(0, rotating_capacity - refresh_prefix_count),
+        )
+        self._scope_observation_refresh_priority_ids = tuple(
+            rotated_refresh_candidates[:refresh_prefix_count]
+        )
         materialized_rotating_ids: set[str] = set()
         materialized_deferred_ids: set[str] = set()
-        # Protected rolling selections remain first.  One persisted deferred
-        # candidate is admitted before the remainder of current rotation.
+        # Protected rolling selections remain first.  Refresh candidates are
+        # admitted ahead of normal rotation, while the reserved normal slot
+        # prevents an unbounded refresh queue from starving current work.
         candidate_order = list(dict.fromkeys([
             *protected_current_ids,
+            *rotated_refresh_candidates[:refresh_prefix_count],
             *rotated_current_ids[:rotating_prefix_count],
             *ordered_deferred_candidates[:reserve_deferred],
+            *rotated_refresh_candidates[refresh_prefix_count:],
             *rotated_current_ids[rotating_prefix_count:],
             *ordered_deferred_candidates[reserve_deferred:],
         ]))
@@ -4096,6 +4428,8 @@ class PolymarketCollector:
                 # early only after their bounded direct lookup has run.
                 deferred_resolution_ids.append(candidate_id)
                 continue
+            if candidate_id in refresh_candidate_set:
+                self._scope_observation_refresh_attempted_ids.add(candidate_id)
 
 
 
@@ -4329,6 +4663,12 @@ class PolymarketCollector:
             proof = result.as_dict() if hasattr(result, "as_dict") and callable(result.as_dict) else result
             if isinstance(proof, Mapping):
                 self._scope_resolutions[candidate_id] = proof
+                if (
+                    candidate_id in refresh_candidate_set
+                    and str(proof.get("status", "")).strip().upper() == "MATCHED"
+                    and not getattr(result, "deferred_markets", ())
+                ):
+                    self._scope_observation_refresh_succeeded_ids.add(candidate_id)
         deferred_priority_resolution_ids = [
             candidate_id
             for candidate_id in deferred_resolution_ids
@@ -4347,6 +4687,18 @@ class PolymarketCollector:
                 *truncated_scope_candidate_ids,
             ])
         )[:_MAX_SCOPE_RESOLUTION_CANDIDATES]
+        refresh_queue = [
+            candidate_id
+            for candidate_id in self._scope_observation_refresh_candidate_ids
+            if candidate_id not in self._scope_observation_refresh_succeeded_ids
+        ]
+        self._scope_observation_refresh_candidate_ids = tuple(
+            refresh_queue
+        )[:_MAX_SCOPE_RESOLUTION_CANDIDATES]
+        attempted_refresh_count = len(self._scope_observation_refresh_attempted_ids)
+        self._scope_observation_refresh_cursor = (
+            refresh_cursor + attempted_refresh_count
+        ) % len(refresh_queue) if refresh_queue else 0
         return scope_candidates, candidate_markets, snapshots, next_cursor
 
     @staticmethod
@@ -5036,7 +5388,15 @@ class PolymarketCollector:
                 assumption_error,
             ))
         suitability_specs.sort(
-            key=lambda item: (item[4], item[0], item[1])
+            key=lambda item: (
+                item[4],
+                0
+                if str(item[2].get("candidate_id", "")).strip()
+                in self._scope_observation_refresh_priority_ids
+                else 1,
+                item[0],
+                item[1],
+            )
         )
         suitability_enabled = bool(suitability_specs)
         exact_market_ids = set(self._scope_exact_market_ids(documents))

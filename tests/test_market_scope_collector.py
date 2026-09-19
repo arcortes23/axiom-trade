@@ -4972,6 +4972,228 @@ class MarketScopeCollectorTests(unittest.TestCase):
             )
             collector.close()
 
+    def test_stale_observation_scope_refresh_precedes_deferred_tail_with_fair_cursor(self) -> None:
+        normal_ids = tuple(f"normal-{index:03d}" for index in range(73))
+        deferred_ids = normal_ids[:72]
+        missing_normal_id = normal_ids[-1]
+        invalid_id = "observation-invalid"
+        live_id = "observation-live"
+        mismatch_id = "observation-mismatched"
+        target_id = "observation-stale-tail"
+        current_ids = (*normal_ids, invalid_id, live_id, mismatch_id, target_id)
+        scope_hash = normalize_market_scope(scope("RULE_BASED_MARKETS")).scope_hash
+        scope_version = "1"
+        target_intent_id = f"observation-intent-{target_id}"
+        mismatch_intent_id = f"observation-intent-{mismatch_id}"
+
+        def intent_config(
+            candidate_id: str,
+            intent_id: str,
+            *,
+            paper_only: bool = True,
+            allocation_active: bool = False,
+        ) -> dict[str, object]:
+            return {
+                "candidate_id": candidate_id,
+                "observation_intent": True,
+                "paper_only": paper_only,
+                "research_only": True,
+                "allocation_active": allocation_active,
+                "canary_armed": False,
+                "observation_intent_id": intent_id,
+                "paper_observation_intent_id": intent_id,
+                "market_scope": scope("RULE_BASED_MARKETS"),
+                "market_scope_hash": scope_hash,
+                "market_scope_version": scope_version,
+                "scope_resolution_freshness_sla_seconds": 60.0,
+                "execution_scope": "OBSERVATION",
+                "observation_only_lineage": True,
+                "observation_capture_only": False,
+            }
+
+        documents = {
+            candidate_id: {
+                "candidate_id": candidate_id,
+                "experiment_plan": {
+                    "market_scope": scope("RULE_BASED_MARKETS"),
+                },
+            }
+            for candidate_id in normal_ids[:-1]
+        }
+        target_config = intent_config(target_id, target_intent_id)
+        materialized_id = f"forward-{target_id}-materialized"
+        target_payload = {
+            **target_config,
+            "paper_observation_intent": True,
+            "paper_only": True,
+            "research_only": True,
+            "allocation_active": False,
+            "canary_armed": False,
+            "paper_forward_started": True,
+            "holdout_used": False,
+            "selection_excluded": True,
+            "observation_only_lineage": True,
+            "forward_test_id": materialized_id,
+            "allowed_markets": [target_id],
+        }
+        invalid_intent_id = f"observation-intent-{invalid_id}"
+        invalid_config = intent_config(invalid_id, invalid_intent_id, paper_only=False)
+        invalid_payload = {
+            **invalid_config,
+            "paper_observation_intent": True,
+            "paper_only": True,
+        }
+        live_intent_id = f"observation-intent-{live_id}"
+        live_config = intent_config(live_id, live_intent_id, allocation_active=True)
+        live_payload = {
+            **live_config,
+            "paper_observation_intent": True,
+            "allocation_active": False,
+        }
+        mismatch_config = intent_config(mismatch_id, mismatch_intent_id)
+        mismatch_payload = {
+            **mismatch_config,
+            "candidate_id": "wrong-candidate",
+            "paper_observation_intent": True,
+            "paper_forward_started": True,
+            "holdout_used": False,
+            "selection_excluded": True,
+            "observation_only_lineage": True,
+            "forward_test_id": f"forward-{mismatch_id}",
+            "allowed_markets": [mismatch_id],
+        }
+        documents.update({
+            target_id: target_payload,
+            invalid_id: invalid_payload,
+            live_id: live_payload,
+            mismatch_id: mismatch_payload,
+        })
+        store = _ScopeStore(documents)
+        for candidate_id, intent_id, config in (
+            (target_id, target_intent_id, target_config),
+            (invalid_id, invalid_intent_id, invalid_config),
+            (live_id, live_intent_id, live_config),
+            (mismatch_id, mismatch_intent_id, mismatch_config),
+        ):
+            store.documents[candidate_id]["stage"] = "PAPER_FORWARD"
+            store.forward_tests[intent_id] = {
+                "experiment_id": intent_id,
+                "strategy_hash": f"strategy-{candidate_id}",
+                "model_hash": f"model-{candidate_id}",
+                "config": config,
+                "start_timestamp": T0.isoformat(),
+                "bankroll": 1.0,
+                "allowed_markets": [],
+                "risk_limits": {},
+                "quality": "PAPER_FORWARD",
+            }
+        store.forward_tests[materialized_id] = {
+            "experiment_id": materialized_id,
+            "strategy_hash": f"strategy-{target_id}",
+            "model_hash": f"model-{target_id}",
+            "config": dict(target_config),
+            "start_timestamp": T0.isoformat(),
+            "bankroll": 1.0,
+            "allowed_markets": [target_id],
+            "risk_limits": {},
+            "quality": "PAPER_FORWARD",
+        }
+
+        class RefreshCollector(_ScopeCollector):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.budget_calls = 0
+
+            def _discover_scope_inventory(
+                self,
+                observed_at,
+                counters,
+                *,
+                carry_cursor,
+                provider=None,
+                documents=(),
+            ):
+                del counters, carry_cursor, provider, documents
+                self._scope_inventory_continuation = {"coverage_status": "COMPLETE"}
+                snapshots = {
+                    candidate_id: market(candidate_id)
+                    for candidate_id in store.documents
+                }
+                records = [
+                    self._scope_market_record(snapshot, observed_at, self.provider)
+                    for snapshot in snapshots.values()
+                ]
+                return records, snapshots, None
+
+            def _scope_pipeline_budget_available(self):
+                self.budget_calls += 1
+                return self.budget_calls <= 2
+
+            def _scope_candidate_has_cached_evidence(
+                self,
+                document,
+                records,
+                snapshots,
+            ):
+                del records, snapshots
+                return str(document.get("candidate_id", "")).strip() == target_id
+
+        collector = RefreshCollector(
+            _RecordingProvider(()),
+            store,
+            CollectorConfig(
+                max_markets=100,
+                discovery_budget_per_cycle=1,
+                max_attempts=1,
+                backoff_initial_seconds=0,
+                jitter_seconds=0,
+            ),
+            candidate_ids=current_ids,
+            clock=lambda: T0,
+            sleep=lambda _seconds: None,
+        )
+        collector._scope_resolution_candidate_cursor = 0
+        collector._scope_resolution_deferred_cursor = 0
+        collector._scope_observation_refresh_candidate_ids = ()
+        root_state = {
+            "scope_resolution_deferred_candidate_ids": list(deferred_ids),
+        }
+        collector._resolve_market_scopes(
+            T0 + timedelta(seconds=61),
+            current_ids,
+            root_state,
+            {"errors": 0},
+        )
+
+        self.assertEqual(
+            store.resolutions[0].candidate_id,
+            target_id,
+        )
+        self.assertIn(target_id, collector._scope_observation_refresh_succeeded_ids)
+        self.assertGreater(collector._scope_resolution_candidate_cursor, 0)
+        self.assertNotIn(target_id, collector._scope_observation_refresh_candidate_ids)
+        self.assertNotIn(invalid_id, collector._scope_observation_refresh_candidate_ids)
+        self.assertNotIn(live_id, collector._scope_observation_refresh_candidate_ids)
+        self.assertNotIn(mismatch_id, collector._scope_observation_refresh_candidate_ids)
+        self.assertGreater(collector.budget_calls, 0)
+
+        collector.budget_calls = 0
+        collector._scope_observation_refresh_candidate_ids = ()
+        collector._scope_observation_refresh_attempted_ids.clear()
+        collector._scope_observation_refresh_succeeded_ids.clear()
+        collector._scope_inventory_continuation = None
+        collector._scope_resolution_candidate_cursor = 0
+        collector._scope_resolution_deferred_cursor = 0
+        collector._resolve_market_scopes(
+            T0 + timedelta(seconds=61),
+            current_ids,
+            root_state,
+            {"errors": 0},
+        )
+        self.assertEqual(collector._scope_observation_refresh_priority_ids, ())
+        self.assertEqual(collector._scope_observation_refresh_attempted_ids, set())
+        collector.close()
+
     def test_truncated_scope_candidates_preserve_existing_deferred_queue(self) -> None:
         current_ids = tuple(f"current-{index:04d}" for index in range(1001))
         deferred_ids = ("deferred-0000", "deferred-0001")
