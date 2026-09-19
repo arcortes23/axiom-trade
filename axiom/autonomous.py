@@ -8481,6 +8481,23 @@ class AutonomousResearchProcessor:
                             == candidate_id
                             and _binding_value(
                                 (
+                                    candidate.config
+                                    if isinstance(
+                                        getattr(candidate, "config", None), Mapping
+                                    )
+                                    else {}
+                                ).get("observation_intent_id")
+                                or (
+                                    candidate.config
+                                    if isinstance(
+                                        getattr(candidate, "config", None), Mapping
+                                    )
+                                    else {}
+                                ).get("paper_observation_intent_id")
+                            )
+                            == intent_id
+                            and _binding_value(
+                                (
                                     (
                                         candidate.config
                                         if isinstance(
@@ -8822,7 +8839,6 @@ class AutonomousResearchProcessor:
             if (
                 str(existing.strategy_hash).strip() == expected_strategy_hash
                 and str(existing.model_hash).strip() == expected_model_hash
-                and isinstance(existing_config.get("observation_handoff"), Mapping)
             ):
                 identity_ignored = {
                     "observation_handoff",
