@@ -1990,6 +1990,75 @@ class MarketScopeCollectorTests(unittest.TestCase):
             )
         )
 
+    def test_scope_resolution_timestamp_uses_resolution_clock_after_delayed_inventory(self) -> None:
+        resolved_market = market("delayed-resolution")
+        store = _ScopeStore(
+            {
+                "delayed-candidate": {
+                    "experiment_plan": {
+                        "market_scope": scope(
+                            "EXACT_MARKETS",
+                            market_ids=("delayed-resolution",),
+                        )
+                    }
+                }
+            }
+        )
+        provider = _RecordingProvider((resolved_market,))
+        current = [T0]
+        collector = _ScopeCollector(
+            provider,
+            store,
+            CollectorConfig(
+                max_markets=1,
+                discovery_budget_per_cycle=10,
+                max_attempts=1,
+                backoff_initial_seconds=0,
+                jitter_seconds=0,
+            ),
+            candidate_ids=("delayed-candidate",),
+            clock=lambda: current[0],
+            sleep=lambda _seconds: None,
+        )
+        record = PolymarketCollector._scope_market_record(
+            resolved_market,
+            T0,
+            provider,
+        )
+
+        def delayed_inventory(*args, **kwargs):
+            del args, kwargs
+            current[0] = T0 + timedelta(seconds=18.8)
+            return [record], {}, None
+
+        collector._discover_scope_inventory = delayed_inventory
+        observed_timestamps: list[datetime] = []
+        real_resolver = resolve_market_scope
+
+        def delayed_resolver(*args, **kwargs):
+            observed_timestamps.append(kwargs["resolved_at"])
+            return real_resolver(*args, **kwargs)
+
+        with patch("axiom.market_scope.resolve_market_scope", side_effect=delayed_resolver):
+            collector._resolve_market_scopes(
+                T0,
+                ("delayed-candidate",),
+                {},
+                collector._new_counters(),
+            )
+
+        resolution_at = T0 + timedelta(seconds=18.8)
+        self.assertEqual(observed_timestamps, [resolution_at])
+        self.assertEqual(store.resolutions[0].resolved_at, resolution_at)
+        worker_at = T0 + timedelta(seconds=73.8)
+        self.assertLess((worker_at - store.resolutions[0].resolved_at).total_seconds(), 60)
+
+        collector.clock = lambda: T0 - timedelta(seconds=1)
+        self.assertEqual(collector._scope_resolution_timestamp(T0), T0)
+        collector.clock = lambda: "malformed-clock"
+        self.assertEqual(collector._scope_resolution_timestamp(T0), T0)
+        collector.close()
+
     def test_shared_scope_refresh_snapshot_is_reused_by_later_candidate(self) -> None:
         shared = market("shared-refresh")
         document = {

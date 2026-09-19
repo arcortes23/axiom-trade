@@ -4617,12 +4617,13 @@ class PolymarketCollector:
                 _MAX_SCOPE_RESOLUTION_MARKETS,
                 max(0, len(candidate_records)),
             )
+            resolution_at = self._scope_resolution_timestamp(observed_at)
             try:
                 result = resolve_market_scope(
                     candidate_id,
                     document,
                     candidate_records,
-                    resolved_at=observed_at,
+                    resolved_at=resolution_at,
                     max_matches=100,
                     max_markets=candidate_limit,
                 )
@@ -4700,6 +4701,22 @@ class PolymarketCollector:
             refresh_cursor + attempted_refresh_count
         ) % len(refresh_queue) if refresh_queue else 0
         return scope_candidates, candidate_markets, snapshots, next_cursor
+
+    def _scope_resolution_timestamp(self, observed_at: datetime) -> datetime:
+        """Stamp a proof when its canonical scope decision is made.
+
+        ``observed_at`` is the cycle start and therefore may be much older
+        than the bounded scope-resolution work.  Keep it as a lower bound so
+        an injected or backwards-moving clock cannot make a proof appear
+        newer than the cycle's observation, while a valid current clock
+        reflects the actual resolution point.
+        """
+        fallback = ensure_utc(observed_at)
+        try:
+            current = ensure_utc(self.clock())
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return fallback
+        return max(fallback, current)
 
     @staticmethod
     def _scope_cursor(root_state: Mapping[str, Any]) -> Any:
