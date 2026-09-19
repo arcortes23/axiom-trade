@@ -2032,7 +2032,7 @@ def _main_impl(argv: Sequence[str] | None = None) -> int:
                 pid_path=args.pid,
                 log_path=args.log,
                 execution_profile=ISOLATED_EXECUTION_PROFILE if isolated else None,
-                shadow_enabled=args.shadow_enabled,
+                system_bootstrap_enabled=not isolated,
                 shadow_interval=args.shadow_interval,
                 shadow_jobs_per_cycle=args.shadow_jobs_per_cycle,
                 interval_seconds=args.interval,
@@ -2112,6 +2112,7 @@ def _main_impl(argv: Sequence[str] | None = None) -> int:
         control = OperatorControlPlane(
             dashboard_store,
             db_path=args.db,
+            system_bootstrap_enabled=True,
             hermes_job_id=args.hermes_job_id,
             historical_refresh_enabled=args.historical_refresh_enabled,
             historical_refresh_interval_seconds=args.historical_refresh_interval_seconds,

@@ -25,7 +25,10 @@ import time
 import uuid
 from typing import Any, Callable, Mapping
 
-from .autonomous import AutonomousResearchProcessor
+from .autonomous import (
+    AutonomousResearchProcessor,
+    bootstrap_system_exploratory_admission_policy,
+)
 from .canary import (
     CANARY_READINESS_SNAPSHOT_MAX_AGE_SECONDS,
     CanaryBlocked,
@@ -47,7 +50,15 @@ from .canary_positions import (
     recovery_identifier,
 )
 from .canary_settings import CanarySettingsService
-from .rolling_portfolio import RollingAdmissionPolicy, default_rolling_admission_policy
+from .rolling_portfolio import (
+    RollingAdmissionPolicy,
+    RollingPolicyBootstrapError,
+    SYSTEM_EXPLORATORY_ADMISSION_ID,
+    SYSTEM_EXPLORATORY_ADMISSION_VERSION,
+    _system_bootstrap_hash,
+    default_rolling_admission_policy,
+    validate_system_exploratory_admission_policy,
+)
 from .bootstrap import BTC_HISTORY_START, HistoricalBootstrapper
 from .crypto_universe import load_crypto_universe
 from .data import BinanceAdapter
@@ -187,6 +198,8 @@ _ISOLATED_OPERATOR_BLOCKED_ACTIONS = frozenset(
         "risk.settings.activate_draft",
     }
 )
+_SYSTEM_EXPLORATORY_ADMISSION_CONFIG_KEY = "rolling_admission_policy_active"
+_SYSTEM_EXPLORATORY_OPERATING_POLICY_KEY = "rolling_exploratory_operating_policy"
 CANARY_CONNECTIVITY_CONFIG_KEY = "canary_connectivity_status"
 
 
@@ -1541,6 +1554,7 @@ class OperatorControlPlane:
         hermes_job_id: str | None = None,
         execution_profile: str | None = None,
         profile: Any | None = None,
+        system_bootstrap_enabled: bool = False,
         historical_refresh_enabled: bool = False,
         historical_refresh_interval_seconds: float = 3600.0,
         historical_refresh_request_budget: int = 25,
@@ -1601,6 +1615,18 @@ class OperatorControlPlane:
         self._selection_reconciliation_error: str | None = None
         self._reconcile_pending_canary_selection_binding()
         self._research_processor = AutonomousResearchProcessor(self.store, clock=utc_now)
+        self._rolling_bootstrap_error: str | None = None
+        if system_bootstrap_enabled and self.execution_profile == PRODUCTION_EXECUTION_PROFILE:
+            try:
+                self._bootstrap_system_exploratory_admission_policy()
+                self.store.set_operator_config("rolling_exploratory_bootstrap_blocker", None)
+            except OperatorControlError as exc:
+                self._rolling_bootstrap_error = exc.code
+                self.store.set_operator_config(
+                    "rolling_exploratory_bootstrap_blocker",
+                    exc.code,
+                )
+                _LOGGER.warning("rolling admission bootstrap blocked: %s", exc.code)
     def risk_settings_snapshot(self) -> dict[str, Any]:
         """Return the bounded persisted active/draft risk settings projection."""
         snapshot = self.settings.snapshot()
@@ -4502,7 +4528,11 @@ class OperatorControlPlane:
     def controller_lease_status(self) -> dict[str, Any]:
         loader = getattr(self.store, "load_canary_controller_lease", None)
         if not callable(loader):
-            return {"status": "UNAVAILABLE", "owner_id": None, "paper_only": True}
+            return {
+                "status": "NONE",
+                "paper_only": True,
+                "live_execution": False,
+            }
         try:
             value = loader(now=utc_now())
         except TypeError:
@@ -4516,9 +4546,16 @@ class OperatorControlPlane:
         result["live_execution"] = False
         return result
 
-
     def rolling_portfolio_state(self) -> dict[str, Any]:
         """Return persisted rolling state without mutating read/status paths."""
+        bootstrap_blocker = self._rolling_bootstrap_blocker()
+        if bootstrap_blocker:
+            return {
+                "status": "BLOCKED",
+                "blockers": [bootstrap_blocker],
+                "paper_only": True,
+                "live_execution": False,
+            }
         if not self._reconcile_pending_canary_selection_binding():
             return {
                 "status": "BLOCKED",
@@ -4674,6 +4711,46 @@ class OperatorControlPlane:
             "active_risk_config_generation": generation,
             "active_risk_config_hash": config_hash,
         }
+
+    def _rolling_bootstrap_blocker(self) -> str | None:
+        """Return the exact system-bootstrap blocker without mutating state."""
+        loader = getattr(self.store, "get_operator_config", None)
+        if not callable(loader):
+            return self._rolling_bootstrap_error or "ROLLING_POLICY_BOOTSTRAP_UNAVAILABLE"
+        bootstrap_required = loader("rolling_exploratory_bootstrap_required", False) is True
+        operating = loader(_SYSTEM_EXPLORATORY_OPERATING_POLICY_KEY, None)
+        if operating is None:
+            return (
+                "ROLLING_POLICY_BOOTSTRAP_REQUIRED"
+                if bootstrap_required
+                else self._rolling_bootstrap_error
+            )
+        if not bootstrap_required:
+            return self._rolling_bootstrap_error
+        active = loader(_SYSTEM_EXPLORATORY_ADMISSION_CONFIG_KEY, None)
+        try:
+            validate_system_exploratory_admission_policy(
+                active if isinstance(active, Mapping) else None,
+                operating if isinstance(operating, Mapping) else operating,
+                self._rolling_risk_binding(),
+            )
+        except RollingPolicyBootstrapError as exc:
+            return exc.code
+        except OperatorControlError as exc:
+            return exc.code
+        return self._rolling_bootstrap_error
+
+    def _bootstrap_system_exploratory_admission_policy(self) -> dict[str, Any]:
+        """Activate only the immutable system exploratory paper policy."""
+        try:
+            return bootstrap_system_exploratory_admission_policy(
+                self.store,
+                ensure_operating=self._research_processor._ensure_exploratory_live_bootstrap,
+                risk_binding_loader=self._rolling_risk_binding,
+                now=utc_now(),
+            )
+        except RollingPolicyBootstrapError as exc:
+            raise OperatorControlError(exc.code) from exc
 
     def _rolling_active_policy_document(self) -> tuple[dict[str, Any], dict[str, Any]]:
         """Return the active envelope and its exact immutable policy document."""
@@ -4909,7 +4986,6 @@ class OperatorControlPlane:
             status = "UNKNOWN"
         else:
             feasible = minimum <= all_in_buy
-            status = "FEASIBLE" if feasible else "BLOCKED"
         return {
             "status": status,
             "feasible": feasible,
@@ -4932,6 +5008,9 @@ class OperatorControlPlane:
         expected_risk_config_hash: Any | None = None,
     ) -> dict[str, Any]:
         """Create a non-active, internally identified rolling allocation draft."""
+        bootstrap_blocker = self._rolling_bootstrap_blocker()
+        if bootstrap_blocker:
+            raise OperatorControlError(bootstrap_blocker)
         if values is not None and not isinstance(values, Mapping):
             raise OperatorControlError("ROLLING_POLICY_REQUIRED")
         actor_value = _safe_identifier(actor, "actor")
@@ -5132,6 +5211,11 @@ class OperatorControlPlane:
         expected_risk_config_hash: Any | None = None,
     ) -> dict[str, Any]:
         """Activate a reviewed policy only after its exact selection is committed."""
+        if self.store.get_operator_config(
+            "rolling_exploratory_bootstrap_required",
+            False,
+        ) is True:
+            raise OperatorControlError("ROLLING_POLICY_BOOTSTRAP_MANUAL_ACTIVATION_BLOCKED")
         actor_value = _safe_identifier(actor, "actor")
         reviewed = self.store.get_operator_config("rolling_admission_policy_review", {})
         if not isinstance(reviewed, Mapping):

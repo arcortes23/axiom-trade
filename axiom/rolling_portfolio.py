@@ -15,6 +15,7 @@ import hashlib
 import json
 from types import MappingProxyType
 from typing import Any, Mapping, Sequence
+from .forward import EXPLORATORY_LIVE_POLICY, _content_hash
 
 
 UTC = timezone.utc
@@ -76,6 +77,8 @@ DEFAULT_SCORE_FORMULA = (
 "execution_cost_rate remains an informational cost breakdown"
 )
 SCORE_FORMULA_VERSION = "rolling-score-v1"
+SYSTEM_EXPLORATORY_ADMISSION_ID = "system:polymarket-exploratory-live"
+SYSTEM_EXPLORATORY_ADMISSION_VERSION = "exploratory-live-bootstrap-v1"
 POLICY_VERSION = "rolling-admission-v1"
 REASON_REDUCE = "REDUCE"
 _MEMBER_ACTIONS = frozenset({"ADD", "HOLD", "REDUCE", "OBSERVE"})
@@ -1131,6 +1134,103 @@ class RollingAdmissionPolicy:
         )
 
 
+
+
+class RollingPolicyBootstrapError(ValueError):
+    """A scheduler-owned exploratory admission policy failed validation."""
+
+    def __init__(self, code: str) -> None:
+        self.code = str(code)
+        super().__init__(self.code)
+
+
+def _system_bootstrap_hash(
+    value: Mapping[str, Any],
+    *,
+    excluded: frozenset[str],
+) -> str:
+    return str(_content_hash({key: value[key] for key in value if key not in excluded}))
+
+
+def validate_system_exploratory_admission_policy(
+    active: Mapping[str, Any] | None,
+    operating: Mapping[str, Any] | None,
+    risk_binding: Mapping[str, Any],
+    *,
+    require_active: bool = True,
+) -> dict[str, Any] | None:
+    """Validate the exact system bootstrap envelope or allow legacy fallback."""
+    if operating is None:
+        return None
+    if not isinstance(operating, Mapping):
+        raise RollingPolicyBootstrapError("ROLLING_POLICY_BOOTSTRAP_DRIFT")
+    expected_operating = dict(EXPLORATORY_LIVE_POLICY)
+    if any(operating.get(key) != expected for key, expected in expected_operating.items()):
+        raise RollingPolicyBootstrapError("ROLLING_POLICY_BOOTSTRAP_DRIFT")
+    scope = operating.get("scope")
+    if not isinstance(scope, Mapping) or (
+        scope.get("schema_version") != "1"
+        or scope.get("mode") != "RULE_BASED_MARKETS"
+        or scope.get("instrument") != "POLYMARKET"
+        or scope.get("provenance") != "public-current-market"
+        or scope.get("bounded_pool_cap") != 10
+    ):
+        raise RollingPolicyBootstrapError("ROLLING_POLICY_BOOTSTRAP_DRIFT")
+    if operating.get("config_hash") != _system_bootstrap_hash(
+        operating,
+        excluded=frozenset({"updated_at", "config_hash"}),
+    ):
+        raise RollingPolicyBootstrapError("ROLLING_POLICY_BOOTSTRAP_HASH_MISMATCH")
+    if active is None and not require_active:
+        return None
+    if active is None:
+        active = {}
+    if not isinstance(active, Mapping) or not active:
+        raise RollingPolicyBootstrapError("ROLLING_POLICY_BOOTSTRAP_ACTIVE_REQUIRED")
+    expected_policy = default_rolling_admission_policy().as_dict()
+    expected_identity = {
+        "policy_id": expected_policy["policy_id"],
+        "version": expected_policy["version"],
+        "config_hash": expected_policy["config_hash"],
+    }
+    if (
+        active.get("system_bootstrap_id") != SYSTEM_EXPLORATORY_ADMISSION_ID
+        or active.get("system_bootstrap_version") != SYSTEM_EXPLORATORY_ADMISSION_VERSION
+        or active.get("policy_id") != expected_identity["policy_id"]
+        or active.get("version") != expected_identity["version"]
+        or active.get("policy_version") != expected_identity["version"]
+        or active.get("config_hash") != expected_identity["config_hash"]
+        or active.get("paper_only") is not True
+        or active.get("live_execution") is not False
+        or active.get("allocation_active") is not False
+        or active.get("canary_armed") is not False
+        or active.get("status") != "ACTIVE"
+    ):
+        raise RollingPolicyBootstrapError("ROLLING_POLICY_BOOTSTRAP_DRIFT")
+    for key in ("risk_config_id", "risk_config_generation", "risk_config_hash"):
+        if str(active.get(key, "")).strip() != str(risk_binding.get(key, "")).strip():
+            raise RollingPolicyBootstrapError("ROLLING_POLICY_BOOTSTRAP_RISK_DRIFT")
+    if (
+        active.get("operating_policy") != dict(operating)
+        or active.get("exploratory_policy") != dict(operating)
+        or not isinstance(active.get("policy"), Mapping)
+        or _system_bootstrap_hash(
+            active,
+            excluded=frozenset(
+                {"activated_at", "activated_by", "system_bootstrap_hash"}
+            ),
+        )
+        != str(active.get("system_bootstrap_hash") or "")
+    ):
+        raise RollingPolicyBootstrapError("ROLLING_POLICY_BOOTSTRAP_HASH_MISMATCH")
+    policy = dict(active["policy"])
+    if (
+        policy.get("policy_id") != expected_identity["policy_id"]
+        or policy.get("version", policy.get("policy_version")) != expected_identity["version"]
+        or policy.get("config_hash") != expected_identity["config_hash"]
+    ):
+        raise RollingPolicyBootstrapError("ROLLING_POLICY_BOOTSTRAP_DRIFT")
+    return dict(active)
 def default_rolling_admission_policy() -> RollingAdmissionPolicy:
     """Return the conservative, explicitly paper-only default policy."""
     return RollingAdmissionPolicy(policy_id="rolling-default", version=POLICY_VERSION)
