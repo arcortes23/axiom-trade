@@ -152,13 +152,21 @@ class AutonomousCanaryWorker:
             selection.get("authorization_mode"),
             selection.get("execution_mode"),
             selection.get("execution_policy"),
+            selection.get("operating_policy"),
+            selection.get("exploratory_policy"),
+            selection.get("setup_policy"),
             selection.get("policy_mode"),
         )
         raw: Any = next((value for value in candidates if value not in (None, "")), None)
         if isinstance(raw, Mapping):
             raw = raw.get("mode") or raw.get("name") or raw.get("type")
         mode = str(raw or "EVIDENCE_SELECTED").strip().upper()
-        if mode in {"EXPLORATORY", "EXPLORATORY_MICRO_CANARY", "MICRO_CANARY"}:
+        if mode in {
+            "EXPLORATORY",
+            "EXPLORATORY_LIVE",
+            "EXPLORATORY_MICRO_CANARY",
+            "MICRO_CANARY",
+        }:
             return "EXPLORATORY_MICRO_CANARY"
         return "EVIDENCE_SELECTED"
 
@@ -2012,6 +2020,23 @@ class AutonomousCanaryWorker:
                 or ""
             ).strip(),
         }
+        for field in (
+            "operational_setup_hash",
+            "setup_hash",
+            "setup_id",
+            "setup_version",
+            "operating_policy",
+            "policy_id",
+            "policy_version",
+            "policy_hash",
+            "scope_hash",
+            "scope_version",
+        ):
+            value = member.get(field)
+            if value in (None, "") and isinstance(member.get("operational_setup"), Mapping):
+                value = member["operational_setup"].get(field)
+            if value not in (None, ""):
+                context[field] = value
         return context
 
     @staticmethod

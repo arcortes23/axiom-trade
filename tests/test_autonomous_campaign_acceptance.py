@@ -14,6 +14,10 @@ from axiom.autonomous import (
     CAMPAIGN_SCHEMA_V2,
     _hash_document,
 )
+from axiom.forward import (
+    EXPLORATORY_LIVE_POLICY_VERSION,
+    _operational_setup_for_strategy,
+)
 from axiom.storage import AxiomStore
 
 
@@ -220,6 +224,100 @@ def _v2_prior_plan(
 
 
 class AutonomousCampaignAcceptanceTests(unittest.TestCase):
+    def test_exploratory_setup_is_versioned_and_paper_only(self) -> None:
+        strategy = {
+            "version": 1,
+            "market_type": "prediction",
+            "family": "momentum",
+            "parameters": {
+                "lookback": 1,
+                "threshold": 0.05,
+                "entry_predicate": {
+                    "version": "absolute-move-v1",
+                    "minimum_move": 0.05,
+                    "units": "probability",
+                    "boundary": "inclusive",
+                },
+            },
+            "probability_model": "plan-model-probability",
+            "resolution_aware": True,
+            "resolution_inputs": ["expiry", "settlement"],
+        }
+        scope = {
+            "mode": "RULE_BASED_MARKETS",
+            "instrument": "POLYMARKET",
+            "filters": {},
+            "regime_restrictions": {},
+            "provenance": "canonical",
+        }
+        frozen = _operational_setup_for_strategy(strategy, {"market_scope": scope})
+        exploratory = _operational_setup_for_strategy(
+            strategy,
+            {"market_scope": scope, "operating_policy": {"mode": "EXPLORATORY_LIVE"}},
+        )
+        self.assertIsNotNone(frozen)
+        self.assertIsNotNone(exploratory)
+        assert frozen is not None and exploratory is not None
+        self.assertNotEqual(frozen["setup_id"], exploratory["setup_id"])
+        self.assertEqual(exploratory["setup_version"], EXPLORATORY_LIVE_POLICY_VERSION)
+        self.assertTrue(exploratory["setup_policy"]["paper_only"])
+        self.assertFalse(exploratory["setup_policy"]["allocation_active"])
+        self.assertFalse(exploratory["setup_policy"]["canary_armed"])
+        self.assertEqual(exploratory["capture_spec"]["lookback"], 1)
+        self.assertEqual(
+            exploratory["capture_spec"]["entry"]["predicate"]["version"],
+            "absolute-move-v1",
+        )
+    def test_canonical_evaluation_without_declared_exit_uses_safe_fixed_policy(self) -> None:
+        with AxiomStore(":memory:") as store:
+            processor = AutonomousResearchProcessor(store, clock=lambda: T0)
+            result = processor._rolling_canonical_evaluation(
+                {
+                    "strategy_version_id": "strategy-no-exit",
+                    "strategy_document": None,
+                },
+                [
+                    {
+                        "timestamp": T0.isoformat(),
+                        "market_id": "market-no-exit",
+                        "yes_mid": 0.5,
+                    }
+                ],
+                "HISTORICAL",
+            )
+            self.assertIsNotNone(result)
+            assert result is not None
+            self.assertEqual(result["exit_policy"]["type"], "fixed_holding_period")
+            self.assertEqual(result["holding_period"], 1)
+
+    def test_canonical_evaluation_preserves_mapping_exit_policy(self) -> None:
+        with AxiomStore(":memory:") as store:
+            processor = AutonomousResearchProcessor(store, clock=lambda: T0)
+            declared_exit = {
+                "type": "signal_reversal",
+                "lookback": 4,
+                "holding_period": 2,
+            }
+            result = processor._rolling_canonical_evaluation(
+                {
+                    "strategy_version_id": "strategy-mapping-exit",
+                    "strategy_document": None,
+                    "exit_policy": declared_exit,
+                },
+                [
+                    {
+                        "timestamp": T0.isoformat(),
+                        "market_id": "market-mapping-exit",
+                        "yes_mid": 0.5,
+                    }
+                ],
+                "HISTORICAL",
+            )
+            self.assertIsNotNone(result)
+            assert result is not None
+            self.assertEqual(result["exit_policy"]["type"], "signal_reversal")
+            self.assertEqual(result["exit_policy"]["lookback"], 4)
+
     def test_large_campaign_uses_compact_locked_provenance(self) -> None:
         with AxiomStore(":memory:") as store:
             _save_catalog_attested_dataset(

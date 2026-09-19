@@ -36,6 +36,7 @@ from axiom.canary import (
     PRODUCTION_LIVE_EXECUTION,
     _canary_lifecycle_snapshot_hashes,
     _canary_lifecycle_evidence_class,
+    _require_execution_authorization,
 )
 from axiom.cli import main
 from axiom.dashboard import DashboardData, _dashboard_html
@@ -330,6 +331,125 @@ def _blocked_submit_worker(database_path, entered, release, results):
 
 
 class CanaryTests(unittest.TestCase):
+    def test_revoked_originating_authorization_is_exit_only(self):
+        settings_hash = "settings-hash"
+        authorization = {
+            "authorization_id": "revoked-auth",
+            "mode": "EVIDENCE_SELECTED",
+            "status": "REVOKED",
+            "expires_at": (T0 - timedelta(minutes=5)).isoformat(),
+            "active_settings_hash": settings_hash,
+            "active_settings_generation": 1,
+            "exact_strategy_versions": [],
+        }
+
+        class Store:
+            def load_active_execution_authorization(self, **kwargs):
+                return None
+
+            def list_execution_authorizations(self, **kwargs):
+                return [authorization]
+
+        service = SimpleNamespace(
+            store=Store(),
+            _settings_identity=lambda: ("settings", 1, settings_hash),
+        )
+        recovered = _require_execution_authorization(
+            service,
+            signal=None,
+            lineage={"execution_authorization_id": "revoked-auth"},
+            context={"execution_authorization_mode": "EVIDENCE_SELECTED"},
+            now=T0,
+        )
+        self.assertEqual(recovered["authorization_id"], "revoked-auth")
+        with self.assertRaises(CanaryBlocked):
+            _require_execution_authorization(
+                service,
+                signal={"side": "BUY"},
+                lineage={},
+                context={},
+                now=T0,
+            )
+
+        self.assertEqual(
+            AutonomousCanaryWorker._rolling_execution_mode(
+                {"operating_policy": {"mode": "EXPLORATORY_LIVE"}}
+            ),
+            "EXPLORATORY_MICRO_CANARY",
+        )
+        self.assertEqual(
+            AutonomousCanaryWorker._rolling_execution_mode({}),
+            "EVIDENCE_SELECTED",
+        )
+
+
+    def test_exploratory_live_buy_requires_setup_binding(self):
+        current = {
+            "portfolio_selection_id": "selection-live",
+            "policy_id": "policy-live",
+            "policy_version": "policy-v1",
+            "risk_config_id": "risk-live",
+            "risk_config_generation": 1,
+            "risk_config_hash": "risk-hash",
+            "members": [
+                {
+                    "strategy_version_id": "strategy-live",
+                    "research_trial_id": "trial-live",
+                    "candidate_id": "candidate-live",
+                    "status": "ACTIVE",
+                    "allocation": "1.00",
+                }
+            ],
+        }
+
+        class Cursor:
+            def fetchone(self):
+                return {"strategy_version_id": "strategy-live"}
+
+        class Connection:
+            def execute(self, *_args):
+                return Cursor()
+
+        class Store:
+            connection = Connection()
+
+            def load_current_portfolio_selection(self):
+                return current
+
+            def list_strategy_evidence_windows(self, _strategy, limit=4096):
+                return [
+                    {
+                        "strategy_version_id": "strategy-live",
+                        "research_trial_id": "trial-live",
+                        "candidate_id": "candidate-live",
+                        "evidence_window_id": "window-live",
+                        "evidence_digest": "digest-live",
+                        "source_class": "historical",
+                    }
+                ]
+
+        service = object.__new__(CanaryService)
+        service.store = Store()
+        service.validate_rolling_selection_fence = lambda _selection: {
+            "selection_hash": "selection-hash"
+        }
+        with self.assertRaisesRegex(
+            CanaryBlocked, "^EXPLORATORY_SETUP_BINDING_REQUIRED$"
+        ):
+            service._rolling_lineage(
+                {
+                    "lineage_type": "ROLLING_PORTFOLIO",
+                    "strategy_version_id": "strategy-live",
+                    "research_trial_id": "trial-live",
+                    "portfolio_selection_id": "selection-live",
+                    "evidence_window_id": "window-live",
+                    "evidence_digest": "digest-live",
+                    "candidate_id": "candidate-live",
+                },
+                require_active=True,
+                side="BUY",
+                execution_authorization_mode="EXPLORATORY_LIVE",
+            )
 
     def setUp(self):
         self._production_profile = patch.dict(

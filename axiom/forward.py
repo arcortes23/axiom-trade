@@ -1266,6 +1266,31 @@ def _normalized_strategy_document(value: Any) -> Any:
 # remain readable and are never backfilled by ``ForwardTestSpec``.
 OPERATIONAL_SETUP_SCHEMA = "axiom-operational-setup"
 OPERATIONAL_SETUP_VERSION = "1"
+EXPLORATORY_LIVE_SETUP_VERSION = "exploratory-live-v1"
+EXPLORATORY_LIVE_POLICY_ID = "polymarket-exploratory-live"
+EXPLORATORY_LIVE_POLICY_VERSION = "exploratory-live-v1"
+EXPLORATORY_LIVE_POLICY: Mapping[str, Any] = MappingProxyType(
+    {
+        "policy_id": EXPLORATORY_LIVE_POLICY_ID,
+        "version": EXPLORATORY_LIVE_POLICY_VERSION,
+        "mode": "EXPLORATORY_LIVE",
+        "pool_cap": 10,
+        "target_members": {"minimum": 1, "maximum": 3},
+        "member_requirements": {
+            "fresh_market_metadata": True,
+            "fresh_selected_token_book": True,
+            "fresh_token_identity": True,
+        },
+        "discovery": {
+            "bounded": True,
+            "independent_of_active_refresh": True,
+            "partial_results_are_usable": True,
+        },
+        "paper_only": True,
+        "allocation_active": False,
+        "canary_armed": False,
+    }
+)
 _DIRECTIONAL_SETUP_FAMILIES = frozenset({"momentum", "mean_reversion"})
 _ABSOLUTE_MOVE_PREDICATE = {
     "version": "absolute-move-v1",
@@ -1325,6 +1350,57 @@ def _operational_dataset_identity(
         result.append(values[field][0] if values[field] else None)
     return result[0], result[1]
 
+def _exploratory_live_requested(config: Mapping[str, Any] | None) -> bool:
+    """Return whether a new record explicitly opts into the exploratory policy.
+
+    The marker is deliberately opt-in.  Evidence-selected records and legacy
+    frozen policies therefore retain their existing setup identity.
+    """
+    source = config if isinstance(config, Mapping) else {}
+    metadata = source.get("metadata")
+    candidates = (
+        source.get("operating_policy"),
+        source.get("exploratory_policy"),
+        source.get("execution_mode"),
+        source.get("policy_mode"),
+        metadata.get("operating_policy") if isinstance(metadata, Mapping) else None,
+        metadata.get("exploratory_policy") if isinstance(metadata, Mapping) else None,
+    )
+    for raw in candidates:
+        if isinstance(raw, Mapping):
+            raw = raw.get("mode") or raw.get("name") or raw.get("type")
+        if str(raw or "").strip().upper() == "EXPLORATORY_LIVE":
+            return True
+    return False
+
+
+def _exploratory_live_capture_spec() -> dict[str, Any]:
+    """Return the exact capture contract consumed by canonical evaluation."""
+    return {
+        "entry": {
+            "predicate": dict(_ABSOLUTE_MOVE_PREDICATE),
+            "raw": "abs(delta_probability) >= 0.05",
+        },
+        "direction": {
+            "positive_delta": "BUY YES",
+            "negative_delta": "BUY NO",
+            "buy_interpretation": "BUY",
+        },
+        "sizing": {
+            "rule": "active_settings",
+            "allocation_reference": "paper_assumptions.sizing.allocated_capital",
+            "limit_reference": "active_settings",
+        },
+        "exit": {
+            "type": "fixed_holding_period",
+            "count": 1,
+            "unit": "same_market_observation",
+        },
+        "lookback": 1,
+        "required_features": ["timestamp", "market_id", "yes_mid"],
+        "evaluator": "canonical_prediction_research",
+    }
+
 
 
 
@@ -1347,6 +1423,12 @@ def _operational_setup_for_strategy(
         return None
     if not isinstance(document, Mapping):
         return None
+    strategy_metadata = document.get("metadata")
+    metadata_policy = (
+        strategy_metadata.get("operating_policy")
+        if isinstance(strategy_metadata, Mapping)
+        else None
+    )
     if document.get("market_type") != "prediction":
         return None
     family = document.get("family")
@@ -1434,8 +1516,15 @@ def _operational_setup_for_strategy(
             "regime_restrictions": [],
             "provenance": "canonical",
         }
+    exploratory = (
+        source.get("legacy_predeclared") is not True
+        and (
+            _exploratory_live_requested(source)
+            or str(metadata_policy or "").strip() == EXPLORATORY_LIVE_POLICY_VERSION
+        )
+    )
     setup_id = f"{family}:absolute-move-v1:L1:H1"
-    return {
+    result = {
         "contract_schema": OPERATIONAL_SETUP_SCHEMA,
         "contract_version": OPERATIONAL_SETUP_VERSION,
         "setup_id": setup_id,
@@ -1500,6 +1589,16 @@ def _operational_setup_for_strategy(
         "paper_only": True,
         "paper_only_statement": "Paper-only research; no live capability or submission path.",
     }
+    if exploratory:
+        result.update(
+            {
+                "setup_version": EXPLORATORY_LIVE_SETUP_VERSION,
+                "setup_policy": dict(EXPLORATORY_LIVE_POLICY),
+                "capture_spec": _exploratory_live_capture_spec(),
+            }
+        )
+        result["setup_id"] = f"{setup_id}:{EXPLORATORY_LIVE_SETUP_VERSION}"
+    return result
 
 
 def _operational_setup_hash(setup: Mapping[str, Any]) -> str:
@@ -1618,6 +1717,10 @@ def _plain(value: Any) -> Any:
 
 __all__ = [
     "COMMON_PAPER_ASSUMPTIONS",
+    "EXPLORATORY_LIVE_POLICY",
+    "EXPLORATORY_LIVE_POLICY_ID",
+    "EXPLORATORY_LIVE_POLICY_VERSION",
+    "EXPLORATORY_LIVE_SETUP_VERSION",
     "ForwardTestRegistry",
     "ForwardTestSpec",
     "OPERATIONAL_SETUP_SCHEMA",

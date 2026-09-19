@@ -33,6 +33,7 @@ from .canary import (
     PolymarketClobV2Venue,
     _canary_adverse_acknowledged,
     _canary_authorization_current_selection_hash,
+    _canary_selection_member_is_funded,
     credential_fingerprint,
 )
 from .canary_positions import (
@@ -108,7 +109,7 @@ _ALLOWED_ACTIONS = frozenset(
         "exploratory.authorization.activate",
         "exploratory.authorization.revoke",
         "authorization.review",
-        "authorization.activate",
+        "exploratory.live.review_confirm",
         "authorization.revoke",
     }
 )
@@ -122,6 +123,11 @@ _AUTHORIZATION_ACTION_ALIASES = {
     "authorization.review": "execution_authorization.review",
     "authorization.activate": "execution_authorization.activate",
     "authorization.revoke": "execution_authorization.revoke",
+}
+_EXPLORATORY_LIVE_ACTION_ALIASES = {
+    "exploratory.live.review_confirm": "exploratory.live.review_confirm",
+    "exploratory_live.review_confirm": "exploratory.live.review_confirm",
+    "canary.exploratory_live.review_confirm": "exploratory.live.review_confirm",
 }
 _ROLLING_ACTION_ALIASES = {
     "rolling.admission.review": "rolling.admission.review",
@@ -141,6 +147,7 @@ _ACTION_ALIASES = {
     **_ROLLING_ACTION_ALIASES,
     **_SETTINGS_ACTION_ALIASES,
     **_AUTHORIZATION_ACTION_ALIASES,
+    **_EXPLORATORY_LIVE_ACTION_ALIASES,
 }
 _CONFIRMATIONS = {
     "canary.eligibility.mark": "MARK CANARY ELIGIBLE",
@@ -160,6 +167,7 @@ _CONFIRMATIONS = {
     "admission_policy.review": "REVIEW ROLLING ADMISSION POLICY",
     "admission_policy.activate": "ACTIVATE ROLLING ADMISSION POLICY",
 }
+_CONFIRMATIONS["exploratory.live.review_confirm"] = "CONFIRM EXPLORATORY LIVE"
 _CONFIRMATIONS.update(
     {
         "execution_authorization.review": "REVIEW EXPLORATORY AUTHORIZATION",
@@ -172,7 +180,7 @@ _ISOLATED_OPERATOR_BLOCKED_ACTIONS = frozenset(
         "canary.connectivity_check",
         "canary.arm",
         "canary.enable_auto",
-        "canary.settings.activate_draft",
+        "exploratory.live.review_confirm",
         "risk.settings.activate_draft",
     }
 )
@@ -1772,14 +1780,53 @@ class OperatorControlPlane:
         policy_identity = rolling.get("active_policy_identity")
         if not isinstance(policy_identity, Mapping):
             policy_identity = rolling.get("policy_identity")
+        policy_identity = dict(policy_identity) if isinstance(policy_identity, Mapping) else {}
         policy_hash = (
             str(
                 policy_identity.get("config_hash")
-                if isinstance(policy_identity, Mapping)
-                else ""
+                or policy_identity.get("policy_hash")
+                or selection.get("policy_hash")
+                or selection.get("config_hash")
+                or ""
             ).strip()
-            or str(selection.get("policy_hash") or selection.get("config_hash") or "").strip()
         )
+        policy_id = str(
+            policy_identity.get("policy_id")
+            or policy_identity.get("id")
+            or selection.get("policy_id")
+            or selection.get("admission_policy_id")
+            or ""
+        ).strip() or None
+        policy_version = str(
+            policy_identity.get("policy_version")
+            or policy_identity.get("version")
+            or selection.get("policy_version")
+            or selection.get("admission_policy_version")
+            or ""
+        ).strip() or None
+        setup_bindings: list[dict[str, Any]] = []
+        for member in members[:64]:
+            if not isinstance(member, Mapping):
+                continue
+            setup = member.get("operational_setup")
+            setup = setup if isinstance(setup, Mapping) else {}
+            strategy_id = str(member.get("strategy_version_id") or "").strip()
+            if not strategy_id:
+                continue
+            setup_bindings.append(
+                {
+                    "strategy_version_id": strategy_id,
+                    "candidate_id": str(member.get("candidate_id") or "").strip() or None,
+                    "setup_id": member.get("setup_id", setup.get("setup_id")),
+                    "setup_version": member.get("setup_version", setup.get("setup_version")),
+                    "setup_hash": member.get(
+                        "operational_setup_hash",
+                        setup.get("operational_setup_hash", setup.get("setup_hash")),
+                    ),
+                    "scope_hash": member.get("scope_hash", setup.get("scope_hash")),
+                    "scope_version": member.get("scope_version", setup.get("scope_version")),
+                }
+            )
         scope_loader = getattr(self.store, "market_scope_resolution_funnel", None)
         if callable(scope_loader):
             try:
@@ -1811,9 +1858,13 @@ class OperatorControlPlane:
             "now": now,
             "selection_id": selection_id or None,
             "selection_hash": selection_hash or None,
+            "selection_policy_hash": policy_hash or None,
             "strategy_versions": strategy_versions,
             "rejected_strategy_versions": rejected_strategy_versions,
-            "selection_policy_hash": policy_hash or None,
+            "policy_id": policy_id,
+            "policy_version": policy_version,
+            "policy_hash": policy_hash or None,
+            "setup_bindings": setup_bindings,
             "scope_hash": scope_hash,
             "scope_version": scope_version,
             "active_settings_hash": settings_hash,
@@ -1822,7 +1873,6 @@ class OperatorControlPlane:
             "selection": selection,
             "scope": scope,
         }
-
     def execution_authorization_snapshot(self) -> dict[str, Any]:
         """Return active and latest reviewed exploratory authorization state."""
         loader = getattr(self.store, "load_active_execution_authorization", None)
@@ -1912,6 +1962,22 @@ class OperatorControlPlane:
             status = "UNKNOWN"
         else:
             status = "DISABLED"
+        if isinstance(active, Mapping) and isinstance(draft, Mapping):
+            active_id = str(active.get("authorization_id") or active.get("id") or "").strip()
+            draft_id = str(draft.get("authorization_id") or draft.get("id") or "").strip()
+            if active_id and active_id == draft_id:
+                enriched = dict(active)
+                for key in (
+                    "selection_id",
+                    "selection_hash",
+                    "policy_id",
+                    "policy_version",
+                    "policy_hash",
+                    "setup_bindings",
+                ):
+                    if enriched.get(key) in (None, "", [], {}):
+                        enriched[key] = draft.get(key)
+                active = enriched
         authorization = active or latest or draft
         authorization_id = (
             authorization.get("authorization_id") or authorization.get("id")
@@ -2171,8 +2237,8 @@ class OperatorControlPlane:
             {
                 "mode": "EXPLORATORY_MICRO_CANARY",
                 "purpose": purpose,
+                "strategy_versions": strategy_versions,
                 "exact_strategy_versions": strategy_versions,
-                "reviewed_selection_policy_hash": policy_hash or None,
                 "adverse_evidence_ack": persisted_ack,
                 "adverse_evidence_ack_required": funding_rejected_strategy,
                 "lifetime_budget": lifetime_budget,
@@ -2184,6 +2250,10 @@ class OperatorControlPlane:
                 "active_settings_generation": context["active_settings_generation"],
                 "selection_id": context["selection_id"],
                 "selection_hash": context["selection_hash"],
+                "policy_id": context.get("policy_id"),
+                "policy_version": context.get("policy_version"),
+                "policy_hash": context.get("policy_hash"),
+                "setup_bindings": _safe_value(context.get("setup_bindings", [])),
                 "actor": actor_value,
                 "actor_version": actor_version,
                 "status": "DRAFT",
@@ -2248,6 +2318,10 @@ class OperatorControlPlane:
         if not isinstance(projected, Mapping):
             raise OperatorControlError("EXECUTION_AUTHORIZATION_ACTIVE_INVALID")
         document = dict(projected)
+        document.setdefault(
+            "strategy_versions",
+            document.get("exact_strategy_versions", document.get("strategy_version_ids", [])),
+        )
         document.setdefault("mode", "EXPLORATORY_MICRO_CANARY")
         document["paper_only"] = True
         document["live_execution"] = False
@@ -2316,6 +2390,950 @@ class OperatorControlPlane:
             "live_execution": False,
         }
 
+    _EXPLORATORY_LIVE_REVIEW_LIMITS = {
+        "max_all_in_buy_usd": "1.00",
+        "max_fee_reserve_usd": "0.01",
+        "max_gross_daily_buy_usd": "5.00",
+        "max_aggregate_open_cost_usd": "5.00",
+        "max_aggregate_exposure_usd": "5.00",
+        "max_positions": 3,
+        "max_submitted_orders_per_day": 5,
+        "realized_loss_entry_stop_usd": "2.00",
+        "equity_loss_entry_stop_usd": "2.00",
+        "max_slippage_bps": 100,
+    }
+    @staticmethod
+    def _exploratory_live_policy_mode(value: Any) -> str:
+        if isinstance(value, Mapping):
+            value = value.get("mode") or value.get("name") or value.get("type")
+        return str(value or "").strip().upper()
+
+    def _selected_market_readiness(
+        self,
+        selection: Mapping[str, Any],
+        *,
+        scope: Mapping[str, Any] | None = None,
+        target_candidate_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Require fresh account and selected-market readiness evidence."""
+        getter = getattr(self.store, "get_operator_config", None)
+        connectivity = getter(CANARY_CONNECTIVITY_CONFIG_KEY, {}) if callable(getter) else {}
+        connectivity = dict(connectivity) if isinstance(connectivity, Mapping) else {}
+        diagnostics = connectivity.get("diagnostics")
+        diagnostics = dict(diagnostics) if isinstance(diagnostics, Mapping) else {}
+        checked_at = connectivity.get("checked_at")
+        fresh = False
+        if isinstance(checked_at, str):
+            try:
+                stamp = datetime.fromisoformat(checked_at.replace("Z", "+00:00"))
+                age = (utc_now() - stamp.astimezone(timezone.utc)).total_seconds()
+                fresh = 0 <= age <= CANARY_READINESS_SNAPSHOT_MAX_AGE_SECONDS
+            except (TypeError, ValueError):
+                fresh = False
+        members = selection.get("members", selection.get("selected_members", ()))
+        if isinstance(members, (list, tuple)) and target_candidate_id:
+            first_member = next(
+                (
+                    item
+                    for item in members
+                    if isinstance(item, Mapping)
+                    and str(item.get("candidate_id") or "").strip()
+                    == str(target_candidate_id).strip()
+                ),
+                {},
+            )
+        else:
+            first_member = next(
+                (item for item in members if isinstance(item, Mapping))
+                if isinstance(members, (list, tuple))
+                else iter(())
+            )
+        first_member = first_member if isinstance(first_member, Mapping) else {}
+        canonical_scope = first_member.get("market_scope")
+        canonical_scope = canonical_scope if isinstance(canonical_scope, Mapping) else {}
+        exact_market_ids = canonical_scope.get(
+            "market_ids", canonical_scope.get("exact_market_ids", ())
+        )
+        if isinstance(exact_market_ids, str):
+            exact_market_ids = (exact_market_ids,)
+        exact_market_ids = tuple(
+            str(value).strip()
+            for value in (exact_market_ids or ())
+            if str(value).strip()
+        )
+        materialized: list[Mapping[str, Any]] = []
+        candidate_id = str(first_member.get("candidate_id") or "").strip()
+        resolution_loader = getattr(self.store, "load_current_market_resolution", None)
+        if not callable(resolution_loader):
+            resolution_loader = getattr(self.store, "load_market_scope_resolution", None)
+        if callable(resolution_loader) and candidate_id:
+            try:
+                resolution = resolution_loader(
+                    candidate_id,
+                    scope_hash=str(first_member.get("scope_hash") or "").strip() or None,
+                    scope_version=str(first_member.get("scope_version") or "").strip() or None,
+                )
+            except TypeError:
+                try:
+                    resolution = resolution_loader(candidate_id)
+                except Exception:
+                    resolution = None
+            except Exception:
+                resolution = None
+            matched = getattr(resolution, "matched_markets", None)
+            if matched is None and isinstance(resolution, Mapping):
+                matched = resolution.get("matched_markets", resolution.get("markets", ()))
+            if isinstance(matched, (list, tuple)):
+                for item in matched:
+                    if hasattr(item, "as_dict") and callable(item.as_dict):
+                        item = item.as_dict()
+                    if isinstance(item, Mapping):
+                        materialized.append(dict(item))
+        if isinstance(scope, Mapping):
+            for key in ("current_markets", "matched_markets", "markets"):
+                values = scope.get(key)
+                if isinstance(values, (list, tuple)):
+                    materialized.extend(
+                        dict(item) for item in values if isinstance(item, Mapping)
+                    )
+        market_binding = (
+            first_member.get("current_market_binding")
+            or first_member.get("market_binding")
+            or first_member.get("selected_market")
+        )
+        market_binding = market_binding if isinstance(market_binding, Mapping) else {}
+        if market_binding:
+            materialized.append(dict(market_binding))
+        binding_market_id = str(
+            market_binding.get("market_id")
+            or market_binding.get("id")
+            or market_binding.get("market")
+            or ""
+        ).strip()
+        candidates = []
+        for item in materialized:
+            item_market = str(
+                item.get("market_id") or item.get("id") or item.get("market") or ""
+            ).strip()
+            if (
+                item_market
+                and (not exact_market_ids or item_market in exact_market_ids)
+                and (not binding_market_id or item_market == binding_market_id)
+            ):
+                candidates.append(item)
+        unique_candidates: dict[str, dict[str, Any]] = {}
+        for item in candidates:
+            item_market = str(
+                item.get("market_id") or item.get("id") or item.get("market") or ""
+            ).strip()
+            existing = unique_candidates.get(item_market)
+            if existing is None:
+                unique_candidates[item_market] = dict(item)
+            else:
+                for key, value in item.items():
+                    if existing.get(key) in (None, "", {}, []):
+                        existing[key] = value
+        candidates = list(unique_candidates.values())
+        requested_market = ""
+        requested_token = ""
+        selected_materialized: Mapping[str, Any] = {}
+        if len(candidates) == 1:
+            selected_materialized = candidates[0]
+            requested_market = str(
+                selected_materialized.get("market_id")
+                or selected_materialized.get("id")
+                or selected_materialized.get("market")
+                or ""
+            ).strip()
+            setup = first_member.get("operational_setup")
+            setup = setup if isinstance(setup, Mapping) else {}
+            capture_spec = setup.get("capture_spec")
+            capture_spec = capture_spec if isinstance(capture_spec, Mapping) else {}
+            outcome_mapping = setup.get("outcome_mapping") or capture_spec.get("direction")
+            outcome_mapping = outcome_mapping if isinstance(outcome_mapping, Mapping) else {}
+            direction_value = (
+                first_member.get("direction")
+                or first_member.get("intended_outcome")
+                or first_member.get("outcome")
+                or setup.get("direction")
+                or capture_spec.get("direction")
+            )
+            if isinstance(direction_value, Mapping):
+                direction_value = (
+                    direction_value.get("outcome")
+                    or direction_value.get("direction")
+                    or direction_value.get("side")
+                )
+            direction_text = str(direction_value or "").strip().casefold()
+            for side_prefix in ("buy ", "sell "):
+                if direction_text.startswith(side_prefix):
+                    direction_text = direction_text[len(side_prefix) :].strip()
+                    break
+            direction_alias = direction_text.replace("-", "_").replace(" ", "_")
+            if direction_alias in {"positive_delta", "positive", "up"}:
+                direction_text = str(outcome_mapping.get("positive_delta") or "").strip().casefold()
+            elif direction_alias in {"negative_delta", "negative", "down"}:
+                direction_text = str(outcome_mapping.get("negative_delta") or "").strip().casefold()
+            for side_prefix in ("buy ", "sell "):
+                if direction_text.startswith(side_prefix):
+                    direction_text = direction_text[len(side_prefix) :].strip()
+                    break
+            outcome = str(
+                selected_materialized.get("outcome")
+                or selected_materialized.get("outcome_name")
+                or market_binding.get("outcome")
+                or market_binding.get("outcome_name")
+                or direction_text
+                or ""
+            ).strip().casefold()
+            explicit_token = (
+                market_binding.get("token_id")
+                or selected_materialized.get("token_id")
+            )
+            if explicit_token not in (None, ""):
+                requested_token = str(explicit_token).strip()
+            else:
+                token_ids = selected_materialized.get(
+                    "token_ids",
+                    selected_materialized.get("clob_token_ids", selected_materialized.get("tokens", {})),
+                )
+                token_ids = token_ids if isinstance(token_ids, Mapping) else {}
+                token = token_ids.get(outcome) if outcome else None
+                if token in (None, "") and outcome in {"yes", "yes_token", "affirmative"}:
+                    token = selected_materialized.get("yes_token_id")
+                if token in (None, "") and outcome in {"no", "no_token", "negative"}:
+                    token = selected_materialized.get("no_token_id")
+                if token not in (None, ""):
+                    requested_token = str(token).strip()
+                elif (
+                    outcome in {"yes", "yes_token", "affirmative", "no", "no_token", "negative"}
+                    and market_binding.get("token_id") not in (None, "")
+                ):
+                    requested_token = str(market_binding.get("token_id")).strip()
+        market = diagnostics.get("market")
+        market = dict(market) if isinstance(market, Mapping) else {}
+        book = diagnostics.get("book", diagnostics.get("order_book"))
+        book = dict(book) if isinstance(book, Mapping) else {}
+        blockers: list[str] = []
+        if not connectivity.get("ready") or str(connectivity.get("status") or "").upper() != "READY":
+            blockers.append("CONNECTIVITY_NOT_READY")
+        if not fresh:
+            blockers.append("SELECTED_MARKET_READINESS_STALE")
+        authentication = diagnostics.get("authentication")
+        authentication = authentication if isinstance(authentication, Mapping) else {}
+        if str(authentication.get("status") or "").upper() not in {"OK", "PASS"}:
+            blockers.append("ACCOUNT_AUTHENTICATION_REQUIRED")
+        account = diagnostics.get("account")
+        account = account if isinstance(account, Mapping) else {}
+        if account.get("authenticated") is not True:
+            blockers.append("ACCOUNT_NOT_TRUSTED")
+        geoblock = diagnostics.get("geoblock")
+        geoblock = geoblock if isinstance(geoblock, Mapping) else {}
+        if (
+            not geoblock
+            or geoblock.get("blocked") is not False
+            or geoblock.get("close_only") is not False
+        ):
+            blockers.append("GEOGRAPHICALLY_BLOCKED")
+        balance = diagnostics.get("balance")
+        balance = balance if isinstance(balance, Mapping) else {}
+        if str(balance.get("status") or "").upper() not in {"OK", "PASS"}:
+            blockers.append("BALANCE_READINESS_REQUIRED")
+        allowance = diagnostics.get("allowance")
+        allowance = allowance if isinstance(allowance, Mapping) else {}
+        if str(allowance.get("status") or "").upper() not in {"OK", "PASS", "SUFFICIENT"}:
+            blockers.append("ALLOWANCE_READINESS_REQUIRED")
+        observed_market = str(market.get("market_id") or market.get("id") or "").strip()
+        observed_token = str(market.get("token_id") or "").strip()
+        if not requested_market or not requested_token:
+            blockers.append("SELECTED_MARKET_REQUIRED")
+        if not observed_market or observed_market != requested_market:
+            blockers.append("SELECTED_MARKET_CHANGED")
+        if not observed_token or observed_token != requested_token:
+            blockers.append("SELECTED_MARKET_TOKEN_CHANGED")
+        if market.get("accepting_orders") is not True:
+            blockers.append("SELECTED_MARKET_NOT_ACCEPTING_ORDERS")
+        if not book.get("min_order_size") or not book.get("tick_size"):
+            blockers.append("SELECTED_MARKET_MINIMUMS_REQUIRED")
+        if not isinstance(book.get("bids"), (list, tuple)) or not book["bids"]:
+            blockers.append("SELECTED_MARKET_BIDS_REQUIRED")
+        if not isinstance(book.get("asks"), (list, tuple)) or not book["asks"]:
+            blockers.append("SELECTED_MARKET_ASKS_REQUIRED")
+        depth = book.get("depth_assessment")
+        if (
+            not isinstance(depth, Mapping)
+            or str(depth.get("action") or "").strip().upper() != "SUITABLE"
+        ):
+            blockers.append("SELECTED_MARKET_DEPTH_REQUIRED")
+        return {
+            "status": "READY" if not blockers else "BLOCKED",
+            "fresh": fresh,
+            "checked_at": checked_at,
+            "market_id": requested_market or None,
+            "token_id": requested_token or None,
+            "diagnostics": {
+                "account": _safe_value(account),
+                "geoblock": _safe_value(geoblock),
+                "balance": _safe_value(balance),
+                "allowance": _safe_value(allowance),
+                "market": _safe_value(market),
+                "book": _safe_value(book),
+            },
+            "blockers": list(dict.fromkeys(blockers)),
+        }
+
+    def exploratory_live_review_snapshot(
+        self, values: Mapping[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """Build the final review disclosure without mutating state."""
+        if values is not None and not isinstance(values, Mapping):
+            raise OperatorControlError("EXPLORATORY_LIVE_VALUES_REQUIRED")
+        raw = dict(values or {})
+        context = self._authorization_context()
+        selection = context.get("selection")
+        selection = dict(selection) if isinstance(selection, Mapping) else {}
+        policy = (
+            selection.get("operating_policy")
+            or selection.get("exploratory_policy")
+            or selection.get("setup_policy")
+        )
+        if self._exploratory_live_policy_mode(policy) != "EXPLORATORY_LIVE":
+            raise OperatorControlError("EXPLORATORY_LIVE_POLICY_REQUIRED")
+        members_raw = selection.get("members", selection.get("selected_members", ()))
+        members = [item for item in members_raw if isinstance(item, Mapping)] if isinstance(members_raw, (list, tuple)) else []
+        funded: list[Mapping[str, Any]] = []
+        rejected: list[Mapping[str, Any]] = []
+        for member in members[:10]:
+            status = str(member.get("status") or member.get("stage") or "").upper()
+            if bool(member.get("rejected")) or status == "REJECTED":
+                rejected.append(member)
+            elif _canary_selection_member_is_funded(member):
+                funded.append(member)
+        reviewed_candidate = str(raw.get("candidate_id") or "").strip()
+        server_candidate = (
+            str(funded[0].get("candidate_id") or "").strip() if funded else ""
+        )
+        if reviewed_candidate and reviewed_candidate != server_candidate:
+            raise OperatorControlError("EXPLORATORY_LIVE_AUTHORIZATION_BINDING_STALE")
+        limits = self._rolling_effective_limits()
+        expected_limits = {
+            "max_all_in_buy_usd": "1.00",
+            "max_fee_reserve_usd": "0.01",
+            "max_gross_daily_buy_usd": "5.00",
+            "max_aggregate_open_cost_usd": "5.00",
+            "max_aggregate_exposure_usd": "5.00",
+            "max_positions": 3,
+            "max_submitted_orders_per_day": 5,
+            "realized_loss_entry_stop_usd": "2.00",
+            "equity_loss_entry_stop_usd": "2.00",
+            "max_slippage_bps": 100,
+        }
+        limit_blockers = [
+            name for name, expected in expected_limits.items()
+            if str(limits.get(name)) != str(expected)
+        ]
+        binding_blockers: list[str] = []
+        if any(
+            context.get(field) in (None, "")
+            for field in ("policy_id", "policy_version", "policy_hash")
+        ):
+            binding_blockers.append("EXPLORATORY_SETUP_BINDING_REQUIRED")
+        for member in funded:
+            setup = member.get("operational_setup")
+            setup = setup if isinstance(setup, Mapping) else {}
+            setup_id = member.get("setup_id") or setup.get("setup_id")
+            setup_version = (
+                member.get("setup_version")
+                or setup.get("setup_version")
+                or setup.get("contract_version")
+            )
+            setup_hash = (
+                member.get("operational_setup_hash")
+                or member.get("setup_hash")
+                or setup.get("operational_setup_hash")
+                or setup.get("setup_hash")
+            )
+            if any(value in (None, "") for value in (setup_id, setup_version, setup_hash)):
+                binding_blockers.append("EXPLORATORY_SETUP_BINDING_REQUIRED")
+                break
+        setups = []
+        for member in funded[:3]:
+            setup = member.get("operational_setup")
+            setup = setup if isinstance(setup, Mapping) else {}
+            outcome_mapping = setup.get("outcome_mapping")
+            holding_semantics = setup.get("holding_semantics")
+            setups.append(
+                {
+                    "strategy_version_id": str(member.get("strategy_version_id") or "").strip() or None,
+                    "candidate_id": str(member.get("candidate_id") or "").strip() or None,
+                    "setup_id": setup.get("setup_id"),
+                    "setup_version": setup.get("setup_version") or setup.get("contract_version"),
+                    "setup_hash": member.get(
+                        "operational_setup_hash",
+                        setup.get("operational_setup_hash", setup.get("setup_hash")),
+                    ),
+                    "entry_predicate": _safe_value(setup.get("entry_predicate")),
+                    "outcome_mapping": _safe_value(outcome_mapping),
+                    "direction": _safe_value(outcome_mapping),
+                    "sizing": _safe_value(setup.get("sizing")),
+                    "holding_semantics": _safe_value(holding_semantics),
+                    "exit_semantics": _safe_value(
+                        setup.get("exit_semantics", setup.get("exit_policy", holding_semantics))
+                    ),
+                    "lookback": setup.get("lookback"),
+                }
+            )
+        adverse = [
+            {
+                "strategy_version_id": str(member.get("strategy_version_id") or "").strip() or None,
+                "verdict": "REJECTED",
+                "evidence": _safe_value(member.get("adverse_evidence", member.get("evidence", {}))),
+            }
+            for member in rejected[:16]
+        ]
+        scope = context.get("scope")
+        scope = scope if isinstance(scope, Mapping) else {}
+        readiness = self._selected_market_readiness(
+            selection,
+            scope=scope,
+            target_candidate_id=server_candidate or None,
+        )
+        authorization_snapshot = self.execution_authorization_snapshot()
+        authorization = authorization_snapshot.get("authorization")
+        authorization = authorization if isinstance(authorization, Mapping) else {}
+        persisted_lifetime = authorization.get(
+            "lifetime_budget", authorization.get("lifetime_budget_json")
+        )
+        persisted_expiry = authorization.get("expires_at")
+        persisted_stops = authorization.get(
+            "stop_rules", authorization.get("stop_rules_json")
+        )
+        settings_snapshot = self.risk_settings_snapshot()
+        authorization_blockers: list[str] = []
+        if persisted_lifetime in (None, "", {}):
+            authorization_blockers.append("EXPLORATORY_LIVE_LIFETIME_BUDGET_REQUIRED")
+        if persisted_expiry in (None, ""):
+            authorization_blockers.append("EXPLORATORY_LIVE_EXPIRES_AT_REQUIRED")
+        if not isinstance(persisted_stops, Mapping) or not persisted_stops:
+            authorization_blockers.append("EXPLORATORY_LIVE_STOP_RULES_REQUIRED")
+        authoritative_usage = settings_snapshot.get("usage")
+        authoritative_usage = (
+            dict(authoritative_usage)
+            if isinstance(authoritative_usage, Mapping)
+            else {}
+        )
+        reserved_exit_capacity = authoritative_usage.get(
+            "pending_sell_quantity_by_market",
+            authoritative_usage.get("reserved_exit_capacity", {}),
+        )
+        return {
+            "profitability": "UNPROVEN",
+            "paper_only": True,
+            "live_execution": False,
+            "policy": _safe_value(policy),
+            "selected_setups": setups,
+            "entry_predicate": [item.get("entry_predicate") for item in setups],
+            "direction": [item.get("direction") for item in setups],
+            "sizing": [item.get("sizing") for item in setups],
+            "exit": [item.get("exit_semantics") for item in setups],
+            "lookback": [item.get("lookback") for item in setups],
+            "adverse_evidence": adverse,
+            "scope": {
+                "scope_hash": context.get("scope_hash"),
+                "scope_version": context.get("scope_version"),
+                "market_ids": list(scope.get("market_ids", scope.get("exact_market_ids", ())))[:16],
+            },
+            "members": [
+                {
+                    "strategy_version_id": item.get("strategy_version_id"),
+                    "candidate_id": item.get("candidate_id"),
+                    "allocation": item.get("sizing"),
+                }
+                for item in setups
+            ],
+            "limits": dict(limits),
+            "limit_blockers": limit_blockers,
+            "allocation": {
+                "selected_members": len(funded),
+                "maximum_members": 3,
+                "bounded": 1 <= len(funded) <= 3,
+            },
+            "readiness": readiness,
+            "authorization": authorization_snapshot,
+            "authorization_bindings": {
+                "selection_id": context.get("selection_id"),
+                "selection_hash": context.get("selection_hash"),
+                "policy_id": context.get("policy_id"),
+                "policy_version": context.get("policy_version"),
+                "policy_hash": context.get("policy_hash"),
+                "setup_bindings": _safe_value(context.get("setup_bindings", [])),
+            },
+            "lifetime_budget": _safe_value(persisted_lifetime),
+            "expires_at": persisted_expiry,
+            "stop_rules": _safe_value(persisted_stops),
+            "accounting": {
+                "buy_pending_usd": authoritative_usage.get("buy_pending_usd"),
+                "buy_unknown_usd": authoritative_usage.get("buy_unknown_usd"),
+                "all_in_buy_reserved_usd": authoritative_usage.get("all_in_buy_reserved_usd"),
+                "reserved_exit_capacity": _safe_value(reserved_exit_capacity),
+                "equity_status": authoritative_usage.get("equity_status"),
+            },
+            "blockers": list(
+                dict.fromkeys(
+                    [
+                        *authorization_blockers,
+                        *limit_blockers,
+                        *binding_blockers,
+                        *readiness.get("blockers", []),
+                        *([] if 1 <= len(funded) <= 3 else ["BOUNDED_ALLOCATION_REQUIRED"]),
+                    ]
+                )
+            ),
+        }
+
+    def confirm_exploratory_live(
+        self,
+        values: Mapping[str, Any] | None = None,
+        *,
+        actor: str = "operator",
+    ) -> dict[str, Any]:
+        """Coordinate one reviewed authorization through arm and enable fences."""
+        if values is not None and not isinstance(values, Mapping):
+            raise OperatorControlError("EXPLORATORY_LIVE_VALUES_REQUIRED")
+        raw = dict(values or {})
+        snapshot = self.execution_authorization_snapshot()
+        active = snapshot.get("active")
+        draft = snapshot.get("draft")
+        active = dict(active) if isinstance(active, Mapping) else None
+        draft = dict(draft) if isinstance(draft, Mapping) else None
+        auth = active or draft
+        if not isinstance(auth, Mapping):
+            raise OperatorControlError("EXPLORATORY_LIVE_AUTHORIZATION_REQUIRED")
+        auth = dict(auth)
+        if auth.get("lifetime_budget") in (None, "", {}):
+            auth["lifetime_budget"] = auth.get("lifetime_budget_json")
+        if auth.get("stop_rules") in (None, "", {}):
+            auth["stop_rules"] = auth.get("stop_rules_json")
+        status = str(auth.get("status") or "").upper()
+        if status not in {"DRAFT", "ACTIVE"}:
+            raise OperatorControlError("EXPLORATORY_LIVE_AUTHORIZATION_REQUIRED")
+        for field in ("lifetime_budget", "expires_at", "stop_rules"):
+            if auth.get(field) in (None, "", {}):
+                raise OperatorControlError(f"EXPLORATORY_LIVE_{field.upper()}_REQUIRED")
+        lifetime = self._authorization_decimal(auth["lifetime_budget"], "lifetime_budget")
+        expiry_text = self._authorization_timestamp(auth["expires_at"], "expires_at")
+        expiry = datetime.fromisoformat(expiry_text)
+        if expiry <= utc_now():
+            raise OperatorControlError("EXPLORATORY_LIVE_EXPIRED")
+        if not isinstance(auth.get("stop_rules"), Mapping) or not auth["stop_rules"]:
+            raise OperatorControlError("EXPLORATORY_LIVE_STOP_RULES_REQUIRED")
+        if not (
+            auth["stop_rules"].get("halt_on_unknown_execution") is True
+            or auth["stop_rules"].get("on_unknown_execution") is True
+            or str(auth["stop_rules"].get("on_any_blocker") or "").strip().upper() == "STOP"
+        ):
+            raise OperatorControlError("EXPLORATORY_LIVE_UNKNOWN_STOP_REQUIRED")
+        review = self.exploratory_live_review_snapshot(raw)
+        if review["blockers"]:
+            raise OperatorControlError(str(review["blockers"][0]))
+        context = self._authorization_context()
+        for field in ("selection_id", "selection_hash", "policy_id", "policy_version", "policy_hash"):
+            expected = context.get(field)
+            observed = auth.get(field)
+            if expected not in (None, "") and str(observed or "") != str(expected):
+                raise OperatorControlError("EXPLORATORY_LIVE_AUTHORIZATION_BINDING_STALE")
+        expected_setups = context.get("setup_bindings", [])
+        observed_setups = auth.get("setup_bindings", [])
+        if expected_setups:
+            if not isinstance(observed_setups, (list, tuple)):
+                raise OperatorControlError("EXPLORATORY_LIVE_AUTHORIZATION_BINDING_STALE")
+            try:
+                expected_encoded = json.dumps(
+                    expected_setups, sort_keys=True, separators=(",", ":"), default=str
+                )
+                observed_encoded = json.dumps(
+                    observed_setups, sort_keys=True, separators=(",", ":"), default=str
+                )
+            except (TypeError, ValueError):
+                raise OperatorControlError("EXPLORATORY_LIVE_AUTHORIZATION_BINDING_STALE") from None
+            if observed_encoded != expected_encoded:
+                raise OperatorControlError("EXPLORATORY_LIVE_AUTHORIZATION_BINDING_STALE")
+        expected_versions = {str(item).strip() for item in context.get("strategy_versions", ()) if str(item).strip()}
+        observed_versions = auth.get("exact_strategy_versions", auth.get("strategy_version_ids", ()))
+        if isinstance(observed_versions, str):
+            observed_versions = (observed_versions,)
+        if {str(item).strip() for item in (observed_versions or ()) if str(item).strip()} != expected_versions:
+            raise OperatorControlError("EXPLORATORY_LIVE_AUTHORIZATION_BINDING_STALE")
+        for field in ("scope_hash", "scope_version", "active_settings_hash"):
+            if str(auth.get(field) or "") != str(context.get(field) or ""):
+                raise OperatorControlError("EXPLORATORY_LIVE_AUTHORIZATION_BINDING_STALE")
+        try:
+            if int(auth.get("active_settings_generation") or 0) != int(context.get("active_settings_generation") or 0):
+                raise OperatorControlError("EXPLORATORY_LIVE_AUTHORIZATION_BINDING_STALE")
+        except (TypeError, ValueError, OverflowError):
+            raise OperatorControlError("EXPLORATORY_LIVE_AUTHORIZATION_BINDING_STALE") from None
+        activated_new = False
+        armed_new = False
+        service: CanaryService | None = None
+        def _encoded(value: Any) -> str:
+            return json.dumps(
+                _safe_value(value),
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            )
+
+        def _candidate_ids(binding_context: Mapping[str, Any]) -> set[str]:
+            identifiers: set[str] = set()
+            selection_value = binding_context.get("selection")
+            selection_value = (
+                selection_value if isinstance(selection_value, Mapping) else {}
+            )
+            members_value = selection_value.get(
+                "members", selection_value.get("selected_members", ())
+            )
+            if isinstance(members_value, (list, tuple)):
+                for member in members_value:
+                    if isinstance(member, Mapping):
+                        identifier = str(member.get("candidate_id") or "").strip()
+                        if identifier:
+                            identifiers.add(identifier)
+            setup_values = binding_context.get("setup_bindings", ())
+            if isinstance(setup_values, (list, tuple)):
+                for binding in setup_values:
+                    if isinstance(binding, Mapping):
+                        identifier = str(binding.get("candidate_id") or "").strip()
+                        if identifier:
+                            identifiers.add(identifier)
+            return identifiers
+
+        def _same_reviewed_context(
+            expected: Mapping[str, Any], observed: Mapping[str, Any]
+        ) -> bool:
+            for field in (
+                "selection_id",
+                "selection_hash",
+                "policy_id",
+                "policy_version",
+                "policy_hash",
+                "setup_bindings",
+                "strategy_versions",
+                "scope_hash",
+                "scope_version",
+                "active_settings_hash",
+                "active_settings_generation",
+            ):
+                if _encoded(expected.get(field)) != _encoded(observed.get(field)):
+                    return False
+            return True
+
+        candidate_id = str(
+            raw.get("candidate_id")
+            or (review.get("members") or [{}])[0].get("candidate_id")
+            or ""
+        ).strip()
+        if not candidate_id:
+            raise OperatorControlError("EXPLORATORY_LIVE_CANDIDATE_REQUIRED")
+        selection_value = context.get("selection")
+        selection_value = (
+            selection_value if isinstance(selection_value, Mapping) else {}
+        )
+        selected_members = selection_value.get(
+            "members", selection_value.get("selected_members", ())
+        )
+        server_candidate_id = ""
+        if isinstance(selected_members, (list, tuple)):
+            for member in selected_members[:10]:
+                if not isinstance(member, Mapping):
+                    continue
+                status_value = str(
+                    member.get("status") or member.get("stage") or ""
+                ).strip().upper()
+                if bool(member.get("rejected")) or status_value == "REJECTED":
+                    continue
+                try:
+                    allocation_value = Decimal(str(member.get("allocation") or "0"))
+                except (ArithmeticError, TypeError, ValueError):
+                    allocation_value = Decimal("0")
+                if allocation_value.is_finite() and allocation_value > 0:
+                    server_candidate_id = str(
+                        member.get("candidate_id") or ""
+                    ).strip()
+                    break
+        if server_candidate_id and candidate_id != server_candidate_id:
+            raise OperatorControlError(
+                "EXPLORATORY_LIVE_AUTHORIZATION_BINDING_STALE"
+            )
+        reviewed_candidate_ids = {
+            str(member.get("candidate_id") or "").strip()
+            for member in (review.get("members") or ())
+            if isinstance(member, Mapping)
+            and str(member.get("candidate_id") or "").strip()
+        }
+        if reviewed_candidate_ids and candidate_id not in reviewed_candidate_ids:
+            raise OperatorControlError("EXPLORATORY_LIVE_AUTHORIZATION_BINDING_STALE")
+        current_candidate_ids = _candidate_ids(context)
+        if current_candidate_ids and candidate_id not in current_candidate_ids:
+            raise OperatorControlError("EXPLORATORY_LIVE_AUTHORIZATION_BINDING_STALE")
+
+        def _verify_control_identity(
+            status_document: Any, *, require_control: bool
+        ) -> None:
+            if not isinstance(status_document, Mapping):
+                if require_control:
+                    raise OperatorControlError(
+                        "EXPLORATORY_LIVE_AUTHORIZATION_BINDING_STALE"
+                    )
+                return
+            control_candidate = str(
+                status_document.get("control_candidate")
+                or status_document.get("candidate")
+                or ""
+            ).strip()
+            selected_candidate = str(
+                status_document.get("selected_candidate")
+                or status_document.get("winner_id")
+                or ""
+            ).strip()
+            if require_control and control_candidate != candidate_id:
+                raise OperatorControlError(
+                    "EXPLORATORY_LIVE_AUTHORIZATION_BINDING_STALE"
+                )
+            if selected_candidate and selected_candidate != candidate_id:
+                raise OperatorControlError(
+                    "EXPLORATORY_LIVE_AUTHORIZATION_BINDING_STALE"
+                )
+
+        auth_id = str(auth.get("authorization_id") or auth.get("id") or "").strip()
+        activated_generation = auth.get("generation")
+        try:
+            if status == "DRAFT":
+                activated = self.activate_execution_authorization(
+                    auth_id, actor=actor, expected_generation=auth.get("generation")
+                )
+                activated_new = True
+                activated_auth = dict(activated.get("authorization") or {})
+                activated_auth_id = str(
+                    activated_auth.get("authorization_id") or activated_auth.get("id") or auth_id
+                ).strip()
+                activated_generation = activated_auth.get(
+                    "generation", auth.get("generation")
+                )
+                auth_id = activated_auth_id
+                reviewed_bindings = {
+                    field: auth.get(field)
+                    for field in (
+                        "selection_id",
+                        "selection_hash",
+                        "policy_id",
+                        "policy_version",
+                        "policy_hash",
+                        "setup_bindings",
+                        "strategy_versions",
+                        "exact_strategy_versions",
+                        "strategy_version_ids",
+                        "scope_hash",
+                        "scope_version",
+                        "active_settings_hash",
+                        "active_settings_generation",
+                    )
+                }
+                for field, expected in reviewed_bindings.items():
+                    if expected in (None, "", [], {}):
+                        continue
+                    observed = activated_auth.get(field)
+                    if observed not in (None, "", [], {}) and field in {
+                        "selection_id",
+                        "selection_hash",
+                        "policy_id",
+                        "policy_version",
+                        "policy_hash",
+                        "setup_bindings",
+                    }:
+                        try:
+                            if json.dumps(observed, sort_keys=True, separators=(",", ":"), default=str) != json.dumps(
+                                expected, sort_keys=True, separators=(",", ":"), default=str
+                            ):
+                                raise OperatorControlError(
+                                    "EXPLORATORY_LIVE_AUTHORIZATION_BINDING_STALE"
+                                )
+                        except (TypeError, ValueError):
+                            raise OperatorControlError(
+                                "EXPLORATORY_LIVE_AUTHORIZATION_BINDING_STALE"
+                            ) from None
+                    activated_auth.setdefault(field, expected)
+                auth = activated_auth
+            if str(auth.get("status") or "").upper() != "ACTIVE":
+                raise OperatorControlError("EXPLORATORY_LIVE_AUTHORIZATION_REQUIRED")
+            settings_snapshot = self.settings.snapshot()
+            config_id = settings_snapshot.get("config_id")
+            generation = settings_snapshot.get("generation")
+            if not isinstance(config_id, str) or not config_id.strip():
+                raise OperatorControlError("CANARY_SETTINGS_CONFIG_REQUIRED")
+            if isinstance(generation, bool):
+                raise OperatorControlError("CANARY_SETTINGS_GENERATION_REQUIRED")
+            try:
+                generation = int(generation)
+            except (TypeError, ValueError, OverflowError):
+                raise OperatorControlError("CANARY_SETTINGS_GENERATION_REQUIRED") from None
+            if generation < 1:
+                raise OperatorControlError("CANARY_SETTINGS_GENERATION_REQUIRED")
+            credentials = CredentialStore()
+            venue = PolymarketClobV2Venue(allow_environment=False)
+            service = CanaryService(
+                self.store, credentials=credentials, initialize=True, settings=self.settings
+            )
+            status_document = service.authoritative_status()
+            state = str(
+                status_document.get("micro_live_canary")
+                if isinstance(status_document, Mapping)
+                else ""
+            ).upper()
+            current_context = self._authorization_context()
+            current_ids = _candidate_ids(current_context)
+            context_changed = not _same_reviewed_context(context, current_context)
+            candidate_changed = bool(current_ids) and candidate_id not in current_ids
+            if context_changed or candidate_changed:
+                if state in {"ARMED", "AUTONOMOUS_MICRO_LIVE"}:
+                    service.disarm()
+                raise OperatorControlError(
+                    "EXPLORATORY_LIVE_AUTHORIZATION_BINDING_STALE"
+                )
+            identity_keys = {
+                "control_candidate",
+                "candidate",
+                "selected_candidate",
+                "winner_id",
+            }
+            identity_present = isinstance(status_document, Mapping) and bool(
+                identity_keys.intersection(status_document)
+            )
+            if state in {"ARMED", "AUTONOMOUS_MICRO_LIVE"}:
+                if not identity_present:
+                    service.disarm()
+                    state = "DISARMED"
+                else:
+                    try:
+                        _verify_control_identity(status_document, require_control=True)
+                    except OperatorControlError:
+                        service.disarm()
+                        state = "DISARMED"
+            if state not in {"ARMED", "AUTONOMOUS_MICRO_LIVE"}:
+                armed = service.arm(
+                    candidate_id,
+                    venue=venue,
+                    config_id=str(config_id),
+                    expected_generation=generation,
+                    credentials_configured=True,
+                )
+                armed_new = True
+                if isinstance(armed, Mapping):
+                    _verify_control_identity(armed, require_control=True)
+            final_context = self._authorization_context()
+            final_ids = _candidate_ids(final_context)
+            if (
+                not _same_reviewed_context(context, final_context)
+                or (final_ids and candidate_id not in final_ids)
+            ):
+                service.disarm()
+                armed_new = False
+                raise OperatorControlError(
+                    "EXPLORATORY_LIVE_AUTHORIZATION_BINDING_STALE"
+                )
+            final_status = service.authoritative_status()
+            final_state = str(
+                final_status.get("micro_live_canary")
+                if isinstance(final_status, Mapping)
+                else ""
+            ).upper()
+            if final_state in {"ARMED", "AUTONOMOUS_MICRO_LIVE"}:
+                try:
+                    _verify_control_identity(final_status, require_control=True)
+                except OperatorControlError:
+                    service.disarm()
+                    armed_new = False
+                    raise
+            enabled = service.enable_autonomous_micro_live(
+                venue="polymarket",
+                config_id=str(config_id),
+                expected_generation=generation,
+                expected_credential_fingerprint=credential_fingerprint(
+                    credentials.load(allow_environment=False)
+                ),
+                expected_candidate_id=candidate_id,
+            )
+            try:
+                _verify_control_identity(enabled, require_control=True)
+                post_enable_status = service.authoritative_status()
+                _verify_control_identity(post_enable_status, require_control=True)
+            except OperatorControlError:
+                service.disarm()
+                armed_new = False
+                raise
+            return {
+                "status": "AUTONOMOUS_MICRO_LIVE",
+                "authorization": _safe_value(auth),
+                "review": review,
+                "lifetime_budget": lifetime,
+                "expires_at": expiry_text,
+                "stop_rules": _safe_value(auth["stop_rules"]),
+                "canary": _safe_value(enabled),
+                "paper_only": False,
+                "live_execution": True,
+            }
+        except Exception as original_error:
+            rollback_failures: list[str] = []
+            if service is not None and armed_new:
+                try:
+                    service.disarm()
+                except Exception as exc:
+                    rollback_failures.append(f"DISARM_FAILED:{type(exc).__name__}")
+            if activated_new and auth_id:
+                try:
+                    self.revoke_execution_authorization(
+                        auth_id,
+                        actor=actor,
+                        expected_generation=activated_generation,
+                        reason="exploratory_live_review_rollback",
+                    )
+                except Exception as exc:
+                    rollback_failures.append(f"REVOKE_FAILED:{type(exc).__name__}")
+            if rollback_failures:
+                failsafe = service or getattr(self, "_canary_service", None)
+                if failsafe is not None:
+                    try:
+                        failsafe.kill()
+                    except Exception as exc:
+                        rollback_failures.append(f"KILL_FAILED:{type(exc).__name__}")
+                failure_document = dict(auth)
+                failure_document.update(
+                    {
+                        "status": "UNKNOWN",
+                        "rollback_status": "INCOMPLETE",
+                        "rollback_failures": list(rollback_failures),
+                        "paper_only": True,
+                        "live_execution": False,
+                    }
+                )
+                try:
+                    self.store.set_operator_config(
+                        "execution_authorization_review", failure_document
+                    )
+                except Exception as exc:
+                    rollback_failures.append(
+                        f"ROLLBACK_STATUS_PERSIST_FAILED:{type(exc).__name__}"
+                    )
+                self._audit(
+                    "exploratory.live.rollback_failed",
+                    auth_id or "unknown",
+                    success=False,
+                    reason=";".join(rollback_failures),
+                    result={"rollback_failures": rollback_failures},
+                )
+                raise OperatorControlError(
+                    "EXPLORATORY_LIVE_ROLLBACK_INCOMPLETE"
+                ) from original_error
+            raise
     def controller_lease_status(self) -> dict[str, Any]:
         loader = getattr(self.store, "load_canary_controller_lease", None)
         if not callable(loader):
@@ -2534,7 +3552,6 @@ class OperatorControlPlane:
         ).hexdigest()
     @staticmethod
     def _rolling_fence_hash(value: Mapping[str, Any]) -> str:
-        """Hash the complete persisted pointer, without bounded projection."""
         return hashlib.sha256(
             json.dumps(
                 value,
@@ -2566,6 +3583,9 @@ class OperatorControlPlane:
                 "max_submitted_orders_per_day", "max_orders_per_day"
             ),
             "max_all_in_buy_usd": first("max_all_in_buy_usd", "target_notional_usd"),
+            "max_fee_reserve_usd": first(
+                "max_fee_reserve_usd", "max_buy_fee_reserve_usd", "buy_fee_reserve_usd"
+            ),
             "max_gross_daily_buy_usd": first(
                 "max_gross_daily_buy_usd", "gross_daily_buy_usd"
             ),
@@ -2579,6 +3599,11 @@ class OperatorControlPlane:
             "per_market_buy_cap_usd": first("per_market_buy_cap_usd"),
             "per_event_buy_cap_usd": first("per_event_buy_cap_usd"),
             "cumulative_buy_cap_usd": first("cumulative_buy_cap_usd"),
+            "realized_loss_entry_stop_usd": first(
+                "realized_loss_entry_stop_usd", "max_daily_loss_usd"
+            ),
+            "equity_loss_entry_stop_usd": first("equity_loss_entry_stop_usd"),
+            "max_slippage_bps": first("max_slippage_bps"),
         }
         required = (
             "max_submitted_orders_per_day",
@@ -4449,6 +5474,22 @@ class OperatorControlPlane:
             or rolling_state.get("reviewed_at")
             or rolling_state.get("active_at")
         )
+        try:
+            exploratory_live_review = self.exploratory_live_review_snapshot()
+        except Exception as exc:
+            exploratory_live_review = {
+                "profitability": "UNPROVEN",
+                "status": "BLOCKED",
+                "blockers": [type(exc).__name__.upper()],
+                "paper_only": True,
+                "live_execution": False,
+            }
+        exploratory_live_enabled = (
+            str(control_state or "").upper() in {"AUTONOMOUS_MICRO_LIVE", "LIVE"}
+            or exploratory_live_review.get("live_execution") is True
+        )
+        execution_state["live_execution"] = exploratory_live_enabled
+        execution_state["paper_only"] = not exploratory_live_enabled
         return {
             "execution_profile": self.execution_profile,
             "identity": identity,
@@ -4462,6 +5503,9 @@ class OperatorControlPlane:
             "economic_policy": economic_policy,
             "policy": economic_policy.get("policy", {}),
             "budgets": economic_policy,
+            "live_execution": execution_state["live_execution"],
+            "paper_only": execution_state["paper_only"],
+            "exploratory_live_review": exploratory_live_review,
             "limits": limits,
             "daily_budget": economic_policy.get("daily", {}),
             "lifetime_budget": economic_policy.get("lifetime", {}),
@@ -4536,8 +5580,8 @@ class OperatorControlPlane:
                 "connectivity": latest_connectivity,
                 "submit": canary_submit,
             },
-            "live_execution": False,
-            "paper_only": True,
+            "live_execution": execution_state["live_execution"],
+            "paper_only": execution_state["paper_only"],
         }
 
     def _audit(
@@ -4743,6 +5787,11 @@ class OperatorControlPlane:
                         raise OperatorControlError(
                             "EXECUTION_AUTHORIZATION_GENERATION_CHANGED"
                         )
+            elif action_value == "exploratory.live.review_confirm":
+                allowed = {"actor", "market_id", "token_id", "candidate_id"}
+                if set(action_payload) - allowed:
+                    raise OperatorControlError("UNSUPPORTED_EXPLORATORY_LIVE_FIELDS")
+                target_value = "exploratory-live"
             if action_value == RECOVERY_ACTION:
                 allowed = {"event_id", "signal_id", "exchange_order_id"}
                 if set(action_payload) - allowed:
@@ -4875,6 +5924,13 @@ class OperatorControlPlane:
                         actor=action_payload.get("actor", "operator"),
                         expected_generation=action_payload.get("expected_generation"),
                         reason=action_payload.get("reason", "operator_revoke"),
+                    )
+                }
+            elif action_value == "exploratory.live.review_confirm":
+                result = {
+                    "exploratory_live": self.confirm_exploratory_live(
+                        action_payload,
+                        actor=action_payload.get("actor", "operator"),
                     )
                 }
             elif action_value == "rolling.admission.review":
@@ -5112,6 +6168,15 @@ class OperatorControlPlane:
                 result=public if isinstance(public, Mapping) else {},
             )
             audit_id = self._audit(action_value, target_value, success=True, result=public)
+            response_live_execution = False
+            response_paper_only = True
+            if action_value == "exploratory.live.review_confirm":
+                exploratory_result = result.get("exploratory_live") if isinstance(result, Mapping) else {}
+                exploratory_result = (
+                    exploratory_result if isinstance(exploratory_result, Mapping) else {}
+                )
+                response_live_execution = exploratory_result.get("live_execution") is True
+                response_paper_only = not response_live_execution
             response = {
                 "ok": True,
                 "action": requested_action_value,
@@ -5119,8 +6184,8 @@ class OperatorControlPlane:
                 "action_id": action_id or audit_id,
                 "action_status": "COMPLETE",
                 "result": public,
-                "paper_only": True,
-                "live_execution": False,
+                "paper_only": response_paper_only,
+                "live_execution": response_live_execution,
             }
             if action_value.startswith("hermes."):
                 response["control_scope"] = HERMES_CONTROL_SCOPE

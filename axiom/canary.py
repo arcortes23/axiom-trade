@@ -101,6 +101,28 @@ _ROLLING_AUTHORIZATION_FIELDS = (
     "execution_authorization_strategy_versions",
     "execution_authorization_adverse_evidence_ack",
 )
+_EXPLORATORY_BINDING_FIELDS = (
+    "operational_setup_hash",
+    "setup_hash",
+    "setup_id",
+    "setup_version",
+    "operating_policy",
+    "policy_id",
+    "policy_version",
+    "policy_hash",
+    "scope_hash",
+    "scope_version",
+)
+_EXPLORATORY_REQUIRED_BINDING_FIELDS = (
+    "operational_setup_hash",
+    "setup_id",
+    "setup_version",
+    "policy_id",
+    "policy_version",
+    "policy_hash",
+    "scope_hash",
+    "scope_version",
+)
 _ROLLING_NON_ACTIVE_STATUSES = frozenset({"OBSERVE", "PAPER", "REJECTED"})
 _ROLLING_EXPLICIT_ADVERSE_ACK_REQUIRED = frozenset({"REJECTED"})
 _CANARY_MODEL_FREE_DOCUMENT = {"model_required": False}
@@ -195,6 +217,23 @@ def _canary_canonical_selection_hash(selection: Mapping[str, Any]) -> str:
 
 
 def _canary_selection_member_is_positive(member: Mapping[str, Any]) -> bool:
+    try:
+        allocation = Decimal(str(member.get("allocation") or "0"))
+    except (TypeError, ValueError, ArithmeticError):
+        return False
+    return allocation.is_finite() and allocation > 0
+
+
+_CANARY_FUNDED_MEMBER_STATUSES = frozenset({"ACTIVE", "PAPER", "RETAINED", "REDUCE"})
+
+
+def _canary_selection_member_is_funded(member: Mapping[str, Any]) -> bool:
+    """Return the one canonical positive-allocation funding predicate."""
+    if not isinstance(member, Mapping):
+        return False
+    status = str(member.get("status", member.get("stage", ""))).strip().upper()
+    if status not in _CANARY_FUNDED_MEMBER_STATUSES:
+        return False
     try:
         allocation = Decimal(str(member.get("allocation") or "0"))
     except (TypeError, ValueError, ArithmeticError):
@@ -2492,6 +2531,7 @@ def _canary_authorization_binding_fence(
     candidate_id: str | None = None,
     side: str | None = None,
     selection_fence: bool = True,
+    is_exit: bool = False,
 ) -> None:
     exact_raw = auth.get(
         "exact_strategy_versions",
@@ -2666,6 +2706,8 @@ def _canary_authorization_binding_fence(
                         "EXECUTION_AUTHORIZATION_ADVERSE_EVIDENCE_ACK_REQUIRED"
                     )
 
+    if is_exit:
+        return
     budget = auth.get("lifetime_budget")
     stop_rules = auth.get("stop_rules")
     if budget is None and stop_rules is None:
@@ -2694,6 +2736,27 @@ def _canary_authorization_binding_fence(
         ),
         field="lifetime_used_usd",
     )
+    pending = _canary_authorization_decimal(
+        usage.get("buy_pending_usd", "0"), field="buy_pending_usd"
+    )
+    unknown = _canary_authorization_decimal(
+        usage.get("buy_unknown_usd", "0"), field="buy_unknown_usd"
+    )
+    reserved = _canary_authorization_decimal(
+        usage.get(
+            "all_in_buy_reserved_usd",
+            usage.get("aggregate_exposure_usd", "0"),
+        ),
+        field="reserved_buy_usd",
+    )
+    reserved_exit = _canary_authorization_decimal(
+        usage.get(
+            "reserved_exit_capacity_usd",
+            usage.get("sell_pending_usd", usage.get("exit_reserved_usd", "0")),
+        ),
+        field="reserved_exit_capacity_usd",
+    )
+    used = max(used + pending + unknown + reserved_exit, reserved)
     orders = usage.get("exploratory_lifetime_orders", usage.get("submitted_orders", 0))
     try:
         orders_value = int(orders)
@@ -2714,9 +2777,30 @@ def _canary_authorization_binding_fence(
                 raise CanaryBlocked("EXECUTION_AUTHORIZATION_BUDGET_EXHAUSTED")
         except (TypeError, ValueError, OverflowError) as exc:
             raise CanaryBlocked("EXECUTION_AUTHORIZATION_BINDING_INVALID") from exc
-    unknown = _canary_authorization_decimal(
-        usage.get("buy_unknown_usd", "0"), field="buy_unknown_usd"
+    raw_blockers = usage.get(
+        "blockers",
+        usage.get("entry_blockers", usage.get("entry_block_reasons", ())),
     )
+    has_blockers = (
+        pending > 0
+        or unknown > 0
+        or usage.get("risk_breaker") not in (None, "", False, 0)
+        or (
+            isinstance(raw_blockers, Mapping)
+            and bool(raw_blockers)
+        )
+        or (
+            isinstance(raw_blockers, Sequence)
+            and not isinstance(raw_blockers, (str, bytes, bytearray))
+            and bool(raw_blockers)
+        )
+        or (
+            isinstance(raw_blockers, str)
+            and bool(raw_blockers.strip())
+        )
+    )
+    if str(stop_rules.get("on_any_blocker") or "").strip().upper() == "STOP" and has_blockers:
+        raise CanaryBlocked("EXECUTION_AUTHORIZATION_STOP_RULE")
     if (
         stop_rules.get("halt_on_unknown_execution") is True
         or stop_rules.get("on_unknown_execution") is True
@@ -2775,6 +2859,9 @@ def _require_execution_authorization(
                 "execution_authorization_mode",
                 "authorization_mode",
                 "execution_mode",
+                "operating_policy",
+                "exploratory_policy",
+                "setup_policy",
                 "policy_mode",
             )
         )
@@ -2785,6 +2872,9 @@ def _require_execution_authorization(
                 "execution_authorization_mode",
                 "authorization_mode",
                 "execution_mode",
+                "operating_policy",
+                "exploratory_policy",
+                "setup_policy",
                 "policy_mode",
             ):
                 if policy_source.get(name) in (None, "") and source.get(name) not in (
@@ -2802,6 +2892,9 @@ def _require_execution_authorization(
                 "execution_authorization_mode",
                 "authorization_mode",
                 "execution_mode",
+                "operating_policy",
+                "exploratory_policy",
+                "setup_policy",
                 "policy_mode",
             )
             if policy_source.get(name) not in (None, "")
@@ -2811,7 +2904,12 @@ def _require_execution_authorization(
     if isinstance(raw_mode, Mapping):
         raw_mode = raw_mode.get("mode") or raw_mode.get("name") or raw_mode.get("type")
     mode = str(raw_mode or "").strip().upper()
-    if mode in {"EXPLORATORY", "EXPLORATORY_MICRO_CANARY", "MICRO_CANARY"}:
+    if mode in {
+        "EXPLORATORY",
+        "EXPLORATORY_LIVE",
+        "EXPLORATORY_MICRO_CANARY",
+        "MICRO_CANARY",
+    }:
         mode = "EXPLORATORY_MICRO_CANARY"
     elif mode in {"EVIDENCE", "EVIDENCE_SELECTED"}:
         mode = "EVIDENCE_SELECTED"
@@ -2910,16 +3008,18 @@ def _require_execution_authorization(
                     continue
                 auth = record
                 break
-    if not isinstance(auth, Mapping) or str(auth.get("status") or "").upper() != "ACTIVE":
-        if is_exit and isinstance(auth, Mapping):
-            record_expiry = parse_timestamp(auth.get("expires_at"))
-            if str(auth.get("status") or "").upper() == "EXPIRED" or (
-                record_expiry is not None and now >= record_expiry
-            ):
-                raise CanaryBlocked("EXECUTION_AUTHORIZATION_EXPIRED")
-        # Active loaders hide expired rows.  A bounded historical projection
-        # lets callers distinguish an expired binding from a never-issued one
-        # without using a non-active row as authority.
+    nonactive_exit = (
+        is_exit
+        and isinstance(auth, Mapping)
+        and str(auth.get("status") or "").upper() in {"EXPIRED", "REVOKED"}
+        and bool(expected_id)
+        and str(auth.get("authorization_id") or "").strip() == expected_id
+    )
+    if not isinstance(auth, Mapping) or (
+        str(auth.get("status") or "").upper() != "ACTIVE" and not nonactive_exit
+    ):
+        # Active loaders hide non-active rows.  A bounded historical projection
+        # lets exits recover their originating obligation without granting BUY.
         if auth is None:
             try:
                 history_loader = getattr(
@@ -2944,20 +3044,33 @@ def _require_execution_authorization(
                         continue
                     if str(record.get("mode") or mode).strip().upper() != mode:
                         continue
+                    record_status = str(record.get("status") or "").upper()
                     record_expiry = parse_timestamp(record.get("expires_at"))
-                    if str(record.get("status") or "").upper() == "EXPIRED" or (
-                        record_expiry is not None and now >= record_expiry
+                    if record_status == "EXPIRED" or (
+                        record_expiry is not None
+                        and now >= record_expiry
+                        and record_status != "REVOKED"
                     ):
                         raise CanaryBlocked("EXECUTION_AUTHORIZATION_EXPIRED")
-            except CanaryBlocked:
-                raise
+                    auth = record
+                    break
             except (TypeError, ValueError, RuntimeError):
                 pass
-        raise CanaryBlocked("EXECUTION_AUTHORIZATION_REQUIRED")
+        nonactive_exit = (
+            is_exit
+            and isinstance(auth, Mapping)
+            and str(auth.get("status") or "").upper() in {"EXPIRED", "REVOKED"}
+            and bool(expected_id)
+            and str(auth.get("authorization_id") or "").strip() == expected_id
+        )
+        if not isinstance(auth, Mapping) or (
+            str(auth.get("status") or "").upper() != "ACTIVE" and not nonactive_exit
+        ):
+            raise CanaryBlocked("EXECUTION_AUTHORIZATION_REQUIRED")
     if str(auth.get("mode") or mode).strip().upper() != mode:
         raise CanaryBlocked("EXECUTION_AUTHORIZATION_CHANGED")
     expires_at = parse_timestamp(auth.get("expires_at"))
-    if expires_at is None or now >= expires_at:
+    if expires_at is None or (now >= expires_at and not nonactive_exit):
         raise CanaryBlocked("EXECUTION_AUTHORIZATION_EXPIRED")
     try:
         auth_generation = int(
@@ -3043,6 +3156,7 @@ def _require_execution_authorization(
         service,
         auth=auth,
         actual_id=actual_id,
+        is_exit=is_exit,
         strategy=strategy,
         rolling=rolling,
         selection_id=selection_id,
@@ -7580,6 +7694,97 @@ class CanaryService:
             "EXPLORATORY_MICRO_CANARY",
             "MICRO_CANARY",
         }
+        member_setup = member.get("operational_setup")
+        member_setup = member_setup if isinstance(member_setup, Mapping) else {}
+        policy_value = values.get("operating_policy")
+        if policy_value in (None, ""):
+            policy_value = (
+                current.get("operating_policy")
+                or current.get("exploratory_policy")
+                or current.get("setup_policy")
+            )
+        if policy_value in (None, ""):
+            policy_value = member.get("operating_policy", member_setup.get("operating_policy"))
+        policy_mode = (
+            policy_value.get("mode")
+            if isinstance(policy_value, Mapping)
+            else policy_value
+        )
+        member_authorization_mode = str(
+            member.get("execution_authorization_mode") or ""
+        ).strip().upper()
+        exploratory_live = (
+            authorization_mode == "EXPLORATORY_LIVE"
+            or member_authorization_mode == "EXPLORATORY_LIVE"
+            or str(policy_mode or "").strip().upper() == "EXPLORATORY_LIVE"
+            or str(values.get("setup_version") or "").strip().lower()
+            == "exploratory-live-v1"
+        )
+        exploratory = exploratory or exploratory_live
+        for field in _EXPLORATORY_BINDING_FIELDS:
+            supplied_value = values.get(field)
+            if supplied_value in (None, "") and field in {"operational_setup_hash", "setup_hash"}:
+                supplied_value = values.get("setup_hash") or values.get("operational_setup_hash")
+            elif supplied_value in (None, "") and field == "operating_policy":
+                supplied_value = values.get("exploratory_policy") or values.get("setup_policy")
+            elif supplied_value in (None, "") and field == "policy_id":
+                supplied_value = values.get("admission_policy_id")
+            elif supplied_value in (None, "") and field == "policy_version":
+                supplied_value = values.get("admission_policy_version")
+            elif supplied_value in (None, "") and field == "policy_hash":
+                supplied_value = (
+                    values.get("selection_policy_hash")
+                    or values.get("admission_policy_hash")
+                )
+            member_value = member.get(field)
+            if member_value in (None, ""):
+                member_value = member_setup.get(field)
+            if field in {"operational_setup_hash", "setup_hash"} and member_value in (
+                None,
+                "",
+            ):
+                member_value = member_setup.get("operational_setup_hash") or member_setup.get(
+                    "setup_hash"
+                )
+            if field == "policy_id" and member_value in (None, ""):
+                member_value = member.get("admission_policy_id", current.get("policy_id"))
+            elif field == "policy_version" and member_value in (None, ""):
+                member_value = member.get(
+                    "admission_policy_version", current.get("policy_version")
+                )
+            elif field == "policy_hash" and member_value in (None, ""):
+                member_value = (
+                    member.get("admission_policy_hash")
+                    or _canary_authorization_selection_policy_hash(current)
+                )
+            elif field in {"scope_hash", "scope_version"} and member_value in (None, ""):
+                member_value = current.get(field)
+            if exploratory_live and field in _EXPLORATORY_REQUIRED_BINDING_FIELDS and (
+                member_value in (None, "")
+            ):
+                raise CanaryBlocked("EXPLORATORY_SETUP_BINDING_REQUIRED")
+            if exploratory_live and supplied_value in (None, "") and member_value not in (
+                None,
+                "",
+            ):
+                supplied_value = member_value
+            if exploratory_live and (
+                supplied_value not in (None, "") or member_value not in (None, "")
+            ):
+                if supplied_value in (None, "") or member_value in (None, ""):
+                    raise CanaryBlocked("EXPLORATORY_SETUP_BINDING_REQUIRED")
+                try:
+                    supplied_encoded = json.dumps(
+                        supplied_value, sort_keys=True, separators=(",", ":"), default=str
+                    )
+                    member_encoded = json.dumps(
+                        member_value, sort_keys=True, separators=(",", ":"), default=str
+                    )
+                except (TypeError, ValueError):
+                    raise CanaryBlocked("EXPLORATORY_SETUP_BINDING_INVALID") from None
+                if supplied_encoded != member_encoded:
+                    raise CanaryBlocked("EXPLORATORY_SETUP_BINDING_CHANGED")
+                explicit[field] = supplied_value
         raw_versions = (
             execution_authorization_strategy_versions
             if execution_authorization_strategy_versions not in (None, "")
@@ -7684,7 +7889,11 @@ class CanaryService:
         signal_values = dict(signal)
         signal_evidence = signal.get("evidence")
         if isinstance(signal_evidence, Mapping):
-            for field in (*_ROLLING_EVIDENCE_FIELDS, *_ROLLING_AUTHORIZATION_FIELDS):
+            for field in (
+                *_ROLLING_EVIDENCE_FIELDS,
+                *_ROLLING_AUTHORIZATION_FIELDS,
+                *_EXPLORATORY_BINDING_FIELDS,
+            ):
                 if signal_values.get(field) in (None, ""):
                     signal_values[field] = signal_evidence.get(field)
         stored_type = str(signal_values.get("lineage_type") or "").strip().upper()
@@ -7759,6 +7968,22 @@ class CanaryService:
                 matches = str(persisted_value).strip() == str(supplied_value or "").strip()
             if not matches:
                 raise CanaryBlocked("ROLLING_LINEAGE_CONFLICT")
+        for field in _EXPLORATORY_BINDING_FIELDS:
+            persisted_value = signal_values.get(field)
+            supplied_value = context_values.get(field)
+            if persisted_value not in (None, "") and supplied_value not in (None, ""):
+                try:
+                    matches = json.dumps(
+                        persisted_value, sort_keys=True, separators=(",", ":"), default=str
+                    ) == json.dumps(
+                        supplied_value, sort_keys=True, separators=(",", ":"), default=str
+                    )
+                except (TypeError, ValueError):
+                    matches = False
+                if not matches:
+                    raise CanaryBlocked("EXPLORATORY_SETUP_BINDING_CHANGED")
+            elif persisted_value not in (None, ""):
+                context_values[field] = persisted_value
         candidate_id = str(signal.get("candidate_id") or "").strip()
         validated = self._rolling_lineage(
             {
@@ -8177,8 +8402,9 @@ class CanaryService:
         config_id: str,
         expected_generation: int,
         expected_credential_fingerprint: str | None = None,
+        expected_candidate_id: str | None = None,
     ) -> Mapping[str, Any]:
-        """Enable autonomous canary only for the reviewed active settings."""
+        """Enable autonomous canary only for the reviewed active settings and candidate."""
         requested_venue = str(venue or "").strip().lower()
         if requested_venue != AUTONOMOUS_CANARY_VENUE:
             raise CanaryBlocked("UNSUPPORTED_VENUE")
@@ -8191,6 +8417,13 @@ class CanaryService:
             or expected_generation < 1
         ):
             raise CanaryBlocked("CANARY_SETTINGS_GENERATION_REQUIRED")
+        requested_candidate = (
+            str(expected_candidate_id or "").strip()
+            if expected_candidate_id is not None
+            else None
+        )
+        if expected_candidate_id is not None and not requested_candidate:
+            raise CanaryBlocked("EXECUTION_AUTHORIZATION_SELECTION_CHANGED")
         _, credential_digest = self._load_credential_binding()
         if expected_credential_fingerprint is not None:
             expected_digest = _valid_credential_fingerprint(
@@ -8232,7 +8465,7 @@ class CanaryService:
                 raise CanaryBlocked("CANARY_TRANSACTION_ACTIVE")
             with connection:
                 current = connection.execute(
-                    "SELECT state,control_generation,limits_json,integrity_hash,"
+                    "SELECT state,candidate_id,control_generation,limits_json,integrity_hash,"
                     "settings_config_id,settings_generation,credential_fingerprint "
                     "FROM canary_control WHERE singleton=1"
                 ).fetchone()
@@ -8254,9 +8487,24 @@ class CanaryService:
                     raise CanaryBlocked("CANARY_SETTINGS_GENERATION_CHANGED")
                 if str(active_current["state"] or "").upper() != "ACTIVE":
                     raise CanaryBlocked("CANARY_SETTINGS_GENERATION_CHANGED")
-                if current is not None and str(current["state"]).upper() == "KILLED":
+                current_state = (
+                    str(current["state"]).upper() if current is not None else "DISARMED"
+                )
+                if (
+                    requested_candidate is not None
+                    and current_state == "ARMED"
+                    and str(current["candidate_id"] or "").strip() != requested_candidate
+                ):
+                    raise CanaryBlocked("EXECUTION_AUTHORIZATION_SELECTION_CHANGED")
+                if current_state == "KILLED":
                     raise CanaryBlocked("CANARY_KILLED")
-                if current is not None and str(current["state"]).upper() == AUTONOMOUS_MICRO_LIVE:
+                if current_state == AUTONOMOUS_MICRO_LIVE:
+                    if (
+                        requested_candidate is not None
+                        and str(current["candidate_id"] or "").strip()
+                        != requested_candidate
+                    ):
+                        raise CanaryBlocked("EXECUTION_AUTHORIZATION_SELECTION_CHANGED")
                     try:
                         persisted = json.loads(current["limits_json"] or "{}")
                     except (TypeError, ValueError, json.JSONDecodeError):
@@ -8288,6 +8536,10 @@ class CanaryService:
                         selection_state = self._selection_validation(dict(selection))
                         if selection_state.get("selection_valid"):
                             candidate_id = selection_state.get("selected_candidate")
+                    if requested_candidate is not None and (
+                        str(candidate_id or "").strip() != requested_candidate
+                    ):
+                        raise CanaryBlocked("EXECUTION_AUTHORIZATION_SELECTION_CHANGED")
                     connection.execute(
                         "INSERT INTO canary_control("
                         "singleton,state,candidate_id,venue,armed_at,expires_at,"
@@ -13506,7 +13758,35 @@ class CanaryService:
                 str(signal.get("candidate_id") or ""),
                 _record=lifecycle,
             )
-            if not validation.get("eligible"):
+            validation_checks = validation.get("checks", ())
+            authorization_mode = str(
+                (submission_lineage or {}).get(
+                    "execution_authorization_mode",
+                    (
+                        execution_authorization.get("execution_authorization_mode")
+                        if isinstance(execution_authorization, Mapping)
+                        else ""
+                    ),
+                )
+                or ""
+            ).strip().upper()
+            exploratory_authorized = authorization_mode == "EXPLORATORY_MICRO_CANARY"
+            exploratory_only_failures = {
+                "Historical backtest",
+                "Validation",
+                "Robustness",
+                "Minimum samples and trades",
+            }
+            failed_checks = {
+                str(item.get("name") or "")
+                for item in validation_checks
+                if isinstance(item, Mapping) and item.get("passed") is not True
+            }
+            if not validation.get("eligible") and not (
+                exploratory_authorized
+                and failed_checks
+                and failed_checks <= exploratory_only_failures
+            ):
                 block(
                     str(
                         validation.get("reason_code")
