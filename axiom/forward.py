@@ -645,10 +645,16 @@ class ForwardTestRegistry:
             if existing not in (None, "") and _canonical(existing) != _canonical(value):
                 raise ValueError(f"forward test lineage conflicts for {key}")
             config_record[key] = value
-        config_record = _bind_operational_setup(
-            strategy_value,
-            _canonical_forward_config(config_record),
-        )
+        if (
+            config_record.get("observation_intent") is True
+            and config_record.get("observation_capture_only") is True
+        ):
+            config_record = _canonical_forward_config(config_record)
+        else:
+            config_record = _bind_operational_setup(
+                strategy_value,
+                _canonical_forward_config(config_record),
+            )
         _validate_forward_config(config_record)
         start = ensure_utc(start_timestamp or utc_now())
         normalized_markets = tuple(dict.fromkeys(str(item).strip() for item in allowed_markets if str(item).strip()))
@@ -799,10 +805,16 @@ class ForwardTestRegistry:
         computed_strategy_hash = _content_hash(_normalized_strategy_document(strategy))
         if rolling_strategy_hash is not None and str(rolling_strategy_hash).strip() != computed_strategy_hash:
             raise ValueError("rolling_strategy_hash does not match strategy")
-        normalized_config = _bind_operational_setup(
-            strategy,
-            _canonical_forward_config(intent_config),
-        )
+        if (
+            intent_config.get("observation_intent") is True
+            and intent_config.get("observation_capture_only") is True
+        ):
+            normalized_config = _canonical_forward_config(intent_config)
+        else:
+            normalized_config = _bind_operational_setup(
+                strategy,
+                _canonical_forward_config(intent_config),
+            )
         identity_config = dict(normalized_config)
         # The generated intent ID is persisted as provenance but must not
         # participate in its own rolling digest.

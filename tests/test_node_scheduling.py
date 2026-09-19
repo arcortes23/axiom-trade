@@ -1560,6 +1560,31 @@ class MutationSchedulingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             db = str(Path(directory) / "rolling-observation.sqlite")
             with AxiomStore(db) as store:
+                current_market = {
+                    "market_id": "market-initialization",
+                    "condition_id": "condition-market-initialization",
+                    "yes_token_id": "yes-market-initialization",
+                    "no_token_id": "no-market-initialization",
+                    "metadata_provenance": {"source_type": "CURRENT"},
+                    "source_type": "CURRENT",
+                    "provider": "polymarket",
+                    "venue": "POLYMARKET",
+                    "instrument": "POLYMARKET",
+                    "active": True,
+                    "closed": False,
+                    "settlement": "OPEN",
+                    "enable_order_book": True,
+                    "accepting_orders": True,
+                }
+                proof = resolve_market_scope(
+                    "candidate-initialization",
+                    {"market_scope": document["market_scope"]},
+                    [current_market],
+                    resolved_at=T0,
+                )
+                document["scope_resolution"] = proof.as_dict()
+                document["scope_resolution_freshness_sla_seconds"] = 60
+                store.save_market_scope_resolution(proof)
                 processor = AutonomousResearchProcessor(store, clock=lambda: T0)
                 result = processor._ensure_rolling_paper_observation(
                     document,
@@ -3166,6 +3191,205 @@ class MutationSchedulingTests(unittest.TestCase):
                     "UNKNOWN_NO_RETRY",
                 )
 
+
+    def test_capture_families_persist_safety_and_reload_for_node_route(self) -> None:
+        families = (
+            (
+                "probability_mispricing",
+                {
+                    "threshold": 0.05,
+                },
+                "fixed",
+                {"probability": 0.5},
+                False,
+            ),
+            (
+                "momentum",
+                {
+                    "lookback": 1,
+                    "threshold": 0.05,
+                    "entry_predicate": {
+                        "version": "absolute-move-v1",
+                        "minimum_move": 0.05,
+                        "units": "probability",
+                        "boundary": "inclusive",
+                    },
+                },
+                "market-history",
+                {"model_required": False},
+                True,
+            ),
+            (
+                "mean_reversion",
+                {
+                    "lookback": 1,
+                    "threshold": 0.05,
+                    "entry_predicate": {
+                        "version": "absolute-move-v1",
+                        "minimum_move": 0.05,
+                        "units": "probability",
+                        "boundary": "inclusive",
+                    },
+                },
+                "market-history",
+                {"model_required": False},
+                True,
+            ),
+        )
+        for index, (family, parameters, probability_model, model, explicit_capture) in enumerate(
+            families
+        ):
+            with self.subTest(family=family):
+                candidate_id = f"capture-family-{family}"
+                market_id = f"capture-family-market-{index}"
+                strategy_document = {
+                    "version": 1,
+                    "market_type": "prediction",
+                    "family": family,
+                    "parameters": parameters,
+                    "probability_model": probability_model,
+                    "resolution_aware": True,
+                    "resolution_inputs": ["expiry", "settlement"],
+                }
+                policy = normalize_market_scope(
+                    target_instrument="POLYMARKET"
+                )
+                market = {
+                    "market_id": market_id,
+                    "condition_id": "condition-" + market_id,
+                    "yes_token_id": "yes-" + market_id,
+                    "no_token_id": "no-" + market_id,
+                    "metadata_provenance": {"source_type": "CURRENT"},
+                    "source_type": "CURRENT",
+                    "provider": "polymarket",
+                    "venue": "POLYMARKET",
+                    "instrument": "POLYMARKET",
+                    "active": True,
+                    "closed": False,
+                    "settlement": "OPEN",
+                    "enable_order_book": True,
+                    "accepting_orders": True,
+                }
+                with tempfile.TemporaryDirectory() as directory:
+                    db = str(Path(directory) / "capture-family.sqlite")
+                    with AxiomStore(db) as store:
+                        proof = resolve_market_scope(
+                            candidate_id,
+                            {"market_scope": policy.as_dict()},
+                            [market],
+                            resolved_at=T0,
+                        )
+                        processor = AutonomousResearchProcessor(
+                            store,
+                            config=AutonomousResearchConfig(
+                                scope_resolution_freshness_sla_seconds=60
+                            ),
+                            clock=lambda: T0,
+                        )
+                        store.save_market_scope_resolution(proof)
+                        source = {
+                            "candidate_id": candidate_id,
+                            "strategy_version_id": f"{candidate_id}-version",
+                            "research_trial_id": f"{candidate_id}-trial",
+                            "strategy_hash": _content_hash(
+                                _normalized_strategy_document(strategy_document)
+                            ),
+                            "strategy_document": strategy_document,
+                            "model_document": model,
+                            "market_scope": policy.as_dict(),
+                            "scope_resolution": proof.as_dict(),
+                            "scope_resolution_freshness_sla_seconds": 60,
+                        }
+                        if explicit_capture:
+                            source["observation_capture_only"] = True
+                        binding = processor._ensure_rolling_paper_observation(
+                            source,
+                            T0,
+                            market_ids=(market_id,),
+                        )
+                        self.assertIsNotNone(binding)
+                        intent_id = str(binding["intent_id"])
+                        registry = ForwardTestRegistry(store)
+                        materialized = next(
+                            item
+                            for item in registry.list()
+                            if item.config.get("candidate_id") == candidate_id
+                            and item.config.get("market_authority_required") is True
+                        )
+                        config = materialized.config
+                        self.assertEqual(config.get("execution_scope"), "OBSERVATION")
+                        self.assertTrue(config.get("observation_capture_only"))
+                        self.assertTrue(config.get("research_only"))
+                        self.assertTrue(config.get("selection_excluded"))
+                        self.assertFalse(config.get("allocation_active"))
+                        self.assertFalse(config.get("canary_armed"))
+                        self.assertNotIn("operational_setup", config)
+                        self.assertNotIn("operational_setup_hash", config)
+                        self.assertNotIn("canonical_operational_setup_required", config)
+                        self.assertEqual(config.get("capture_market_id"), market_id)
+                        lifecycle_payload = {
+                            "candidate_id": candidate_id,
+                            "paper_observation_intent": True,
+                            "paper_observation_intent_id": intent_id,
+                            "forward_test_id": materialized.experiment_id,
+                            "paper_only": True,
+                            "research_only": True,
+                            "paper_forward_started": True,
+                            "holdout_used": False,
+                            "execution_scope": "OBSERVATION",
+                            "observation_only_lineage": True,
+                            "selection_excluded": True,
+                            "allocation_active": False,
+                            "canary_armed": False,
+                            "allowed_markets": [market_id],
+                            "current_market_ids": [market_id],
+                            "resolved_market_ids": [market_id],
+                            "scope_hash": policy.scope_hash,
+                            "scope_version": policy.scope_version,
+                            "scope_resolution": proof.as_dict(),
+                            "market_scope_resolution": proof.as_dict(),
+                        }
+                        store.save_candidate_lifecycle(
+                            candidate_id,
+                            CandidateStage.IDEA.value,
+                            {"candidate_id": candidate_id},
+                            timestamp=T0,
+                        )
+                        store.save_candidate_lifecycle(
+                            candidate_id,
+                            CandidateStage.PAPER_FORWARD.value,
+                            lifecycle_payload,
+                            from_stage=CandidateStage.IDEA.value,
+                            reason="capture family materialized",
+                            timestamp=T0,
+                        )
+                    with AxiomStore(db) as reloaded:
+                        persisted = ForwardTestRegistry(reloaded).get(
+                            materialized.experiment_id
+                        )
+                        self.assertIsNotNone(persisted)
+                        assert persisted is not None
+                        capture_node = ResearchNode.__new__(ResearchNode)
+                        capture_node.store = reloaded
+                        capture_node.config = SimpleNamespace(shadow_interval=60)
+                        result = capture_node._capture_legacy_observations(
+                            persisted,
+                            [
+                                {
+                                    "market_id": market_id,
+                                    "timestamp": T0,
+                                    "source_timestamp": T0,
+                                    "source_snapshot_id": f"capture-{family}",
+                                }
+                            ],
+                            store=reloaded,
+                            now=T0,
+                        )
+                        self.assertNotEqual(
+                            result.get("blocker"),
+                            "OBSERVATION_LIFECYCLE_IDENTITY_MISMATCH",
+                        )
+                        self.assertEqual(result.get("status"), "OBSERVING", repr(result))
 
 class NodeStopPollingTests(unittest.TestCase):
     def test_stop_closes_collector_resources(self) -> None:

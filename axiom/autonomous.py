@@ -8665,6 +8665,12 @@ class AutonomousResearchProcessor:
         if "observation_capture_only" in strategy and type(marker_value) is not bool:
             raise ValueError("OBSERVATION_CAPTURE_MARKER_INVALID")
         capture_only = marker_value is True
+        if marker_value is None:
+            capture_only = (
+                "operational_setup" not in strategy
+                and "operational_setup_hash" not in strategy
+                and _operational_setup_for_strategy(strategy_document, strategy) is None
+            )
         current_market_ids = tuple(
             sorted(
                 {
@@ -8736,7 +8742,7 @@ class AutonomousResearchProcessor:
             "allocation_active": False if capture_only else None,
             "canary_armed": False if capture_only else None,
         }
-        if not strategy.get("observation_capture_only"):
+        if not capture_only:
             for safety_key in (
                 "execution_scope",
                 "research_only",
@@ -8757,7 +8763,6 @@ class AutonomousResearchProcessor:
             or source_binding.get("predecessor_operational_setup_hash")
             or ""
         ).strip()
-        capture_only = marker_value is True
         if capture_only:
             if declared_setup_hash:
                 config["predecessor_operational_setup_hash"] = declared_setup_hash
