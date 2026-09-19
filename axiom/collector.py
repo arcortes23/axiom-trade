@@ -1503,6 +1503,8 @@ class PolymarketCollector:
             else "cycle_complete"
         )
         self._set_current_stage(final_stage, self._current_endpoint, ended)
+        counters.pop("_bootstrap_request_budget_exhausted", None)
+        counters.pop("_bootstrap_request_budget_endpoint", None)
         cycle = CollectionCycle(
             started,
             ended,
