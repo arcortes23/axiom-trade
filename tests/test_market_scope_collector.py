@@ -3225,6 +3225,52 @@ class MarketScopeCollectorTests(unittest.TestCase):
             "BOOTSTRAP_REQUEST_BUDGET_EXHAUSTED",
         )
         collector.close()
+    def test_bootstrap_budget_counter_keys_are_not_unpacked_into_cycle(self) -> None:
+        target = market("cycle-budget")
+
+        class BudgetCollector(_ScopeCollector):
+            def __init__(self, *args, initial_requests: int, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.initial_requests = initial_requests
+
+            def _new_counters(self):
+                counters = super()._new_counters()
+                counters["requests"] = self.initial_requests
+                return counters
+
+            def _rolling_scope_market_ids(self):
+                self._rolling_background_discovery_enabled = True
+                self._rolling_scope_candidate_ids = ()
+                self._rolling_scope_documents = {}
+                return []
+
+        for initial_requests in (0, 16):
+            with self.subTest(initial_requests=initial_requests):
+                store = _ScopeStore({})
+                store.states["polymarket"] = {
+                    "cycle_continuation": {"remaining_market_ids": [target.market_id]}
+                }
+                collector = BudgetCollector(
+                    _PagedProvider((target,), ()),
+                    store,
+                    CollectorConfig(
+                        max_markets=1,
+                        discovery_budget_per_cycle=1,
+                        max_attempts=1,
+                        backoff_initial_seconds=0,
+                        jitter_seconds=0,
+                    ),
+                    candidate_ids=(),
+                    initial_requests=initial_requests,
+                    clock=lambda: T0,
+                    sleep=lambda _seconds: None,
+                )
+                cycle = collector.collect_once(now=T0)
+                record = cycle.as_record()
+                self.assertIn("requests", record)
+                self.assertNotIn("_bootstrap_request_budget_exhausted", record)
+                self.assertNotIn("_bootstrap_request_budget_endpoint", record)
+                collector.close()
 
     def test_hanging_inventory_does_not_starve_direct_exact_scope_across_cycles(self) -> None:
         closed = replace(
