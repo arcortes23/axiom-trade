@@ -381,7 +381,7 @@ class NodeConfig:
     max_attempts: int = 3
     max_provider_clock_skew_seconds: float = 5.0
     failure_cooldown_seconds: float = 30.0
-    provider_timeout_seconds: float = 10.0
+    provider_timeout_seconds: float = 20.0
     retain_cycles: int = 5
     research_enabled: bool = True
     research_max_items_per_cycle: int = 1

@@ -202,6 +202,21 @@ class NodeConfigValidationTests(unittest.TestCase):
         self.assertEqual(config.failure_cooldown_seconds, 0)
         self.assertEqual(config.discovery_budget_per_cycle, 4)
         self.assertEqual(config.max_concurrency, 2)
+    def test_production_provider_timeout_propagates_to_collector_and_cycle_budget(self) -> None:
+        config = NodeConfig(":memory:", crypto_enabled=False)
+        self.assertEqual(config.provider_timeout_seconds, 20.0)
+        with AxiomStore(":memory:") as store:
+            node = ResearchNode(
+                config,
+                provider=InMemoryPredictionProvider([]),
+                store=store,
+                clock=lambda: T0,
+            )
+            self.assertEqual(node.collector.config.provider_timeout_seconds, 20.0)
+            self.assertGreaterEqual(
+                node.collector.config.cycle_budget_seconds,
+                node.collector.config.provider_timeout_seconds,
+            )
     def test_direct_construction_rejects_non_boolean_crypto_enabled(self) -> None:
         for crypto_enabled in (None, 0, 1, "false", object()):
             with self.subTest(crypto_enabled=crypto_enabled):

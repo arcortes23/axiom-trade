@@ -233,7 +233,7 @@ class CollectorConfig:
     backoff_max_seconds: float = 30.0
     jitter_seconds: float = 0.25
     failure_cooldown_seconds: float = 30.0
-    provider_timeout_seconds: float = 10.0
+    provider_timeout_seconds: float = 20.0
     max_trade_pages: int = 100
     max_provider_clock_skew_seconds: float = 5.0
     retain_cycles: int = 1
