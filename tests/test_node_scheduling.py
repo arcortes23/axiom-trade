@@ -2286,13 +2286,104 @@ class MutationSchedulingTests(unittest.TestCase):
                 proof_persisted_during_load = [False]
 
                 def load_current_proof(*args: Any, **kwargs: Any) -> Any:
+                    result = original_loader(*args, **kwargs)
                     if not proof_persisted_during_load[0]:
                         store.save_market_scope_resolution(proof_b)
                         proof_persisted_during_load[0] = True
-                    return original_loader(*args, **kwargs)
+                    return result
 
                 store.load_market_scope_resolution = load_current_proof
                 processor._migrate_observation_setup_intents(T0)
+                paper_calls: list[str] = []
+
+                def paper_workers() -> Mapping[str, Any]:
+                    lifecycle = store.load_candidate_lifecycle(candidate_id)
+                    linked_forward = (
+                        lifecycle["payload"]["forward_test_id"]
+                        if isinstance(lifecycle, Mapping)
+                        and isinstance(lifecycle.get("payload"), Mapping)
+                        else ""
+                    )
+                    current_forwards = [
+                        item
+                        for item in registry.list()
+                        if item.config.get("observation_intent") is True
+                        and item.config.get("market_authority_required") is True
+                        and tuple(item.allowed_markets) == tuple(sorted(replacement_market_ids))
+                    ]
+                    self.assertEqual(len(current_forwards), 1)
+                    self.assertEqual(linked_forward, current_forwards[0].experiment_id)
+                    self.assertIn(
+                        current_forwards[0].config.get("capture_market_id"),
+                        set(current_forwards[0].allowed_markets),
+                    )
+                    paper_calls.append(linked_forward)
+                    return {
+                        "processed_candidates": 1,
+                        "successful_candidates": 1,
+                        "blocked_candidates": 0,
+                    }
+
+                node._run_crypto_paper = lambda: None
+                node._run_opportunity_pipeline = lambda: True
+                node._run_paper_workers = paper_workers
+                node._run_research_queue = lambda: {}
+                processor.reevaluate_forward_candidates = lambda now: None
+                research_result = node._run_research_cycle()
+                self.assertGreaterEqual(
+                    research_result["observation_setup_migrations"],
+                    1,
+                )
+                self.assertEqual(len(paper_calls), 1)
+                intent_ids_after_handoff = tuple(
+                    sorted(item.experiment_id for item in registry.list())
+                )
+                restarted = ResearchNode(
+                    NodeConfig(
+                        db,
+                        crypto_enabled=False,
+                        rolling_review_interval_seconds=86400,
+                    ),
+                    provider=InMemoryPredictionProvider([]),
+                    store=store,
+                    clock=lambda: T0,
+                )
+                restarted._run_crypto_paper = lambda: None
+                restarted._run_opportunity_pipeline = lambda: True
+                restarted._run_paper_workers = lambda: {
+                    "processed_candidates": 0,
+                    "successful_candidates": 0,
+                    "blocked_candidates": 0,
+                }
+                restarted._run_research_queue = lambda: {}
+                restarted.research_processor.reevaluate_forward_candidates = (
+                    lambda now: None
+                )
+                restart_result = restarted._run_research_cycle()
+                self.assertEqual(
+                    restart_result["observation_setup_migrations"],
+                    0,
+                )
+                def fail_migration(now: datetime) -> tuple[Mapping[str, Any], ...]:
+                    raise RuntimeError("migration unavailable")
+
+                restarted.research_processor._migrate_observation_setup_intents = (
+                    fail_migration
+                )
+                failed_result = restarted._run_research_cycle()
+                self.assertTrue(failed_result["degraded"])
+                self.assertEqual(
+                    failed_result["observation_setup_migration_error"],
+                    "migration unavailable",
+                )
+                self.assertIn(
+                    "observation setup migration completed with degraded output",
+                    failed_result["errors"],
+                )
+                self.assertEqual(
+                    tuple(sorted(item.experiment_id for item in registry.list())),
+                    intent_ids_after_handoff,
+                )
                 self.assertTrue(proof_persisted_during_load[0])
                 capture_successors = [
                     item

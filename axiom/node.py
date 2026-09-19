@@ -3875,6 +3875,24 @@ class ResearchNode:
 
     def _run_research_cycle(self) -> dict[str, Any]:
         errors: list[str] = []
+        observation_migrations: Any = ()
+        observation_migration_error: str | None = None
+        migrate = getattr(
+            self.research_processor,
+            "_migrate_observation_setup_intents",
+            None,
+        )
+        if callable(migrate):
+            try:
+                observation_migrations = migrate(ensure_utc(self.clock()))
+            except BaseException as exc:
+                observation_migration_error = str(exc)[:240]
+                self._log(
+                    logging.WARNING,
+                    "research observation migration failed: %s",
+                    exc,
+                )
+                errors.append("observation setup migration completed with degraded output")
         self._run_crypto_paper()
         if self._crypto_status.get("last_error"):
             errors.append(f"crypto paper: {self._crypto_status['last_error']}")
@@ -3896,6 +3914,12 @@ class ResearchNode:
         return {
             "paper": paper_stats,
             "research_queue": queue_stats,
+            "observation_setup_migrations": (
+                len(observation_migrations)
+                if isinstance(observation_migrations, (list, tuple))
+                else 0
+            ),
+            "observation_setup_migration_error": observation_migration_error,
             "degraded": bool(errors),
             "errors": errors,
         }
