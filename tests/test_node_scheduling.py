@@ -2328,13 +2328,17 @@ class MutationSchedulingTests(unittest.TestCase):
                 stale_forward_config = dict(replacement_forward.config)
                 stale_forward_config["observation_intent_id"] = migrated[0].experiment_id
                 stale_forward_config["paper_observation_intent_id"] = migrated[0].experiment_id
+                stale_forward_config["capture_market_id"] = market_id
+                stale_forward_config["current_market_ids"] = list(
+                    sorted(replacement_market_ids)
+                )
                 registry.freeze(
                     strategy=stale_forward_config["strategy_document"],
                     model=stale_forward_config["model_document"],
                     config=stale_forward_config,
                     start_timestamp=T0,
                     allowed_markets=tuple(sorted(replacement_market_ids)),
-                    experiment_id="forward-stale-capture",
+                    experiment_id="forward-aaa-stale-capture",
                 )
                 processor._migrate_observation_setup_intents(T0)
                 capture_successors_after_repeat = [

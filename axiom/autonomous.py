@@ -8465,6 +8465,38 @@ class AutonomousResearchProcessor:
                             )
                         )
                     predecessor_intent_ids.discard("")
+                    def capture_binding_is_current(candidate: Any) -> bool:
+                        candidate_config = (
+                            candidate.config
+                            if isinstance(
+                                getattr(candidate, "config", None), Mapping
+                            )
+                            else {}
+                        )
+                        if (
+                            candidate_config.get("observation_capture_only")
+                            is not True
+                        ):
+                            return True
+                        capture_market_id = _binding_value(
+                            candidate_config.get("capture_market_id")
+                        )
+                        allowed_market_ids = {
+                            _binding_value(item)
+                            for item in getattr(candidate, "allowed_markets", ())
+                            if _binding_value(item)
+                        }
+                        current_market_ids = {
+                            _binding_value(item)
+                            for item in matched_ids
+                            if _binding_value(item)
+                        }
+                        return bool(
+                            capture_market_id
+                            and capture_market_id in allowed_market_ids
+                            and capture_market_id in current_market_ids
+                        )
+
                     materialized = next(
                         (
                             candidate
@@ -8522,6 +8554,7 @@ class AutonomousResearchProcessor:
                                 for item in getattr(candidate, "allowed_markets", ())
                             )
                             == set(str(item).strip() for item in matched_ids)
+                            and capture_binding_is_current(candidate)
                         ),
                         None,
                     )
