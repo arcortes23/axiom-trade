@@ -1234,6 +1234,71 @@ def validate_system_exploratory_admission_policy(
 def default_rolling_admission_policy() -> RollingAdmissionPolicy:
     """Return the conservative, explicitly paper-only default policy."""
     return RollingAdmissionPolicy(policy_id="rolling-default", version=POLICY_VERSION)
+def system_risk_binding_from_active_config(
+    active_config: Mapping[str, Any] | None,
+    policy: RollingAdmissionPolicy,
+) -> dict[str, Any]:
+    """Return the canonical risk binding used by bootstrap validation.
+
+    Both the autonomous processor and the public collector validate the same
+    system envelope. Keeping extraction here prevents one path from accepting
+    a stale or weaker risk identity than the other.
+    """
+    if isinstance(active_config, Mapping):
+        if str(active_config.get("risk_config_id", "")).strip():
+            identifier = str(
+                active_config.get("risk_config_id", active_config.get("config_id", ""))
+            ).strip()
+            generation = int(
+                active_config.get(
+                    "risk_config_generation",
+                    active_config.get("generation", 0),
+                )
+                or 0
+            )
+            digest = str(
+                active_config.get(
+                    "risk_config_hash",
+                    active_config.get("config_hash", ""),
+                )
+            ).strip() or _content_hash(active_config)
+            budget = active_config.get(
+                "global_budget",
+                active_config.get("budget", policy.global_budget),
+            )
+            return {
+                "risk_config_id": identifier,
+                "risk_config_generation": generation,
+                "risk_config_hash": digest,
+                "global_budget": str(budget),
+            }
+        values = active_config.get("values", active_config.get("settings", {}))
+        values = values if isinstance(values, Mapping) else {}
+        identifier = str(active_config.get("config_id", "")).strip()
+        generation = int(active_config.get("generation", 0) or 0)
+        digest = str(active_config.get("config_hash", "")).strip()
+        if identifier and generation > 0 and digest:
+            budget = values.get(
+                "global_budget",
+                values.get("max_notional", values.get("budget", policy.global_budget)),
+            )
+            return {
+                "risk_config_id": identifier,
+                "risk_config_generation": generation,
+                "risk_config_hash": digest,
+                "global_budget": str(budget),
+            }
+    return {
+        "risk_config_id": "rolling-risk-default",
+        "risk_config_generation": 0,
+        "risk_config_hash": _content_hash(
+            {
+                "risk_config_id": "rolling-risk-default",
+                "global_budget": str(policy.global_budget),
+            }
+        ),
+        "global_budget": str(policy.global_budget),
+    }
 
 
 @dataclass(frozen=True, slots=True)

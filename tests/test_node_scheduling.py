@@ -23,7 +23,7 @@ from axiom.canary_settings import CanarySettingsService
 from axiom.collector import CollectionCycle, CollectorConfig, PolymarketCollector
 from axiom.data import InMemoryPredictionProvider
 from axiom.data.polymarket import MarketDiscoveryPage
-from axiom.domain import PredictionMarketSnapshot
+from axiom.domain import OrderBookLevel, OrderBookSnapshot, PredictionMarketSnapshot
 from axiom.dashboard import DashboardData
 from axiom.experiment_plan import normalize_market_scope
 from axiom.forward import (
@@ -1037,6 +1037,184 @@ class ExploratoryRollingProgressionTests(unittest.TestCase):
                 self.assertEqual(blocked["status"], "BLOCKED")
                 self.assertEqual(blocked["blocker"], "ROLLING_POLICY_BOOTSTRAP_DRIFT")
                 self.assertEqual(store.research_queue_stats(), before)
+    def test_empty_selection_discovers_bounded_current_members_and_queues_evaluation(self) -> None:
+        class BootstrapProvider(InMemoryPredictionProvider):
+            provider_name = "polymarket"
+
+            def __init__(self, markets: list[PredictionMarketSnapshot]) -> None:
+                books = {
+                    market.market_id: OrderBookSnapshot(
+                        T0,
+                        (OrderBookLevel(0.40, 10.0),),
+                        (OrderBookLevel(0.60, 10.0),),
+                        min_order_size=1.0,
+                        tick_size=0.01,
+                        neg_risk=False,
+                    )
+                    for market in markets
+                }
+                super().__init__(markets, order_books=books)
+                self.market_page_limits: list[int] = []
+                self.order_book_calls: list[str] = []
+
+            def market_page(
+                self,
+                limit: int,
+                *,
+                after_cursor: str | None = None,
+                closed: bool = False,
+                include_tag: bool | None = None,
+            ) -> MarketDiscoveryPage:
+                self.market_page_limits.append(limit)
+                snapshots = tuple(self.markets(active=not closed))[:limit]
+                return MarketDiscoveryPage(
+                    snapshots=snapshots,
+                    next_cursor=None,
+                    request_path="/markets/keyset",
+                    query={
+                        "limit": limit,
+                        "after_cursor": after_cursor,
+                        "closed": closed,
+                        "include_tag": include_tag,
+                    },
+                    query_fingerprint="bootstrap-fixture",
+                    raw_count=len(snapshots),
+                    unique_count=len(snapshots),
+                    duplicate_count=0,
+                    malformed_count=0,
+                    coverage_status="COMPLETE",
+                )
+
+            def order_books(
+                self,
+                market_id: str,
+                depth: int = 20,
+            ) -> Mapping[str, OrderBookSnapshot]:
+                self.order_book_calls.append(str(market_id))
+                snapshot = self.market(market_id)
+                assert snapshot is not None
+                source = self._books[str(market_id)]
+                common = {
+                    "condition_id": snapshot.condition_id,
+                    "min_order_size": source.min_order_size,
+                    "tick_size": source.tick_size,
+                    "neg_risk": source.neg_risk,
+                }
+                return {
+                    "yes": OrderBookSnapshot(
+                        source.timestamp,
+                        source.bids[:depth],
+                        source.asks[:depth],
+                        token_id=snapshot.yes_token_id,
+                        **common,
+                    ),
+                    "no": OrderBookSnapshot(
+                        source.timestamp,
+                        source.bids[:depth],
+                        source.asks[:depth],
+                        token_id=snapshot.no_token_id,
+                        **common,
+                    ),
+                }
+
+        markets = [
+            PredictionMarketSnapshot(
+                timestamp=T0,
+                market_id=f"bootstrap-market-{index}",
+                condition_id=f"bootstrap-condition-{index}",
+                question=f"Will bootstrap event {index} happen?",
+                yes_token_id=f"bootstrap-yes-{index}",
+                no_token_id=f"bootstrap-no-{index}",
+                yes_bid=0.40,
+                yes_ask=0.60,
+                yes_mid=0.50,
+                active=True,
+                closed=False,
+                accepting_orders=True,
+                enable_order_book=True,
+            )
+            for index in range(3)
+        ]
+        with AxiomStore(":memory:") as store:
+            CanarySettingsService(store, clock=lambda: T0).snapshot(now=T0)
+            provider = BootstrapProvider(markets)
+            node = ResearchNode(
+                NodeConfig(
+                    ":memory:",
+                    mutation_enabled=False,
+                    crypto_enabled=False,
+                    execution_profile=PRODUCTION_EXECUTION_PROFILE,
+                    system_bootstrap_enabled=True,
+                    max_markets=10,
+                    discovery_budget_per_cycle=10,
+                ),
+                provider=provider,
+                store=store,
+                clock=lambda: T0,
+            )
+            result = node.research_processor.refresh_rolling_evidence(T0)
+            cycle = store.get_collector_state("polymarket")
+            self.assertIsNotNone(cycle)
+            assert cycle is not None
+            self.assertLessEqual(max(provider.market_page_limits), 10)
+            self.assertLessEqual(cycle["markets_attempted"], 10)
+            self.assertLessEqual(cycle["requests"], 16)
+            resolutions = store.list_market_scope_resolutions(limit=10)
+            matched = [item for item in resolutions if item.status == "MATCHED"]
+            self.assertTrue(matched, resolutions)
+            self.assertGreaterEqual(len(matched[-1].matched_markets), 1)
+            self.assertLessEqual(len(matched[-1].matched_markets), 3)
+            self.assertEqual(len(store.list_strategy_versions(limit=10)), 2)
+            self.assertEqual(len(store.list_research_trials(limit=10)), 2)
+            queue_item_id = result.get("queue_item_id")
+            self.assertIsInstance(queue_item_id, str)
+            queue_item = store.get_research_item(queue_item_id)
+            self.assertIsNotNone(queue_item)
+            assert queue_item is not None
+            self.assertEqual(queue_item["item_type"], "review_request")
+            first_versions = store.list_strategy_versions(limit=10)
+            first_trials = store.list_research_trials(limit=10)
+            second_result = node.research_processor.refresh_rolling_evidence(
+                T0 + timedelta(seconds=1)
+            )
+            second_versions = store.list_strategy_versions(limit=10)
+            second_trials = store.list_research_trials(limit=10)
+            self.assertIsInstance(second_result.get("queue_item_id"), str)
+            self.assertEqual(
+                sorted(item["strategy_version_id"] for item in first_versions),
+                sorted(item["strategy_version_id"] for item in second_versions),
+            )
+            self.assertEqual(
+                sorted(item["research_trial_id"] for item in first_trials),
+                sorted(item["research_trial_id"] for item in second_trials),
+            )
+            self.assertEqual(len(first_versions), len(second_versions))
+            self.assertEqual(len(first_trials), len(second_trials))
+
+    def test_mode_only_stale_bootstrap_policy_blocks_without_queue(self) -> None:
+        with AxiomStore(":memory:") as store:
+            processor = self._processor(":memory:", store)
+            processor._ensure_exploratory_live_bootstrap(T0)
+            operating = dict(
+                store.get_operator_config(
+                    "rolling_exploratory_operating_policy",
+                    None,
+                )
+            )
+            operating.pop("created_by", None)
+            store.set_operator_config(
+                "rolling_exploratory_operating_policy",
+                operating,
+            )
+            before = store.research_queue_stats()
+            result = processor.refresh_rolling_evidence(T0)
+            self.assertEqual(result["status"], "BLOCKED")
+            self.assertEqual(
+                result["blocker"],
+                "ROLLING_POLICY_BOOTSTRAP_REQUIRED",
+            )
+            self.assertEqual(store.research_queue_stats(), before)
+
     def _processor(self, db: str, store: AxiomStore) -> AutonomousResearchProcessor:
         node = ResearchNode(
             NodeConfig(

@@ -846,6 +846,7 @@ class ResearchNode:
         self._historical_refresh_thread: threading.Thread | None = None
         self._auto_canary_thread: threading.Thread | None = None
         self._rolling_portfolio_thread: threading.Thread | None = None
+        self._rolling_discovery_lock = threading.Lock()
         self._shadow_assessment_thread: threading.Thread | None = None
         self._historical_thread: threading.Thread | None = None
         self._worker_runtime_lock = threading.RLock()
@@ -934,6 +935,7 @@ class ResearchNode:
                 ),
             ),
             clock=clock,
+            current_market_discoverer=self._rolling_current_market_discovery,
         )
         self._rolling_bootstrap_error: str | None = None
         if (
@@ -1708,8 +1710,23 @@ class ResearchNode:
             self._close_logging()
             if self._owns_store:
                 self.store.close()
-
         return list(self._cycles)
+
+    def _rolling_current_market_discovery(self, now: datetime) -> Any:
+        """Run one bounded disarmed current-market collection pass.
+
+        The rolling worker must never contend indefinitely with the ordinary
+        collector.  A non-blocking lock makes this an opportunistic refresh;
+        the collector itself applies provider/request deadlines and the
+        system-policy ten-market cap before any transport call.
+        """
+        if not self._rolling_discovery_lock.acquire(blocking=False):
+            return None
+        try:
+            return self.collector.collect_once(now=ensure_utc(now))
+        finally:
+            self._rolling_discovery_lock.release()
+
     def _start_worker_threads(self, max_cycles: int | None) -> None:
         self._collector_thread = threading.Thread(
             target=self._collector_worker_loop,
@@ -3607,7 +3624,8 @@ class ResearchNode:
                         next_work=scheduled_for.isoformat(),
                     )
                     try:
-                        candidate_cycle = collector.collect_once()
+                        with self._rolling_discovery_lock:
+                            candidate_cycle = collector.collect_once()
                         if not isinstance(candidate_cycle, CollectionCycle):
                             raise RuntimeError("collector returned an invalid cycle")
                         cycle = candidate_cycle
@@ -5136,7 +5154,6 @@ class ResearchNode:
                     "yes_token_id",
                     "no_token_id",
                     "outcome_token_id",
-                    "scope_resolution_id",
                     "scope_hash",
                     "scope_version",
                     "book_depth",
