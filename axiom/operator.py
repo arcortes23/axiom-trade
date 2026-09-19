@@ -3077,8 +3077,23 @@ class OperatorControlPlane:
             except Exception:
                 self._selection_reconciliation_error = "EXPLORATORY_LIVE_SELECTION_RECONCILIATION_REQUIRED"
                 return False
+        current_identity_exact = (
+            isinstance(current, Mapping)
+            and str(
+                current.get("selection_id")
+                or current.get("portfolio_selection_id")
+                or ""
+            ).strip()
+            == selection_id
+            and str(current.get("selection_hash") or "").strip() == selection_hash
+        )
+        singleton_target = singleton_candidate == candidate_id
         try:
             if state in {"ARMED", "AUTONOMOUS_MICRO_LIVE"}:
+                if control_candidate not in {"", candidate_id}:
+                    raise OperatorControlError(
+                        "EXPLORATORY_LIVE_SELECTION_RECONCILIATION_REQUIRED"
+                    )
                 self._canary_service.disarm()
             if auth_exact:
                 self.revoke_execution_authorization(
@@ -3096,8 +3111,10 @@ class OperatorControlPlane:
             else:
                 transaction_context = nullcontext()
             with transaction_context:
-                self._reset_prepared_selection_overlay(current)
-                self._restore_canary_selection_binding(binding_before)
+                if current_identity_exact:
+                    self._reset_prepared_selection_overlay(current)
+                if singleton_target:
+                    self._restore_canary_selection_binding(binding_before)
                 connection = getattr(self.store, "connection", None)
                 if connection is None:
                     raise OperatorControlError("EXPLORATORY_LIVE_CANARY_SELECTION_REQUIRED")
