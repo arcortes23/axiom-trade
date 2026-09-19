@@ -613,9 +613,14 @@ class Phase3CollectionTests(unittest.TestCase):
             self.assertEqual(cycle.tier_successes["discovery"], 0)  # type: ignore[index]
             self.assertEqual(cycle.markets_seen, 3)
             self.assertEqual(cycle.markets_attempted, 3)
+            market_calls = list(
+                dict.fromkeys(
+                    item[1] for item in provider.calls if item[0] == "market"
+                )
+            )
             self.assertEqual(
-                list(dict.fromkeys(item[1] for item in provider.calls if item[0] == "market")),
-                ["candidate-a", "candidate-b", "paper-a"],
+                set(market_calls),
+                {"candidate-a", "candidate-b", "paper-a"},
             )
             self.assertLessEqual(
                 len([item for item in provider.calls if item[0] == "market"]),

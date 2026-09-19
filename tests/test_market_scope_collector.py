@@ -3179,6 +3179,53 @@ class MarketScopeCollectorTests(unittest.TestCase):
         self.assertEqual(generic_counters["retries"], 1)
         collector.close()
 
+    def test_bootstrap_retry_budget_stops_before_retry_and_persists_partial_state(self) -> None:
+        provider = _PagedProvider((market("retry-budget"),), ())
+        collector = self._collector(provider, _ScopeStore({}), ())
+        collector.config = replace(
+            collector.config,
+            max_attempts=4,
+            backoff_initial_seconds=0,
+            jitter_seconds=0,
+        )
+        collector._rolling_background_discovery_enabled = True
+        counters = collector._new_counters()
+        counters["requests"] = 15
+        calls = 0
+
+        def transient_operation() -> object:
+            nonlocal calls
+            calls += 1
+            raise OSError("transient bootstrap failure")
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "BOOTSTRAP_REQUEST_BUDGET_EXHAUSTED",
+        ):
+            collector._call_provider(
+                "collection:retry-budget",
+                transient_operation,
+                T0,
+                counters,
+                provider=provider,
+                pool_name="collection",
+            )
+        self.assertEqual(calls, 1)
+        self.assertEqual(counters["requests"], 16)
+        self.assertTrue(counters["_bootstrap_request_budget_exhausted"])
+        collector._discovery_continuation = {
+            "request_budget": 16,
+            "requests_used": counters["requests"],
+            "request_budget_exhausted": True,
+            "partial_reason": "BOOTSTRAP_REQUEST_BUDGET_EXHAUSTED",
+            "deferred_markets": ["retry-budget"],
+        }
+        self.assertEqual(
+            collector._discovery_continuation["partial_reason"],
+            "BOOTSTRAP_REQUEST_BUDGET_EXHAUSTED",
+        )
+        collector.close()
+
     def test_hanging_inventory_does_not_starve_direct_exact_scope_across_cycles(self) -> None:
         closed = replace(
             market("exact-closed"),

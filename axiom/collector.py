@@ -42,12 +42,22 @@ from .canary import (
 )
 from .forward import ForwardTestRegistry, ForwardTestSpec
 from .lifecycle import CandidateLifecycleManager, CandidateStage
+from .rolling_portfolio import (
+    RollingPolicyBootstrapError,
+    default_rolling_admission_policy,
+    system_risk_binding_from_active_config,
+    validate_system_exploratory_admission_policy,
+)
 _UNSET = object()
 _MAX_SCOPE_REQUEST_PATH_LENGTH = 512
 _MAX_SCOPE_QUERY_DEPTH = 8
 _MAX_SCOPE_QUERY_ITEMS = 128
 _MAX_SCOPE_QUERY_STRING_LENGTH = 1024
 _MAX_CYCLE_CONTINUATION_IDS = 256
+_ROLLING_BOOTSTRAP_MARKET_CAP = 10
+_ROLLING_BOOTSTRAP_MEMBER_MAX = 3
+_ROLLING_BOOTSTRAP_REQUEST_BUDGET = 16
+_ROLLING_BOOTSTRAP_MARKET_REQUEST_RESERVE = 5
 
 
 class _ScopePersistenceValueError(ValueError):
@@ -67,6 +77,7 @@ class _ProviderDeadlineExceeded(TimeoutError):
         in_flight: bool = False,
         cycle_expired: bool = False,
     ) -> None:
+
         self.endpoint = str(endpoint)
         self.timeout_seconds = float(timeout_seconds)
         self.in_flight = bool(in_flight)
@@ -79,6 +90,9 @@ class _ProviderDeadlineExceeded(TimeoutError):
         super().__init__(
             f"{reason}: {self.endpoint} exceeded {self.timeout_seconds:g}s deadline"
         )
+
+class _BootstrapRequestBudgetExceeded(RuntimeError):
+    """A bootstrap cycle exhausted its explicit public-request budget."""
 
 
 class _BoundedProviderExecutor:
@@ -997,7 +1011,12 @@ class PolymarketCollector:
                 if market_id not in known_candidate and market_id not in paper_markets:
                     paper_markets.append(market_id)
 
-        capacity = self.config.max_markets
+        capacity = min(
+            self.config.max_markets,
+            _ROLLING_BOOTSTRAP_MARKET_CAP
+            if self._rolling_background_discovery_enabled
+            else self.config.max_markets,
+        )
         candidate_scheduled = due_candidates[:capacity]
         remaining = max(0, capacity - len(candidate_scheduled))
         paper_scheduled = paper_markets[:remaining]
@@ -1031,9 +1050,8 @@ class PolymarketCollector:
             if isinstance(item, Mapping)
         )
         # A scope-bearing candidate has already consumed the one shared public
-        # inventory pass above.  Never append unqualified inventory to its
-        # schedule; this is what prevents research-only/invalid scopes from
-        # widening into live collection authority.
+        # inventory pass above.  The system bootstrap is the sole exception:
+        # before selection it owns a bounded public-current discovery pass.
         if (
             not configured
             and (
@@ -1046,10 +1064,17 @@ class PolymarketCollector:
             and self.config.discovery_budget_per_cycle > 0
         ):
             try:
+                discovery_budget = min(
+                    remaining,
+                    self.config.discovery_budget_per_cycle,
+                    _ROLLING_BOOTSTRAP_MARKET_CAP
+                    if self._rolling_background_discovery_enabled
+                    else self.config.discovery_budget_per_cycle,
+                )
                 discovered_values, next_cursor, deferred = self._discover_markets(
                     started,
                     counters,
-                    budget=min(remaining, self.config.discovery_budget_per_cycle),
+                    budget=discovery_budget,
                     carry_cursor=discovery_cursor,
                     exclude=set(known_candidate) | set(paper_markets),
                 )
@@ -1146,12 +1171,52 @@ class PolymarketCollector:
         }
         tier_by_market.update({market_id: "paper_forward" for market_id in paper_scheduled})
         tier_by_market.update({market_id: "discovery" for market_id in discovery_scheduled})
-        planned_ids = list(dict.fromkeys([
+        all_planned_ids = list(dict.fromkeys([
             *resume_ids,
             *candidate_scheduled,
             *paper_scheduled,
             *discovery_scheduled,
-        ]))[:capacity]
+        ]))
+        planned_limit = capacity
+        request_budget_remaining: int | None = None
+        request_budget_exhausted = False
+        if self._rolling_background_discovery_enabled:
+            request_budget_remaining = max(
+                0,
+                _ROLLING_BOOTSTRAP_REQUEST_BUDGET
+                - int(counters.get("requests", 0)),
+            )
+            planned_limit = min(
+                planned_limit,
+                _ROLLING_BOOTSTRAP_MEMBER_MAX,
+                request_budget_remaining
+                // _ROLLING_BOOTSTRAP_MARKET_REQUEST_RESERVE,
+            )
+            request_budget_exhausted = (
+                bool(all_planned_ids) and planned_limit < len(all_planned_ids)
+            )
+            if request_budget_exhausted:
+                discovery_deferred.extend(
+                    identifier
+                    for identifier in all_planned_ids[planned_limit:]
+                    if identifier not in discovery_deferred
+                )
+                discovery_coverage_status = "PARTIAL"
+        planned_ids = all_planned_ids[:planned_limit]
+        if self._rolling_background_discovery_enabled:
+            self._discovery_continuation = {
+                **dict(self._discovery_continuation or {}),
+                "request_budget": _ROLLING_BOOTSTRAP_REQUEST_BUDGET,
+                "requests_used_before_market_validation": int(
+                    counters.get("requests", 0)
+                ),
+                "request_budget_remaining": request_budget_remaining,
+                "request_budget_exhausted": request_budget_exhausted,
+                "market_validation_request_reserve": (
+                    _ROLLING_BOOTSTRAP_MARKET_REQUEST_RESERVE
+                ),
+                "updated_at": started.isoformat(),
+            }
         for market_id in resume_ids:
             tier_by_market.setdefault(market_id, "discovery")
 
@@ -1283,6 +1348,28 @@ class PolymarketCollector:
                     tier_successes[tier] += 1
                 else:
                     tier_failures[tier] += 1
+        if self._rolling_background_discovery_enabled:
+            budget_exhausted = bool(
+                counters.get("_bootstrap_request_budget_exhausted")
+            ) or int(counters.get("requests", 0)) >= _ROLLING_BOOTSTRAP_REQUEST_BUDGET
+            self._discovery_continuation = {
+                **dict(self._discovery_continuation or {}),
+                "request_budget": _ROLLING_BOOTSTRAP_REQUEST_BUDGET,
+                "requests_used": int(counters.get("requests", 0)),
+                "request_budget_remaining": max(
+                    0,
+                    _ROLLING_BOOTSTRAP_REQUEST_BUDGET
+                    - int(counters.get("requests", 0)),
+                ),
+                "request_budget_exhausted": budget_exhausted,
+                "partial_reason": (
+                    "BOOTSTRAP_REQUEST_BUDGET_EXHAUSTED"
+                    if budget_exhausted
+                    else None
+                ),
+            }
+            if budget_exhausted:
+                discovery_coverage_status = "PARTIAL"
         ended = ensure_utc(now or self.clock())
         if ended < started:
             ended = started
@@ -1723,24 +1810,99 @@ class PolymarketCollector:
         self._rolling_background_discovery_enabled = False
         superseded_candidate_ids, _ = self._superseded_observation_ids()
         selection_loader = getattr(self.store, "load_current_portfolio_selection", None)
-
-        if not callable(selection_loader):
-            return []
-        try:
-            selection = selection_loader()
-        except Exception:
-            return []
-        if selection is None:
-            return []
-        if not isinstance(selection, Mapping):
-            return []
-        policy_sources = (
-            selection.get("exploratory_policy"),
-            selection.get("operating_policy"),
-            selection.get("execution_policy"),
-            selection.get("setup_policy"),
-            selection.get("policy_mode"),
+        selection: Mapping[str, Any] | None = None
+        if callable(selection_loader):
+            try:
+                loaded_selection = selection_loader()
+            except Exception:
+                loaded_selection = None
+            if isinstance(loaded_selection, Mapping):
+                selection = loaded_selection
+        policy_sources: tuple[Any, ...] = (
+            (
+                selection.get("exploratory_policy"),
+                selection.get("operating_policy"),
+                selection.get("execution_policy"),
+                selection.get("setup_policy"),
+                selection.get("policy_mode"),
+            )
+            if selection is not None
+            else ()
         )
+        selection_members = (
+            selection.get("members", selection.get("selected_members", ()))
+            if selection is not None
+            else ()
+        )
+        selection_members_empty = (
+            selection is not None
+            and isinstance(selection_members, (list, tuple))
+            and not selection_members
+        )
+        # The operator-owned envelope, not a mode string, authorizes system
+        # discovery. Selected exact scopes remain independently readable.
+        policy_loader = getattr(self.store, "get_operator_config", None)
+        operator_operating: Mapping[str, Any] | None = None
+        if callable(policy_loader):
+            try:
+                configured_operating = policy_loader(
+                    "rolling_exploratory_operating_policy",
+                    None,
+                )
+            except Exception:
+                configured_operating = None
+            if isinstance(configured_operating, Mapping):
+                operator_operating = configured_operating
+                policy_sources = (*policy_sources, configured_operating)
+        operator_system_authority = False
+        if (
+            isinstance(operator_operating, Mapping)
+            and str(operator_operating.get("mode", "")).strip().upper()
+            == "EXPLORATORY_LIVE"
+            and (selection is None or selection_members_empty)
+        ):
+            marker = False
+            active = None
+            try:
+                marker = policy_loader(
+                    "rolling_exploratory_bootstrap_required",
+                    False,
+                ) is True
+                active = policy_loader("rolling_admission_policy_active", None)
+            except Exception:
+                marker = False
+            active_config = None
+            active_loader = getattr(self.store, "load_canary_setting_config", None)
+            if callable(active_loader):
+                try:
+                    active_config = active_loader(state="ACTIVE")
+                except TypeError:
+                    try:
+                        active_config = active_loader()
+                    except Exception:
+                        active_config = None
+                except Exception:
+                    active_config = None
+            try:
+                if not marker:
+                    raise RollingPolicyBootstrapError(
+                        "ROLLING_POLICY_BOOTSTRAP_REQUIRED"
+                    )
+                validate_system_exploratory_admission_policy(
+                    active if isinstance(active, Mapping) else None,
+                    operator_operating,
+                    system_risk_binding_from_active_config(
+                        active_config,
+                        default_rolling_admission_policy(),
+                    ),
+                )
+                operator_system_authority = True
+            except RollingPolicyBootstrapError:
+                self._rolling_scope_blocked = True
+                return []
+        if operator_system_authority:
+            self._rolling_scope_policy = dict(operator_operating)
+            self._rolling_background_discovery_enabled = True
         policy_value = next(
             (value for value in policy_sources if value not in (None, "")),
             None,
@@ -1748,17 +1910,33 @@ class PolymarketCollector:
         if isinstance(policy_value, Mapping):
             policy_value = dict(policy_value)
         else:
-            policy_value = {"mode": str(policy_value).strip().upper()} if policy_value else {}
-        if str(policy_value.get("mode", "")).strip().upper() == "EXPLORATORY_LIVE":
-            self._rolling_scope_policy = policy_value
+            policy_value = (
+                {"mode": str(policy_value).strip().upper()}
+                if policy_value
+                else {}
+            )
+        selection_policy_active = (
+            str(policy_value.get("mode", "")).strip().upper()
+            == "EXPLORATORY_LIVE"
+        )
+        if selection is not None and selection_policy_active:
+            if selection_members_empty and not operator_system_authority:
+                self._rolling_scope_blocked = True
+                return []
+            self._rolling_scope_policy = dict(policy_value)
             self._rolling_background_discovery_enabled = True
+        if selection is None:
+            # No selection is a valid cold-start state for the system policy.
+            # Discover directly from the public catalog and let the rolling
+            # processor create canonical paper identities after proof capture.
+            return []
         members = selection.get("members", selection.get("selected_members", ()))
         if not isinstance(members, (list, tuple)):
-            if self._rolling_background_discovery_enabled:
+            if str(policy_value.get("mode", "")).strip().upper() == "EXPLORATORY_LIVE":
                 self._rolling_scope_blocked = True
             return []
         if not members:
-            if self._rolling_background_discovery_enabled:
+            if str(policy_value.get("mode", "")).strip().upper() == "EXPLORATORY_LIVE":
                 self._rolling_scope_blocked = True
             return []
         if self._rolling_background_discovery_enabled:
@@ -2028,7 +2206,12 @@ class PolymarketCollector:
             result.extend(member_ids)
         if not self._rolling_background_discovery_enabled:
             self._rolling_scope_member_invalid = False
-        elif not result:
+        elif not result and (
+            self._rolling_scope_candidate_ids
+            or self._rolling_scope_member_invalid
+        ):
+            # Empty system selection is an intentional cold-start state;
+            # invalid selected members remain fail-closed.
             self._rolling_scope_blocked = True
         return list(dict.fromkeys(result))[: self.config.max_markets]
 
@@ -6413,9 +6596,21 @@ class PolymarketCollector:
             parameter.kind is inspect.Parameter.VAR_KEYWORD
             for parameter in parameters.values()
         )
+        discovery_cap = (
+            _ROLLING_BOOTSTRAP_MARKET_CAP
+            if self._rolling_background_discovery_enabled
+            else self.config.max_markets
+        )
         scan_budget = min(
             100,
-            max(1, self.config.max_markets, self.config.discovery_budget_per_cycle),
+            max(
+                1,
+                min(
+                    discovery_cap,
+                    self.config.max_markets,
+                    self.config.discovery_budget_per_cycle,
+                ),
+            ),
         )
         if "limit" in parameters or accepts_kwargs or not parameters:
             kwargs["limit"] = scan_budget
@@ -8560,9 +8755,18 @@ class PolymarketCollector:
         ephemeral_scope_provider = (
             provider_pool == "scope_direct" and provider is not self.provider
         )
-        last_error: Exception | None = None
         timeout = float(self.config.provider_timeout_seconds)
         for attempt in range(self.config.max_attempts):
+            if (
+                self._rolling_background_discovery_enabled
+                and int(counters.get("requests", 0))
+                >= _ROLLING_BOOTSTRAP_REQUEST_BUDGET
+            ):
+                counters["_bootstrap_request_budget_exhausted"] = True
+                counters["_bootstrap_request_budget_endpoint"] = endpoint
+                raise _BootstrapRequestBudgetExceeded(
+                    f"BOOTSTRAP_REQUEST_BUDGET_EXHAUSTED: {endpoint}"
+                )
             self._cycle_budget_available(endpoint, observed_at, counters)
             counters["requests"] += 1
             request_started = time.monotonic()
