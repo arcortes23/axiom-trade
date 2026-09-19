@@ -3338,6 +3338,7 @@ class OperatorControlTests(unittest.TestCase):
         )
         self.assertIsNotNone(restarted)
     def test_exploratory_live_review_confirm_success_merges_persisted_bindings(self) -> None:
+
         context, draft, review = self._exploratory_confirm_context()
         credentials = _configured_credentials()
         service = Mock()
@@ -3391,6 +3392,81 @@ class OperatorControlTests(unittest.TestCase):
         self.assertEqual(result["authorization"]["policy_hash"], "policy-hash")
         service.arm.assert_called_once()
         service.enable_autonomous_micro_live.assert_called_once()
+
+    def test_startup_recovery_does_not_restore_over_newer_binding_config(self) -> None:
+        context, _ = self._seed_proposed_selection()
+        prepared = self.control._prepare_reviewed_proposed_selection()
+        assert prepared is not None
+        self.control._activate_reviewed_proposed_selection(
+            context={
+                **context,
+                "selection_id": prepared["selection_id"],
+                "selection_hash": prepared["selection_hash"],
+            },
+            authorization={"authorization_id": "auth-crash-binding"},
+            actor="test-operator",
+        )
+        newer_binding = {
+            "candidate_id": "candidate-proposed",
+            "selection_id": "selection-newer",
+            "selection_hash": "hash-newer",
+        }
+        self.store.set_operator_config("canary_selection_binding", newer_binding)
+        OperatorControlPlane(self.store)
+        self.assertEqual(
+            self.store.get_operator_config("canary_selection_binding"),
+            newer_binding,
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT candidate_id FROM canary_selection WHERE singleton=1"
+            ).fetchone()[0],
+            "candidate-proposed",
+        )
+        self.assertIsNotNone(
+            self.store.get_operator_config(
+                "canary_selection_binding_rollback", None
+            )
+        )
+        current = self.store.load_current_portfolio_selection()
+        assert current is not None
+        self.assertEqual(current["status"], "ACTIVE")
+
+    def test_startup_recovery_does_not_restore_over_newer_singleton(self) -> None:
+        context, _ = self._seed_proposed_selection()
+        prepared = self.control._prepare_reviewed_proposed_selection()
+        assert prepared is not None
+        self.control._activate_reviewed_proposed_selection(
+            context={
+                **context,
+                "selection_id": prepared["selection_id"],
+                "selection_hash": prepared["selection_hash"],
+            },
+            authorization={"authorization_id": "auth-crash-singleton"},
+            actor="test-operator",
+        )
+        self.store.connection.execute(
+            "UPDATE canary_selection SET candidate_id=? WHERE singleton=1",
+            ("candidate-newer",),
+        )
+        self.store.connection.commit()
+        OperatorControlPlane(self.store)
+        binding = self.store.get_operator_config("canary_selection_binding")
+        self.assertEqual(binding["candidate_id"], "candidate-proposed")
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT candidate_id FROM canary_selection WHERE singleton=1"
+            ).fetchone()[0],
+            "candidate-newer",
+        )
+        self.assertIsNotNone(
+            self.store.get_operator_config(
+                "canary_selection_binding_rollback", None
+            )
+        )
+        current = self.store.load_current_portfolio_selection()
+        assert current is not None
+        self.assertEqual(current["status"], "ACTIVE")
     def test_exploratory_live_confirmation_cannot_retain_stale_candidate(self) -> None:
         context, draft, review = self._exploratory_confirm_context()
 

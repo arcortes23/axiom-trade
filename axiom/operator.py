@@ -3060,6 +3060,7 @@ class OperatorControlPlane:
                 ).strip()
         except Exception:
             control_candidate = ""
+        singleton_target = singleton_candidate == candidate_id
         exact_live = (
             active_view
             and active_candidate == candidate_id
@@ -3077,6 +3078,31 @@ class OperatorControlPlane:
             except Exception:
                 self._selection_reconciliation_error = "EXPLORATORY_LIVE_SELECTION_RECONCILIATION_REQUIRED"
                 return False
+        if singleton_target != binding_exact:
+            try:
+                if state in {"ARMED", "AUTONOMOUS_MICRO_LIVE"}:
+                    if control_candidate not in {"", candidate_id}:
+                        raise OperatorControlError(
+                            "EXPLORATORY_LIVE_SELECTION_RECONCILIATION_PARTIAL"
+                        )
+                    self._canary_service.disarm()
+                if auth_exact:
+                    self.revoke_execution_authorization(
+                        str(auth.get("authorization_id") or auth.get("id") or "").strip(),
+                        actor="operator-recovery",
+                        expected_generation=auth.get("generation"),
+                        reason="prepared_activation_partial_recovery",
+                    )
+            except Exception:
+                self._selection_reconciliation_error = (
+                    "EXPLORATORY_LIVE_SELECTION_RECONCILIATION_PARTIAL"
+                )
+                return False
+            self._selection_reconciliation_error = (
+                "EXPLORATORY_LIVE_SELECTION_RECONCILIATION_PARTIAL"
+            )
+            return False
+
         current_identity_exact = (
             isinstance(current, Mapping)
             and str(
@@ -3088,6 +3114,7 @@ class OperatorControlPlane:
             and str(current.get("selection_hash") or "").strip() == selection_hash
         )
         singleton_target = singleton_candidate == candidate_id
+        restore_binding_safe = singleton_target and binding_exact
         try:
             if state in {"ARMED", "AUTONOMOUS_MICRO_LIVE"}:
                 if control_candidate not in {"", candidate_id}:
@@ -3113,7 +3140,7 @@ class OperatorControlPlane:
             with transaction_context:
                 if current_identity_exact:
                     self._reset_prepared_selection_overlay(current)
-                if singleton_target:
+                if restore_binding_safe:
                     self._restore_canary_selection_binding(binding_before)
                 connection = getattr(self.store, "connection", None)
                 if connection is None:
