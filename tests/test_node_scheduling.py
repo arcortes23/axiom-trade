@@ -1908,6 +1908,300 @@ class MutationSchedulingTests(unittest.TestCase):
                     if row["worker_name"] == f"paper:{successor.experiment_id}"
                 )
                 self.assertEqual(worker["status"], "idle")
+    def test_materialized_successor_rebinds_current_markets_and_remains_schedulable(self) -> None:
+        candidate_id = "rolling-materialized-current-set"
+        market_ids = tuple(f"rolling-materialized-market-{index}" for index in range(8))
+        capture_market_id = market_ids[0]
+        strategy_document = {
+            "version": 1,
+            "market_type": "prediction",
+            "family": "momentum",
+            "parameters": {"lookback": 1, "threshold": 0.05},
+            "probability_model": "market-history",
+            "resolution_aware": True,
+            "resolution_inputs": ["market_history"],
+        }
+        policy = normalize_market_scope(
+            {
+                **normalize_market_scope(
+                    market_ids=market_ids,
+                    target_instrument="POLYMARKET",
+                ).as_dict(),
+                "provenance": "canonical",
+            }
+        )
+
+        def market(market_id: str) -> dict[str, Any]:
+            return {
+                "market_id": market_id,
+                "condition_id": "condition-" + market_id,
+                "yes_token_id": "yes-" + market_id,
+                "no_token_id": "no-" + market_id,
+                "metadata_provenance": {"source_type": "CURRENT"},
+                "source_type": "CURRENT",
+                "provider": "polymarket",
+                "venue": "POLYMARKET",
+                "instrument": "POLYMARKET",
+                "active": True,
+                "closed": False,
+                "settlement": "OPEN",
+                "enable_order_book": True,
+                "accepting_orders": True,
+            }
+
+        strategy_hash = _content_hash(
+            _normalized_strategy_document(strategy_document)
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            db = str(Path(directory) / "rolling-materialized-current-set.sqlite")
+            with AxiomStore(db) as store:
+                registry = ForwardTestRegistry(store)
+                old_proof = resolve_market_scope(
+                    candidate_id,
+                    {"market_scope": policy.as_dict()},
+                    [market(capture_market_id)],
+                    resolved_at=T0,
+                )
+                store.save_market_scope_resolution(old_proof)
+                old_config = {
+                    "observation_intent": True,
+                    "observation_only_lineage": True,
+                    "market_authority_required": False,
+                    "candidate_id": candidate_id,
+                    "strategy_version_id": "rolling-materialized-version",
+                    "research_trial_id": "rolling-materialized-trial",
+                    "source_strategy_hash": strategy_hash,
+                    "rolling_strategy_hash": strategy_hash,
+                    "strategy_document": strategy_document,
+                    "model_document": {"model_required": False},
+                    "rolling_research": True,
+                    "paper_only": True,
+                    "observation_capture_only": True,
+                    "execution_scope": "OBSERVATION",
+                    "research_only": True,
+                    "selection_excluded": True,
+                    "allocation_active": False,
+                    "canary_armed": False,
+                    "capture_market_id": capture_market_id,
+                    "current_market_ids": [capture_market_id],
+                    "scope": policy.as_dict(),
+                    "market_scope": policy.as_dict(),
+                    "scope_resolution": old_proof.as_dict(),
+                    "scope_resolution_freshness_sla_seconds": 600.0,
+                }
+                old_config.update(
+                    {
+                        "plan_hash": _rolling_hash(
+                            {"plan_id": "rolling-materialized-plan"}
+                        ),
+                        "plan_id": "rolling-materialized-plan",
+                        "dataset_selector": {
+                            "dataset_id": "rolling-materialized-history",
+                            "dataset_version": "v1",
+                        },
+                        "dataset_attestation": {
+                            "dataset_id": "rolling-materialized-history",
+                            "dataset_version": "v1",
+                            "integrity": "sha256:rolling-materialized-history",
+                        },
+                        "market_scope_hash": policy.scope_hash,
+                        "market_scope_version": policy.scope_version,
+                    }
+                )
+                old_intent = registry.register_observation_intent(
+                    strategy=strategy_document,
+                    model={"model_required": False},
+                    config=old_config,
+                    registration_timestamp=T0,
+                    candidate_id=candidate_id,
+                    strategy_version_id=old_config["strategy_version_id"],
+                    research_trial_id=old_config["research_trial_id"],
+                    source_strategy_hash=strategy_hash,
+                    rolling_strategy_hash=strategy_hash,
+                    scope=policy.as_dict(),
+                    scope_resolution=old_proof.as_dict(),
+                )
+                new_proof = resolve_market_scope(
+                    candidate_id,
+                    {"market_scope": policy.as_dict()},
+                    [market(market_id) for market_id in market_ids],
+                    resolved_at=T0 + timedelta(minutes=1),
+                )
+                store.save_market_scope_resolution(new_proof)
+                materialized = registry.materialize_observation_intent(
+                    old_intent,
+                    allowed_markets=market_ids,
+                    registration_timestamp=T0 + timedelta(minutes=1),
+                    now=T0 + timedelta(minutes=1),
+                    candidate_id=candidate_id,
+                    scope_resolution=new_proof.as_dict(),
+                )
+                self.assertEqual(materialized.allowed_markets, market_ids)
+                persisted_old_intent = ForwardTestRegistry(store).get(
+                    old_intent.experiment_id
+                )
+                self.assertIsNotNone(persisted_old_intent)
+                assert persisted_old_intent is not None
+                self.assertEqual(
+                    tuple(persisted_old_intent.config["current_market_ids"]),
+                    (capture_market_id,),
+                )
+                self.assertEqual(
+                    tuple(materialized.config["current_market_ids"]),
+                    market_ids,
+                )
+                self.assertIn(
+                    materialized.config["capture_market_id"],
+                    materialized.allowed_markets,
+                )
+
+                retry = ForwardTestRegistry(store).materialize_observation_intent(
+                    old_intent,
+                    allowed_markets=market_ids,
+                    registration_timestamp=T0 + timedelta(hours=1),
+                    now=T0 + timedelta(hours=1),
+                    candidate_id=candidate_id,
+                    scope_resolution=new_proof.as_dict(),
+                )
+                self.assertEqual(retry.as_record(), materialized.as_record())
+
+                lifecycle_payload = {
+                    **dict(materialized.config),
+                    "candidate_id": candidate_id,
+                    "paper_observation_intent": True,
+                    "paper_observation_intent_id": old_intent.experiment_id,
+                    "forward_test_id": materialized.experiment_id,
+                    "allowed_markets": list(materialized.allowed_markets),
+                    "current_market_ids": list(market_ids),
+                    "resolved_market_ids": list(market_ids),
+                    "scope_resolution": new_proof.as_dict(),
+                    "market_scope_resolution": new_proof.as_dict(),
+                }
+                lifecycle_payload["paper_forward_started"] = True
+                lifecycle_payload["holdout_used"] = False
+                lifecycle_payload["observation_handoff"] = {
+                    "version": "observation-capture-v1",
+                    "predecessor_candidate_id": candidate_id,
+                    "predecessor_observation_intent_id": old_intent.experiment_id,
+                    "predecessor_profitability_inherited": False,
+                    "predecessor_allocation_authority_inherited": False,
+                }
+                store.save_candidate_lifecycle(
+                    candidate_id,
+                    CandidateStage.IDEA.value,
+                    {"candidate_id": candidate_id},
+                    timestamp=T0,
+                )
+                lifecycle_manager = CandidateLifecycleManager(store)
+                lifecycle_manager.advance(
+                    candidate_id,
+                    CandidateStage.SCHEMA_VALIDATED.value,
+                    {"candidate_id": candidate_id, "schema_valid": True},
+                    reason="schema validated",
+                )
+                lifecycle_manager.advance(
+                    candidate_id,
+                    CandidateStage.PAPER_FORWARD.value,
+                    lifecycle_payload,
+                    reason="materialized current scope",
+                    observation_only=True,
+                )
+                lifecycle = store.load_candidate_lifecycle(candidate_id)
+                self.assertIsNotNone(lifecycle)
+                assert lifecycle is not None
+                self.assertEqual(
+                    lifecycle["payload"]["forward_test_id"],
+                    materialized.experiment_id,
+                )
+                self.assertEqual(
+                    tuple(lifecycle["payload"]["allowed_markets"]),
+                    market_ids,
+                )
+                self.assertEqual(
+                    tuple(lifecycle["payload"]["current_market_ids"]),
+                    market_ids,
+                )
+
+                store.save_polymarket_snapshot(
+                    "rolling-materialized-current-snapshot",
+                    capture_market_id,
+                    T0,
+                    T0,
+                    {
+                        "source_type": "FORWARD_COLLECTED",
+                        "snapshot": {
+                            "timestamp": T0.isoformat(),
+                            "market_id": capture_market_id,
+                            "yes_mid": 0.50,
+                            "yes_bid": 0.49,
+                            "yes_ask": 0.51,
+                            "no_mid": 0.50,
+                            "no_bid": 0.49,
+                            "no_ask": 0.51,
+                            "settlement": "OPEN",
+                        },
+                    },
+                    source_type="FORWARD_COLLECTED",
+                )
+                node = ResearchNode(
+                    NodeConfig(
+                        db,
+                        crypto_enabled=False,
+                        paper_observations_per_candidate=1,
+                    ),
+                    provider=InMemoryPredictionProvider([]),
+                    store=store,
+                    clock=lambda: T0 + timedelta(minutes=2),
+                    sleep=lambda _seconds: None,
+                )
+                worker = node._run_single_paper_worker(materialized)
+                self.assertNotIn("error", worker or {})
+                self.assertNotEqual((worker or {}).get("status"), "BLOCKED")
+                self.assertGreaterEqual((worker or {}).get("observations_seen", 0), 1)
+
+                bad_candidate = "rolling-materialized-invalid-capture"
+                bad_old_proof = resolve_market_scope(
+                    bad_candidate,
+                    {"market_scope": policy.as_dict()},
+                    [market(capture_market_id)],
+                    resolved_at=T0,
+                )
+                bad_intent = registry.register_observation_intent(
+                    strategy=strategy_document,
+                    model={"model_required": False},
+                    config={
+                        **old_config,
+                        "candidate_id": bad_candidate,
+                        "capture_market_id": "outside-current-scope",
+                        "scope_resolution": bad_old_proof.as_dict(),
+                    },
+                    registration_timestamp=T0,
+                    candidate_id=bad_candidate,
+                    strategy_version_id=old_config["strategy_version_id"],
+                    research_trial_id=old_config["research_trial_id"],
+                    source_strategy_hash=strategy_hash,
+                    rolling_strategy_hash=strategy_hash,
+                    scope=policy.as_dict(),
+                    scope_resolution=bad_old_proof.as_dict(),
+                )
+                bad_proof = resolve_market_scope(
+                    bad_candidate,
+                    {"market_scope": policy.as_dict()},
+                    [market(market_id) for market_id in market_ids],
+                    resolved_at=T0 + timedelta(minutes=1),
+                )
+                with self.assertRaisesRegex(
+                    ValueError, "CAPTURE_MARKET_BINDING_INVALID"
+                ):
+                    registry.materialize_observation_intent(
+                        bad_intent,
+                        allowed_markets=market_ids,
+                        registration_timestamp=T0 + timedelta(minutes=1),
+                        now=T0 + timedelta(minutes=1),
+                        candidate_id=bad_candidate,
+                        scope_resolution=bad_proof.as_dict(),
+                    )
+
     def test_capture_successor_rejects_authority_and_preserves_predecessor_hash(self) -> None:
         class WorkerStore:
             def __init__(self) -> None:

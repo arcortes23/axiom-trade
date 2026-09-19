@@ -1103,6 +1103,18 @@ class ForwardTestRegistry:
             )
         )
         if rolling_only:
+            # The collector's resolved market set is the sole authority for a
+            # materialized observation.  An immutable predecessor may carry a
+            # historical current_market_ids value; retaining it here would
+            # create a forward spec whose execution set disagrees with the
+            # newly bound allowed_markets.
+            source_config["current_market_ids"] = list(markets)
+            if source_config.get("observation_capture_only") is True:
+                capture_market_id = str(
+                    source_config.get("capture_market_id", "") or ""
+                ).strip()
+                if not capture_market_id or capture_market_id not in markets:
+                    raise ValueError("CAPTURE_MARKET_BINDING_INVALID")
             binding_digest = hashlib.sha256(
                 _canonical(
                     {
