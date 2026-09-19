@@ -3263,6 +3263,80 @@ class OperatorControlTests(unittest.TestCase):
             repeated.store.load_current_portfolio_selection(),
             recovered,
         )
+
+    def test_startup_recovery_does_not_reset_newer_selection_or_singleton(self) -> None:
+        context, _ = self._seed_proposed_selection()
+        prepared = self.control._prepare_reviewed_proposed_selection()
+        assert prepared is not None
+        self.control._activate_reviewed_proposed_selection(
+            context={
+                **context,
+                "selection_id": prepared["selection_id"],
+                "selection_hash": prepared["selection_hash"],
+            },
+            authorization={"authorization_id": "auth-crash-newer"},
+            actor="test-operator",
+        )
+        self.store.connection.execute(
+            "UPDATE canary_selection SET candidate_id=? WHERE singleton=1",
+            ("candidate-newer",),
+        )
+        self.store.connection.commit()
+        self.store.set_operator_config(
+            "canary_selection_binding",
+            {
+                "candidate_id": "candidate-newer",
+                "selection_id": "selection-newer",
+                "selection_hash": "hash-newer",
+            },
+        )
+        newer = {
+            "selection_id": "selection-newer",
+            "portfolio_selection_id": "selection-newer",
+            "selection_hash": "hash-newer",
+            "status": "ACTIVE",
+            "paper_only": False,
+            "allocation_active": True,
+            "canary_armed": True,
+            "members": [
+                {
+                    "strategy_version_id": "strategy-newer",
+                    "candidate_id": "candidate-newer",
+                    "allocation": "1.00",
+                    "allocation_active": True,
+                }
+            ],
+        }
+        with patch.object(
+            self.store,
+            "load_current_portfolio_selection",
+            return_value=newer,
+        ):
+            restarted = OperatorControlPlane(self.store)
+        self.assertEqual(
+            self.store.get_operator_config("canary_selection_binding"),
+            {
+                "candidate_id": "candidate-newer",
+                "selection_id": "selection-newer",
+                "selection_hash": "hash-newer",
+            },
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT candidate_id FROM canary_selection WHERE singleton=1"
+            ).fetchone()[0],
+            "candidate-newer",
+        )
+        self.assertIsNone(
+            self.store.get_operator_config(
+                "canary_selection_binding_rollback", None
+            )
+        )
+        self.assertEqual(
+            self.store.get_operator_config("rolling_selection_activation")["status"],
+            "ACTIVE",
+        )
+        self.assertIsNotNone(restarted)
     def test_exploratory_live_review_confirm_success_merges_persisted_bindings(self) -> None:
         context, draft, review = self._exploratory_confirm_context()
         credentials = _configured_credentials()
