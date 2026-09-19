@@ -1478,6 +1478,9 @@ class MutationSchedulingTests(unittest.TestCase):
                         timestamp=base,
                     )
 
+                now = [T0 + timedelta(seconds=59)]
+                events: list[str] = []
+                migration_returned_at: list[datetime] = []
                 node = ResearchNode(
                     NodeConfig(
                         db,
@@ -1486,11 +1489,20 @@ class MutationSchedulingTests(unittest.TestCase):
                     ),
                     provider=InMemoryPredictionProvider([]),
                     store=store,
+                    clock=lambda: now[0],
                 )
                 processed: list[str] = []
 
                 def paper_worker(spec: Any) -> Mapping[str, Any]:
+                    events.append(f"paper:{spec.experiment_id}")
                     processed.append(spec.experiment_id)
+                    if (now[0] - T0).total_seconds() > 60:
+                        return {
+                            "status": "BLOCKED",
+                            "blocker": "CURRENT_SCOPE_PROOF_STALE",
+                            "retryable": False,
+                            "experiment_id": spec.experiment_id,
+                        }
                     return {
                         "status": "SUCCESS",
                         "observations_processed": 0,
@@ -1498,16 +1510,28 @@ class MutationSchedulingTests(unittest.TestCase):
                     }
 
                 node._run_single_paper_worker = paper_worker  # type: ignore[method-assign]
-                node._run_crypto_paper = lambda: None
-                node._run_opportunity_pipeline = lambda: True
+                def delayed_crypto() -> None:
+                    events.append("crypto")
+                    now[0] += timedelta(seconds=5)
+
+                def delayed_opportunity() -> bool:
+                    events.append("opportunity")
+                    now[0] += timedelta(seconds=5)
+                    return True
+
+                node._run_crypto_paper = delayed_crypto
+                node._run_opportunity_pipeline = delayed_opportunity
                 node._run_research_queue = lambda: {}
                 node.research_processor.reevaluate_forward_candidates = lambda now: None
-                node.research_processor._migrate_observation_setup_intents = (
-                    lambda now: tuple(
+
+                def migrated(now: datetime) -> tuple[Mapping[str, Any], ...]:
+                    migration_returned_at.append(now)
+                    return tuple(
                         {"candidate_id": f"capture-candidate-{index}"}
                         for index in range(3)
                     )
-                )
+
+                node.research_processor._migrate_observation_setup_intents = migrated
                 store.set_scheduler_state(
                     "paper-engine",
                     {
@@ -1519,6 +1543,16 @@ class MutationSchedulingTests(unittest.TestCase):
                 self.assertEqual(
                     first["paper"]["processed_candidate_ids"],
                     [*target_ids, normal_ids[17]],
+                )
+                self.assertEqual(migration_returned_at, [T0 + timedelta(seconds=59)])
+                self.assertEqual(
+                    events,
+                    [
+                        *(f"paper:{target_id}" for target_id in target_ids),
+                        f"paper:{normal_ids[17]}",
+                        "crypto",
+                        "opportunity",
+                    ],
                 )
                 self.assertTrue(
                     all(
@@ -3994,6 +4028,7 @@ class MutationSchedulingTests(unittest.TestCase):
                 self.fail_load = False
                 self.fail_save = False
                 self.proof_mode = "MATCHED"
+                self.proof_resolved_at = T0
 
             def load_observation_intents(self, *, limit: int, after_experiment_id: str | None = None):
                 self.calls.append((limit, after_experiment_id))
@@ -4028,7 +4063,7 @@ class MutationSchedulingTests(unittest.TestCase):
                         else (
                             T0 - timedelta(hours=2)
                             if self.proof_mode == "STALE"
-                            else T0
+                            else self.proof_resolved_at
                         )
                     ).isoformat(),
                     "status": "UNMATCHED" if self.proof_mode == "UNMATCHED" else "MATCHED",
@@ -4063,12 +4098,15 @@ class MutationSchedulingTests(unittest.TestCase):
         processor = object.__new__(AutonomousResearchProcessor)
         processor.store = store
         failed_once = {"candidate-0005": True}
+        permanent_failure: dict[str, bool] = {}
         created: list[str] = []
 
         def ensure(strategy: Mapping[str, Any], _now: datetime, *, market_ids=()):
             candidate_id = str(strategy["candidate_id"])
+            if permanent_failure.pop(candidate_id, False):
+                raise ValueError("PAPER_OBSERVATION_BINDING_INCOMPLETE")
             if failed_once.pop(candidate_id, False):
-                raise sqlite3.OperationalError("transient materialization")
+                raise sqlite3.OperationalError("database is locked")
             created.append(candidate_id)
             self.assertEqual(tuple(market_ids), ("market-" + candidate_id,))
             return {"candidate_id": candidate_id}
@@ -4079,18 +4117,50 @@ class MutationSchedulingTests(unittest.TestCase):
             return_value={"setup": "canonical"},
         ):
             first = processor._migrate_observation_setup_intents(T0)
-            self.assertEqual(len(first), 510)
+            self.assertEqual(len(first), 1)
             self.assertEqual(store.calls[0], (512, None))
-            self.assertEqual(store.state["autonomous-observation-setup-migration"]["cursor"], "observation-intent-0511")
+            self.assertEqual(
+                store.state["autonomous-observation-setup-migration"]["cursor"],
+                "observation-intent-0000",
+            )
             self.assertNotIn("candidate-0006", created)
             second = processor._migrate_observation_setup_intents(T0)
-            self.assertEqual(store.calls[1], (512, "observation-intent-0511"))
             self.assertEqual(len(second), 1)
+            self.assertEqual(
+                store.state["autonomous-observation-setup-migration"]["cursor"],
+                "observation-intent-0001",
+            )
             third = processor._migrate_observation_setup_intents(T0)
-            self.assertEqual(store.calls[2:], [(512, "observation-intent-0512"), (512, None)])
+            self.assertEqual(len(third), 1)
+            self.assertEqual(
+                store.state["autonomous-observation-setup-migration"]["cursor"],
+                "observation-intent-0002",
+            )
+            self.assertTrue({"candidate-0000", "candidate-0001", "candidate-0002"} <= set(created))
+            processor._migrate_observation_setup_intents(T0)
+            processor._migrate_observation_setup_intents(T0)
+            failed_retry = processor._migrate_observation_setup_intents(T0)
+            self.assertEqual(failed_retry, ())
+            self.assertEqual(
+                store.state["autonomous-observation-setup-migration"]["cursor"],
+                "observation-intent-0004",
+            )
+            retried = processor._migrate_observation_setup_intents(T0)
+            self.assertEqual(len(retried), 1)
             self.assertIn("candidate-0005", created)
-            self.assertGreaterEqual(len(third), 1)
-            self.assertTrue(store.state["autonomous-observation-setup-migration"]["failures"] == [])
+            self.assertGreaterEqual(len(retried), 1)
+            self.assertEqual(
+                store.state["autonomous-observation-setup-migration"]["failures"],
+                [],
+            )
+            self.assertTrue(
+                any(
+                    failure.get("experiment_id") == "observation-intent-0005"
+                    for failure in store.state["autonomous-observation-setup-migration"][
+                        "failure_history"
+                    ]
+                )
+            )
             for mode in ("STALE", "FUTURE", "UNMATCHED", "MISSING"):
                 store.proof_mode = mode
                 store.state["autonomous-observation-setup-migration"]["cursor"] = ""
@@ -4102,6 +4172,78 @@ class MutationSchedulingTests(unittest.TestCase):
             self.assertIsInstance(processor._migrate_observation_setup_intents(T0), tuple)
             store.fail_load = True
             self.assertEqual(processor._migrate_observation_setup_intents(T0), ())
+            store.fail_load = False
+            store.fail_save = False
+            store.records = store.records[:3]
+            for row in store.records:
+                row["config"].update(
+                    {
+                        "observation_capture_only": True,
+                        "scope_resolution_freshness_sla_seconds": 60.0,
+                        "strategy_document": {
+                            "family": "momentum",
+                            "parameters": {"lookback": 1, "threshold": 0.05},
+                        },
+                    }
+                )
+            store.state["autonomous-observation-setup-migration"]["cursor"] = ""
+            store.proof_resolved_at = T0
+            processor.config = SimpleNamespace(
+                observation_setup_migration_freshness_sla_seconds=3600.0
+            )
+            processor.clock = lambda: T0 + timedelta(seconds=53)
+            first_capture = processor._migrate_observation_setup_intents(
+                T0 + timedelta(seconds=53)
+            )
+            self.assertEqual(len(first_capture), 1)
+            self.assertEqual(
+                store.state["autonomous-observation-setup-migration"]["cursor"],
+                "observation-intent-0000",
+            )
+            processor.clock = lambda: T0 + timedelta(seconds=89)
+            second_capture = processor._migrate_observation_setup_intents(
+                T0 + timedelta(seconds=89)
+            )
+            self.assertEqual(second_capture, ())
+            self.assertEqual(
+                store.state["autonomous-observation-setup-migration"]["cursor"],
+                "observation-intent-0000",
+            )
+            store.proof_resolved_at = T0 + timedelta(seconds=100)
+            processor.clock = lambda: T0 + timedelta(seconds=153)
+            next_capture = processor._migrate_observation_setup_intents(
+                T0 + timedelta(seconds=153)
+            )
+            self.assertEqual(len(next_capture), 1)
+            self.assertEqual(next_capture[0]["candidate_id"], "candidate-0001")
+            self.assertEqual(
+                store.state["autonomous-observation-setup-migration"]["cursor"],
+                "observation-intent-0001",
+            )
+            final_capture = processor._migrate_observation_setup_intents(
+                T0 + timedelta(seconds=153)
+            )
+            self.assertEqual(len(final_capture), 1)
+            self.assertEqual(final_capture[0]["candidate_id"], "candidate-0002")
+            store.records = store.records[:2]
+            store.state["autonomous-observation-setup-migration"]["cursor"] = ""
+            permanent_failure["candidate-0000"] = True
+            malformed_then_valid = processor._migrate_observation_setup_intents(
+                T0 + timedelta(seconds=153)
+            )
+            self.assertEqual(len(malformed_then_valid), 1)
+            self.assertEqual(malformed_then_valid[0]["candidate_id"], "candidate-0001")
+            self.assertEqual(
+                store.state["autonomous-observation-setup-migration"]["cursor"],
+                "observation-intent-0001",
+            )
+            self.assertEqual(
+                [
+                    failure["experiment_id"]
+                    for failure in store.state["autonomous-observation-setup-migration"]["failures"]
+                ],
+                ["observation-intent-0000"],
+            )
     def test_rolling_initialization_commit_rolls_back_and_restart_retries_once(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             db = str(Path(directory) / "rolling-initialization-atomic.sqlite")

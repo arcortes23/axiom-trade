@@ -47,6 +47,7 @@ from .robustness import bootstrap_confidence_interval, minimum_sample_check, nei
 
 from .storage import (
     AxiomStore,
+    SQLiteBusyTimeout,
     _PAPER_POSITION_PROJECTION_LIMIT,
     _json_array_count,
     _json_array_count_for_key,
@@ -7751,8 +7752,30 @@ class AutonomousResearchProcessor:
         except (sqlite3.Error, AttributeError, TypeError, ValueError, RuntimeError):
             scanned = []
         migrated: list[Mapping[str, Any]] = []
+        persisted_failures = (
+            state.get("failure_history")
+            if isinstance(state, Mapping)
+            else None
+        )
+        if not isinstance(persisted_failures, (list, tuple)):
+            persisted_failures = (
+                state.get("failures", ())
+                if isinstance(state, Mapping)
+                else ()
+            )
+        failure_history: list[dict[str, Any]] = [
+            dict(item) for item in persisted_failures if isinstance(item, Mapping)
+        ]
         failures: list[dict[str, Any]] = []
+        def record_failure(item: Mapping[str, Any]) -> None:
+            failure = dict(item)
+            failures.append(failure)
+            failure_history.append(failure)
+        stale_blocked = False
+        retry_blocked = False
+        last_scanned = None
         for intent in scanned:
+            last_scanned = intent
             config = getattr(intent, "config", None)
             if not isinstance(config, Mapping):
                 continue
@@ -8222,7 +8245,7 @@ class AutonomousResearchProcessor:
             try:
                 derived_setup = _operational_setup_for_strategy(strategy_document, config)
             except (sqlite3.Error, AttributeError, KeyError, TypeError, ValueError, RuntimeError) as exc:
-                failures.append(
+                record_failure(
                     {"experiment_id": str(getattr(intent, "experiment_id", "")), "reason": str(exc)[:160]}
                 )
                 continue
@@ -8260,7 +8283,7 @@ class AutonomousResearchProcessor:
                         and _canonical_binding(existing_setup) == _canonical_binding(derived_setup)
                     )
                 except (sqlite3.Error, AttributeError, KeyError, TypeError, ValueError, RuntimeError) as exc:
-                    failures.append(
+                    record_failure(
                         {"experiment_id": str(getattr(intent, "experiment_id", "")), "reason": str(exc)[:160]}
                     )
                     continue
@@ -8345,6 +8368,8 @@ class AutonomousResearchProcessor:
                     freshness = float(freshness_value)
                 except (TypeError, ValueError, OverflowError):
                     raise ValueError("CURRENT_SCOPE_PROOF_SLA_UNAVAILABLE") from None
+                if strict_declared is not None:
+                    freshness = min(freshness, float(strict_declared))
                 # ``now`` is the rolling tick's start timestamp.  A scope
                 # resolver may commit a newer proof while this migration is
                 # loading it, so freshness must use a post-load clock read.
@@ -8394,9 +8419,13 @@ class AutonomousResearchProcessor:
                 if deferred_ids:
                     raise ValueError("CURRENT_SCOPE_PROOF_DEFERRED")
             except (sqlite3.Error, AttributeError, KeyError, TypeError, ValueError, RuntimeError) as exc:
-                failures.append(
-                    {"experiment_id": str(getattr(intent, "experiment_id", "")), "reason": str(exc)[:160]}
+                reason = str(exc)[:160]
+                record_failure(
+                    {"experiment_id": str(getattr(intent, "experiment_id", "")), "reason": reason}
                 )
+                if reason == "CURRENT_SCOPE_PROOF_STALE":
+                    stale_blocked = True
+                    break
                 continue
             try:
                 strategy: dict[str, Any] = {
@@ -8442,7 +8471,7 @@ class AutonomousResearchProcessor:
                 if not strategy["strategy_hash"]:
                     strategy["strategy_hash"] = str(getattr(intent, "strategy_hash", "")).strip()
             except (sqlite3.Error, AttributeError, KeyError, TypeError, ValueError, RuntimeError) as exc:
-                failures.append(
+                record_failure(
                     {"experiment_id": str(getattr(intent, "experiment_id", "")), "reason": str(exc)[:160]}
                 )
                 continue
@@ -8453,10 +8482,40 @@ class AutonomousResearchProcessor:
                     market_ids=matched_ids,
                 )
             except (sqlite3.Error, AttributeError, KeyError, RuntimeError, TypeError, ValueError) as exc:
-                failures.append(
+                record_failure(
                     {"experiment_id": str(getattr(intent, "experiment_id", "")), "reason": str(exc)[:160]}
                 )
+                retryable = isinstance(exc, SQLiteBusyTimeout) or (
+                    isinstance(exc, sqlite3.OperationalError)
+                    and any(
+                        marker in str(exc).lower()
+                        for marker in (
+                            "database is locked",
+                            "database table is locked",
+                            "sqlite_busy",
+                        )
+                    )
+                )
+                if retryable:
+                    retry_blocked = True
+                    break
                 continue
+            # Materialization can perform several durable writes.  Recheck
+            # the original proof after those writes and fail closed before
+            # linking an observation successor whose authority expired.
+            post_clock = getattr(self, "clock", None)
+            post_clock_now = ensure_utc(post_clock() if callable(post_clock) else now)
+            post_now = max(ensure_utc(now), post_clock_now)
+            post_age = (post_now - ensure_utc(resolved_at)).total_seconds()
+            if post_age < 0 or post_age > freshness:
+                record_failure(
+                    {
+                        "experiment_id": str(getattr(intent, "experiment_id", "")),
+                        "reason": "CURRENT_SCOPE_PROOF_STALE",
+                    }
+                )
+                stale_blocked = True
+                break
             if (
                 isinstance(binding, Mapping)
                 and isinstance(lifecycle, Mapping)
@@ -8645,7 +8704,7 @@ class AutonomousResearchProcessor:
                     ValueError,
                     RuntimeError,
                 ) as exc:
-                    failures.append(
+                    record_failure(
                         {
                             "experiment_id": str(getattr(intent, "experiment_id", "")),
                             "reason": f"LIFECYCLE_RECONCILE:{str(exc)[:140]}",
@@ -8653,8 +8712,13 @@ class AutonomousResearchProcessor:
                     )
             if isinstance(binding, Mapping):
                 migrated.append(dict(binding))
+                break
         if callable(state_setter):
-            next_cursor = str(getattr(scanned[-1], "experiment_id", "")) if scanned else ""
+            next_cursor = (
+                cursor
+                if stale_blocked or retry_blocked
+                else (str(getattr(last_scanned, "experiment_id", "")) if last_scanned is not None else "")
+            )
             try:
                 state_setter(
                     _OBSERVATION_SETUP_MIGRATION_STATE_NAME,
@@ -8662,6 +8726,7 @@ class AutonomousResearchProcessor:
                         "schema_version": "autonomous-observation-setup-v1",
                         "updated_at": ensure_utc(now).isoformat(),
                         "cursor": next_cursor,
+                        "failure_history": failure_history[-256:],
                         "failures": failures[-64:],
                     },
                 )

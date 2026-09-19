@@ -3893,13 +3893,6 @@ class ResearchNode:
                     exc,
                 )
                 errors.append("observation setup migration completed with degraded output")
-        self._run_crypto_paper()
-        if self._crypto_status.get("last_error"):
-            errors.append(f"crypto paper: {self._crypto_status['last_error']}")
-        opportunity_result = self._run_opportunity_pipeline()
-        if opportunity_result is False:
-            errors.append("opportunity pipeline completed with degraded output")
-        self.bus.resume_expired(now=ensure_utc(self.clock()))
         migration_candidate_ids = tuple(
             dict.fromkeys(
                 str(item.get("candidate_id", "")).strip()
@@ -3912,11 +3905,23 @@ class ResearchNode:
                 and str(item.get("candidate_id", "")).strip()
             )
         )
+        paper_stats: Mapping[str, Any] | None = None
         if migration_candidate_ids:
+            # Scope proofs are freshness-bounded.  Run linked capture work
+            # before unrelated paper/crypto/opportunity work can consume the
+            # proof's validity window; the normal path below still runs once
+            # when this migration produced no candidate.
             paper_stats = self._run_paper_workers(
                 migration_candidate_ids=migration_candidate_ids
             )
-        else:
+        self._run_crypto_paper()
+        if self._crypto_status.get("last_error"):
+            errors.append(f"crypto paper: {self._crypto_status['last_error']}")
+        opportunity_result = self._run_opportunity_pipeline()
+        if opportunity_result is False:
+            errors.append("opportunity pipeline completed with degraded output")
+        self.bus.resume_expired(now=ensure_utc(self.clock()))
+        if not migration_candidate_ids:
             paper_stats = self._run_paper_workers()
         if isinstance(paper_stats, Mapping):
             processed = int(paper_stats.get("processed_candidates", 0) or 0)
