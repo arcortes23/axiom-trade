@@ -5106,20 +5106,49 @@ class AutonomousResearchProcessor:
         every execution/authorization flag must be explicitly disarmed.
         Active operating policy and portfolio selection are intentionally not
         consulted or modified by this loader.
+
+        The return contract intentionally remains ``Mapping | None``.  The
+        bounded validation trace is kept separately so callers that only need
+        the usable draft do not accidentally treat an invalid present draft as
+        an absent one.
         """
+        self._rolling_last_scope_draft_trace = {
+            "status": "UNAVAILABLE",
+            "reason": "SCOPE_DRAFT_UNAVAILABLE",
+            "validation_status": "MISSING",
+            "present": False,
+        }
+
+        def reject(reason: str, *, status: str = "INVALID") -> None:
+            self._rolling_last_scope_draft_trace = {
+                "status": "UNAVAILABLE",
+                "reason": reason,
+                "validation_status": status,
+                "present": True,
+            }
+
         loader = getattr(self.store, "get_operator_config", None)
         if not callable(loader):
+            reject("SCOPE_DRAFT_LOADER_UNAVAILABLE", status="UNAVAILABLE")
+            self._rolling_last_scope_draft_trace["present"] = False
             return None
         try:
             raw = loader("rolling_exploratory_scope_draft", None)
         except (TypeError, ValueError, RuntimeError):
+            reject("SCOPE_DRAFT_LOAD_FAILED", status="UNAVAILABLE")
+            self._rolling_last_scope_draft_trace["present"] = False
+            return None
+        if raw is None:
             return None
         if not isinstance(raw, Mapping):
+            reject("SCOPE_DRAFT_INVALID_DOCUMENT")
             return None
         if str(raw.get("status", "")).strip().upper() != "DRAFT":
+            reject("SCOPE_DRAFT_STATUS_INVALID")
             return None
         draft_id = str(raw.get("draft_id", "")).strip()
         if not draft_id:
+            reject("SCOPE_DRAFT_ID_MISSING")
             return None
         if any(
             raw.get(name) is not expected
@@ -5130,6 +5159,7 @@ class AutonomousResearchProcessor:
                 ("canary_armed", False),
             )
         ):
+            reject("SCOPE_DRAFT_FLAGS_INVALID")
             return None
         supported_market_types = raw.get("supported_market_types")
         if isinstance(supported_market_types, (list, tuple)):
@@ -5139,22 +5169,30 @@ class AutonomousResearchProcessor:
                 if str(value).strip()
             }
             if normalized_types and "prediction" not in normalized_types:
+                reject("SCOPE_DRAFT_MARKET_TYPE_UNSUPPORTED")
                 return None
         source_scope = raw.get("scope")
         if not isinstance(source_scope, Mapping):
+            reject("SCOPE_DRAFT_SCOPE_INVALID")
             return None
         try:
             scope = normalize_market_scope(source_scope)
         except (TypeError, ValueError, ExperimentPlanError):
+            reject("SCOPE_DRAFT_SCOPE_INVALID")
             return None
         declared_hash = str(raw.get("scope_hash", "")).strip()
         declared_version = str(raw.get("scope_version", "")).strip()
-        if declared_hash != scope.scope_hash or declared_version != scope.scope_version:
+        if declared_hash != scope.scope_hash:
+            reject("SCOPE_DRAFT_SCOPE_HASH_MISMATCH")
+            return None
+        if declared_version != scope.scope_version:
+            reject("SCOPE_DRAFT_SCOPE_VERSION_MISMATCH")
             return None
         declared_draft_hash = str(raw.get("draft_hash", "")).strip()
         if declared_draft_hash != _rolling_hash(
             {key: value for key, value in raw.items() if key != "draft_hash"}
         ):
+            reject("SCOPE_DRAFT_HASH_MISMATCH")
             return None
         # Preserve the canonical draft fields and any bounded provenance
         # supplied by the operator; strategy/setup material is never inferred
@@ -5189,6 +5227,16 @@ class AutonomousResearchProcessor:
             value = raw.get(key)
             if value is not None:
                 result[key] = value
+        self._rolling_last_scope_draft_trace = {
+            "status": "VALID",
+            "reason": "SCOPE_DRAFT_VALID",
+            "validation_status": "VALID",
+            "present": True,
+            "draft_id": draft_id,
+            "draft_hash": declared_draft_hash,
+            "scope_hash": scope.scope_hash,
+            "scope_version": scope.scope_version,
+        }
         return result
 
     @staticmethod
@@ -5223,7 +5271,13 @@ class AutonomousResearchProcessor:
         """Materialize a bounded paper preview from the operator's draft."""
         draft = self._rolling_scope_draft()
         if draft is None:
-            return (), {"status": "UNAVAILABLE", "reason": "SCOPE_DRAFT_UNAVAILABLE"}
+            trace = getattr(self, "_rolling_last_scope_draft_trace", None)
+            return (
+                (),
+                dict(trace)
+                if isinstance(trace, Mapping)
+                else {"status": "UNAVAILABLE", "reason": "SCOPE_DRAFT_UNAVAILABLE"},
+            )
         documents = self._rolling_system_current_market_documents(now, draft=draft)
         strategy_specs = self._rolling_draft_strategy_specs(draft)
         direct_market_count = int(
@@ -5294,8 +5348,46 @@ class AutonomousResearchProcessor:
                 )
                 break
 
-        documents = tuple(
-            document for document in documents if document.get("market_bindings")
+        all_documents = tuple(
+            document for document in documents if isinstance(document, Mapping)
+        )
+
+        def compatible_bindings(document: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:
+            raw_bindings = document.get("market_bindings")
+            if isinstance(raw_bindings, Mapping):
+                raw_bindings = (raw_bindings,)
+            if not isinstance(raw_bindings, (list, tuple)):
+                return ()
+            return tuple(
+                binding
+                for binding in raw_bindings
+                if isinstance(binding, Mapping)
+                and str(binding.get("market_id", binding.get("id", ""))).strip()
+                and str(binding.get("yes_token_id", binding.get("yes_token", ""))).strip()
+                and str(binding.get("no_token_id", binding.get("no_token", ""))).strip()
+            )
+
+        materialized_documents = tuple(
+            document
+            for document in all_documents
+            if compatible_bindings(document)
+        )
+        materialized_market_ids = list(
+            dict.fromkeys(
+                str(binding.get("market_id", binding.get("id", ""))).strip()
+                for document in materialized_documents
+                for binding in compatible_bindings(document)
+                if str(binding.get("market_id", binding.get("id", ""))).strip()
+            )
+        )
+        compatible_binding_count = sum(
+            len(compatible_bindings(document)) for document in materialized_documents
+        )
+        documents = materialized_documents
+        valid_strategy_definition_count = len(all_documents)
+        supported_strategy_definition_count = max(
+            0,
+            strategy_spec_count - invalid_strategy_count,
         )
         trace = {
             "status": "MATERIALIZED" if documents else "NO_SUITABLE_MATERIALIZED_INSTANCE",
@@ -5341,12 +5433,18 @@ class AutonomousResearchProcessor:
                 ).strip()
             ],
             "strategy_spec_count": strategy_spec_count,
+            "supported_strategy_definition_count": supported_strategy_definition_count,
+            "valid_strategy_definition_count": valid_strategy_definition_count,
             "invalid_strategy_count": invalid_strategy_count,
             "invalid_strategy_reasons": list(
                 getattr(self, "_rolling_last_current_invalid_strategy_reasons", ())
             ),
             "direct_market_count": direct_market_count,
+            "compatible_binding_count": compatible_binding_count,
             "materialized_members": len(documents),
+            "materialized_member_count": len(documents),
+            "materialized_market_count": len(materialized_market_ids),
+            "materialized_market_ids": materialized_market_ids,
         }
         if not documents:
             if (
@@ -13782,7 +13880,7 @@ class AutonomousResearchProcessor:
         ):
             try:
                 should_discover = True
-                if system_bootstrap_active:
+                if system_bootstrap_active and draft_for_discovery is None:
                     selection_loader = getattr(
                         self.store,
                         "load_current_portfolio_selection",
@@ -13863,13 +13961,17 @@ class AutonomousResearchProcessor:
                 }
         draft_documents, draft_trace = self._rolling_scope_draft_documents(current)
         draft_preview_active = str(draft_trace.get("status", "")).upper() != "UNAVAILABLE"
-        system_documents = self._rolling_system_current_market_documents(current)
+        system_documents = (
+            self._rolling_system_current_market_documents(current)
+            if not draft_preview_active
+            else ()
+        )
         documents = (
-            system_documents
-            if system_bootstrap_active
+            draft_documents
+            if draft_preview_active
             else (
-                draft_documents
-                if draft_preview_active
+                system_documents
+                if system_bootstrap_active
                 else self._rolling_strategy_documents()
             )
         )
@@ -14645,11 +14747,75 @@ class AutonomousResearchProcessor:
                         )
             if not explicit and not isinstance(reason_counts, Mapping):
                 evaluator_decisions.append(base)
+        def trace_compatible_bindings(
+            strategy: Mapping[str, Any],
+        ) -> tuple[Mapping[str, Any], ...]:
+            raw_bindings = strategy.get("market_bindings")
+            if isinstance(raw_bindings, Mapping):
+                raw_bindings = (raw_bindings,)
+            if not isinstance(raw_bindings, (list, tuple)):
+                return ()
+            return tuple(
+                binding
+                for binding in raw_bindings
+                if isinstance(binding, Mapping)
+                and str(binding.get("market_id", binding.get("id", ""))).strip()
+                and str(binding.get("yes_token_id", binding.get("yes_token", ""))).strip()
+                and str(binding.get("no_token_id", binding.get("no_token", ""))).strip()
+            )
+
+        materialized_strategies = tuple(
+            strategy
+            for strategy in strategies
+            if isinstance(strategy, Mapping)
+            and trace_compatible_bindings(strategy)
+        )
+        materialized_market_ids = list(
+            dict.fromkeys(
+                str(binding.get("market_id", binding.get("id", ""))).strip()
+                for strategy in materialized_strategies
+                for binding in trace_compatible_bindings(strategy)
+                if str(binding.get("market_id", binding.get("id", ""))).strip()
+            )
+        )
+        compatible_binding_count = sum(
+            len(trace_compatible_bindings(strategy))
+            for strategy in materialized_strategies
+        )
+        valid_strategy_definition_count = (
+            draft_trace.get("valid_strategy_definition_count")
+            if draft_preview_active
+            else len(strategies)
+        )
+        try:
+            valid_strategy_definition_count = max(
+                0, int(valid_strategy_definition_count or 0)
+            )
+        except (TypeError, ValueError, OverflowError):
+            valid_strategy_definition_count = len(strategies)
+        supported_strategy_definition_count = (
+            draft_trace.get(
+                "supported_strategy_definition_count",
+                draft_trace.get("strategy_spec_count", valid_strategy_definition_count),
+            )
+            if draft_preview_active
+            else valid_strategy_definition_count
+        )
+        try:
+            supported_strategy_definition_count = max(
+                0, int(supported_strategy_definition_count or 0)
+            )
+        except (TypeError, ValueError, OverflowError):
+            supported_strategy_definition_count = valid_strategy_definition_count
         state["strategy_discovery_trace"] = {
             "source": (
-                "system-bootstrap"
-                if system_bootstrap_active
-                else ("scope-draft-preview" if draft_preview_active else "legacy-enrollment")
+                "scope-draft-preview"
+                if draft_preview_active
+                else (
+                    "system-bootstrap"
+                    if system_bootstrap_active
+                    else "legacy-enrollment"
+                )
             ),
             "discovery": (
                 dict(draft_trace.get("discovery"))
@@ -14658,21 +14824,13 @@ class AutonomousResearchProcessor:
             ),
             "materialization_reason": draft_trace.get("reason"),
             "supported_templates": list(draft_trace.get("supported_templates", ())),
-            "materialized_strategy_count": len(strategies),
-            "materialized_market_count": len(
-                {
-                    str(market.get("market_id", "")).strip()
-                    for document in documents
-                    if isinstance(document, Mapping)
-                    for market in (
-                        document.get("scope_resolution", {}).get("matched_markets", ())
-                        if isinstance(document.get("scope_resolution"), Mapping)
-                        else ()
-                    )
-                    if isinstance(market, Mapping)
-                    and str(market.get("market_id", "")).strip()
-                }
-            ),
+            "materialized_strategy_count": len(materialized_strategies),
+            "supported_strategy_definition_count": supported_strategy_definition_count,
+            "valid_strategy_definition_count": valid_strategy_definition_count,
+            "compatible_binding_count": compatible_binding_count,
+            "materialized_member_count": len(materialized_strategies),
+            "materialized_market_count": len(materialized_market_ids),
+            "materialized_market_ids": materialized_market_ids,
             "evaluator_decisions": evaluator_decisions[: _MAX_ROLLING_QUEUE_RESULTS],
             "paper_only": True,
             "live_execution": False,

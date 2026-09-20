@@ -17,6 +17,7 @@ from types import SimpleNamespace
 
 from axiom import node as node_module
 from axiom.autonomous import AutonomousResearchProcessor
+from axiom.collector import _validated_scope_draft
 from axiom.canary import CanaryBlocked, CanaryService, CredentialStore, credential_fingerprint
 from axiom.canary_positions import RECOVERY_ACTION, RECOVERY_ATTACHED, RECOVERY_CONFIRMATION
 from axiom.dashboard import DashboardData, DashboardServer, _DashboardHandler
@@ -3334,6 +3335,110 @@ class OperatorControlTests(unittest.TestCase):
             self.store.get_operator_config("rolling_admission_policy_active", None),
             active_before,
         )
+
+    def test_rolling_scope_draft_full_hash_is_accepted_with_nested_templates(self) -> None:
+        draft = self.control._prepare_rolling_exploratory_scope_draft()
+        unsigned = {
+            key: value for key, value in draft.items() if key != "draft_hash"
+        }
+        expected = "sha256:" + hashlib.sha256(
+            json.dumps(
+                unsigned,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+                allow_nan=False,
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+        self.assertEqual(
+            draft["trace_requirements"]["evaluation"]["templates"],
+            ["momentum", "mean_reversion"],
+        )
+        self.assertEqual(draft["draft_hash"], expected)
+        self.assertEqual(_validated_scope_draft(draft), draft)
+        self.assertNotEqual(
+            draft["draft_hash"],
+            "sha256:" + self.control._rolling_canonical_hash(unsigned),
+        )
+
+    def test_rolling_scope_draft_repairs_only_known_unactivated_legacy_hash(self) -> None:
+        active_before = self.store.get_operator_config(
+            "rolling_admission_policy_active", None
+        )
+        draft = self.control._prepare_rolling_exploratory_scope_draft()
+        unsigned = {
+            key: value for key, value in draft.items() if key != "draft_hash"
+        }
+        legacy = dict(unsigned)
+        legacy["draft_hash"] = "sha256:" + self.control._rolling_canonical_hash(unsigned)
+        self.assertNotEqual(legacy["draft_hash"], draft["draft_hash"])
+        self.store.set_operator_config(
+            ROLLING_EXPLORATORY_SCOPE_DRAFT_CONFIG_KEY, legacy
+        )
+
+        restarted = OperatorControlPlane(self.store, system_bootstrap_enabled=True)
+        repaired = self.store.get_operator_config(
+            ROLLING_EXPLORATORY_SCOPE_DRAFT_CONFIG_KEY, None
+        )
+        self.assertEqual(repaired, restarted.rolling_exploratory_scope_draft())
+        self.assertEqual(repaired["draft_hash"], draft["draft_hash"])
+        self.assertEqual(_validated_scope_draft(repaired), repaired)
+        self.assertEqual(
+            self.store.get_operator_config("rolling_admission_policy_active", None),
+            active_before,
+        )
+
+        tampered = dict(legacy)
+        tampered_requirements = dict(tampered["trace_requirements"])
+        tampered_evaluation = dict(tampered_requirements["evaluation"])
+        tampered_evaluation["templates"] = ["tampered"]
+        tampered_requirements["evaluation"] = tampered_evaluation
+        tampered["trace_requirements"] = tampered_requirements
+        self.store.set_operator_config(
+            ROLLING_EXPLORATORY_SCOPE_DRAFT_CONFIG_KEY, tampered
+        )
+        with self.assertRaisesRegex(
+            OperatorControlError, "^EXPLORATORY_SCOPE_DRAFT_MISMATCH$"
+        ):
+            self.control._prepare_rolling_exploratory_scope_draft()
+        self.assertEqual(
+            self.store.get_operator_config(
+                ROLLING_EXPLORATORY_SCOPE_DRAFT_CONFIG_KEY, None
+            ),
+            tampered,
+        )
+
+        active = dict(legacy)
+        active.update(
+            {
+                "status": "ACTIVE",
+                "paper_only": False,
+                "live_execution": True,
+                "allocation_active": True,
+                "canary_armed": True,
+            }
+        )
+        active_unsigned = {
+            key: value for key, value in active.items() if key != "draft_hash"
+        }
+        active["draft_hash"] = (
+            "sha256:" + self.control._rolling_canonical_hash(active_unsigned)
+        )
+        self.store.set_operator_config(
+            ROLLING_EXPLORATORY_SCOPE_DRAFT_CONFIG_KEY, active
+        )
+        with self.assertRaisesRegex(
+            OperatorControlError, "^EXPLORATORY_SCOPE_DRAFT_MISMATCH$"
+        ):
+            self.control._prepare_rolling_exploratory_scope_draft()
+        self.assertEqual(
+            self.store.get_operator_config(
+                ROLLING_EXPLORATORY_SCOPE_DRAFT_CONFIG_KEY, None
+            ),
+            active,
+        )
+
 
     def test_rolling_scope_draft_mismatch_fails_closed_without_overwrite(self) -> None:
         self.control._prepare_rolling_exploratory_scope_draft()

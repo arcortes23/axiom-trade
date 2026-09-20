@@ -27,6 +27,7 @@ from typing import Any, Callable, Mapping
 
 from .autonomous import (
     AutonomousResearchProcessor,
+    _rolling_hash,
     bootstrap_system_exploratory_admission_policy,
 )
 from .canary import (
@@ -1511,6 +1512,152 @@ def _operator_safe_mapping(value: Any) -> dict[str, Any]:
             if key in value:
                 result[key] = _safe_value(value[key])
     return result
+_OPERATOR_POLICY_PUBLIC_KEYS = (
+    "policy_id",
+    "id",
+    "version",
+    "policy_version",
+    "config_hash",
+    "policy_hash",
+    "draft_id",
+    "draft_version",
+    "draft_hash",
+    "status",
+    "review_status",
+    "reviewed_at",
+    "active_at",
+    "global_budget",
+    "max_members",
+    "requested_window_days",
+    "review_interval_days",
+    "min_actual_coverage_seconds",
+    "min_completed_outcomes",
+    "min_reliability",
+    "min_score",
+    "replacement_margin",
+    "cooldown_seconds",
+    "experimental_allocation_enabled",
+    "allocation_active",
+    "risk_config_id",
+    "risk_config_generation",
+    "risk_config_hash",
+    "paper_only",
+    "live_execution",
+)
+
+
+def _operator_public_policy(value: Any) -> dict[str, Any]:
+    """Keep policy identity/settings while excluding raw policy documents."""
+    if not isinstance(value, Mapping):
+        return {}
+    projected: dict[str, Any] = {}
+    for key in _OPERATOR_POLICY_PUBLIC_KEYS:
+        child = value.get(key)
+        if child not in (None, ""):
+            projected[key] = _safe_value(child)
+    weights = value.get("weights")
+    if isinstance(weights, Mapping):
+        projected["weights"] = {
+            str(key): _safe_value(child)
+            for key, child in list(weights.items())[:32]
+            if not _SECRET_KEY.search(str(key))
+        }
+    return projected
+
+
+def _operator_public_selection(value: Any) -> dict[str, Any]:
+    """Project selection identity/member bindings without member payloads."""
+    if not isinstance(value, Mapping):
+        return {}
+    fields = (
+        "selection_id",
+        "portfolio_selection_id",
+        "policy_id",
+        "policy_version",
+        "version",
+        "policy_hash",
+        "config_hash",
+        "risk_config_id",
+        "risk_config_generation",
+        "risk_config_hash",
+        "selection_status",
+        "selection_valid",
+        "selection_invalidation_reason",
+        "k",
+        "actual",
+        "actual_k",
+        "status",
+    )
+    projected = {
+        key: _safe_value(value[key])
+        for key in fields
+        if key in value and value[key] not in (None, "")
+    }
+    members = value.get("members", value.get("selected_members"))
+    if isinstance(members, (list, tuple)):
+        member_rows: list[dict[str, Any]] = []
+        for member in members[:64]:
+            binding = _public_draft_member_binding(member)
+            if isinstance(member, Mapping):
+                for key in ("status", "stage", "allocation", "score"):
+                    if member.get(key) not in (None, ""):
+                        binding[key] = _safe_value(member[key])
+            if binding:
+                member_rows.append(binding)
+        projected["members"] = member_rows
+    return projected
+
+
+def _operator_public_rolling_state(value: Any) -> dict[str, Any]:
+    """Return the operator rolling identity/review contract, not raw evidence."""
+    if not isinstance(value, Mapping):
+        return {}
+    scalar_keys = (
+        "status",
+        "selection_status",
+        "portfolio_selection_id",
+        "k",
+        "actual",
+        "actual_k",
+        "actionable",
+        "controller_status",
+        "reviewed_at",
+        "review_due_at",
+        "blocker",
+        "paper_only",
+        "live_execution",
+        "execution_authority",
+    )
+    projected = {
+        key: _safe_value(value[key])
+        for key in scalar_keys
+        if key in value and value[key] not in (None, "")
+    }
+    for key in (
+        "policy_identity",
+        "active_policy_identity",
+        "reviewed_policy_identity",
+        "risk",
+        "actionable_reasons",
+    ):
+        child = value.get(key)
+        if isinstance(child, Mapping):
+            projected[key] = _safe_value(child)
+    selection = _operator_public_selection(value.get("selection"))
+    if selection:
+        projected["selection"] = selection
+    for key in ("policy", "active_policy", "reviewed_policy", "proposed_policy"):
+        policy = _operator_public_policy(value.get(key))
+        if policy:
+            projected[key] = policy
+    blockers = value.get("actionable_blockers", value.get("blockers"))
+    if isinstance(blockers, (list, tuple)):
+        projected["actionable_blockers"] = [
+            _safe_value(item)
+            for item in blockers[:32]
+            if isinstance(item, Mapping)
+        ]
+    return projected
 
 
 
@@ -1893,7 +2040,7 @@ class OperatorControlPlane:
                 },
             },
         }
-        desired["draft_hash"] = "sha256:" + self._rolling_canonical_hash(desired)
+        desired["draft_hash"] = _rolling_hash(desired)
         if callable(loader):
             try:
                 existing = loader(ROLLING_EXPLORATORY_SCOPE_DRAFT_CONFIG_KEY, None)
@@ -1910,8 +2057,35 @@ class OperatorControlPlane:
             immutable.pop("draft_hash", None)
             expected = dict(desired)
             expected.pop("draft_hash", None)
+            immutable_matches = immutable == expected
+            legacy_hash = "sha256:" + self._rolling_canonical_hash(immutable)
+            known_legacy_defect = (
+                immutable_matches
+                and current.get("status") == "DRAFT"
+                and current.get("paper_only") is True
+                and current.get("live_execution") is False
+                and current.get("allocation_active") is False
+                and current.get("canary_armed") is False
+                and current.get("draft_hash") == legacy_hash
+                and legacy_hash != desired["draft_hash"]
+            )
+            if known_legacy_defect:
+                if not callable(setter):
+                    raise OperatorControlError(
+                        "EXPLORATORY_SCOPE_DRAFT_STORAGE_UNAVAILABLE"
+                    )
+                repaired = dict(expected)
+                repaired["draft_hash"] = desired["draft_hash"]
+                try:
+                    setter(ROLLING_EXPLORATORY_SCOPE_DRAFT_CONFIG_KEY, repaired)
+                except Exception as exc:
+                    raise OperatorControlError(
+                        "EXPLORATORY_SCOPE_DRAFT_SAVE_FAILED",
+                        type(exc).__name__,
+                    ) from exc
+                return repaired
             if (
-                immutable != expected
+                not immutable_matches
                 or current.get("draft_hash") != desired["draft_hash"]
                 or current.get("status") != "DRAFT"
             ):
@@ -7855,7 +8029,7 @@ class OperatorControlPlane:
                 "paper_only": True,
                 "live_execution": False,
             },
-            "rolling_portfolio": dict(rolling_state),
+            "rolling_portfolio": _operator_public_rolling_state(rolling_state),
             "rolling_portfolio_worker": rolling_worker,
             "market_scope_funnel": market_scope_funnel,
             "credentials": credentials,

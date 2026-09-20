@@ -8,7 +8,7 @@ import sqlite3
 import threading
 import time
 import unittest
-from axiom.dashboard import DashboardData
+from axiom.dashboard import DashboardData, _http_json_bytes
 from axiom.storage import AxiomStore
 from unittest.mock import patch
 
@@ -1664,6 +1664,222 @@ class DashboardScaleFixtureTests(unittest.TestCase):
                 store=RollingStore(),
                 clock=lambda: T0,
             ).rolling_portfolio_data()
+
+    def test_http_projection_preserves_nested_operator_state_at_byte_cap(self) -> None:
+        oversized_items = [
+            {
+                "candidate_id": f"candidate-{index}",
+                "status": "MATCHED",
+                "scope_hash": f"scope-hash-{index}",
+                "setup_hash": f"setup-hash-{index}",
+                "strategy_version_id": f"strategy-{index}",
+                "research_trial_id": f"trial-{index}",
+                "evidence_digest": f"digest-{index}",
+                "policy": {
+                    f"raw-policy-{part}": "x" * 4096
+                    for part in range(8)
+                },
+                "provenance": {
+                    f"raw-provenance-{part}": "y" * 4096
+                    for part in range(8)
+                },
+            }
+            for index in range(64)
+        ]
+        payload = {
+            "identity": {"revision": "commit6213034"},
+            "canary": {
+                "control_state": "DISARMED",
+                "selection_status": "NONE",
+                "risk_limits": {"max_positions": 3},
+                "autonomous": {"blocker": "AUTONOMOUS_CANARY_DISABLED"},
+            },
+            "risk_settings": {
+                "status": "CURRENT",
+                "active": {
+                    "config_id": "risk-config-active",
+                    "generation": 7,
+                    "config_hash": "risk-config-hash-active",
+                    "values": {"max_positions": 3},
+                },
+                "draft": {
+                    "config_id": "risk-config-draft",
+                    "generation": 8,
+                    "config_hash": "risk-config-hash-draft",
+                    "values": {"max_positions": 2},
+                },
+                "effective_limits": {"max_positions": 3},
+            },
+            "rolling_portfolio": {
+                "status": "READY",
+                "controller_status": "IDLE",
+                "selection": {"status": "VALID", "selection_id": "selection-1"},
+                "policy": {"policy_id": "policy-1", "policy_hash": "policy-hash-1"},
+            },
+            "controller_lease": {
+                "status": "NONE",
+                "owner_id": None,
+                "generation": None,
+            },
+            "execution_authorization": {
+                "status": "DRAFT",
+                "authorization_id": "authorization-draft",
+                "generation": 2,
+                "selection_policy_hash": "selection-policy-hash",
+                "controller_lease": {"status": "NONE"},
+                "draft": {
+                    "authorization_id": "authorization-draft",
+                    "generation": 2,
+                    "selection_policy_hash": "selection-policy-hash",
+                },
+            },
+            "rolling_exploratory_scope_draft": {
+                "draft_id": "scope-draft",
+                "scope_hash": "scope-hash",
+                "scope_version": "1",
+                "status": "DRAFT",
+                "supported_market_types": ["prediction"],
+            },
+            "exploratory_live_review": {
+                "status": "BLOCKED",
+                "profitability": "UNPROVEN",
+                "policy": {
+                    "policy_id": "policy-1",
+                    "version": "v1",
+                    "config_hash": "policy-hash-1",
+                },
+                "selected_setups": [
+                    {
+                        "strategy_version_id": "strategy-0",
+                        "candidate_id": "candidate-0",
+                        "setup_id": "setup-0",
+                        "setup_version": "setup-v1",
+                        "setup_hash": "setup-hash-0",
+                        "direction": "YES",
+                        "sizing": {"all_in_buy_usd": "1.00"},
+                        "exit_semantics": {"mode": "TIMEBOX"},
+                    }
+                ],
+                "scope": {
+                    "scope_hash": "scope-hash",
+                    "scope_version": "1",
+                    "draft": {
+                        "draft_id": "scope-draft",
+                        "draft_hash": "scope-draft-hash",
+                        "draft_version": "draft-v1",
+                        "scope_hash": "scope-hash",
+                        "scope_version": "1",
+                        "scope": {
+                            "schema_version": "1",
+                            "mode": "RULE_BASED_MARKETS",
+                            "instrument": "POLYMARKET",
+                        },
+                    },
+                    "active": {
+                        "scope_hash": "active-scope-hash",
+                        "scope_version": "active-v1",
+                    },
+                },
+                "scope_binding": {
+                    "draft_id": "scope-draft",
+                    "draft_hash": "scope-draft-hash",
+                    "draft_version": "1",
+                    "scope_hash": "scope-hash",
+                    "scope_version": "1",
+                },
+                "authorization_bindings": {
+                    "selection_id": "selection-1",
+                    "selection_hash": "selection-hash-1",
+                    "policy_id": "policy-1",
+                    "policy_version": "v1",
+                    "policy_hash": "policy-hash-1",
+                    "setup_bindings": [
+                        {
+                            "strategy_version_id": "strategy-0",
+                            "candidate_id": "candidate-0",
+                            "setup_id": "setup-0",
+                            "setup_version": "setup-v1",
+                            "setup_hash": "setup-hash-0",
+                            "draft_bound": True,
+                            "draft_id": "scope-draft",
+                            "draft_hash": "scope-draft-hash",
+                            "scope_hash": "scope-hash",
+                            "scope_version": "1",
+                            "market_bindings": [
+                                {
+                                    "market_id": "market-0",
+                                    "condition_id": "condition-0",
+                                    "yes_token_id": "token-yes-0",
+                                }
+                            ],
+                        }
+                    ],
+                },
+                "readiness": {
+                    "status": "BLOCKED",
+                    "market_id": "market-0",
+                    "token_id": "token-yes-0",
+                    "blockers": ["SELECTED_MARKET_READINESS_STALE"],
+                },
+                "limits": {"max_positions": 3},
+                "allocation": {"selected_members": 1, "maximum_members": 3},
+                "blockers": ["EXPLORATORY_LIVE_SELECTION_REQUIRED"],
+            },
+            "market_scope_funnel": {
+                "total": len(oversized_items),
+                "stage_counts": {"matching_current_markets": len(oversized_items)},
+                "resolution_items": oversized_items,
+            },
+        }
+
+        body = _http_json_bytes(payload)
+        self.assertLessEqual(len(body), 1_048_576)
+        projected = json.loads(body.decode("utf-8"))
+        self.assertEqual(projected["risk_settings"]["active"]["config_id"], "risk-config-active")
+        self.assertEqual(projected["rolling_portfolio"]["status"], "READY")
+        self.assertEqual(projected["risk_settings"]["draft"]["config_hash"], "risk-config-hash-draft")
+        self.assertEqual(projected["risk_settings"]["draft"]["values"]["max_positions"], 2)
+        self.assertEqual(projected["controller_lease"]["status"], "NONE")
+        self.assertEqual(
+            projected["execution_authorization"]["authorization_id"],
+            "authorization-draft",
+        )
+        self.assertEqual(
+            projected["execution_authorization"]["draft"]["authorization_id"],
+            "authorization-draft",
+        )
+        review = projected["exploratory_live_review"]
+        self.assertEqual(review["status"], "BLOCKED")
+        self.assertEqual(review["scope"]["draft"]["draft_id"], "scope-draft")
+        self.assertEqual(review["scope"]["draft"]["draft_hash"], "scope-draft-hash")
+        self.assertEqual(review["scope"]["draft"]["draft_version"], "draft-v1")
+        self.assertEqual(review["scope"]["draft"]["scope_hash"], "scope-hash")
+        self.assertEqual(review["scope"]["draft"]["scope_version"], "1")
+        self.assertEqual(
+            review["scope"]["draft"]["scope"]["mode"],
+            "RULE_BASED_MARKETS",
+        )
+        self.assertEqual(review["selected_setups"][0]["setup_hash"], "setup-hash-0")
+        self.assertEqual(
+            review["authorization_bindings"]["setup_bindings"][0]["market_bindings"][0][
+                "market_id"
+            ],
+            "market-0",
+        )
+        self.assertEqual(review["readiness"]["market_id"], "market-0")
+        self.assertIn("EXPLORATORY_LIVE_SELECTION_REQUIRED", review["blockers"])
+        self.assertEqual(
+            projected["market_scope_funnel"]["resolution_items"][0]["candidate_id"],
+            "candidate-0",
+        )
+        self.assertEqual(
+            projected["market_scope_funnel"]["resolution_items"][0]["setup_hash"],
+            "setup-hash-0",
+        )
+        self.assertNotIn(
+            "provenance",
+            projected["market_scope_funnel"]["resolution_items"][0],
+        )
 
     @staticmethod
     def _seed_catalog(store: AxiomStore, count: int) -> None:

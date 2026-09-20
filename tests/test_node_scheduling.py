@@ -1424,6 +1424,154 @@ class ExploratoryRollingProgressionTests(unittest.TestCase):
                     store.get_operator_config("rolling_exploratory_scope_draft", None),
                     draft,
                 )
+    def test_strategy_discovery_trace_requires_explicit_market_bindings(self) -> None:
+        with AxiomStore(":memory:") as store:
+            processor = self._processor(":memory:", store)
+            processor._ensure_exploratory_live_bootstrap(T0)
+            base = _rolling_initialization_document()
+            documents: list[dict[str, object]] = []
+            for index in range(2):
+                document = dict(base)
+                document["strategy_version_id"] = f"sv-unbound-{index}"
+                document["candidate_id"] = f"candidate-unbound-{index}"
+                document["research_trial_id"] = f"trial-unbound-{index}"
+                document["market_bindings"] = []
+                document["scope_resolution"] = {
+                    "status": "MATCHED",
+                    "matched_markets": [
+                        {"market_id": f"metadata-only-{market_index}"}
+                        for market_index in range(10)
+                    ],
+                }
+                document["provenance"] = {
+                    "candidate_id": document["candidate_id"],
+                }
+                documents.append(document)
+            processor._rolling_scope_draft_documents = (  # type: ignore[method-assign]
+                lambda now: (
+                    (),
+                    {
+                        "status": "UNAVAILABLE",
+                        "reason": "SCOPE_DRAFT_UNAVAILABLE",
+                    },
+                )
+            )
+            processor._rolling_strategy_documents = (  # type: ignore[method-assign]
+                lambda: tuple(documents)
+            )
+
+            result = processor.refresh_rolling_evidence(T0)
+
+            trace = result["strategy_discovery_trace"]
+            self.assertEqual(trace["supported_strategy_definition_count"], 2)
+            self.assertEqual(trace["valid_strategy_definition_count"], 2)
+            self.assertEqual(trace["materialized_strategy_count"], 0)
+            self.assertEqual(trace["materialized_member_count"], 0)
+            self.assertEqual(trace["compatible_binding_count"], 0)
+            self.assertEqual(trace["materialized_market_count"], 0)
+            self.assertEqual(trace["materialized_market_ids"], [])
+
+    def test_valid_scope_draft_precedes_bootstrap_when_materialization_empty(self) -> None:
+        with AxiomStore(":memory:") as store:
+            processor = self._processor(":memory:", store)
+            processor._ensure_exploratory_live_bootstrap(T0)
+            policy = normalize_market_scope(
+                {
+                    "schema_version": "1",
+                    "mode": "RULE_BASED_MARKETS",
+                    "instrument": "POLYMARKET",
+                    "categories": [],
+                    "market_ids": [],
+                    "filters": {},
+                    "regime_restrictions": {},
+                    "provenance": "canonical",
+                }
+            )
+            draft = {
+                "draft_id": "rolling-exploratory-scope-draft:precedence:v1",
+                "status": "DRAFT",
+                "scope": policy.as_dict(),
+                "scope_hash": policy.scope_hash,
+                "scope_version": policy.scope_version,
+                "supported_market_types": ["prediction"],
+                "paper_only": True,
+                "live_execution": False,
+                "allocation_active": False,
+                "canary_armed": False,
+            }
+            draft["draft_hash"] = _rolling_hash(draft)
+            store.set_operator_config("rolling_exploratory_scope_draft", draft)
+            system_calls: list[datetime] = []
+
+            def unexpected_system_documents(now: datetime) -> tuple[dict[str, object], ...]:
+                system_calls.append(now)
+                return ()
+
+            processor._rolling_scope_draft_documents = (  # type: ignore[method-assign]
+                lambda now: (
+                    (),
+                    {
+                        "status": "NO_SUITABLE_MATERIALIZED_INSTANCE",
+                        "reason": "NO_SUITABLE_MATERIALIZED_INSTANCE",
+                        "valid_strategy_definition_count": 2,
+                        "supported_strategy_definition_count": 2,
+                    },
+                )
+            )
+            processor._rolling_system_current_market_documents = (  # type: ignore[method-assign]
+                unexpected_system_documents
+            )
+
+            result = processor.refresh_rolling_evidence(T0)
+
+            self.assertEqual(system_calls, [])
+            trace = result["strategy_discovery_trace"]
+            self.assertEqual(trace["source"], "scope-draft-preview")
+            self.assertEqual(trace["valid_strategy_definition_count"], 2)
+            self.assertEqual(trace["materialized_strategy_count"], 0)
+            self.assertEqual(trace["materialized_market_count"], 0)
+
+    def test_scope_draft_trace_distinguishes_invalid_present_from_missing(self) -> None:
+        with AxiomStore(":memory:") as store:
+            processor = self._processor(":memory:", store)
+            _, missing_trace = processor._rolling_scope_draft_documents(T0)
+            self.assertEqual(missing_trace["reason"], "SCOPE_DRAFT_UNAVAILABLE")
+            self.assertEqual(missing_trace["validation_status"], "MISSING")
+            self.assertFalse(missing_trace["present"])
+
+            policy = normalize_market_scope(
+                {
+                    "schema_version": "1",
+                    "mode": "RULE_BASED_MARKETS",
+                    "instrument": "POLYMARKET",
+                    "categories": [],
+                    "market_ids": [],
+                    "filters": {},
+                    "regime_restrictions": {},
+                    "provenance": "canonical",
+                }
+            )
+            draft = {
+                "draft_id": "rolling-exploratory-scope-draft:invalid-hash:v1",
+                "status": "DRAFT",
+                "scope": policy.as_dict(),
+                "scope_hash": policy.scope_hash,
+                "scope_version": policy.scope_version,
+                "supported_market_types": ["prediction"],
+                "paper_only": True,
+                "live_execution": False,
+                "allocation_active": False,
+                "canary_armed": False,
+                "draft_hash": "sha256:not-the-canonical-draft-hash",
+            }
+            store.set_operator_config("rolling_exploratory_scope_draft", draft)
+
+            _, invalid_trace = processor._rolling_scope_draft_documents(T0)
+
+            self.assertEqual(invalid_trace["reason"], "SCOPE_DRAFT_HASH_MISMATCH")
+            self.assertEqual(invalid_trace["validation_status"], "INVALID")
+            self.assertTrue(invalid_trace["present"])
+
     def test_scope_draft_continuation_isolated_from_normal_and_resumes_exact_draft(self) -> None:
         with AxiomStore(":memory:") as store:
             policy = normalize_market_scope(

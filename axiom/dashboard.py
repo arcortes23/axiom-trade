@@ -172,6 +172,69 @@ def _empty_market_scope_funnel() -> dict[str, Any]:
         "as_of": None,
         "live_execution": False,
     }
+_MARKET_SCOPE_PUBLIC_ITEM_FIELDS = (
+    "candidate_id",
+    "market_id",
+    "condition_id",
+    "token_id",
+    "token_ids",
+    "outcome",
+    "category",
+    "market_type",
+    "status",
+    "stage",
+    "count",
+    "reason",
+    "reason_code",
+    "scope_hash",
+    "scope_version",
+    "policy_hash",
+    "provenance_hash",
+    "setup_hash",
+    "strategy_version_id",
+    "research_trial_id",
+    "evidence_digest",
+    "source_class",
+    "resolved_at",
+    "updated_at",
+)
+_MARKET_SCOPE_DETAIL_LIST_KEYS = frozenset(
+    {"items", "resolution_items", "resolution_blockers", "blockers", "stages", "resolution_stages"}
+)
+
+
+def _market_scope_public_item(value: Any) -> Any:
+    """Retain scope identity/status while excluding raw policy/provenance bodies."""
+    if not isinstance(value, Mapping):
+        return _jsonable(value)
+    projected: dict[str, Any] = {}
+    for key in _MARKET_SCOPE_PUBLIC_ITEM_FIELDS:
+        if key not in value or value[key] in (None, ""):
+            continue
+        child = value[key]
+        if key in {"token_ids"}:
+            if isinstance(child, (list, tuple, set, frozenset)):
+                projected[key] = [
+                    _jsonable(item) for item in list(child)[:32] if item not in (None, "")
+                ]
+            continue
+        if isinstance(child, Mapping):
+            continue
+        if isinstance(child, (list, tuple, set, frozenset)):
+            projected[key] = [_jsonable(item) for item in list(child)[:32]]
+        else:
+            projected[key] = _jsonable(child)
+    return projected
+
+
+def _public_market_scope_funnel(value: Any) -> dict[str, Any]:
+    """Cap persisted scope detail lists after internal candidate matching."""
+    result = dict(value) if isinstance(value, Mapping) else {}
+    for key in _MARKET_SCOPE_DETAIL_LIST_KEYS:
+        child = result.get(key)
+        if isinstance(child, (list, tuple)):
+            result[key] = list(child)[:64]
+    return result
 
 
 def _pagination_error(query: Mapping[str, Any]) -> str | None:
@@ -392,6 +455,253 @@ def _http_bound_value(
         converted = "<unserializable>"
     return _http_bound_value(converted, depth=depth, stats=stats)
 
+_HTTP_PUBLIC_SECTION_FIELDS: dict[str, tuple[str, ...]] = {
+    "risk_settings": (
+        "status", "config_id", "generation", "config_hash", "control_generation",
+        "active", "draft", "active_config", "draft_config", "effective_limits",
+        "active_limits", "usage", "remaining", "cumulative_buy_cap_usd",
+        "remaining_cumulative_buy_usd", "cumulative_buy_cap_state",
+        "cumulative_buy_over_limit_reason",
+    ),
+    "active": ("config_id", "id", "generation", "config_hash", "status", "values", "settings", "limits"),
+    "active_config": ("config_id", "id", "generation", "config_hash", "status", "values", "settings", "limits"),
+    "draft": ("config_id", "id", "generation", "config_hash", "status", "values", "settings", "limits"),
+    "draft_config": ("config_id", "id", "generation", "config_hash", "status", "values", "settings", "limits"),
+    "policy": (
+        "policy_id", "id", "version", "policy_version", "config_hash", "policy_hash",
+        "draft_id", "draft_version", "draft_hash", "status", "review_status",
+        "global_budget", "max_members", "risk_config_id", "risk_config_generation",
+        "risk_config_hash", "paper_only", "live_execution",
+    ),
+    "active_policy": (
+        "policy_id", "id", "version", "policy_version", "config_hash", "policy_hash",
+        "draft_id", "draft_version", "draft_hash", "status", "review_status",
+        "global_budget", "max_members", "risk_config_id", "risk_config_generation",
+        "risk_config_hash", "paper_only", "live_execution",
+    ),
+    "reviewed_policy": (
+        "policy_id", "id", "version", "policy_version", "config_hash", "policy_hash",
+        "draft_id", "draft_version", "draft_hash", "status", "review_status",
+        "global_budget", "max_members", "risk_config_id", "risk_config_generation",
+        "risk_config_hash", "paper_only", "live_execution",
+    ),
+    "proposed_policy": (
+        "policy_id", "id", "version", "policy_version", "config_hash", "policy_hash",
+        "draft_id", "draft_version", "draft_hash", "status", "review_status",
+        "global_budget", "max_members", "risk_config_id", "risk_config_generation",
+        "risk_config_hash", "paper_only", "live_execution",
+    ),
+    "execution_authorization": (
+        "status", "authorization_id", "id", "generation", "mode", "purpose",
+        "exact_strategy_versions", "strategy_version_ids", "reviewed_selection_policy_hash",
+        "selection_policy_hash", "selection_id", "selection_hash", "adverse_evidence_ack",
+        "lifetime_budget", "stop_rules", "expires_at", "controller_lease", "active", "draft",
+        "identity", "rolling_exploratory_scope_draft", "blockers", "paper_only", "live_execution",
+    ),
+    "exploratory_live_review": (
+        "profitability", "status", "scope", "scope_binding", "blockers", "allocation",
+        "policy", "review", "selected_setups", "entry_predicate", "direction", "sizing",
+        "exit", "lookback", "adverse_evidence", "members", "limits", "limit_blockers",
+        "readiness", "authorization", "authorization_bindings", "lifetime_budget",
+        "expires_at", "stop_rules", "accounting", "paper_only", "live_execution",
+    ),
+    "selected_setups": (
+        "strategy_version_id", "candidate_id", "setup_id", "setup_version", "setup_hash",
+        "operational_setup_hash", "entry_predicate", "outcome_mapping", "direction",
+        "sizing", "holding_semantics", "exit_semantics", "lookback",
+    ),
+    "scope_binding": (
+        "draft_id", "draft_hash", "draft_version", "scope_hash", "scope_version",
+        "active_scope_hash", "active_scope_version", "frozen_scope_hash",
+        "frozen_scope_version",
+    ),
+    "scope_state": (
+        "draft_id", "draft_hash", "draft_version", "scope_hash", "scope_version",
+        "status", "scope", "market_ids", "market_type", "supported_market_types",
+        "category_restriction", "exclusions",
+    ),
+    "scope_document": (
+        "schema_version", "version", "mode", "name", "type", "instrument", "categories",
+        "market_ids", "exact_market_ids", "filters", "regime_restrictions", "provenance",
+    ),
+    "authorization_bindings": (
+        "selection_id", "selection_hash", "policy_id", "policy_version", "policy_hash",
+        "setup_bindings", "draft_member_bindings", "proposed_allocation_total",
+        "proposed_allocation_risk_digest",
+    ),
+    "setup_bindings": (
+        "strategy_version_id", "candidate_id", "setup_id", "setup_version", "setup_hash",
+        "operational_setup_hash", "draft_bound", "draft_id", "draft_hash", "scope_hash",
+        "scope_version", "market_bindings",
+    ),
+    "draft_member_bindings": (
+        "strategy_version_id", "candidate_id", "draft_bound", "draft_id", "draft_hash",
+        "scope_hash", "scope_version", "operational_setup_hash", "market_bindings",
+    ),
+    "market_bindings": (
+        "market_id", "condition_id", "yes_token_id", "no_token_id", "outcome_token_id",
+        "outcome_token_ids",
+    ),
+    "readiness": (
+        "status", "fresh", "checked_at", "market_id", "token_id", "diagnostics", "blockers",
+    ),
+    "diagnostics": ("account", "geoblock", "balance", "allowance", "market", "book"),
+    "accounting": (
+        "buy_pending_usd", "buy_unknown_usd", "all_in_buy_reserved_usd",
+        "reserved_exit_capacity", "proposed_allocation_total",
+        "proposed_allocation_risk_digest", "equity_status",
+    ),
+    "rolling_portfolio": (
+        "status", "controller_status", "k", "actual", "actual_k", "actionable",
+        "policy", "active_policy", "reviewed_policy", "proposed_policy", "policy_review",
+        "allocation_review", "risk", "evidence", "selection", "signal", "execution",
+        "active_rows", "global_limits", "global_limits_usage", "rolling_usage", "canary_usage",
+        "events", "event_history", "reason_history", "admission_reason_history",
+        "replacement_reason_history", "next_jobs", "cold_start_requirements", "blockers",
+        "actionable_blockers", "paper_only", "live_execution",
+    ),
+    "scope_draft": (
+        "draft_id", "scope_id", "status", "scope_hash", "scope_version", "draft_hash",
+        "draft_version", "market_type", "supported_market_types", "category_restriction",
+        "exclusions", "members", "policy", "scope", "paper_only", "live_execution",
+    ),
+    "rolling_exploratory_scope_draft": (
+        "draft_id", "scope_id", "status", "scope_hash", "scope_version", "draft_hash",
+        "draft_version", "market_type", "supported_market_types", "category_restriction",
+        "exclusions", "members", "policy", "scope", "paper_only", "live_execution",
+    ),
+    "authorization": (
+        "status", "authorization_id", "id", "generation", "mode", "purpose",
+        "exact_strategy_versions", "strategy_version_ids", "reviewed_selection_policy_hash",
+        "selection_policy_hash", "selection_id", "selection_hash", "adverse_evidence_ack",
+        "lifetime_budget", "stop_rules", "expires_at", "controller_lease", "active", "draft",
+        "identity", "rolling_exploratory_scope_draft", "blockers", "paper_only", "live_execution",
+    ),
+    "controller_lease": (
+        "status", "owner_id", "generation", "lease_id", "acquired_at", "expires_at",
+        "heartbeat_at", "updated_at", "reason", "blocker", "paper_only", "live_execution",
+    ),
+    "market_scope_funnel": (
+        "available", "total", "resolution_count", "stage_counts", "stages", "blocker_counts",
+        "timestamps", "resolution_status_counts", "resolution_reason_counts",
+        "resolution_items", "resolution_blockers", "resolution_stages", "as_of",
+        "storage_backed", "live_execution",
+    ),
+    "resolution_items": (
+        "candidate_id", "market_id", "condition_id", "token_id", "token_ids", "outcome",
+        "category", "market_type", "status", "stage", "count", "reason", "reason_code", "scope_hash",
+        "scope_version", "policy_hash", "provenance_hash", "setup_hash",
+        "strategy_version_id", "research_trial_id", "evidence_digest", "source_class",
+        "resolved_at", "updated_at",
+    ),
+    "resolution_blockers": ("reason", "reason_code", "count", "status", "candidate_id", "resolved_at"),
+    "resolution_stages": ("status", "stage", "count", "blocker_counts", "timestamps"),
+    "canary": (
+        "status", "control_state", "micro_live_canary", "display_state", "production_live_trading",
+        "selection_status", "selection_valid", "selection_invalidation_reason", "selected_candidate",
+        "last_selected_candidate", "winner_id", "winner_rank", "winner_score", "risk_envelope",
+        "risk_limits", "risk_settings", "autonomous", "latest_signal", "status_report",
+        "control", "readiness", "worker", "execution", "blocker", "last_cycle_blocker",
+        "signal_scan_reason_counts", "trades", "execution_event_count", "real_execution_events",
+        "credentials", "live_execution",
+    ),
+    "autonomous_canary": (
+        "enabled", "control_state", "micro_live_canary", "display_state", "selection_status",
+        "selection_valid", "selected_candidate", "last_selected_candidate", "rank", "score",
+        "blocker", "next_decision", "worker_status", "last_signal_id", "candidates_ranked",
+        "candidates_signal_checked", "candidates_no_signal", "actionable_candidates_found",
+        "selected_actionable_candidate", "selected_actionable_rank", "selected_actionable_score",
+        "signal_scan_candidate_universe_hash", "signal_scan_cycle_id", "signal_scan_status",
+        "signal_scan_checked_this_cycle", "signal_scan_remaining_this_cycle",
+        "signal_scan_coverage_percentage", "signal_scan_reason_counts_json", "signal_scan_checked_keys",
+    ),
+    "status_report": (
+        "control_state", "micro_live_canary", "display_state", "selection_status",
+        "selection_valid", "selected_candidate", "last_selected_candidate", "winner_id",
+        "winner_rank", "winner_score", "latest_signal", "autonomous", "control",
+        "authoritative_control", "readiness", "authoritative_readiness", "worker", "execution",
+        "risk_envelope", "risk_limits", "blocker", "live_execution",
+    ),
+    "operator_controls": (
+        "node", "bootstrap", "hermes", "paper", "collector", "credentials", "canary",
+        "risk_settings", "controller_lease", "execution_authorization", "exploratory_live_review",
+        "scope_draft", "rolling_exploratory_scope_draft", "blocker", "blockers", "paper_only",
+        "live_execution",
+    ),
+}
+_HTTP_PUBLIC_SECTION_PRIORITY = (
+    "risk_settings",
+    "rolling_portfolio",
+    "execution_authorization",
+    "exploratory_live_review",
+    "rolling_exploratory_scope_draft",
+    "scope_draft",
+    "controller_lease",
+    "canary",
+    "operator_controls",
+    "status_report",
+    "control",
+    "readiness",
+    "worker",
+    "execution",
+    "market_scope_funnel",
+)
+
+
+def _http_public_section(
+    value: Any,
+    key: str,
+    *,
+    depth: int = 0,
+    parent_key: str | None = None,
+) -> Any:
+    """Project known dashboard sections before the hard byte-cap fallback."""
+    if depth >= _HTTP_JSON_MAX_DEPTH:
+        return "<truncated>"
+    if isinstance(value, Mapping):
+        fields_key = key
+        if parent_key == "scope":
+            if key == "draft":
+                fields_key = "scope_draft"
+            elif key in {"active", "frozen"}:
+                fields_key = "scope_state"
+        elif parent_key in {
+            "draft", "active", "frozen", "scope_state", "scope_draft",
+            "rolling_exploratory_scope_draft",
+        } and key == "scope":
+            fields_key = "scope_document"
+        elif parent_key == "policy" and key == "scope":
+            fields_key = "scope_document"
+        elif parent_key in {"execution_authorization", "authorization"} and key in {
+            "active", "draft", "authorization"
+        }:
+            fields_key = "execution_authorization"
+        fields = _HTTP_PUBLIC_SECTION_FIELDS.get(fields_key)
+        if fields is None:
+            return value
+        return {
+            field: _http_public_section(
+                value[field],
+                field,
+                depth=depth + 1,
+                parent_key=fields_key,
+            )
+            for field in fields
+            if field in value
+        }
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [
+            _http_public_section(
+                child,
+                key,
+                depth=depth + 1,
+                parent_key=parent_key,
+            )
+            for child in list(value)[:_HTTP_JSON_MAX_ITEMS]
+        ]
+    return value
+
+
 
 def _http_json_bytes(payload: Any) -> bytes:
     stats: dict[str, int | bool] = {"truncated": False, "omitted_items": 0}
@@ -423,20 +733,33 @@ def _http_json_bytes(payload: Any) -> bytes:
         "byte_cap_applied": True,
     }
     if isinstance(bounded, Mapping):
-        for key, value in bounded.items():
-            if str(key) == "_response_projection":
-                continue
-            if not (isinstance(value, (str, int, float, bool)) or value is None):
-                continue
+        def add_candidate(key: str, value: Any) -> None:
+            if key == "_response_projection" or key in compact:
+                return
+            projected = _http_public_section(value, key)
             candidate = dict(compact)
-            candidate[str(key)] = value
+            candidate[key] = projected
             candidate["_response_projection"] = byte_metadata
-            candidate_body = json.dumps(candidate, sort_keys=True, indent=2, allow_nan=False).encode("utf-8")
+            candidate_body = json.dumps(
+                candidate,
+                sort_keys=True,
+                indent=2,
+                allow_nan=False,
+            ).encode("utf-8")
             if len(candidate_body) > _HTTP_JSON_MAX_BYTES:
                 stats["omitted_items"] = int(stats.get("omitted_items", 0)) + 1
+                return
+            compact[key] = projected
+
+        for key in _HTTP_PUBLIC_SECTION_PRIORITY:
+            if key in bounded:
+                add_candidate(key, bounded[key])
+        for key, value in bounded.items():
+            key_text = str(key)
+            if key_text in compact or key_text == "_response_projection":
                 continue
-            compact[str(key)] = value
-    byte_metadata["omitted_items"] = int(stats.get("omitted_items", 0))
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                add_candidate(key_text, value)
     compact["_response_projection"] = byte_metadata
     body = json.dumps(compact, sort_keys=True, indent=2, allow_nan=False).encode("utf-8")
     if len(body) <= _HTTP_JSON_MAX_BYTES:
@@ -7315,12 +7638,12 @@ class DashboardData:
         }
         return result
 
-    def market_scope_funnel_data(self) -> dict[str, Any]:
-        """Project the persisted market-scope handoff without recomputation.
+    def market_scope_funnel_data(self, *, public: bool = True) -> dict[str, Any]:
+        """Project persisted scope aggregates without retaining raw documents.
 
-        The aggregate is written by the qualification/resolution workers.  A
-        dashboard GET may only read that bounded aggregate; it must not scan
-        candidate lifecycle rows or resolve current markets itself.
+        Internal callers may request the larger identity-only candidate index
+        while they perform exact candidate matching; HTTP-facing responses use
+        the smaller public list.
         """
         empty = _empty_market_scope_funnel()
         if self.store is None:
@@ -7343,12 +7666,24 @@ class DashboardData:
             if depth >= 8:
                 return "<truncated>"
             if isinstance(value, Mapping):
-                return {
-                    str(key): scope_bound(child, depth + 1)
-                    for key, child in list(value.items())[:128]
-                }
+                result: dict[str, Any] = {}
+                for key, child in list(value.items())[:128]:
+                    key_text = str(key)
+                    if (
+                        key_text in _MARKET_SCOPE_DETAIL_LIST_KEYS
+                        and isinstance(child, (list, tuple, set, frozenset))
+                    ):
+                        limit = 64 if public else 1000
+                        result[key_text] = [
+                            _market_scope_public_item(item)
+                            for item in list(child)[:limit]
+                        ]
+                    else:
+                        result[key_text] = scope_bound(child, depth + 1)
+                return result
             if isinstance(value, (list, tuple, set, frozenset)):
-                return [scope_bound(child, depth + 1) for child in list(value)[:1000]]
+                limit = 64 if public else 1000
+                return [scope_bound(child, depth + 1) for child in list(value)[:limit]]
             return _jsonable(value)
 
         bounded = scope_bound(raw)
@@ -7363,10 +7698,11 @@ class DashboardData:
         raw_timestamps = bounded.get("timestamps", {})
         raw_timestamps = raw_timestamps if isinstance(raw_timestamps, Mapping) else {}
         exact_blockers: dict[str, int] = {}
+        detail_limit = 64 if public else 1000
         raw_blocker_values = bounded.get("blockers", [])
         if isinstance(raw_blocker_values, (list, tuple)):
-            result["resolution_blockers"] = list(raw_blocker_values)[:1000]
-            for item in raw_blocker_values[:1000]:
+            result["resolution_blockers"] = list(raw_blocker_values)[:detail_limit]
+            for item in raw_blocker_values[:detail_limit]:
                 if not isinstance(item, Mapping):
                     continue
                 reason = str(item.get("reason") or "").strip()
@@ -7376,9 +7712,11 @@ class DashboardData:
                     except (TypeError, ValueError):
                         exact_blockers[reason] = 0
         if isinstance(raw_stage_values, (list, tuple)):
-            result["resolution_stages"] = list(raw_stage_values)[:1000]
+            result["resolution_stages"] = list(raw_stage_values)[:detail_limit]
         if isinstance(bounded.get("items"), (list, tuple)):
-            result["resolution_items"] = list(bounded["items"])[:1000]
+            result["resolution_items"] = list(bounded["items"])[:detail_limit]
+        result.pop("items", None)
+        result.pop("blockers", None)
         result["resolution_status_counts"] = dict(
             bounded.get("status_counts", bounded.get("statuses", {}))
             if isinstance(bounded.get("status_counts", bounded.get("statuses", {})), Mapping)
@@ -7645,7 +7983,7 @@ class DashboardData:
         funnel = (
             dict(market_scope_funnel)
             if isinstance(market_scope_funnel, Mapping)
-            else self.market_scope_funnel_data()
+            else self.market_scope_funnel_data(public=False)
         )
         health = self._persisted_forward_health(*health_sources)
         stage_counts = funnel.get("stage_counts", {})
@@ -7978,7 +8316,7 @@ class DashboardData:
                 "live_execution": False,
             }
         aggregate = self.store.dashboard_overview_summary(activity_limit=8)
-        market_scope_funnel = self.market_scope_funnel_data()
+        market_scope_funnel = self.market_scope_funnel_data(public=False)
         research_progress = self._research_progress_projection(aggregate=aggregate)
         campaign_progress = self._campaign_progress_projection()
         campaign_activity = self._campaign_activity_rows()
@@ -8440,7 +8778,7 @@ class DashboardData:
             "canary_signal": latest_signal,
             "forward_evidence": forward_evidence,
             "research_progress": research_progress,
-            "market_scope_funnel": market_scope_funnel,
+            "market_scope_funnel": _public_market_scope_funnel(market_scope_funnel),
             "campaign_progress": campaign_progress,
             "signal_scan_reason_counts": signal_scan_reason_counts,
             "candidate_status": {
@@ -8629,7 +8967,7 @@ class DashboardData:
             worker_section if isinstance(worker_section, Mapping) else None,
             canary_report,
         )
-        market_scope_funnel = self.market_scope_funnel_data()
+        market_scope_funnel = self.market_scope_funnel_data(public=False)
         candidate_records = self._bounded_candidate_lifecycle()
         candidate_ids = [
             str(item.get("candidate_id") or "").strip()
@@ -8769,7 +9107,7 @@ class DashboardData:
             "real_execution_events": execution_events,
             "live_execution": False,
             "forward_evidence": forward_evidence,
-            "market_scope_funnel": market_scope_funnel,
+            "market_scope_funnel": _public_market_scope_funnel(market_scope_funnel),
             "signal_scan_reason_counts": signal_scan_reason_counts,
         }
         projection.update({name: canary[name] for name in _CANARY_STATUS_FIELDS})
