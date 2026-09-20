@@ -3416,6 +3416,229 @@ class MarketScopeCollectorTests(unittest.TestCase):
         self.assertEqual(len(trade_requests), 3)
         self.assertTrue(all("offset=0" in url and "offset=None" not in url for url in trade_requests))
 
+    def test_actual_adapter_bounds_trade_http_pages_under_draft_request_budget(self) -> None:
+        market_id = "real-adapter-bounded-trades"
+        condition_id = "0x" + ("c" * 64)
+        yes_token = "yes-real-adapter-bounded-trades"
+        no_token = "no-real-adapter-bounded-trades"
+        gamma_payload = {
+            "id": market_id,
+            "conditionId": condition_id,
+            "question": "Will bounded collection resume this trade stream?",
+            "outcomes": ["Yes", "No"],
+            "clobTokenIds": [yes_token, no_token],
+            "updatedAt": T0.isoformat(),
+            "endDate": (T0 + timedelta(days=1)).isoformat(),
+            "active": True,
+            "closed": False,
+            "acceptingOrders": True,
+            "enableOrderBook": True,
+        }
+        book_payloads = {
+            yes_token: {
+                "asset_id": yes_token,
+                "market": condition_id,
+                "timestamp": T0.isoformat(),
+                "bids": [{"price": "0.49", "size": "10"}],
+                "asks": [{"price": "0.51", "size": "10"}],
+            },
+            no_token: {
+                "asset_id": no_token,
+                "market": condition_id,
+                "timestamp": T0.isoformat(),
+                "bids": [{"price": "0.49", "size": "10"}],
+                "asks": [{"price": "0.51", "size": "10"}],
+            },
+        }
+
+        def trade_payload(index: int) -> dict[str, object]:
+            return {
+                "conditionId": condition_id,
+                "asset": yes_token,
+                "side": "BUY",
+                "price": 0.50,
+                "size": 2,
+                "timestamp": int((T0 - timedelta(seconds=index)).timestamp()),
+                "transactionHash": f"bounded-trade-{index}",
+            }
+
+        first_page = [trade_payload(index) for index in range(1000)]
+        second_page = [trade_payload(index) for index in range(1000, 2000)]
+        trade_requests: list[str] = []
+
+        class Response:
+            status = 200
+            headers: dict[str, str] = {}
+
+            def __init__(self, payload: object) -> None:
+                self.payload = payload
+
+            def read(self) -> bytes:
+                return json.dumps(self.payload).encode("utf-8")
+
+            def close(self) -> None:
+                return None
+
+        def opener(request: object, timeout: float) -> Response:
+            del timeout
+            url = str(getattr(request, "full_url", request))
+            if "/markets/" in url:
+                return Response(gamma_payload)
+            if "/book?" in url:
+                token = yes_token if yes_token in url else no_token
+                return Response(book_payloads[token])
+            if "/trades?" in url:
+                trade_requests.append(url)
+                if "offset=0" in url:
+                    return Response(first_page)
+                if "offset=1000" in url:
+                    return Response(second_page)
+                if "offset=2000" in url:
+                    return Response([])
+            raise AssertionError(f"unexpected public URL: {url}")
+
+        provider = PolymarketAdapter(
+            gamma_url="https://gamma.test",
+            data_api_url="https://data.test",
+            clob_url="https://clob.test",
+            opener=opener,
+        )
+        store = _ImmutableTradeStore({})
+        state_key = f"polymarket:{market_id}"
+        initial_timestamp = T0 - timedelta(days=1)
+        store.states[state_key] = {
+            "market_id": market_id,
+            "last_trade_timestamp": initial_timestamp.isoformat(),
+            "last_trade_cursor": None,
+        }
+        config = CollectorConfig(
+            interval_seconds=1,
+            max_attempts=1,
+            max_trade_pages=100,
+            backoff_initial_seconds=0,
+            jitter_seconds=0,
+        )
+        collector = _ScopeCollector(
+            provider,
+            store,
+            config,
+            candidate_ids=(),
+            clock=lambda: T0,
+            sleep=lambda _seconds: None,
+        )
+        try:
+            collector._rolling_background_discovery_enabled = True
+            collector._scope_draft_preview = {"draft_id": "bounded-trade-pages"}
+            collector._draft_market_request_limit = 4
+            bounded = collector._collect_market(
+                market_id,
+                None,
+                T0,
+                provider=provider,
+                force=True,
+            )
+            bounded_state = store.get_collector_state(state_key)
+            bounded_trade_request_count = len(trade_requests)
+            bounded_trade_requests = tuple(trade_requests)
+
+            resumed_provider = PolymarketAdapter(
+                gamma_url="https://gamma.test",
+                data_api_url="https://data.test",
+                clob_url="https://clob.test",
+                opener=opener,
+            )
+            resumed_collector = _ScopeCollector(
+                resumed_provider,
+                store,
+                config,
+                candidate_ids=(),
+                clock=lambda: T0,
+                sleep=lambda _seconds: None,
+            )
+            try:
+                normal = resumed_collector._collect_market(
+                    market_id,
+                    None,
+                    T0 + timedelta(seconds=1),
+                    provider=resumed_provider,
+                    force=True,
+                )
+                normal_state = store.get_collector_state(state_key)
+            finally:
+                resumed_collector.close()
+        finally:
+            collector.close()
+
+        self.assertEqual(bounded["counters"]["requests"], 4)
+        self.assertEqual(bounded["counters"]["trades_inserted"], 1000)
+        self.assertEqual(bounded_trade_request_count, 1)
+        self.assertIn("offset=0", bounded_trade_requests[0])
+        self.assertEqual(bounded_state["last_trade_cursor"], "1000")
+        self.assertEqual(
+            bounded_state["last_trade_timestamp"],
+            initial_timestamp.isoformat(),
+        )
+        self.assertEqual(
+            bounded_state["pending_trade_timestamp"],
+            T0.isoformat(),
+        )
+        self.assertEqual(normal["counters"]["trade_failures"], 0)
+        self.assertEqual(normal["counters"]["trade_duplicates"], 0)
+        self.assertEqual(normal["counters"]["trades_inserted"], 1000)
+        self.assertEqual(normal_state["last_trade_timestamp"], T0.isoformat())
+        self.assertIsNone(normal_state["last_trade_cursor"])
+        self.assertIsNone(normal_state["pending_trade_timestamp"])
+        self.assertEqual(len(store.trade_payloads), 2000)
+        self.assertEqual(len(trade_requests), 3)
+        self.assertIn("offset=1000", trade_requests[1])
+        self.assertIn("offset=2000", trade_requests[2])
+
+    def test_bounded_adapter_trade_fetch_does_not_lookup_uncached_market(self) -> None:
+        market_id = "real-adapter-bounded-cache-miss"
+        calls: list[str] = []
+
+        def opener(request: object, timeout: float) -> object:
+            del timeout
+            calls.append(str(getattr(request, "full_url", request)))
+            raise AssertionError("bounded trade fetch must not perform an implicit market lookup")
+
+        provider = PolymarketAdapter(
+            gamma_url="https://gamma.test",
+            data_api_url="https://data.test",
+            clob_url="https://clob.test",
+            opener=opener,
+        )
+        collector = _ScopeCollector(
+            provider,
+            _ScopeStore({}),
+            CollectorConfig(
+                interval_seconds=1,
+                max_attempts=1,
+                backoff_initial_seconds=0,
+                jitter_seconds=0,
+            ),
+            candidate_ids=(),
+            clock=lambda: T0,
+            sleep=lambda _seconds: None,
+        )
+        counters = collector._new_counters()
+        collector._scope_draft_preview = {"draft_id": "bounded-cache-miss"}
+        collector._draft_market_request_limit = 1
+        try:
+            with self.assertRaisesRegex(ValueError, "metadata is not cached"):
+                collector._fetch_trades(
+                    market_id,
+                    None,
+                    T0,
+                    counters,
+                    provider=provider,
+                )
+        finally:
+            collector.close()
+        self.assertEqual(counters["requests"], 1)
+        self.assertEqual(calls, [])
+        self.assertFalse(provider.last_trades_complete)
+
     def test_explicit_point_in_time_collection_rejects_future_order_books(self) -> None:
         target = market("future-point-in-time")
 

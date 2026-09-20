@@ -3966,6 +3966,13 @@ def _rolling_rule_scope_market_ids(
                 resolution = None
         except Exception:
             resolution = None
+    draft_provenance = record.get("provenance")
+    draft_bound_record = _rolling_document_is_draft_bound(
+        record,
+        draft_provenance if isinstance(draft_provenance, Mapping) else None,
+    )
+    if resolution is None and draft_bound_record:
+        raise ValueError("RULE_BASED_MARKET_SCOPE_RESOLUTION_INVALID")
     if resolution is not None:
         if hasattr(resolution, "as_dict") and callable(resolution.as_dict):
             resolution = resolution.as_dict()
@@ -3982,19 +3989,150 @@ def _rolling_rule_scope_market_ids(
         matched = resolution.get("matched_markets", ())
         if not isinstance(matched, (list, tuple)):
             raise ValueError("RULE_BASED_MARKET_SCOPE_RESOLUTION_INVALID")
-        result: set[str] = set()
+        matched_by_id: dict[str, Mapping[str, Any]] = {}
         for market in matched:
             if isinstance(market, Mapping):
-                market_id = _binding_value(
-                    market.get("market_id", market.get("id"))
-                )
+                market_id = _binding_value(market.get("market_id", market.get("id")))
+                identity = {
+                    name: _binding_value(market.get(name))
+                    for name in (
+                        "condition_id",
+                        "yes_token_id",
+                        "no_token_id",
+                    )
+                }
             else:
                 market_id = _binding_value(market)
-            if market_id:
-                result.add(market_id)
-        if not result:
+                identity = {}
+            if not market_id:
+                continue
+            prior = matched_by_id.get(market_id)
+            if prior is not None and _canonical_binding(prior) != _canonical_binding(
+                identity
+            ):
+                raise ValueError("RULE_BASED_MARKET_SCOPE_RESOLUTION_INVALID")
+            matched_by_id[market_id] = identity
+        if not matched_by_id:
             raise ValueError("RULE_BASED_MARKET_SCOPE_RESOLUTION_INCOMPLETE")
-        return result
+
+        resolution_provenance = resolution.get("provenance")
+        member_binding = (
+            resolution_provenance.get("member_binding")
+            if isinstance(resolution_provenance, Mapping)
+            else None
+        )
+        draft_bound = draft_bound_record
+        if draft_bound and not isinstance(member_binding, Mapping):
+            raise ValueError("RULE_BASED_MARKET_SCOPE_RESOLUTION_INVALID")
+        if isinstance(member_binding, Mapping):
+            try:
+                canonical_scope = normalize_market_scope(scope)
+            except (TypeError, ValueError, AttributeError):
+                raise ValueError(
+                    "RULE_BASED_MARKET_SCOPE_RESOLUTION_INVALID"
+                ) from None
+            if (
+                canonical_scope.scope_hash != scope_hash
+                or canonical_scope.scope_version != scope_version
+                or not isinstance(resolution.get("policy"), Mapping)
+                or _canonical_binding(resolution["policy"])
+                != _canonical_binding(canonical_scope.as_dict())
+            ):
+                raise ValueError("RULE_BASED_MARKET_SCOPE_RESOLUTION_INVALID")
+            if draft_bound:
+                for field_name in ("draft_id", "draft_hash"):
+                    expected = _binding_value(record.get(field_name))
+                    if expected is None and isinstance(draft_provenance, Mapping):
+                        expected = _binding_value(draft_provenance.get(field_name))
+                    actual = (
+                        _binding_value(resolution_provenance.get(field_name))
+                        if isinstance(resolution_provenance, Mapping)
+                        else None
+                    )
+                    if not expected or actual != expected:
+                        raise ValueError(
+                            "RULE_BASED_MARKET_SCOPE_RESOLUTION_INVALID"
+                        )
+
+        proof_bindings: Any = None
+        if isinstance(member_binding, Mapping):
+            expected = _binding_value(binding.get("candidate_id"))
+            actual = _binding_value(member_binding.get("candidate_id"))
+            if not expected or actual != expected:
+                raise ValueError("RULE_BASED_MARKET_SCOPE_RESOLUTION_INVALID")
+            proof_bindings = member_binding.get("market_bindings")
+            if proof_bindings is None:
+                raise ValueError("RULE_BASED_MARKET_SCOPE_RESOLUTION_INVALID")
+
+        declared_bindings: Any = proof_bindings
+        direct_bindings: Any = None
+        for owner in (
+            record,
+            record.get("provenance"),
+            record.get("payload"),
+        ):
+            if not isinstance(owner, Mapping) or "market_bindings" not in owner:
+                continue
+            direct_bindings = owner.get("market_bindings")
+            break
+        if proof_bindings is not None and direct_bindings is not None:
+            proof_items = (
+                (proof_bindings,)
+                if isinstance(proof_bindings, Mapping)
+                else proof_bindings
+            )
+            direct_items = (
+                (direct_bindings,)
+                if isinstance(direct_bindings, Mapping)
+                else direct_bindings
+            )
+            if not isinstance(proof_items, (list, tuple)) or not isinstance(
+                direct_items, (list, tuple)
+            ):
+                raise ValueError("RULE_BASED_MARKET_SCOPE_RESOLUTION_INVALID")
+            proof_identity = tuple(
+                sorted(
+                    _canonical_binding(item)
+                    for item in proof_items
+                    if isinstance(item, Mapping)
+                )
+            )
+            direct_identity = tuple(
+                sorted(
+                    _canonical_binding(item)
+                    for item in direct_items
+                    if isinstance(item, Mapping)
+                )
+            )
+            if proof_identity != direct_identity:
+                raise ValueError("RULE_BASED_MARKET_SCOPE_RESOLUTION_INVALID")
+            declared_bindings = proof_items
+        if declared_bindings is not None:
+            if isinstance(declared_bindings, Mapping):
+                declared_bindings = (declared_bindings,)
+            if not isinstance(declared_bindings, (list, tuple)):
+                raise ValueError("RULE_BASED_MARKET_SCOPE_RESOLUTION_INVALID")
+            bound_ids: set[str] = set()
+            for raw_binding in declared_bindings:
+                if not isinstance(raw_binding, Mapping):
+                    raise ValueError("RULE_BASED_MARKET_SCOPE_RESOLUTION_INVALID")
+                market_id = _binding_value(
+                    raw_binding.get("market_id", raw_binding.get("id"))
+                )
+                if not market_id or market_id not in matched_by_id:
+                    raise ValueError("RULE_BASED_MARKET_SCOPE_RESOLUTION_INVALID")
+                for field_name in ("condition_id", "yes_token_id", "no_token_id"):
+                    expected = _binding_value(raw_binding.get(field_name))
+                    actual = matched_by_id[market_id].get(field_name)
+                    if not expected or not actual or expected != actual:
+                        raise ValueError("RULE_BASED_MARKET_SCOPE_RESOLUTION_INVALID")
+                if market_id in bound_ids:
+                    raise ValueError("RULE_BASED_MARKET_SCOPE_RESOLUTION_INVALID")
+                bound_ids.add(market_id)
+            if not bound_ids:
+                raise ValueError("RULE_BASED_MARKET_SCOPE_RESOLUTION_INCOMPLETE")
+            return bound_ids
+        return set(matched_by_id)
     # Custom stores may not persist resolutions.  Reuse the canonical resolver
     # against their bounded inventory rather than implementing a second rule
     # matcher here; unresolved or partial results fail closed.
@@ -6474,6 +6612,11 @@ class AutonomousResearchProcessor:
             if draft_preview and isinstance(draft, Mapping)
             else ""
         )
+        draft_id = (
+            str(draft.get("draft_id", "")).strip()
+            if draft_preview and isinstance(draft, Mapping)
+            else ""
+        )
         documents: list[dict[str, Any]] = []
         def mark_invalid(reason: str) -> None:
             self._rolling_last_current_invalid_strategy_count += 1
@@ -6494,6 +6637,10 @@ class AutonomousResearchProcessor:
                 for family in ("momentum", "mean_reversion")
             )
         )
+        member_resolution_timestamp = ensure_utc(now)
+        member_resolution_cache: dict[
+            tuple[str, str, str, str], tuple[dict[str, Any], str]
+        ] = {}
         for spec in draft_specs:
             if not isinstance(spec, Mapping):
                 continue
@@ -6621,15 +6768,71 @@ class AutonomousResearchProcessor:
                     "operational_setup_hash": setup_hash,
                 }
             ).removeprefix("sha256:")[:40]
+            member_resolution_key = (
+                candidate_id,
+                scope_hash,
+                scope_version,
+                member_resolution_timestamp.isoformat(),
+            )
+            cached_member_resolution = member_resolution_cache.get(
+                member_resolution_key
+            )
+            if cached_member_resolution is None:
+                member_resolution = resolve_market_scope(
+                    candidate_id,
+                    {"market_scope": scope_policy.as_dict()},
+                    records,
+                    resolved_at=member_resolution_timestamp,
+                    max_matches=_EXPLORATORY_POOL_CAP,
+                    max_markets=_EXPLORATORY_POOL_CAP,
+                )
+                member_resolution_mapping = member_resolution.as_dict()
+                member_provenance = member_resolution_mapping.get("provenance")
+                member_provenance = (
+                    dict(member_provenance)
+                    if isinstance(member_provenance, Mapping)
+                    else {}
+                )
+                member_provenance.update(
+                    {
+                        "draft_id": draft_id,
+                        "draft_hash": draft_hash,
+                        "draft_bound": bool(draft_id and draft_hash),
+                        "scope_hash": scope_hash,
+                        "scope_version": scope_version,
+                        "member_binding": {
+                            "candidate_id": candidate_id,
+                            "market_bindings": [
+                                dict(binding) for binding in market_bindings
+                            ],
+                        },
+                    }
+                )
+                member_resolution_mapping["provenance"] = member_provenance
+                member_resolution_id = str(
+                    member_resolution_mapping.get("resolution_id", "")
+                ).strip()
+                if callable(resolver_saver):
+                    try:
+                        resolver_saver(member_resolution_mapping, if_absent=True)
+                    except (AttributeError, TypeError, ValueError, RuntimeError):
+                        pass
+                member_resolution_cache[member_resolution_key] = (
+                    member_resolution_mapping,
+                    member_resolution_id,
+                )
+            else:
+                cached_mapping, member_resolution_id = cached_member_resolution
+                member_resolution_mapping = {
+                    **cached_mapping,
+                    "provenance": dict(cached_mapping.get("provenance") or {}),
+                }
+
+
             source_label = (
                 "rolling-scope-draft"
                 if draft_preview
                 else "system-bootstrap-current-market"
-            )
-            draft_id = (
-                str(draft.get("draft_id", "")).strip()
-                if draft_preview and isinstance(draft, Mapping)
-                else ""
             )
             documents.append(
                 {
@@ -6653,8 +6856,8 @@ class AutonomousResearchProcessor:
                     "market_scope": scope_policy.as_dict(),
                     "market_scope_hash": scope_hash,
                     "market_scope_version": scope_version,
-                    "scope_resolution": resolution_mapping,
-                    "scope_resolution_id": resolution_id,
+                    "scope_resolution": member_resolution_mapping,
+                    "scope_resolution_id": member_resolution_id,
                     **(
                         {
                             "operational_setup_hash": setup_hash,
@@ -6686,7 +6889,7 @@ class AutonomousResearchProcessor:
                         "research_mode": "ROLLING_RESEARCH",
                         "source": source_label,
                         "candidate_id": candidate_id,
-                        "scope_resolution_id": resolution_id,
+                        "scope_resolution_id": member_resolution_id,
                         "scope_hash": scope_hash,
                         "scope_version": scope_version,
                         "current_market_ids": list(market_ids),

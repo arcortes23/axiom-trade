@@ -5881,6 +5881,27 @@ class PolymarketCollector:
             return True
         return remaining > self._scope_phase_reserve_seconds() + 1e-6
 
+    def _provider_request_limit(
+        self,
+        endpoint: str | None = None,
+        *,
+        provider_pool: str | None = None,
+    ) -> int | None:
+        """Return the request budget currently governing one provider call."""
+        request_limit = self._draft_precollection_request_limit(
+            endpoint,
+            provider_pool=provider_pool,
+        )
+        if (
+            request_limit is None
+            and isinstance(self._scope_draft_preview, Mapping)
+            and provider_pool == "collection"
+        ):
+            request_limit = self._draft_market_request_limit
+        if request_limit is None and self._rolling_background_discovery_enabled:
+            request_limit = _ROLLING_BOOTSTRAP_REQUEST_BUDGET
+        return request_limit
+
     def _draft_precollection_request_limit(
         self,
         endpoint: str | None = None,
@@ -8645,12 +8666,14 @@ class PolymarketCollector:
         else:
             counters["snapshot_duplicates"] += 1
         last_trade = _parse_iso(state.get("last_trade_timestamp"))
+        pending_trade = _parse_iso(state.get("pending_trade_timestamp"))
         raw_trade_cursor = state.get("last_trade_cursor")
         last_trade_cursor = _normalized_trade_cursor(
             raw_trade_cursor,
             repair_legacy_none=True,
         )
         trade_fetch_failed = False
+        trade_errors_before = int(counters.get("errors", 0))
         try:
             trades = self._fetch_trades(
                 market_id,
@@ -8667,6 +8690,7 @@ class PolymarketCollector:
             self.store.save_collection_error(market_id, collection_observed_at, "trades", str(exc))
             trade_fetch_failed = True
         latest_trade: datetime | None = last_trade
+        batch_trade_highwater: datetime | None = None
         for trade in trades or ():
             if not isinstance(trade, TradePrint):
                 counters["errors"] += 1
@@ -8729,18 +8753,49 @@ class PolymarketCollector:
                 counters["trades_inserted"] += 1
             else:
                 counters["trade_duplicates"] += 1
+            batch_trade_highwater = (
+                max(batch_trade_highwater, trade.timestamp)
+                if batch_trade_highwater is not None
+                else trade.timestamp
+            )
             latest_trade = max(latest_trade, trade.timestamp) if latest_trade else trade.timestamp
+        provider_complete = bool(getattr(provider, "last_trades_complete", True))
+        trade_errors = int(counters.get("errors", 0)) > trade_errors_before
+        pending_highwater = pending_trade
+        if batch_trade_highwater is not None:
+            pending_highwater = (
+                max(pending_highwater, batch_trade_highwater)
+                if pending_highwater is not None
+                else batch_trade_highwater
+            )
         trade_cursor: Any = None
+        pending_trade_timestamp: datetime | None | object = _UNSET
         if trade_fetch_failed:
             latest_trade = last_trade
             trade_cursor = last_trade_cursor
-        elif not getattr(provider, "last_trades_complete", True):
+            pending_trade_timestamp = pending_highwater
+        elif not provider_complete and not trade_errors:
             latest_trade = last_trade
             provider_cursor = _normalized_trade_cursor(
                 getattr(provider, "last_trade_cursor", None),
                 repair_legacy_none=True,
             )
             trade_cursor = provider_cursor or last_trade_cursor
+            pending_trade_timestamp = pending_highwater
+        elif trade_errors:
+            latest_trade = last_trade
+            trade_cursor = last_trade_cursor
+            pending_trade_timestamp = pending_highwater
+        else:
+            completed_highwater = pending_highwater
+            if latest_trade is not None:
+                completed_highwater = (
+                    max(completed_highwater, latest_trade)
+                    if completed_highwater is not None
+                    else latest_trade
+                )
+            latest_trade = completed_highwater
+            pending_trade_timestamp = None
         self._save_market_state(
             state_key,
             state,
@@ -8751,6 +8806,7 @@ class PolymarketCollector:
             source_timestamp=canonical_source_timestamp,
             latest_trade=latest_trade,
             trade_cursor=trade_cursor,
+            pending_trade_timestamp=pending_trade_timestamp,
         )
         return finish(bool(counters["errors"]))
 
@@ -8827,7 +8883,13 @@ class PolymarketCollector:
         provider: Any | None = None,
     ) -> Sequence[TradePrint]:
         provider = provider or self.provider
-
+        provider_pool = "scope" if self._scope_phase_active else "collection"
+        request_limit = self._provider_request_limit(
+            f"trades:{market_id}",
+            provider_pool=provider_pool,
+        )
+        bounded = request_limit is not None
+        max_pages = 1 if bounded else self.config.max_trade_pages
         def call() -> Sequence[TradePrint]:
             method = provider.trades
             kwargs: dict[str, Any] = {"start": last_trade, "end": observed_at}
@@ -8840,7 +8902,9 @@ class PolymarketCollector:
                 for parameter in parameters.values()
             )
             if not parameters or "max_pages" in parameters or accepts_kwargs:
-                kwargs["max_pages"] = self.config.max_trade_pages
+                kwargs["max_pages"] = max_pages
+            if bounded and ("allow_market_lookup" in parameters or accepts_kwargs):
+                kwargs["allow_market_lookup"] = False
             if cursor is not None and (not parameters or "cursor" in parameters or accepts_kwargs):
                 kwargs["cursor"] = cursor
             try:
@@ -9309,18 +9373,10 @@ class PolymarketCollector:
         for attempt in range(self.config.max_attempts):
             request_limit = None
             if charge_request:
-                request_limit = self._draft_precollection_request_limit(
+                request_limit = self._provider_request_limit(
                     endpoint,
                     provider_pool=provider_pool,
                 )
-                if (
-                    request_limit is None
-                    and isinstance(self._scope_draft_preview, Mapping)
-                    and provider_pool == "collection"
-                ):
-                    request_limit = self._draft_market_request_limit
-                if request_limit is None and self._rolling_background_discovery_enabled:
-                    request_limit = _ROLLING_BOOTSTRAP_REQUEST_BUDGET
                 if (
                     request_limit is not None
                     and int(counters.get("requests", 0)) >= request_limit
@@ -9570,6 +9626,7 @@ class PolymarketCollector:
         source_timestamp: datetime | None = None,
         latest_trade: datetime | None = None,
         trade_cursor: Any = _UNSET,
+        pending_trade_timestamp: datetime | None | object = _UNSET,
         cooldown: bool = False,
     ) -> None:
         payload = {
@@ -9589,6 +9646,12 @@ class PolymarketCollector:
             "cooldown_until": self._cooldown_until(observed_at).isoformat() if cooldown else None,
             "stale_after_seconds": self.config.stale_after_seconds,
         }
+        if pending_trade_timestamp is not _UNSET:
+            payload["pending_trade_timestamp"] = (
+                pending_trade_timestamp.isoformat()
+                if pending_trade_timestamp is not None
+                else None
+            )
         self.store.set_collector_state(state_key, payload)
 
 

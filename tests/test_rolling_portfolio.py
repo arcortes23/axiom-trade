@@ -2351,6 +2351,123 @@ class TestRollingPortfolio(unittest.TestCase):
                 (),
                 NOW,
             )
+    def test_rule_scope_member_resolution_preserves_exact_bound_identity(self) -> None:
+        market = {
+            "market_id": "member-market",
+            "condition_id": "member-condition",
+            "yes_token_id": "member-yes",
+            "no_token_id": "member-no",
+        }
+        member_binding = {
+            "candidate_id": "rule-member",
+            "strategy_version_id": "strategy-version-member",
+            "research_trial_id": "research-trial-member",
+            "strategy_hash": "sha256:" + ("a" * 64),
+            "operational_setup_hash": "sha256:" + ("b" * 64),
+            "market_bindings": [market],
+        }
+        scope = normalize_market_scope(
+            {
+                "schema_version": "1",
+                "mode": "RULE_BASED_MARKETS",
+                "instrument": "POLYMARKET",
+                "categories": [],
+                "market_ids": [],
+                "filters": {},
+                "regime_restrictions": {},
+                "provenance": "canonical",
+            }
+        )
+        record = {
+            **member_binding,
+            "market_scope": scope.as_dict(),
+            "market_scope_hash": scope.scope_hash,
+            "market_scope_version": scope.scope_version,
+            "market_bindings": [market],
+        }
+
+        class MemberResolutionStore:
+            def load_market_scope_resolution(self, *_args: object, **_kwargs: object) -> object:
+                return {
+                    "candidate_id": "rule-member",
+                    "scope_hash": scope.scope_hash,
+                    "scope_version": scope.scope_version,
+                    "status": "MATCHED",
+                    "policy": scope.as_dict(),
+                    "matched_markets": [market],
+                    "provenance": {"member_binding": member_binding},
+                }
+
+        self.assertEqual(
+            _rolling_rule_scope_market_ids(
+                MemberResolutionStore(),
+                record,
+                record,
+                (),
+                NOW,
+            ),
+            {"member-market"},
+        )
+
+    def test_rule_scope_foreign_member_proof_is_rejected(self) -> None:
+        market = {
+            "market_id": "member-market",
+            "condition_id": "member-condition",
+            "yes_token_id": "member-yes",
+            "no_token_id": "member-no",
+        }
+        scope = normalize_market_scope(
+            {
+                "schema_version": "1",
+                "mode": "RULE_BASED_MARKETS",
+                "instrument": "POLYMARKET",
+                "categories": [],
+                "market_ids": [],
+                "filters": {},
+                "regime_restrictions": {},
+                "provenance": "canonical",
+            }
+        )
+        record = {
+            "candidate_id": "rule-member",
+            "strategy_version_id": "strategy-version-member",
+            "research_trial_id": "research-trial-member",
+            "strategy_hash": "sha256:" + ("a" * 64),
+            "operational_setup_hash": "sha256:" + ("b" * 64),
+            "market_scope": scope.as_dict(),
+            "market_scope_hash": scope.scope_hash,
+            "market_scope_version": scope.scope_version,
+            "market_bindings": [market],
+        }
+
+        class ForeignResolutionStore:
+            def load_market_scope_resolution(self, *_args: object, **_kwargs: object) -> object:
+                return {
+                    "candidate_id": "rule-member",
+                    "scope_hash": scope.scope_hash,
+                    "scope_version": scope.scope_version,
+                    "status": "MATCHED",
+                    "policy": scope.as_dict(),
+                    "matched_markets": [market],
+                    "provenance": {
+                        "member_binding": {
+                            **record,
+                            "candidate_id": "foreign-member",
+                        }
+                    },
+                }
+
+        with self.assertRaisesRegex(
+            ValueError, "RULE_BASED_MARKET_SCOPE_RESOLUTION_INVALID"
+        ):
+            _rolling_rule_scope_market_ids(
+                ForeignResolutionStore(),
+                record,
+                record,
+                (),
+                NOW,
+            )
+
 
     def test_replay_partial_scope_is_ineligible_before_payload_load(self) -> None:
         dataset_id = "Polymarket-recorded-book-replay"

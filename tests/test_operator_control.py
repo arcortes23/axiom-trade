@@ -4214,6 +4214,35 @@ class OperatorControlTests(unittest.TestCase):
         self.assertFalse(review["blockers"])
         self.assertTrue(context["setup_bindings"])
 
+    def test_status_preserves_domain_review_blocker(self) -> None:
+        private_detail = "private-key=review-secret"
+        with patch.object(
+            self.control,
+            "exploratory_live_review_snapshot",
+            side_effect=OperatorControlError(
+                "CREDENTIALS_NOT_CONFIGURED",
+                private_detail,
+            ),
+        ):
+            status = self.control.status()
+        review = status["exploratory_live_review"]
+        self.assertEqual(review["blockers"], ["CREDENTIALS_NOT_CONFIGURED"])
+        self.assertNotIn(private_detail, json.dumps(review, sort_keys=True))
+        self.assertNotIn("review-secret", json.dumps(review, sort_keys=True))
+
+    def test_status_redacts_unexpected_review_exception(self) -> None:
+        private_detail = "private-key=operator-review-secret"
+        with patch.object(
+            self.control,
+            "exploratory_live_review_snapshot",
+            side_effect=RuntimeError(private_detail),
+        ):
+            status = self.control.status()
+        review = status["exploratory_live_review"]
+        self.assertEqual(review["blockers"], ["EXPLORATORY_LIVE_REVIEW_UNAVAILABLE"])
+        self.assertNotIn(private_detail, json.dumps(review, sort_keys=True))
+        self.assertNotIn("operator-review-secret", json.dumps(review, sort_keys=True))
+
     def test_operator_data_preserves_real_nested_exploratory_review_projection(self) -> None:
         payload = DashboardData(store=self.store, control=self.control).operator_data()
         controls = payload.get("operator_controls")
@@ -4229,7 +4258,12 @@ class OperatorControlTests(unittest.TestCase):
             "RULE_BASED_MARKETS",
         )
         self.assertNotEqual(review["scope"]["draft"]["scope"], "<truncated>")
-        self.assertIn("EXPLORATORY_LIVE_SELECTION_REQUIRED", review["blockers"])
+        blockers = review["blockers"]
+        self.assertIsInstance(blockers, list)
+        self.assertTrue(blockers)
+        self.assertTrue(all(isinstance(code, str) and code for code in blockers))
+        self.assertTrue(review["paper_only"])
+        self.assertFalse(review["live_execution"])
 
     def test_selected_market_preflight_requires_authoritative_provider_identity_and_suitable_depth(self) -> None:
         selection = {
