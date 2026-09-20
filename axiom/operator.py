@@ -42,6 +42,7 @@ from .canary import (
     _canary_selection_member_is_proposed,
     credential_fingerprint,
 )
+from .experiment_plan import normalize_market_scope
 from .canary_positions import (
     RECOVERY_ACTION,
     RECOVERY_CONFIRMATION,
@@ -63,6 +64,7 @@ from .bootstrap import BTC_HISTORY_START, HistoricalBootstrapper
 from .crypto_universe import load_crypto_universe
 from .data import BinanceAdapter
 from .domain import utc_now
+from .forward import _operational_setup_hash
 from .node import (
     EXECUTION_PROFILE_ENV,
     ISOLATED_EXECUTION_PROFILE,
@@ -71,6 +73,7 @@ from .node import (
     _pid_matches_node,
     normalized_execution_profile,
 )
+from .storage import AxiomStore
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -201,6 +204,25 @@ _ISOLATED_OPERATOR_BLOCKED_ACTIONS = frozenset(
 _SYSTEM_EXPLORATORY_ADMISSION_CONFIG_KEY = "rolling_admission_policy_active"
 _SYSTEM_EXPLORATORY_OPERATING_POLICY_KEY = "rolling_exploratory_operating_policy"
 CANARY_CONNECTIVITY_CONFIG_KEY = "canary_connectivity_status"
+ROLLING_EXPLORATORY_SCOPE_DRAFT_CONFIG_KEY = "rolling_exploratory_scope_draft"
+ROLLING_EXPLORATORY_SCOPE_DRAFT_ID = "rolling-exploratory-scope-draft:polymarket:standard:v1"
+ROLLING_EXPLORATORY_SCOPE_DRAFT_VERSION = "1"
+ROLLING_EXPLORATORY_SUPPORTED_MARKET_TYPES = ("prediction",)
+ROLLING_EXPLORATORY_SCOPE_EXCLUSIONS = (
+    "COMBO",
+    "UNSUPPORTED_MARKET_TYPE",
+    "NON_BINARY",
+    "CLOSED",
+    "NOT_ACCEPTING_ORDERS",
+    "NO_ORDER_BOOK",
+    "STALE_MARKET",
+    "INSUFFICIENT_LIQUIDITY",
+    "INSUFFICIENT_DEPTH",
+    "INVALID_TOKEN_IDENTITY",
+    "INVALID_STRATEGY_SETUP",
+    "INSUFFICIENT_DATA",
+    "FAILED_EVALUATION",
+)
 
 
 
@@ -889,6 +911,120 @@ def _safe_value(value: Any, *, depth: int = 0) -> Any:
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value if not isinstance(value, str) or len(value) <= 1024 else value[:1021] + "..."
     return str(value)[:1024]
+_PUBLIC_MARKET_BINDING_FIELDS = (
+    "market_id",
+    "condition_id",
+    "yes_token_id",
+    "no_token_id",
+    "outcome_token_id",
+    "outcome_token_ids",
+)
+_PUBLIC_DRAFT_MEMBER_FIELDS = (
+    "strategy_version_id",
+    "candidate_id",
+    "draft_bound",
+    "draft_id",
+    "draft_hash",
+    "scope_hash",
+    "scope_version",
+    "operational_setup_hash",
+)
+_PUBLIC_SETUP_BINDING_FIELDS = (
+    "strategy_version_id",
+    "candidate_id",
+    "setup_id",
+    "setup_version",
+    "setup_hash",
+    "operational_setup_hash",
+    "draft_bound",
+    "draft_id",
+    "draft_hash",
+    "scope_hash",
+    "scope_version",
+)
+
+
+def _public_market_bindings(value: Any) -> list[dict[str, Any]]:
+    """Project bounded, nonsecret market identity bindings explicitly."""
+    if not isinstance(value, (list, tuple)):
+        return []
+    projected: list[dict[str, Any]] = []
+    for raw in value[:64]:
+        if not isinstance(raw, Mapping):
+            continue
+        item: dict[str, Any] = {}
+        for key in _PUBLIC_MARKET_BINDING_FIELDS:
+            child = raw.get(key)
+            if key == "outcome_token_ids":
+                if isinstance(child, (list, tuple, set, frozenset)):
+                    ids = [
+                        str(token).strip()
+                        for token in list(child)[:32]
+                        if str(token).strip()
+                    ]
+                    if ids:
+                        item[key] = ids
+                continue
+            if child not in (None, ""):
+                item[key] = str(child).strip()
+        if item:
+            projected.append(item)
+    return projected
+
+
+def _public_draft_member_binding(value: Any) -> dict[str, Any]:
+    """Project one draft/member binding without generic depth truncation."""
+    if not isinstance(value, Mapping):
+        return {}
+    projected: dict[str, Any] = {}
+    for key in _PUBLIC_DRAFT_MEMBER_FIELDS:
+        child = value.get(key)
+        if key == "draft_bound":
+            if child is not None:
+                projected[key] = child is True
+        elif child not in (None, ""):
+            projected[key] = str(child).strip()
+    bindings = value.get("market_bindings")
+    if not isinstance(bindings, (list, tuple)):
+        bindings = value.get("current_market_bindings")
+    if isinstance(bindings, (list, tuple)):
+        projected["market_bindings"] = _public_market_bindings(bindings)
+    return projected
+
+
+def _public_draft_member_bindings(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [
+        projected
+        for projected in (
+            _public_draft_member_binding(item) for item in value[:64]
+        )
+        if projected
+    ]
+
+
+def _public_setup_bindings(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, (list, tuple)):
+        return []
+    projected: list[dict[str, Any]] = []
+    for raw in value[:64]:
+        if not isinstance(raw, Mapping):
+            continue
+        item: dict[str, Any] = {}
+        for key in _PUBLIC_SETUP_BINDING_FIELDS:
+            child = raw.get(key)
+            if key == "draft_bound":
+                if child is not None:
+                    item[key] = child is True
+            elif child not in (None, ""):
+                item[key] = str(child).strip()
+        bindings = raw.get("market_bindings")
+        if isinstance(bindings, (list, tuple)):
+            item["market_bindings"] = _public_market_bindings(bindings)
+        if item:
+            projected.append(item)
+    return projected
 _ROLLING_POLICY_ID_ALIASES = ("policy_id", "id", "draft_id")
 _ROLLING_POLICY_VERSION_ALIASES = ("version", "policy_version", "draft_version")
 _ROLLING_POLICY_HASH_ALIASES = ("config_hash", "policy_hash", "draft_hash")
@@ -1616,6 +1752,7 @@ class OperatorControlPlane:
         self._reconcile_pending_canary_selection_binding()
         self._research_processor = AutonomousResearchProcessor(self.store, clock=utc_now)
         self._rolling_bootstrap_error: str | None = None
+        self._rolling_scope_draft_error: str | None = None
         if system_bootstrap_enabled and self.execution_profile == PRODUCTION_EXECUTION_PROFILE:
             try:
                 self._bootstrap_system_exploratory_admission_policy()
@@ -1627,6 +1764,531 @@ class OperatorControlPlane:
                     exc.code,
                 )
                 _LOGGER.warning("rolling admission bootstrap blocked: %s", exc.code)
+        if self.execution_profile == PRODUCTION_EXECUTION_PROFILE:
+            try:
+                self._prepare_rolling_exploratory_scope_draft()
+            except OperatorControlError as exc:
+                self._rolling_scope_draft_error = exc.code
+                _LOGGER.warning("rolling scope draft preparation blocked: %s", exc.code)
+    def rolling_exploratory_scope_draft(self) -> dict[str, Any]:
+        """Project the canonical paper-only broad Polymarket scope draft.
+
+        The draft is deliberately separate from the active system operating
+        scope and every member's frozen scope. It is a discovery/evaluation
+        input only; no selection, allocation, canary, or execution authority is
+        changed here.
+        """
+        scope_policy = normalize_market_scope(
+            {
+                "schema_version": "1",
+                "mode": "RULE_BASED_MARKETS",
+                "instrument": "POLYMARKET",
+                "categories": [],
+                "market_ids": [],
+                "filters": {},
+                "regime_restrictions": {},
+                "provenance": "canonical",
+            }
+        )
+        scope = scope_policy.as_dict()
+        loader = getattr(self.store, "get_operator_config", None)
+        setter = getattr(self.store, "set_operator_config", None)
+
+        def config_value(key: str) -> Mapping[str, Any]:
+            if not callable(loader):
+                return {}
+            try:
+                value = loader(key, None)
+            except Exception:
+                return {}
+            return dict(value) if isinstance(value, Mapping) else {}
+
+        operating = config_value(_SYSTEM_EXPLORATORY_OPERATING_POLICY_KEY)
+        active = config_value(_SYSTEM_EXPLORATORY_ADMISSION_CONFIG_KEY)
+        operating_scope = operating.get("scope")
+        active_scope = active.get("operating_policy", {}).get("scope") if isinstance(
+            active.get("operating_policy"), Mapping
+        ) else None
+        operating_scope = (
+            operating_scope
+            if isinstance(operating_scope, Mapping)
+            else active_scope
+            if isinstance(active_scope, Mapping)
+            else {}
+        )
+        active_scope_ref = {
+            "source": _SYSTEM_EXPLORATORY_OPERATING_POLICY_KEY,
+            "scope_hash": (
+                operating.get("scope_hash")
+                or operating.get("market_scope_hash")
+                or (
+                    "sha256:" + self._rolling_canonical_hash(operating_scope)
+                    if operating_scope
+                    else None
+                )
+            ),
+            "scope_version": operating.get("scope_version")
+            or operating.get("market_scope_version")
+            or (str(operating_scope.get("schema_version")) if operating_scope else None),
+        }
+        frozen_scope_ref = {
+            "source": _SYSTEM_EXPLORATORY_ADMISSION_CONFIG_KEY,
+            "scope_hash": active.get("scope_hash")
+            or active.get("market_scope_hash")
+            or active_scope_ref["scope_hash"],
+            "scope_version": active.get("scope_version")
+            or active.get("market_scope_version")
+            or active_scope_ref["scope_version"],
+        }
+        desired: dict[str, Any] = {
+            "draft_id": ROLLING_EXPLORATORY_SCOPE_DRAFT_ID,
+            "status": "DRAFT",
+            "scope": scope,
+            "scope_hash": scope_policy.scope_hash,
+            "scope_version": ROLLING_EXPLORATORY_SCOPE_DRAFT_VERSION,
+            "supported_market_types": list(ROLLING_EXPLORATORY_SUPPORTED_MARKET_TYPES),
+            "category_restriction": {"mode": "UNRESTRICTED", "categories": []},
+            "exclusions": list(ROLLING_EXPLORATORY_SCOPE_EXCLUSIONS),
+            "paper_only": True,
+            "live_execution": False,
+            "allocation_active": False,
+            "canary_armed": False,
+            "policy_provenance": {
+                "operating_policy_id": operating.get("policy_id"),
+                "operating_policy_version": operating.get("version")
+                or operating.get("policy_version"),
+                "operating_policy_hash": operating.get("config_hash"),
+                "active_policy_id": active.get("policy_id"),
+                "active_policy_version": active.get("version")
+                or active.get("policy_version"),
+                "active_policy_hash": active.get("config_hash"),
+                "active_scope": active_scope_ref,
+                "frozen_scope": frozen_scope_ref,
+            },
+            "setup_provenance": {
+                "source": _SYSTEM_EXPLORATORY_ADMISSION_CONFIG_KEY,
+                "binding": "selected_member.operational_setup",
+                "hash_field": "operational_setup_hash",
+                "templates": ["momentum", "mean_reversion"],
+                "retained": True,
+            },
+            "trace_requirements": {
+                "discovery": {
+                    "source": "PolymarketCollector",
+                    "pool_cap": 10,
+                    "paper_only": True,
+                },
+                "materialization": {
+                    "fresh_market_metadata": True,
+                    "fresh_selected_token_book": True,
+                    "fresh_token_identity": True,
+                },
+                "evaluation": {
+                    "templates": ["momentum", "mean_reversion"],
+                    "strategy_setup_required": True,
+                    "data_quality_required": True,
+                    "liquidity_required": True,
+                    "depth_required": True,
+                    "sizing_required": True,
+                },
+            },
+        }
+        desired["draft_hash"] = "sha256:" + self._rolling_canonical_hash(desired)
+        if callable(loader):
+            try:
+                existing = loader(ROLLING_EXPLORATORY_SCOPE_DRAFT_CONFIG_KEY, None)
+            except Exception as exc:
+                raise OperatorControlError(
+                    "EXPLORATORY_SCOPE_DRAFT_STORAGE_UNAVAILABLE",
+                    type(exc).__name__,
+                ) from exc
+        else:
+            existing = None
+        if isinstance(existing, Mapping):
+            current = dict(existing)
+            immutable = dict(current)
+            immutable.pop("draft_hash", None)
+            expected = dict(desired)
+            expected.pop("draft_hash", None)
+            if (
+                immutable != expected
+                or current.get("draft_hash") != desired["draft_hash"]
+                or current.get("status") != "DRAFT"
+            ):
+                raise OperatorControlError("EXPLORATORY_SCOPE_DRAFT_MISMATCH")
+            return current
+        return dict(desired)
+
+    def _prepare_rolling_exploratory_scope_draft(self) -> dict[str, Any]:
+        """Persist the canonical scope draft during startup or explicit review."""
+        draft = self.rolling_exploratory_scope_draft()
+        loader = getattr(self.store, "get_operator_config", None)
+        setter = getattr(self.store, "set_operator_config", None)
+        existing = (
+            loader(ROLLING_EXPLORATORY_SCOPE_DRAFT_CONFIG_KEY, None)
+            if callable(loader)
+            else None
+        )
+        if isinstance(existing, Mapping):
+            return dict(existing)
+        if not callable(setter):
+            raise OperatorControlError("EXPLORATORY_SCOPE_DRAFT_STORAGE_UNAVAILABLE")
+        try:
+            setter(ROLLING_EXPLORATORY_SCOPE_DRAFT_CONFIG_KEY, draft)
+        except Exception as exc:
+            raise OperatorControlError(
+                "EXPLORATORY_SCOPE_DRAFT_SAVE_FAILED",
+                type(exc).__name__,
+            ) from exc
+        return dict(draft)
+    @staticmethod
+    def _member_binding_value(member: Mapping[str, Any], *keys: str) -> Any:
+        for source in (
+            member,
+            member.get("provenance"),
+            member.get("scope_resolution"),
+            member.get("market_scope"),
+            member.get("operational_setup"),
+        ):
+            if not isinstance(source, Mapping):
+                continue
+            for key in keys:
+                value = source.get(key)
+                if value not in (None, ""):
+                    return value
+        return None
+
+    def _draft_member_binding(
+        self,
+        member: Mapping[str, Any],
+        draft: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        """Return exact immutable draft/member identity, or fail closed."""
+        provenance = member.get("provenance")
+        provenance = provenance if isinstance(provenance, Mapping) else {}
+        draft_bound = member.get("draft_bound") is True or provenance.get("draft_bound") is True
+        draft_id = str(
+            self._member_binding_value(member, "draft_id") or ""
+        ).strip()
+        draft_hash = str(
+            self._member_binding_value(member, "draft_hash") or ""
+        ).strip()
+        scope_hash = str(
+            self._member_binding_value(member, "scope_hash", "market_scope_hash") or ""
+        ).strip()
+        scope_version = str(
+            self._member_binding_value(member, "scope_version", "market_scope_version") or ""
+        ).strip()
+        expected_id = str(draft.get("draft_id") or "").strip()
+        expected_hash = str(draft.get("draft_hash") or "").strip()
+        expected_scope_hash = str(draft.get("scope_hash") or "").strip()
+        expected_scope_version = str(draft.get("scope_version") or "").strip()
+        setup = member.get("operational_setup")
+        if not isinstance(setup, Mapping):
+            setup = provenance.get("operational_setup")
+        setup_hash = str(
+            self._member_binding_value(
+                member, "operational_setup_hash", "setup_hash"
+            )
+            or ""
+        ).strip()
+        if not isinstance(setup, Mapping) or not setup_hash:
+            return None
+        try:
+            if _operational_setup_hash(setup) != setup_hash:
+                return None
+        except (TypeError, ValueError, OverflowError, RecursionError):
+            return None
+        if (
+            not draft_bound
+            or not draft_id
+            or not draft_hash
+            or not scope_hash
+            or not scope_version
+            or not setup_hash
+            or draft_id != expected_id
+            or draft_hash != expected_hash
+            or scope_hash != expected_scope_hash
+            or scope_version != expected_scope_version
+        ):
+            return None
+
+        raw_bindings = member.get("market_bindings")
+        if not isinstance(raw_bindings, (list, tuple)):
+            raw_bindings = member.get("current_market_bindings")
+        if not isinstance(raw_bindings, (list, tuple)):
+            raw_bindings = provenance.get("market_bindings")
+        if not isinstance(raw_bindings, (list, tuple)):
+            scope_resolution = member.get("scope_resolution")
+            scope_resolution = (
+                scope_resolution if isinstance(scope_resolution, Mapping) else {}
+            )
+            raw_bindings = scope_resolution.get("market_bindings")
+            if not isinstance(raw_bindings, (list, tuple)):
+                raw_bindings = scope_resolution.get("current_market_bindings")
+        if not isinstance(raw_bindings, (list, tuple)):
+            raw_bindings = provenance.get("current_market_bindings")
+        bindings: list[dict[str, Any]] = []
+        if isinstance(raw_bindings, (list, tuple)):
+            for raw_binding in raw_bindings:
+                if not isinstance(raw_binding, Mapping):
+                    return None
+                market_id = str(raw_binding.get("market_id") or "").strip()
+                condition_id = str(raw_binding.get("condition_id") or "").strip()
+                yes_token_id = str(raw_binding.get("yes_token_id") or "").strip()
+                no_token_id = str(raw_binding.get("no_token_id") or "").strip()
+                outcome_token_id = str(raw_binding.get("outcome_token_id") or "").strip()
+                raw_outcome_ids = raw_binding.get("outcome_token_ids")
+                outcome_token_ids = [
+                    str(value).strip()
+                    for value in (raw_outcome_ids or ())
+                    if str(value).strip()
+                ] if isinstance(raw_outcome_ids, (list, tuple, set)) else []
+                if (
+                    not market_id
+                    or not condition_id
+                    or (
+                        not yes_token_id
+                        and not no_token_id
+                        and not outcome_token_id
+                        and not outcome_token_ids
+                    )
+                ):
+                    return None
+                binding: dict[str, Any] = {
+                    "market_id": market_id,
+                    "condition_id": condition_id,
+                }
+                if yes_token_id:
+                    binding["yes_token_id"] = yes_token_id
+                if no_token_id:
+                    binding["no_token_id"] = no_token_id
+                if outcome_token_id:
+                    binding["outcome_token_id"] = outcome_token_id
+                if outcome_token_ids:
+                    binding["outcome_token_ids"] = outcome_token_ids
+                bindings.append(binding)
+        else:
+            market_id = str(
+                self._member_binding_value(member, "market_id", "market") or ""
+            ).strip()
+            condition_id = str(
+                self._member_binding_value(member, "condition_id", "condition") or ""
+            ).strip()
+            yes_token_id = str(
+                self._member_binding_value(member, "yes_token_id", "yes_token") or ""
+            ).strip()
+            no_token_id = str(
+                self._member_binding_value(member, "no_token_id", "no_token") or ""
+            ).strip()
+            outcome_token_id = str(
+                self._member_binding_value(member, "outcome_token_id", "token_id") or ""
+            ).strip()
+            raw_outcome_ids = self._member_binding_value(member, "outcome_token_ids")
+            outcome_token_ids = [
+                str(value).strip()
+                for value in (raw_outcome_ids or ())
+                if str(value).strip()
+            ] if isinstance(raw_outcome_ids, (list, tuple, set)) else []
+            if (
+                not market_id
+                or not condition_id
+                or (
+                    not yes_token_id
+                    and not no_token_id
+                    and not outcome_token_id
+                    and not outcome_token_ids
+                )
+            ):
+                return None
+            binding: dict[str, Any] = {
+                "market_id": market_id,
+                "condition_id": condition_id,
+            }
+            if yes_token_id:
+                binding["yes_token_id"] = yes_token_id
+            if no_token_id:
+                binding["no_token_id"] = no_token_id
+            if outcome_token_id:
+                binding["outcome_token_id"] = outcome_token_id
+            if outcome_token_ids:
+                binding["outcome_token_ids"] = outcome_token_ids
+            bindings.append(binding)
+        if not self._draft_member_lineage_is_current(member, draft, bindings):
+            return None
+        return {
+            "strategy_version_id": str(member.get("strategy_version_id") or "").strip(),
+            "candidate_id": str(member.get("candidate_id") or "").strip() or None,
+            "draft_bound": True,
+            "draft_id": draft_id,
+            "draft_hash": draft_hash,
+            "scope_hash": scope_hash,
+            "scope_version": scope_version,
+            "operational_setup_hash": setup_hash,
+            "market_bindings": bindings,
+        }
+    def _draft_member_lineage_is_current(
+        self,
+        member: Mapping[str, Any],
+        draft: Mapping[str, Any],
+        bindings: list[dict[str, str]],
+    ) -> bool:
+        """Require draft flags to resolve to persisted strategy and markets."""
+        strategy_id = str(member.get("strategy_version_id") or "").strip()
+        candidate_id = str(member.get("candidate_id") or "").strip()
+        if not strategy_id or not candidate_id:
+            return False
+        provenance = member.get("provenance")
+        provenance = provenance if isinstance(provenance, Mapping) else {}
+        setup = member.get("operational_setup")
+        if not isinstance(setup, Mapping):
+            setup = provenance.get("operational_setup")
+        setup_hash = str(
+            self._member_binding_value(
+                member, "operational_setup_hash", "setup_hash"
+            )
+            or ""
+        ).strip()
+        if not isinstance(setup, Mapping) or not setup_hash:
+            return False
+        try:
+            if _operational_setup_hash(setup) != setup_hash:
+                return False
+        except (TypeError, ValueError, OverflowError, RecursionError):
+            return False
+        strategy_loader = getattr(self.store, "load_strategy_version", None)
+        if not callable(strategy_loader):
+            return False
+        try:
+            strategy = strategy_loader(strategy_id)
+        except Exception:
+            return False
+        if not isinstance(strategy, Mapping):
+            return False
+        stored_strategy_id = str(
+            strategy.get("strategy_version_id") or strategy.get("id") or ""
+        ).strip()
+        if stored_strategy_id and stored_strategy_id != strategy_id:
+            return False
+        candidate_loader = getattr(self.store, "load_candidate_lifecycle", None)
+        if not callable(candidate_loader):
+            return False
+        try:
+            candidate = candidate_loader(candidate_id)
+        except Exception:
+            return False
+        if not isinstance(candidate, Mapping):
+            return False
+        payload = candidate.get("payload")
+        payload = payload if isinstance(payload, Mapping) else candidate
+        payload_strategy_id = str(
+            payload.get("strategy_version_id") or ""
+        ).strip()
+        if payload_strategy_id and payload_strategy_id != strategy_id:
+            return False
+        payload_scope_hash = str(
+            payload.get("scope_hash") or payload.get("market_scope_hash") or ""
+        ).strip()
+        payload_scope_version = str(
+            payload.get("scope_version") or payload.get("market_scope_version") or ""
+        ).strip()
+        if payload_scope_hash and payload_scope_hash != str(
+            member.get("scope_hash") or member.get("market_scope_hash") or ""
+        ).strip():
+            return False
+        if payload_scope_version and payload_scope_version != str(
+            member.get("scope_version") or member.get("market_scope_version") or ""
+        ).strip():
+            return False
+        resolution_loader = getattr(self.store, "load_market_scope_resolution", None)
+        member_scope_hash = str(
+            member.get("scope_hash") or member.get("market_scope_hash") or ""
+        ).strip()
+        member_scope_version = str(
+            member.get("scope_version") or member.get("market_scope_version") or ""
+        ).strip()
+        resolution = None
+        if callable(resolution_loader):
+            try:
+                resolution = resolution_loader(
+                    candidate_id,
+                    scope_hash=member_scope_hash,
+                    scope_version=member_scope_version,
+                )
+            except TypeError:
+                try:
+                    resolution = resolution_loader(candidate_id)
+                except Exception:
+                    resolution = None
+            except Exception:
+                resolution = None
+        if resolution is None:
+            resolution = member.get("scope_resolution")
+            if not isinstance(resolution, Mapping):
+                resolution = provenance.get("scope_resolution")
+        if resolution is None:
+            return False
+        if isinstance(resolution, Mapping):
+            resolution_hash = str(resolution.get("scope_hash") or "").strip()
+            resolution_version = str(resolution.get("scope_version") or "").strip()
+            matched = resolution.get("matched_markets")
+        else:
+            resolution_hash = str(getattr(resolution, "scope_hash", "") or "").strip()
+            resolution_version = str(
+                getattr(resolution, "scope_version", "") or ""
+            ).strip()
+            matched = getattr(resolution, "matched_markets", None)
+        if (
+            resolution_hash != member_scope_hash
+            or resolution_version != member_scope_version
+            or not isinstance(matched, (list, tuple))
+        ):
+            return False
+        for expected in bindings:
+            found = False
+            for market in matched:
+                if not isinstance(market, Mapping):
+                    continue
+                if str(market.get("market_id") or "").strip() != expected["market_id"]:
+                    continue
+                if str(market.get("condition_id") or "").strip() != expected["condition_id"]:
+                    continue
+                if expected.get("yes_token_id") and str(
+                    market.get("yes_token_id") or ""
+                ).strip() != expected["yes_token_id"]:
+                    continue
+                if expected.get("no_token_id") and str(
+                    market.get("no_token_id") or ""
+                ).strip() != expected["no_token_id"]:
+                    continue
+                outcome_token_id = expected.get("outcome_token_id")
+                if outcome_token_id:
+                    outcome_ids = market.get("outcome_token_ids")
+                    if isinstance(outcome_ids, (list, tuple, set)):
+                        if outcome_token_id not in {
+                            str(value).strip() for value in outcome_ids
+                        }:
+                            continue
+                    elif str(market.get("outcome_token_id") or "").strip() != outcome_token_id:
+                        continue
+                expected_outcome_ids = expected.get("outcome_token_ids")
+                if expected_outcome_ids:
+                    observed_outcome_ids = market.get("outcome_token_ids")
+                    if not isinstance(observed_outcome_ids, (list, tuple, set)):
+                        observed_outcome_ids = (
+                            [market.get("outcome_token_id")]
+                            if market.get("outcome_token_id")
+                            else []
+                        )
+                    if set(expected_outcome_ids) != {
+                        str(value).strip() for value in observed_outcome_ids
+                    }:
+                        continue
+                found = True
+                break
+            if not found:
+                return False
+        return bool(bindings)
     def risk_settings_snapshot(self) -> dict[str, Any]:
         """Return the bounded persisted active/draft risk settings projection."""
         snapshot = self.settings.snapshot()
@@ -1710,7 +2372,9 @@ class OperatorControlPlane:
             raise OperatorControlError(f"EXECUTION_AUTHORIZATION_{field.upper()}_INVALID")
         return stamp.astimezone(timezone.utc).isoformat()
 
-    def _authorization_context(self) -> dict[str, Any]:
+    def _authorization_context(
+        self, *, require_draft_members: bool = False
+    ) -> dict[str, Any]:
         """Derive immutable authorization bindings from persisted state.
 
         The browser supplies intent and bounded stop values only.  Strategy,
@@ -1817,9 +2481,9 @@ class OperatorControlPlane:
                 policy_identity.get("config_hash")
                 or policy_identity.get("policy_hash")
                 or selection.get("policy_hash")
-                or selection.get("config_hash")
                 or ""
             ).strip()
+            or None
         )
         policy_id = str(
             policy_identity.get("policy_id")
@@ -1876,13 +2540,102 @@ class OperatorControlPlane:
                     type(exc).__name__,
                 ) from exc
         scope = scope if isinstance(scope, Mapping) else {}
-        scope_hash = self._rolling_canonical_hash(scope)
-        scope_version = str(
+        active_scope_hash = "sha256:" + self._rolling_canonical_hash(scope)
+        active_scope_version = str(
             scope.get("scope_version")
             or scope.get("version")
             or scope.get("snapshot_version")
             or "scope-v1"
         ).strip()[:128]
+        scope_draft = self.rolling_exploratory_scope_draft()
+        draft_scope = scope_draft.get("scope")
+        draft_scope = draft_scope if isinstance(draft_scope, Mapping) else {}
+        scope_hash = str(scope_draft.get("scope_hash") or "").strip()
+        scope_version = str(scope_draft.get("scope_version") or "").strip()[:128]
+        draft_member_bindings: list[dict[str, Any]] = []
+        if require_draft_members:
+            for member in members[:64]:
+                if not isinstance(member, Mapping):
+                    continue
+                status = str(
+                    member.get("status") or member.get("stage") or ""
+                ).strip().upper()
+                if bool(member.get("rejected")) or status == "REJECTED":
+                    continue
+                allocation = _rolling_decimal(
+                    member.get("allocation", member.get("proposed_allocation"))
+                )
+                relevant = (
+                    status in {"ACTIVE", "REDUCE", "PAPER"}
+                    or (allocation is not None and allocation > 0)
+                    or _canary_selection_member_is_funded(member)
+                    or _canary_selection_member_is_proposed(member)
+                )
+                if not relevant:
+                    continue
+                binding = self._draft_member_binding(member, scope_draft)
+                if binding is None:
+                    raise OperatorControlError(
+                        "EXPLORATORY_SCOPE_DRAFT_MEMBER_BINDING_REQUIRED"
+                    )
+                draft_member_bindings.append(binding)
+            for binding in draft_member_bindings:
+                for setup_binding in setup_bindings:
+                    if (
+                        str(setup_binding.get("strategy_version_id") or "").strip()
+                        == str(binding.get("strategy_version_id") or "").strip()
+                    ):
+                        setup_binding.update(
+                            {
+                                "draft_bound": True,
+                                "draft_id": binding["draft_id"],
+                                "draft_hash": binding["draft_hash"],
+                                "scope_hash": binding["scope_hash"],
+                                "scope_version": binding["scope_version"],
+                                "operational_setup_hash": binding[
+                                    "operational_setup_hash"
+                                ],
+                                "market_bindings": _public_market_bindings(
+                                    binding["market_bindings"]
+                                ),
+                            }
+                        )
+        frozen_scope = {}
+        for member in members[:64]:
+            if not isinstance(member, Mapping):
+                continue
+            candidate_scope = member.get("market_scope")
+            if isinstance(candidate_scope, Mapping):
+                frozen_scope = dict(candidate_scope)
+                break
+        frozen_scope_hash = str(
+            next(
+                (
+                    member.get("scope_hash")
+                    for member in members[:64]
+                    if isinstance(member, Mapping) and member.get("scope_hash")
+                ),
+                "",
+            )
+        ).strip() or None
+        frozen_scope_version = str(
+            next(
+                (
+                    member.get("scope_version")
+                    for member in members[:64]
+                    if isinstance(member, Mapping) and member.get("scope_version")
+                ),
+                "",
+            )
+        ).strip() or None
+        if frozen_scope and not frozen_scope_hash:
+            frozen_scope_hash = "sha256:" + self._rolling_canonical_hash(frozen_scope)
+        if frozen_scope and not frozen_scope_version:
+            frozen_scope_version = str(
+                frozen_scope.get("scope_version")
+                or frozen_scope.get("version")
+                or "1"
+            ).strip()[:128]
         limits = risk.get("effective_limits", risk.get("active_limits", {}))
         limits = dict(limits) if isinstance(limits, Mapping) else {}
         return {
@@ -1895,9 +2648,25 @@ class OperatorControlPlane:
             "policy_id": policy_id,
             "policy_version": policy_version,
             "policy_hash": policy_hash or None,
-            "setup_bindings": setup_bindings,
+            "setup_bindings": _public_setup_bindings(setup_bindings),
+            "draft_member_bindings": _public_draft_member_bindings(
+                draft_member_bindings
+            ),
+            # ``scope_hash`` is the intended unactivated draft.  The active
+            # funnel and each member's frozen scope stay separately visible.
             "scope_hash": scope_hash,
             "scope_version": scope_version,
+            "scope_draft_id": scope_draft.get("draft_id"),
+            "scope_draft_hash": scope_draft.get("draft_hash"),
+            "scope_draft_version": scope_draft.get("scope_version"),
+            "scope_draft": _safe_value(scope_draft),
+            "draft_scope": _safe_value(draft_scope),
+            "active_scope_hash": active_scope_hash,
+            "active_scope_version": active_scope_version,
+            "active_scope": _safe_value(scope),
+            "frozen_scope_hash": frozen_scope_hash,
+            "frozen_scope_version": frozen_scope_version,
+            "frozen_scope": _safe_value(frozen_scope),
             "active_settings_hash": settings_hash,
             "active_settings_generation": settings_generation,
             "proposed_allocation_total": selection.get("proposed_allocation_total"),
@@ -1977,10 +2746,46 @@ class OperatorControlPlane:
                 or str(draft.get("status") or "").strip().upper() == "ACTIVE"
             )
         ):
-            # The operator config is a compatibility cache and can still
-            # carry ACTIVE after a restart.  Prefer the durable row's
-            # terminal state and generated identifier.
-            draft = dict(latest)
+            # Prefer the durable terminal state and identifier while retaining
+            # explicit scope/setup bindings from the matching review cache.
+            durable_id = str(
+                latest.get("authorization_id") or latest.get("id") or ""
+            ).strip()
+            cached_id = (
+                str(draft.get("authorization_id") or draft.get("id") or "").strip()
+                if isinstance(draft, Mapping)
+                else ""
+            )
+            merged = dict(latest)
+            if isinstance(draft, Mapping) and (
+                not durable_id or not cached_id or durable_id == cached_id
+            ):
+                for key in (
+                    "scope_draft_id",
+                    "scope_draft_hash",
+                    "scope_draft_version",
+                    "scope",
+                    "supported_market_types",
+                    "scope_exclusions",
+                    "active_scope_hash",
+                    "active_scope_version",
+                    "frozen_scope_hash",
+                    "frozen_scope_version",
+                    "selection_id",
+                    "selection_hash",
+                    "policy_id",
+                    "policy_version",
+                    "policy_hash",
+                    "setup_bindings",
+                    "draft_member_bindings",
+                    "active_settings_hash",
+                    "active_settings_generation",
+                    "proposed_allocation_total",
+                    "proposed_allocation_risk_digest",
+                ):
+                    if merged.get(key) in (None, "", [], {}):
+                        merged[key] = draft.get(key)
+            draft = merged
 
         draft_status = (
             str(draft.get("status") or "").strip().upper()
@@ -2009,6 +2814,20 @@ class OperatorControlPlane:
                     "policy_version",
                     "policy_hash",
                     "setup_bindings",
+                    "draft_member_bindings",
+                    "scope_draft_id",
+                    "scope_draft_hash",
+                    "scope_draft_version",
+                    "scope_hash",
+                    "scope_version",
+                    "active_scope_hash",
+                    "active_scope_version",
+                    "frozen_scope_hash",
+                    "frozen_scope_version",
+                    "active_settings_hash",
+                    "active_settings_generation",
+                    "proposed_allocation_total",
+                    "proposed_allocation_risk_digest",
                 ):
                     if enriched.get(key) in (None, "", [], {}):
                         enriched[key] = draft.get(key)
@@ -2049,7 +2868,6 @@ class OperatorControlPlane:
         if values is not None and not isinstance(values, Mapping):
             raise OperatorControlError("EXECUTION_AUTHORIZATION_VALUES_REQUIRED")
         raw = dict(values or {})
-        context = self._authorization_context()
         allowed = {
             "purpose",
             "exact_strategy_versions",
@@ -2063,6 +2881,9 @@ class OperatorControlPlane:
             "expires_at",
             "scope_hash",
             "scope_version",
+            "scope_draft_id",
+            "scope_draft_hash",
+            "scope_draft_version",
             "active_settings_hash",
             "active_settings_generation",
             "selection_id",
@@ -2074,9 +2895,14 @@ class OperatorControlPlane:
         unknown = set(raw) - allowed
         if unknown:
             raise OperatorControlError("UNSUPPORTED_EXECUTION_AUTHORIZATION_FIELDS")
+        self._prepare_rolling_exploratory_scope_draft()
+        context = self._authorization_context()
         for field, context_key in (
             ("scope_hash", "scope_hash"),
             ("scope_version", "scope_version"),
+            ("scope_draft_id", "scope_draft_id"),
+            ("scope_draft_hash", "scope_draft_hash"),
+            ("scope_draft_version", "scope_draft_version"),
             ("active_settings_hash", "active_settings_hash"),
             ("proposed_allocation_total", "proposed_allocation_total"),
             ("proposed_allocation_risk_digest", "proposed_allocation_risk_digest"),
@@ -2198,10 +3024,8 @@ class OperatorControlPlane:
             "acknowledged": True,
             "required": False,
         }
-        if not strategy_versions and not policy_hash:
-            raise OperatorControlError("EXECUTION_AUTHORIZATION_SELECTION_BINDING_REQUIRED")
         lifetime_budget = self._authorization_decimal(
-            raw.get("lifetime_budget", "1.00"), "lifetime_budget"
+            raw.get("lifetime_budget"), "lifetime_budget"
         )
         now = context["now"]
         expires_value = raw.get("expires_at")
@@ -2283,23 +3107,46 @@ class OperatorControlPlane:
                 "lifetime_budget": lifetime_budget,
                 "stop_rules": dict(stop_rules),
                 "expires_at": expires_text,
-                "scope_hash": context["scope_hash"],
-                "scope_version": context["scope_version"],
-                "active_settings_hash": context["active_settings_hash"],
-                "active_settings_generation": context["active_settings_generation"],
-                "selection_id": context["selection_id"],
-                "selection_hash": context["selection_hash"],
-                "policy_id": context.get("policy_id"),
-                "policy_version": context.get("policy_version"),
-                "policy_hash": context.get("policy_hash"),
-                "setup_bindings": _safe_value(context.get("setup_bindings", [])),
                 "actor": actor_value,
                 "actor_version": actor_version,
                 "status": "DRAFT",
                 "paper_only": True,
-                "proposed_allocation_total": context.get(
-                    "proposed_allocation_total"
+                "scope_hash": context["scope_hash"],
+                "scope_version": context["scope_version"],
+                "scope_draft_id": context.get("scope_draft_id"),
+                "scope_draft_hash": context.get("scope_draft_hash"),
+                "scope_draft_version": context.get("scope_draft_version"),
+                "scope": _safe_value(context.get("draft_scope", {})),
+                "supported_market_types": _safe_value(
+                    (context.get("scope_draft") or {}).get("supported_market_types", [])
+                    if isinstance(context.get("scope_draft"), Mapping)
+                    else []
                 ),
+                "scope_exclusions": _safe_value(
+                    (context.get("scope_draft") or {}).get("exclusions", [])
+                    if isinstance(context.get("scope_draft"), Mapping)
+                    else []
+                ),
+                "active_scope_hash": context.get("active_scope_hash"),
+                "active_scope_version": context.get("active_scope_version"),
+                "frozen_scope_hash": context.get("frozen_scope_hash"),
+                "frozen_scope_version": context.get("frozen_scope_version"),
+                "selection_id": context.get("selection_id"),
+                "selection_hash": context.get("selection_hash"),
+                "policy_id": context.get("policy_id"),
+                "policy_version": context.get("policy_version"),
+                "policy_hash": context.get("policy_hash"),
+                "setup_bindings": _public_setup_bindings(
+                    context.get("setup_bindings", [])
+                ),
+                "draft_member_bindings": _public_draft_member_bindings(
+                    context.get("draft_member_bindings", [])
+                ),
+                "active_settings_hash": context.get("active_settings_hash"),
+                "active_settings_generation": context.get(
+                    "active_settings_generation"
+                ),
+                "proposed_allocation_total": context.get("proposed_allocation_total"),
                 "proposed_allocation_risk_digest": context.get(
                     "proposed_allocation_risk_digest"
                 ),
@@ -2547,6 +3394,15 @@ class OperatorControlPlane:
             or first_member.get("selected_market")
         )
         market_binding = market_binding if isinstance(market_binding, Mapping) else {}
+        if not market_binding:
+            raw_bindings = (
+                first_member.get("market_bindings")
+                or first_member.get("current_market_bindings")
+            )
+            if isinstance(raw_bindings, (list, tuple)) and raw_bindings:
+                first_binding = raw_bindings[0]
+                if isinstance(first_binding, Mapping):
+                    market_binding = dict(first_binding)
         if market_binding:
             materialized.append(dict(market_binding))
         binding_market_id = str(
@@ -2751,6 +3607,27 @@ class OperatorControlPlane:
             if isinstance(member, Mapping)
             and _canary_selection_member_is_proposed(member)
         ]
+        draft = self.rolling_exploratory_scope_draft()
+        for member in raw_members:
+            if not isinstance(member, Mapping):
+                continue
+            status = str(member.get("status") or member.get("stage") or "").strip().upper()
+            if bool(member.get("rejected")) or status == "REJECTED":
+                continue
+            allocation = _rolling_decimal(
+                member.get("allocation", member.get("proposed_allocation"))
+            )
+            if not (
+                status in {"ACTIVE", "REDUCE", "PAPER"}
+                or (allocation is not None and allocation > 0)
+                or _canary_selection_member_is_funded(member)
+                or _canary_selection_member_is_proposed(member)
+            ):
+                continue
+            if self._draft_member_binding(member, draft) is None:
+                raise OperatorControlError(
+                    "EXPLORATORY_SCOPE_DRAFT_MEMBER_BINDING_REQUIRED"
+                )
         if not proposal_members:
             return current
         if len(proposal_members) > 3:
@@ -3449,7 +4326,7 @@ class OperatorControlPlane:
             )
         raw = dict(values or {})
         self._prepare_reviewed_proposed_selection()
-        context = self._authorization_context()
+        context = self._authorization_context(require_draft_members=True)
         selection = context.get("selection")
         selection = dict(selection) if isinstance(selection, Mapping) else {}
         policy = (
@@ -3602,9 +4479,44 @@ class OperatorControlPlane:
             "lookback": [item.get("lookback") for item in setups],
             "adverse_evidence": adverse,
             "scope": {
+                # Top-level aliases retain the existing consumer contract and
+                # point at the intended unactivated draft.
                 "scope_hash": context.get("scope_hash"),
                 "scope_version": context.get("scope_version"),
                 "market_ids": list(scope.get("market_ids", scope.get("exact_market_ids", ())))[:16],
+                "draft": {
+                    "draft_id": context.get("scope_draft_id"),
+                    "status": "DRAFT",
+                    "scope": _safe_value(context.get("draft_scope", {})),
+                    "scope_hash": context.get("scope_hash"),
+                    "scope_version": context.get("scope_version"),
+                    "draft_hash": context.get("scope_draft_hash"),
+                    "supported_market_types": _safe_value(
+                        (context.get("scope_draft") or {}).get("supported_market_types", [])
+                        if isinstance(context.get("scope_draft"), Mapping)
+                        else []
+                    ),
+                    "category_restriction": _safe_value(
+                        (context.get("scope_draft") or {}).get("category_restriction", {})
+                        if isinstance(context.get("scope_draft"), Mapping)
+                        else {}
+                    ),
+                    "exclusions": _safe_value(
+                        (context.get("scope_draft") or {}).get("exclusions", [])
+                        if isinstance(context.get("scope_draft"), Mapping)
+                        else []
+                    ),
+                },
+                "active": {
+                    "scope_hash": context.get("active_scope_hash"),
+                    "scope_version": context.get("active_scope_version"),
+                    "scope": _safe_value(context.get("active_scope", {})),
+                },
+                "frozen": {
+                    "scope_hash": context.get("frozen_scope_hash"),
+                    "scope_version": context.get("frozen_scope_version"),
+                    "scope": _safe_value(context.get("frozen_scope", {})),
+                },
             },
             "members": [
                 {
@@ -3616,6 +4528,17 @@ class OperatorControlPlane:
             ],
             "limits": dict(limits),
             "limit_blockers": limit_blockers,
+            "scope_binding": {
+                "draft_id": context.get("scope_draft_id"),
+                "draft_hash": context.get("scope_draft_hash"),
+                "draft_version": context.get("scope_draft_version"),
+                "scope_hash": context.get("scope_hash"),
+                "scope_version": context.get("scope_version"),
+                "active_scope_hash": context.get("active_scope_hash"),
+                "active_scope_version": context.get("active_scope_version"),
+                "frozen_scope_hash": context.get("frozen_scope_hash"),
+                "frozen_scope_version": context.get("frozen_scope_version"),
+            },
             "allocation": {
                 "selected_members": len(funded),
                 "maximum_members": 3,
@@ -3629,7 +4552,12 @@ class OperatorControlPlane:
                 "policy_id": context.get("policy_id"),
                 "policy_version": context.get("policy_version"),
                 "policy_hash": context.get("policy_hash"),
-                "setup_bindings": _safe_value(context.get("setup_bindings", [])),
+                "setup_bindings": _public_setup_bindings(
+                    context.get("setup_bindings", [])
+                ),
+                "draft_member_bindings": _public_draft_member_bindings(
+                    context.get("draft_member_bindings", [])
+                ),
                 "proposed_allocation_total": selection.get(
                     "proposed_allocation_total"
                 ),
@@ -3697,6 +4625,27 @@ class OperatorControlPlane:
         raw_members = current.get("members", current.get("selected_members", ()))
         if not isinstance(raw_members, (list, tuple)):
             raise OperatorControlError("EXPLORATORY_LIVE_SELECTION_REQUIRED")
+        draft = self.rolling_exploratory_scope_draft()
+        for member in raw_members:
+            if not isinstance(member, Mapping):
+                continue
+            status_value = str(member.get("status") or member.get("stage") or "").strip().upper()
+            if bool(member.get("rejected")) or status_value == "REJECTED":
+                continue
+            allocation = _rolling_decimal(
+                member.get("allocation", member.get("proposed_allocation"))
+            )
+            if not (
+                status_value in {"ACTIVE", "REDUCE", "PAPER"}
+                or (allocation is not None and allocation > 0)
+                or _canary_selection_member_is_funded(member)
+                or _canary_selection_member_is_proposed(member)
+            ):
+                continue
+            if self._draft_member_binding(member, draft) is None:
+                raise OperatorControlError(
+                    "EXPLORATORY_SCOPE_DRAFT_MEMBER_BINDING_REQUIRED"
+                )
         proposal_risk_snapshot = current.get("proposed_allocation_risk_snapshot")
         proposal_risk_digest = str(
             current.get("proposed_allocation_risk_digest") or ""
@@ -3954,10 +4903,7 @@ class OperatorControlPlane:
                     or authorization.get("id"),
                     "proposal_digest": proposal_digest,
                     "activated_at": activated_at,
-                    "policy_id": context.get("policy_id"),
-                    "policy_version": context.get("policy_version"),
                     "policy_hash": context.get("policy_hash"),
-                    "active_settings_hash": context.get("active_settings_hash"),
                     "active_settings_generation": context.get(
                         "active_settings_generation"
                     ),
@@ -4044,7 +4990,7 @@ class OperatorControlPlane:
         review = self.exploratory_live_review_snapshot(raw)
         if review["blockers"]:
             raise OperatorControlError(str(review["blockers"][0]))
-        context = self._authorization_context()
+        context = self._authorization_context(require_draft_members=True)
         for field in ("selection_id", "selection_hash", "policy_id", "policy_version", "policy_hash"):
             expected = context.get(field)
             observed = auth.get(field)
@@ -4065,6 +5011,15 @@ class OperatorControlPlane:
             except (TypeError, ValueError):
                 raise OperatorControlError("EXPLORATORY_LIVE_AUTHORIZATION_BINDING_STALE") from None
             if observed_encoded != expected_encoded:
+                raise OperatorControlError("EXPLORATORY_LIVE_AUTHORIZATION_BINDING_STALE")
+        expected_draft_bindings = context.get("draft_member_bindings", [])
+        observed_draft_bindings = auth.get("draft_member_bindings", [])
+        if expected_draft_bindings:
+            if not isinstance(observed_draft_bindings, (list, tuple)):
+                raise OperatorControlError("EXPLORATORY_LIVE_AUTHORIZATION_BINDING_STALE")
+            if _public_draft_member_bindings(
+                observed_draft_bindings
+            ) != _public_draft_member_bindings(expected_draft_bindings):
                 raise OperatorControlError("EXPLORATORY_LIVE_AUTHORIZATION_BINDING_STALE")
         expected_versions = {
             str(item).strip()
@@ -4088,6 +5043,9 @@ class OperatorControlPlane:
         for field in (
             "scope_hash",
             "scope_version",
+            "scope_draft_id",
+            "scope_draft_hash",
+            "scope_draft_version",
             "active_settings_hash",
             "proposed_allocation_total",
             "proposed_allocation_risk_digest",
@@ -4144,9 +5102,13 @@ class OperatorControlPlane:
                 "policy_version",
                 "policy_hash",
                 "setup_bindings",
+                "draft_member_bindings",
                 "strategy_versions",
                 "scope_hash",
                 "scope_version",
+                "scope_draft_id",
+                "scope_draft_hash",
+                "scope_draft_version",
                 "active_settings_hash",
                 "active_settings_generation",
                 "proposed_allocation_total",
@@ -4243,7 +5205,9 @@ class OperatorControlPlane:
                 activated_new = True
                 activated_auth = dict(activated.get("authorization") or {})
                 activated_auth_id = str(
-                    activated_auth.get("authorization_id") or activated_auth.get("id") or auth_id
+                    activated_auth.get("authorization_id")
+                    or activated_auth.get("id")
+                    or auth_id
                 ).strip()
                 activated_generation = activated_auth.get(
                     "generation", auth.get("generation")
@@ -4258,11 +5222,15 @@ class OperatorControlPlane:
                         "policy_version",
                         "policy_hash",
                         "setup_bindings",
+                        "draft_member_bindings",
                         "strategy_versions",
                         "exact_strategy_versions",
                         "strategy_version_ids",
                         "scope_hash",
                         "scope_version",
+                        "scope_draft_id",
+                        "scope_draft_hash",
+                        "scope_draft_version",
                         "active_settings_hash",
                         "active_settings_generation",
                         "proposed_allocation_total",
@@ -4280,6 +5248,16 @@ class OperatorControlPlane:
                         "policy_version",
                         "policy_hash",
                         "setup_bindings",
+                        "draft_member_bindings",
+                        "scope_hash",
+                        "scope_version",
+                        "scope_draft_id",
+                        "scope_draft_hash",
+                        "scope_draft_version",
+                        "active_settings_hash",
+                        "active_settings_generation",
+                        "proposed_allocation_total",
+                        "proposed_allocation_risk_digest",
                     }:
                         try:
                             if json.dumps(observed, sort_keys=True, separators=(",", ":"), default=str) != json.dumps(
@@ -4320,7 +5298,7 @@ class OperatorControlPlane:
                 if isinstance(status_document, Mapping)
                 else ""
             ).upper()
-            current_context = self._authorization_context()
+            current_context = self._authorization_context(require_draft_members=True)
             current_ids = _candidate_ids(current_context)
             context_changed = not _same_reviewed_context(context, current_context)
             candidate_changed = bool(current_ids) and candidate_id not in current_ids
@@ -4360,7 +5338,7 @@ class OperatorControlPlane:
                 armed_new = True
                 if isinstance(armed, Mapping):
                     _verify_control_identity(armed, require_control=True)
-            final_context = self._authorization_context()
+            final_context = self._authorization_context(require_draft_members=True)
             final_ids = _candidate_ids(final_context)
             if (
                 not _same_reviewed_context(context, final_context)
@@ -6566,11 +7544,33 @@ class OperatorControlPlane:
         skip_reasons = autonomous_state.get("signal_scan_reason_counts")
         if not isinstance(skip_reasons, Mapping):
             skip_reasons = {}
+        rolling_policy = rolling_state.get("active_policy")
+        rolling_policy = (
+            rolling_policy
+            if isinstance(rolling_policy, Mapping)
+            else rolling_state.get("policy")
+            if isinstance(rolling_state.get("policy"), Mapping)
+            else {}
+        )
+        rolling_global_budget = rolling_policy.get("global_budget")
+        if rolling_global_budget is not None:
+            rolling_global_budget = str(rolling_global_budget)
+        rolling_policy_disclosure = {
+            "global_budget": rolling_global_budget,
+            "experimental_enabled": rolling_policy.get(
+                "experimental_enabled", False
+            ) is True,
+            "allocation_active": rolling_policy.get("allocation_active") is True,
+            "paper_only": True,
+        }
+        financial_caps = dict(limits)
         economic_policy = {
             "mode": operator_mode,
             "policy": rolling_state.get("policy_identity")
             or rolling_state.get("active_policy_identity")
             or {},
+            "rolling_policy": rolling_policy_disclosure,
+            "financial_caps": financial_caps,
             "limits": limits,
             "usage": usage,
             "remaining": remaining,
@@ -6744,12 +7744,33 @@ class OperatorControlPlane:
             or rolling_state.get("active_at")
         )
         try:
+            rolling_scope_draft = self.rolling_exploratory_scope_draft()
+        except Exception as draft_exc:
+            rolling_scope_draft = {
+                "draft_id": ROLLING_EXPLORATORY_SCOPE_DRAFT_ID,
+                "status": "BLOCKED",
+                "paper_only": True,
+                "live_execution": False,
+                "allocation_active": False,
+                "canary_armed": False,
+                "blocker": type(draft_exc).__name__.upper(),
+            }
+        try:
             exploratory_live_review = self.exploratory_live_review_snapshot()
         except Exception as exc:
             exploratory_live_review = {
                 "profitability": "UNPROVEN",
                 "status": "BLOCKED",
-                "blockers": [type(exc).__name__.upper()],
+                "scope": {
+                    "draft": _safe_value(rolling_scope_draft),
+                    "active": {},
+                    "frozen": {},
+                },
+                "blockers": [
+                    type(exc).__name__.upper(),
+                    "EXPLORATORY_LIVE_MARKET_MATERIALIZATION_REQUIRED",
+                    "EXPLORATORY_LIVE_SELECTION_REQUIRED",
+                ],
                 "paper_only": True,
                 "live_execution": False,
             }
@@ -6772,6 +7793,9 @@ class OperatorControlPlane:
             "economic_policy": economic_policy,
             "policy": economic_policy.get("policy", {}),
             "budgets": economic_policy,
+            "rolling_exploratory_scope_draft": _safe_value(rolling_scope_draft),
+            "scope_draft": _safe_value(rolling_scope_draft),
+            "active_scope": _safe_value(market_scope_funnel),
             "live_execution": execution_state["live_execution"],
             "paper_only": execution_state["paper_only"],
             "exploratory_live_review": exploratory_live_review,
@@ -7291,9 +8315,43 @@ class OperatorControlPlane:
                             credentials=credentials,
                             initialize=False,
                         )
+                        selection_loader = getattr(
+                            self.store, "load_current_portfolio_selection", None
+                        )
+                        selected_market_id: str | None = None
+                        selected_token_id: str | None = None
+                        if callable(selection_loader):
+                            try:
+                                selection = selection_loader()
+                            except Exception:
+                                selection = None
+                            if isinstance(selection, Mapping):
+                                try:
+                                    readiness = self._selected_market_readiness(
+                                        selection
+                                    )
+                                except Exception:
+                                    readiness = {}
+                                if isinstance(readiness, Mapping):
+                                    selected_market_id = str(
+                                        readiness.get("market_id") or ""
+                                    ).strip() or None
+                                    selected_token_id = str(
+                                        readiness.get("token_id") or ""
+                                    ).strip() or None
+                        connectivity_kwargs: dict[str, Any] = {
+                            "venue": venue,
+                            "allow_environment": False,
+                        }
+                        if selected_market_id and selected_token_id:
+                            connectivity_kwargs.update(
+                                {
+                                    "market_id": selected_market_id,
+                                    "token_id": selected_token_id,
+                                }
+                            )
                         raw_connectivity = service.connectivity_check(
-                            venue=venue,
-                            allow_environment=False,
+                            **connectivity_kwargs
                         )
                         connectivity = _project_connectivity(
                             raw_connectivity,
@@ -7500,7 +8558,12 @@ __all__ = [
     "HERMES_EXTERNAL_STATUS",
     "HERMES_EXTERNAL_EVIDENCE",
     "CANARY_CONNECTIVITY_CONFIG_KEY",
-    "HermesOperatorAdapter",
+    "ROLLING_EXPLORATORY_SCOPE_DRAFT_CONFIG_KEY",
+    "ROLLING_EXPLORATORY_SCOPE_DRAFT_ID",
+    "ROLLING_EXPLORATORY_SCOPE_DRAFT_VERSION",
+    "ROLLING_EXPLORATORY_SUPPORTED_MARKET_TYPES",
+    "ROLLING_EXPLORATORY_SCOPE_EXCLUSIONS",
     "OperatorControlError",
     "OperatorControlPlane",
+    "HermesOperatorAdapter",
 ]

@@ -19,6 +19,7 @@ from itertools import islice, product
 from statistics import mean
 from typing import Any, Callable, Iterable, Mapping, NoReturn, Sequence
 
+from .data._http import HTTPFetchError
 from .backtest import CryptoBacktester
 from .backtest.prediction import run_prediction_research_mode
 from .forward import (
@@ -3678,6 +3679,27 @@ def _rolling_document_is_marked(value: Mapping[str, Any], provenance: Mapping[st
         if str(item.get("source", "")).strip().lower() == "rolling":
             return True
     return False
+def _rolling_document_is_draft_bound(
+    value: Mapping[str, Any],
+    provenance: Mapping[str, Any] | None = None,
+) -> bool:
+    """Identify draft-bound lineage before it can enter ordinary authority."""
+    pending: list[tuple[Mapping[str, Any], int]] = [(value, 0)]
+    if isinstance(provenance, Mapping):
+        pending.append((provenance, 0))
+    seen: set[int] = set()
+    while pending:
+        item, depth = pending.pop()
+        marker = id(item)
+        if marker in seen or depth > _ROLLING_MAX_PROVENANCE_DEPTH:
+            continue
+        seen.add(marker)
+        if item.get("draft_bound") is True:
+            return True
+        for child in item.values():
+            if isinstance(child, Mapping):
+                pending.append((child, depth + 1))
+    return False
 def _rolling_campaign_bound(value: Mapping[str, Any]) -> bool:
     """Reject campaign lineage while bounding unrelated bulk observations.
 
@@ -5072,42 +5094,412 @@ class AutonomousResearchProcessor:
         self.current_market_discoverer = current_market_discoverer
         self.lifecycle = CandidateLifecycleManager(store, criteria=self.config.promotion_criteria)
         self._campaign_active_state: dict[str, Any] = {}
+        self._rolling_last_current_discovery: dict[str, Any] = {
+            "status": "NOT_RUN",
+        }
 
+    def _rolling_scope_draft(self) -> Mapping[str, Any] | None:
+        """Read the unactivated scope draft without granting it authority.
+
+        The operator owns this record.  A draft is usable here only as a
+        paper-preview input: the canonical scope/hash pair is recomputed and
+        every execution/authorization flag must be explicitly disarmed.
+        Active operating policy and portfolio selection are intentionally not
+        consulted or modified by this loader.
+        """
+        loader = getattr(self.store, "get_operator_config", None)
+        if not callable(loader):
+            return None
+        try:
+            raw = loader("rolling_exploratory_scope_draft", None)
+        except (TypeError, ValueError, RuntimeError):
+            return None
+        if not isinstance(raw, Mapping):
+            return None
+        if str(raw.get("status", "")).strip().upper() != "DRAFT":
+            return None
+        draft_id = str(raw.get("draft_id", "")).strip()
+        if not draft_id:
+            return None
+        if any(
+            raw.get(name) is not expected
+            for name, expected in (
+                ("paper_only", True),
+                ("live_execution", False),
+                ("allocation_active", False),
+                ("canary_armed", False),
+            )
+        ):
+            return None
+        supported_market_types = raw.get("supported_market_types")
+        if isinstance(supported_market_types, (list, tuple)):
+            normalized_types = {
+                str(value).strip().casefold()
+                for value in supported_market_types
+                if str(value).strip()
+            }
+            if normalized_types and "prediction" not in normalized_types:
+                return None
+        source_scope = raw.get("scope")
+        if not isinstance(source_scope, Mapping):
+            return None
+        try:
+            scope = normalize_market_scope(source_scope)
+        except (TypeError, ValueError, ExperimentPlanError):
+            return None
+        declared_hash = str(raw.get("scope_hash", "")).strip()
+        declared_version = str(raw.get("scope_version", "")).strip()
+        if declared_hash != scope.scope_hash or declared_version != scope.scope_version:
+            return None
+        declared_draft_hash = str(raw.get("draft_hash", "")).strip()
+        if declared_draft_hash != _rolling_hash(
+            {key: value for key, value in raw.items() if key != "draft_hash"}
+        ):
+            return None
+        # Preserve the canonical draft fields and any bounded provenance
+        # supplied by the operator; strategy/setup material is never inferred
+        # from active configuration.
+        result = {
+            **dict(raw),
+            "draft_id": draft_id,
+            "draft_hash": declared_draft_hash,
+            "status": "DRAFT",
+            "scope": scope.as_dict(),
+            "scope_hash": scope.scope_hash,
+            "scope_version": scope.scope_version,
+            "paper_only": True,
+            "live_execution": False,
+            "allocation_active": False,
+            "canary_armed": False,
+        }
+        for key in (
+            "strategy_definitions",
+            "canonical_strategy_definitions",
+            "supported_templates",
+            "templates",
+            "strategies",
+            "operational_setups",
+            "setup_definitions",
+            "policy_provenance",
+            "supported_market_types",
+            "category_restriction",
+            "exclusions",
+            "provenance",
+        ):
+            value = raw.get(key)
+            if value is not None:
+                result[key] = value
+        return result
+
+    @staticmethod
+    def _rolling_draft_strategy_specs(
+        draft: Mapping[str, Any],
+    ) -> tuple[Mapping[str, Any], ...]:
+        """Extract at most the supported paper-preview definitions from draft."""
+        values: Any = None
+        for key in (
+            "strategy_definitions",
+            "canonical_strategy_definitions",
+            "supported_templates",
+            "templates",
+            "strategies",
+        ):
+            candidate = draft.get(key)
+            if candidate is not None:
+                values = candidate
+                break
+        if values is None:
+            values = PREDECLARED_STRATEGY_STARTING_SET
+        if isinstance(values, Mapping):
+            values = values.get("records", values.get("rows", values.get("items", (values,))))
+        if not isinstance(values, (list, tuple)):
+            return ()
+        return tuple(item for item in values[:_EXPLORATORY_MEMBER_MAX] if isinstance(item, Mapping))
+
+    def _rolling_scope_draft_documents(
+        self,
+        now: datetime,
+    ) -> tuple[tuple[dict[str, Any], ...], Mapping[str, Any]]:
+        """Materialize a bounded paper preview from the operator's draft."""
+        draft = self._rolling_scope_draft()
+        if draft is None:
+            return (), {"status": "UNAVAILABLE", "reason": "SCOPE_DRAFT_UNAVAILABLE"}
+        documents = self._rolling_system_current_market_documents(now, draft=draft)
+        strategy_specs = self._rolling_draft_strategy_specs(draft)
+        direct_market_count = int(
+            getattr(self, "_rolling_last_current_direct_market_count", 0) or 0
+        )
+        strategy_spec_count = int(
+            getattr(self, "_rolling_last_current_strategy_spec_count", 0) or 0
+        )
+        invalid_strategy_count = int(
+            getattr(self, "_rolling_last_current_invalid_strategy_count", 0) or 0
+        )
+        discovery = getattr(
+            self,
+            "_rolling_last_current_discovery",
+            {"status": "NOT_RUN"},
+        )
+        discovery = dict(discovery) if isinstance(discovery, Mapping) else {
+            "status": "NO_RESULT",
+        }
+        discovery_cycle = discovery.get("cycle")
+        discovery_cycle = (
+            discovery_cycle if isinstance(discovery_cycle, Mapping) else {}
+        )
+        discovery_status = str(discovery.get("status", "")).upper()
+        discovery_ready = (
+            discovery_status == "OK"
+            and (
+                int(discovery_cycle.get("markets_attempted", 0) or 0) > 0
+                or str(discovery_cycle.get("discovery_coverage_status", "")).upper()
+                in {"NO_MATCHING_MARKETS", "COMPLETE"}
+            )
+            and str(discovery_cycle.get("discovery_coverage_status", "")).upper()
+            != "ERROR"
+        )
+        try:
+            from .experiment_plan import normalize_market_scope
+
+            effective_filter_trace = self._rolling_draft_filter_trace(
+                draft,
+                normalize_market_scope(draft["scope"]),
+                strategy_specs,
+            )
+        except (TypeError, ValueError, ExperimentPlanError):
+            effective_filter_trace = {
+                "category_mode": "INVALID",
+                "declared_categories": [],
+                "effective_categories": [],
+                "effective_noncategory_filters": {},
+                "active_frozen_historical_scope": {
+                    "applied_to_draft_discovery": False,
+                },
+            }
+        evidence_attribution: Mapping[str, Any] = {}
+        for document in documents:
+            resolution_document = document.get("scope_resolution")
+            resolution_document = (
+                resolution_document
+                if isinstance(resolution_document, Mapping)
+                else {}
+            )
+            resolution_provenance = resolution_document.get("provenance")
+            if isinstance(resolution_provenance, Mapping) and isinstance(
+                resolution_provenance.get("evidence_attribution"),
+                Mapping,
+            ):
+                evidence_attribution = dict(
+                    resolution_provenance["evidence_attribution"]
+                )
+                break
+
+        documents = tuple(
+            document for document in documents if document.get("market_bindings")
+        )
+        trace = {
+            "status": "MATERIALIZED" if documents else "NO_SUITABLE_MATERIALIZED_INSTANCE",
+            "discovery": discovery,
+            "effective_category_filters": effective_filter_trace,
+            "draft_id": draft["draft_id"],
+            "evidence_attribution": dict(evidence_attribution),
+            "scope_hash": draft["scope_hash"],
+            "scope_version": draft["scope_version"],
+            "draft_hash": draft["draft_hash"],
+            "paper_only": True,
+            "live_execution": False,
+            "allocation_active": False,
+            "canary_armed": False,
+            "supported_templates": [
+                str(
+                    item.get(
+                        "template",
+                        item.get(
+                            "family",
+                            (
+                                item.get("strategy_document", {}).get("family", "")
+                                if isinstance(item.get("strategy_document"), Mapping)
+                                else ""
+                            ),
+                        ),
+                    )
+                ).strip().lower()
+                for item in strategy_specs
+                if isinstance(item, Mapping)
+                and str(
+                    item.get(
+                        "template",
+                        item.get(
+                            "family",
+                            (
+                                item.get("strategy_document", {}).get("family", "")
+                                if isinstance(item.get("strategy_document"), Mapping)
+                                else ""
+                            ),
+                        ),
+                    )
+                ).strip()
+            ],
+            "strategy_spec_count": strategy_spec_count,
+            "invalid_strategy_count": invalid_strategy_count,
+            "invalid_strategy_reasons": list(
+                getattr(self, "_rolling_last_current_invalid_strategy_reasons", ())
+            ),
+            "direct_market_count": direct_market_count,
+            "materialized_members": len(documents),
+        }
+        if not documents:
+            if (
+                invalid_strategy_count >= strategy_spec_count
+                and strategy_spec_count
+            ):
+                trace["reason"] = (
+                    "INVALID_STRATEGY_SETUP"
+                    if "INVALID_STRATEGY_SETUP"
+                    in trace.get("invalid_strategy_reasons", ())
+                    else "INVALID_STRATEGY_DEFINITIONS"
+                )
+            elif discovery_status == "PROVIDER_FAILURE":
+                trace["reason"] = "DISCOVERY_PROVIDER_FAILURE"
+            elif discovery_status == "APPLICATION_ERROR":
+                trace["reason"] = "DISCOVERY_APPLICATION_ERROR"
+            elif discovery_status == "NO_RESULT":
+                trace["reason"] = "DISCOVERY_NO_RESULT"
+            elif discovery_status == "RESULT_ERROR":
+                trace["reason"] = "DISCOVERY_RESULT_ERROR"
+            elif not discovery_ready:
+                trace["reason"] = "DISCOVERY_NOT_EXAMINED"
+            elif strategy_spec_count == 0:
+                trace["reason"] = "NO_SUPPORTED_STRATEGY_TEMPLATES"
+            else:
+                trace["reason"] = "NO_SUITABLE_MATERIALIZED_INSTANCE"
+        return documents, trace
+
+    @staticmethod
+    def _rolling_draft_filter_trace(
+        draft: Mapping[str, Any],
+        scope_policy: Any,
+        strategy_specs: Sequence[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        """Describe effective discovery filters without inheriting strategy selectors."""
+        scope_filters = (
+            dict(scope_policy.filters)
+            if isinstance(getattr(scope_policy, "filters", None), Mapping)
+            else {}
+        )
+        categories = [
+            str(value).strip().casefold()
+            for value in getattr(scope_policy, "categories", ())
+            if str(value).strip()
+        ]
+        ignored_sources: list[str] = []
+        for index, spec in enumerate(strategy_specs):
+            if not isinstance(spec, Mapping):
+                continue
+            source = spec.get("strategy_document", spec.get("canonical_strategy"))
+            source = source if isinstance(source, Mapping) else spec
+            market_filters = source.get("market_filters")
+            if isinstance(market_filters, Mapping) and any(
+                key in market_filters
+                for key in ("category", "categories", "tag_id", "tag_ids")
+            ):
+                ignored_sources.append(f"strategy[{index}].market_filters")
+            experiment_plan = source.get("experiment_plan")
+            if isinstance(experiment_plan, Mapping):
+                nested_scope = experiment_plan.get("market_scope")
+                if isinstance(nested_scope, Mapping) and any(
+                    key in nested_scope
+                    for key in ("category", "categories", "filters", "tag_id", "tag_ids")
+                ):
+                    ignored_sources.append(f"strategy[{index}].experiment_plan.market_scope")
+            selector = source.get("selector", source.get("market_selector"))
+            if isinstance(selector, Mapping) and any(
+                key in selector for key in ("label", "labels", "tag_id", "tag_ids")
+            ):
+                ignored_sources.append(f"strategy[{index}].selector")
+            if any(key in source for key in ("tag_id", "tag_ids", "gamma_tag_id")):
+                ignored_sources.append(f"strategy[{index}].gamma_tag_id")
+        policy_provenance = draft.get("policy_provenance")
+        policy_provenance = (
+            policy_provenance if isinstance(policy_provenance, Mapping) else {}
+        )
+
+        def scope_ref(value: Any) -> dict[str, Any]:
+            if not isinstance(value, Mapping):
+                return {}
+            return {
+                key: value.get(key)
+                for key in ("source", "scope_hash", "scope_version")
+                if value.get(key) is not None
+            }
+
+        return {
+            "category_mode": "UNRESTRICTED" if not categories else "RESTRICTED",
+            "declared_categories": categories,
+            "effective_categories": categories,
+            "effective_category_filter": scope_filters.get("category"),
+            "effective_noncategory_filters": {
+                str(key): value
+                for key, value in scope_filters.items()
+                if str(key) not in {"category", "categories"}
+            },
+            "inherited_category_sources_ignored": sorted(set(ignored_sources)),
+            "selector_labels_applied": False,
+            "gamma_tag_id_applied": False,
+            "profitability_filters_inherited": False,
+            "active_frozen_historical_scope": {
+                "active": scope_ref(policy_provenance.get("active_scope")),
+                "frozen": scope_ref(policy_provenance.get("frozen_scope")),
+                "applied_to_draft_discovery": False,
+            },
+        }
     def _rolling_system_current_market_documents(
         self,
         now: datetime,
+        *,
+        draft: Mapping[str, Any] | None = None,
     ) -> tuple[dict[str, Any], ...]:
-        """Create canonical paper identities from the system scope.
+        """Create canonical paper identities from bounded current evidence.
 
-        This path is intentionally independent of legacy candidate rows.  The
-        system operating policy owns a bounded public-current scope, while the
-        collector owns transport and freshness/depth capture.  Only directly
-        resolved markets can produce the two supported directional templates.
+        ``draft`` is an explicitly disarmed operator preview.  It follows the
+        same fresh tracked-market checks as the active system route, but never
+        reads or changes active/frozen market authority.
         """
-        loader = getattr(self.store, "get_operator_config", None)
+        draft_preview = isinstance(draft, Mapping)
+        self._rolling_last_current_direct_market_count = 0
+        self._rolling_last_current_strategy_spec_count = 0
+        self._rolling_last_current_invalid_strategy_count = 0
+        self._rolling_last_current_invalid_strategy_reasons: list[str] = []
         tracked_loader = getattr(self.store, "tracked_polymarket_markets", None)
         resolver_saver = getattr(self.store, "save_market_scope_resolution", None)
-        if not callable(loader) or not callable(tracked_loader):
+        loader = getattr(self.store, "get_operator_config", None)
+        if not callable(tracked_loader):
             return ()
-        try:
-            operating = loader("rolling_exploratory_operating_policy", None)
-        except (TypeError, ValueError, RuntimeError):
-            operating = None
+        if draft_preview:
+            operating = draft
+        else:
+            if not callable(loader):
+                return ()
+            try:
+                operating = loader("rolling_exploratory_operating_policy", None)
+            except (TypeError, ValueError, RuntimeError):
+                operating = None
         if not isinstance(operating, Mapping):
             return ()
-        if str(operating.get("mode", "")).strip().upper() != "EXPLORATORY_LIVE":
-            return ()
-        try:
-            if loader("rolling_exploratory_bootstrap_required", False) is not True:
+        if not draft_preview:
+            if str(operating.get("mode", "")).strip().upper() != "EXPLORATORY_LIVE":
                 return ()
-            active = loader("rolling_admission_policy_active", None)
-            validate_system_exploratory_admission_policy(
-                active if isinstance(active, Mapping) else None,
-                operating,
-                self._rolling_risk_binding(self._rolling_policy()),
-            )
-        except (AttributeError, TypeError, ValueError, RuntimeError):
-            return ()
+            try:
+                if loader("rolling_exploratory_bootstrap_required", False) is not True:
+                    return ()
+                active = loader("rolling_admission_policy_active", None)
+                validate_system_exploratory_admission_policy(
+                    active if isinstance(active, Mapping) else None,
+                    operating,
+                    self._rolling_risk_binding(self._rolling_policy()),
+                )
+            except (AttributeError, TypeError, ValueError, RuntimeError):
+                return ()
         scope = operating.get("scope")
         if not isinstance(scope, Mapping):
             return ()
@@ -5207,7 +5599,13 @@ class AutonomousResearchProcessor:
             record["source_type"] = "CURRENT"
             record["instrument"] = "POLYMARKET"
             records.append(record)
-        candidate_prefix = SYSTEM_EXPLORATORY_ADMISSION_ID
+        candidate_prefix = (
+            str(operating.get("draft_id", "")).strip()
+            if draft_preview
+            else SYSTEM_EXPLORATORY_ADMISSION_ID
+        )
+        if not candidate_prefix:
+            return ()
         try:
             resolution = resolve_market_scope(
                 candidate_prefix,
@@ -5224,47 +5622,95 @@ class AutonomousResearchProcessor:
             if hasattr(resolution, "as_dict") and callable(resolution.as_dict)
             else {}
         )
-        matched = resolution_mapping.get("matched_markets", ())
-        matched = matched if isinstance(matched, (list, tuple)) else ()
-        def depth_valid(value: Any) -> bool:
+        matched = resolution_mapping.get(
+            "matched_markets",
+            resolution_mapping.get("resolved_markets", ()),
+        )
+        if not isinstance(matched, (list, tuple)):
+            matched = ()
+
+        def depth_valid(value: Any, token_id: str | None = None) -> bool:
             if not isinstance(value, Mapping):
                 return False
-            sides: list[bool] = []
+            attached_token = value.get("token_id", value.get("asset_id"))
+            if (
+                token_id
+                and attached_token not in (None, "")
+                and str(attached_token).strip() != token_id
+            ):
+                return False
             for side in ("bids", "asks"):
                 levels = value.get(side)
                 if not isinstance(levels, (list, tuple)):
                     return False
-                valid_levels: list[bool] = []
-                for level in levels:
-                    if not isinstance(level, Mapping):
-                        continue
-                    try:
-                        price = float(level.get("price", level.get("px")))
-                        size = float(level.get("size", level.get("quantity", level.get("qty"))))
-                    except (TypeError, ValueError, OverflowError):
-                        continue
-                    valid_levels.append(math.isfinite(price) and math.isfinite(size) and price > 0 and size > 0)
-                sides.append(bool(valid_levels))
-            return all(sides)
+                if not any(
+                    isinstance(level, Mapping)
+                    and _rolling_number(level.get("price", level.get("px"))).is_finite()
+                    and _rolling_number(level.get("size", level.get("quantity", level.get("qty")))).is_finite()
+                    and _rolling_number(level.get("price", level.get("px"))) > 0
+                    and _rolling_number(level.get("size", level.get("quantity", level.get("qty")))) > 0
+                    for level in levels
+                ):
+                    return False
+            return True
 
-        def direct_book(record: Mapping[str, Any]) -> Any:
-            for source in (record, record.get("snapshot"), record.get("payload")):
-                if not isinstance(source, Mapping):
-                    continue
-                book = source.get("order_book", source.get("book"))
-                if isinstance(book, Mapping):
-                    return book.get("yes", book.get("YES", book))
-                books = source.get("order_books", source.get("books"))
-                if isinstance(books, Mapping):
-                    candidate = books.get("yes", books.get("YES"))
-                    if isinstance(candidate, Mapping):
-                        return candidate
-            return None
-        records_by_market = {
-            str(record.get("market_id", "")).strip(): record
-            for record in records
-            if str(record.get("market_id", "")).strip()
-        }
+        def token_books(
+            record: Mapping[str, Any],
+            item: Mapping[str, Any],
+        ) -> tuple[tuple[str, Mapping[str, Any]], ...]:
+            result: list[tuple[str, Mapping[str, Any]]] = []
+            for alias, token_key in (
+                ("yes", "yes_token_id"),
+                ("no", "no_token_id"),
+            ):
+                token_id = str(item.get(token_key, "")).strip()
+                found: Mapping[str, Any] | None = None
+                for source in (item, record, record.get("snapshot"), record.get("payload")):
+                    if not isinstance(source, Mapping):
+                        continue
+                    for name in ("order_books", "books"):
+                        books = source.get(name)
+                        if isinstance(books, Mapping):
+                            for key in (token_id, alias, alias.upper()):
+                                candidate = books.get(key)
+                                if isinstance(candidate, Mapping):
+                                    found = candidate
+                                    break
+                        if found is not None:
+                            break
+                    if found is None:
+                        for name in (
+                            f"{alias}_order_book",
+                            f"{alias}_book",
+                        ):
+                            candidate = source.get(name)
+                            if isinstance(candidate, Mapping):
+                                found = candidate
+                                break
+                    if found is None:
+                        for name in ("order_book", "book"):
+                            candidate = source.get(name)
+                            if not isinstance(candidate, Mapping):
+                                continue
+                            exact = candidate.get(token_id)
+                            if isinstance(exact, Mapping):
+                                found = exact
+                                break
+                            nested = candidate.get(alias, candidate.get(alias.upper()))
+                            if isinstance(nested, Mapping):
+                                found = nested
+                                break
+                            if "bids" in candidate or "asks" in candidate:
+                                # A single unlabelled snapshot book is the
+                                # venue's paired YES/NO projection.
+                                found = candidate
+                                break
+                    if found is not None:
+                        break
+                if not token_id or not isinstance(found, Mapping):
+                    return ()
+                result.append((token_id, found))
+            return tuple(result)
 
         def direct_record_valid(item: Mapping[str, Any]) -> bool:
             market_id = str(item.get("market_id", item.get("id", ""))).strip()
@@ -5287,15 +5733,26 @@ class AutonomousResearchProcessor:
                 return False
             yes_token_id = str(item.get("yes_token_id", "")).strip()
             no_token_id = str(item.get("no_token_id", "")).strip()
+            condition_id = str(item.get("condition_id", "")).strip()
             if (
                 not yes_token_id
                 or not no_token_id
+                or not condition_id
                 or str(record.get("yes_token_id", "")).strip() != yes_token_id
                 or str(record.get("no_token_id", "")).strip() != no_token_id
+                or str(record.get("condition_id", "")).strip() != condition_id
                 or str(metadata.get("market_id", "")).strip() != market_id
             ):
                 return False
-            return depth_valid(direct_book(record))
+            books = token_books(record, item)
+            return len(books) == 2 and all(
+                depth_valid(book, token_id) for token_id, book in books
+            )
+        records_by_market = {
+            str(record.get("market_id", "")).strip(): record
+            for record in records
+            if str(record.get("market_id", "")).strip()
+        }
 
         direct_markets = [
             item
@@ -5304,9 +5761,77 @@ class AutonomousResearchProcessor:
             and str(item.get("market_id", item.get("id", ""))).strip()
             and direct_record_valid(item)
         ][: _EXPLORATORY_POOL_CAP]
+        self._rolling_last_current_direct_market_count = len(direct_markets)
         market_ids = tuple(
             str(item.get("market_id", item.get("id", ""))).strip()
             for item in direct_markets
+        )
+        discovery = getattr(self, "_rolling_last_current_discovery", {})
+        discovery_cycle = (
+            discovery.get("cycle")
+            if isinstance(discovery, Mapping)
+            else None
+        )
+        discovery_cycle = (
+            discovery_cycle if isinstance(discovery_cycle, Mapping) else {}
+        )
+        cycle_started = parse_timestamp(discovery_cycle.get("started_at"))
+        cycle_ended = parse_timestamp(discovery_cycle.get("ended_at"))
+        current_collected_market_ids: list[str] = []
+        reused_fresh_market_ids: list[str] = []
+        reused_stale_market_ids: list[str] = []
+        for item in matched:
+            if not isinstance(item, Mapping):
+                continue
+            market_id = str(item.get("market_id", item.get("id", ""))).strip()
+            record = records_by_market.get(market_id)
+            if not market_id or not isinstance(record, Mapping):
+                continue
+            observed_at = parse_timestamp(record.get("observed_at"))
+            if observed_at is None:
+                continue
+            if (
+                cycle_started is not None
+                and observed_at >= cycle_started
+                and (cycle_ended is None or observed_at <= cycle_ended)
+            ):
+                current_collected_market_ids.append(market_id)
+            elif (
+                ensure_utc(now) - observed_at
+            ).total_seconds() <= _EXPLORATORY_MARKET_FRESHNESS_SECONDS:
+                reused_fresh_market_ids.append(market_id)
+            else:
+                reused_stale_market_ids.append(market_id)
+        partial_collection_failure = (
+            str(discovery.get("status", "")).strip().upper()
+            in {"PROVIDER_FAILURE", "RESULT_ERROR", "APPLICATION_ERROR"}
+            if isinstance(discovery, Mapping)
+            else False
+        ) or any(
+            int(discovery_cycle.get(name, 0) or 0) > 0
+            for name in ("errors", "provider_failures", "provider_timeouts")
+        )
+        evidence_attribution = {
+            "current_collected_market_ids": list(
+                dict.fromkeys(current_collected_market_ids)
+            ),
+            "reused_fresh_market_ids": list(
+                dict.fromkeys(reused_fresh_market_ids)
+            ),
+            "reused_stale_market_ids": list(
+                dict.fromkeys(reused_stale_market_ids)
+            ),
+            "partial_collection_failure": bool(partial_collection_failure),
+        }
+
+        draft_filter_trace = (
+            self._rolling_draft_filter_trace(
+                draft,
+                scope_policy,
+                self._rolling_draft_strategy_specs(draft),
+            )
+            if draft_preview and isinstance(draft, Mapping)
+            else {}
         )
         resolution_mapping["provenance"] = {
             **(
@@ -5314,7 +5839,43 @@ class AutonomousResearchProcessor:
                 if isinstance(resolution_mapping.get("provenance"), Mapping)
                 else {}
             ),
-            "source": "system-bootstrap-current-market",
+            "source": (
+                "rolling-scope-draft"
+                if draft_preview
+                else "system-bootstrap-current-market"
+            ),
+            "effective_category_filters": draft_filter_trace,
+            "evidence_attribution": dict(evidence_attribution),
+            **(
+                {
+                    "draft_id": str(operating.get("draft_id", "")).strip(),
+                    "draft_hash": str(operating.get("draft_hash", "")).strip(),
+                    "draft_bound": True,
+                    "scope_hash": scope_policy.scope_hash,
+                    "scope_version": scope_policy.scope_version,
+                    "market_bindings": [
+                        dict(binding) for binding in (
+                            {
+                                "market_id": str(item.get("market_id", item.get("id", ""))).strip(),
+                                "condition_id": str(item.get("condition_id", "")).strip(),
+                                "yes_token_id": str(item.get("yes_token_id", "")).strip(),
+                                "no_token_id": str(item.get("no_token_id", "")).strip(),
+                            }
+                            for item in direct_markets
+                        )
+                    ],
+                    "supported_market_types": list(
+                        operating.get("supported_market_types", ())
+                    )
+                    if isinstance(operating.get("supported_market_types"), (list, tuple))
+                    else [],
+                    "exclusions": list(operating.get("exclusions", ()))
+                    if isinstance(operating.get("exclusions"), (list, tuple))
+                    else [],
+                }
+                if draft_preview
+                else {}
+            ),
             "transport": "PolymarketCollector",
             "original_market_provenance": [
                 {
@@ -5363,40 +5924,151 @@ class AutonomousResearchProcessor:
         market_bindings = tuple(
             {
                 "market_id": str(item.get("market_id", item.get("id", ""))).strip(),
+                "condition_id": str(item.get("condition_id", "")).strip(),
                 "yes_token_id": str(item.get("yes_token_id", "")).strip(),
                 "no_token_id": str(item.get("no_token_id", "")).strip(),
+                **(
+                    {"outcome_token_ids": item.get("outcome_token_ids")}
+                    if item.get("outcome_token_ids") is not None
+                    else {}
+                ),
             }
             for item in direct_markets
         )
+        draft_hash = (
+            str(draft.get("draft_hash", "")).strip()
+            if draft_preview and isinstance(draft, Mapping)
+            else ""
+        )
         documents: list[dict[str, Any]] = []
-        for family in ("momentum", "mean_reversion"):
-            strategy_document = {
-                "version": 1,
-                "market_type": "prediction",
-                "family": family,
-                "parameters": {
-                    "lookback": 1,
-                    "threshold": 0.05,
-                    "entry_predicate": {
-                        "version": "absolute-move-v1",
-                        "minimum_move": 0.05,
-                        "units": "probability",
-                        "boundary": "inclusive",
+        def mark_invalid(reason: str) -> None:
+            self._rolling_last_current_invalid_strategy_count += 1
+            reasons = getattr(self, "_rolling_last_current_invalid_strategy_reasons", [])
+            if reason not in reasons:
+                reasons.append(reason)
+        draft_specs = (
+            self._rolling_draft_strategy_specs(draft)
+            if draft_preview and isinstance(draft, Mapping)
+            else (
+                {
+                    "template": family,
+                    "parameters": {
+                        "lookback": 1,
+                        "threshold": 0.05,
                     },
-                },
-                "probability_model": "market-history",
-                "resolution_aware": True,
-                "resolution_inputs": ["market_history"],
-                "metadata": {
-                    "research_role": (
-                        "PRICE_MOMENTUM_ASSESSMENT"
-                        if family == "momentum"
-                        else "PRICE_MEAN_REVERSION_ASSESSMENT"
-                    ),
+                }
+                for family in ("momentum", "mean_reversion")
+            )
+        )
+        for spec in draft_specs:
+            if not isinstance(spec, Mapping):
+                continue
+            self._rolling_last_current_strategy_spec_count += 1
+            source = spec.get("strategy_document", spec.get("canonical_strategy"))
+            if not isinstance(source, Mapping):
+                template = str(spec.get("template", spec.get("family", ""))).strip().lower()
+                parameters = spec.get("parameters", {})
+                parameters = dict(parameters) if isinstance(parameters, Mapping) else {}
+                parameters = {
+                    str(key): (
+                        value[0]
+                        if isinstance(value, (list, tuple)) and len(value) == 1
+                        else value
+                    )
+                    for key, value in parameters.items()
+                }
+                if not template:
+                    mark_invalid("INVALID_STRATEGY_DEFINITION")
+                    continue
+                if template in {"momentum", "mean_reversion"}:
+                    parameters.setdefault("entry_predicate", dict(_ABSOLUTE_MOVE_PREDICATE))
+                source = {
+                    "version": 1,
+                    "market_type": "prediction",
+                    "family": template,
+                    "parameters": parameters,
+                    "probability_model": "market-history",
+                    "resolution_aware": True,
+                    "resolution_inputs": ["market_history"],
+                }
+            try:
+                definition = load_strategy(source)
+            except (TypeError, ValueError, RuntimeError):
+                mark_invalid("INVALID_STRATEGY_DEFINITION")
+                continue
+            strategy_document = definition.to_dict()
+            family = str(strategy_document.get("family", "")).strip().lower()
+            if not family:
+                mark_invalid("INVALID_STRATEGY_DEFINITION")
+                continue
+            metadata = dict(strategy_document.get("metadata") or {})
+            metadata.update(
+                dict(spec.get("metadata"))
+                if isinstance(spec.get("metadata"), Mapping)
+                else {}
+            )
+            metadata.setdefault(
+                "research_role",
+                (
+                    "PRICE_MOMENTUM_ASSESSMENT"
+                    if family == "momentum"
+                    else (
+                        "PRICE_MEAN_REVERSION_ASSESSMENT"
+                        if family == "mean_reversion"
+                        else "ZERO_EDGE_CONTROL"
+                    )
+                ),
+            )
+            strategy_document["metadata"] = metadata
+            setup_definitions = (
+                draft.get("operational_setups", draft.get("setup_definitions", {}))
+                if draft_preview and isinstance(draft, Mapping)
+                else {}
+            )
+            setup_declared = "operational_setup" in spec
+            supplied_setup = spec.get("operational_setup")
+            if (
+                isinstance(setup_definitions, Mapping)
+                and family in setup_definitions
+            ):
+                setup_declared = True
+                supplied_setup = setup_definitions.get(family)
+            expected_setup = _operational_setup_for_strategy(
+                strategy_document,
+                {
+                    "market_scope": scope_policy.as_dict(),
                     "operating_policy": EXPLORATORY_LIVE_POLICY_VERSION,
-                    "source": "system-bootstrap-current-market",
                 },
-            }
+            )
+            if not isinstance(expected_setup, Mapping):
+                mark_invalid("INVALID_STRATEGY_SETUP")
+                continue
+
+            if setup_declared:
+                if not isinstance(supplied_setup, Mapping):
+                    mark_invalid("INVALID_OPERATIONAL_SETUP")
+                    continue
+                setup = _canonical_operational_document(supplied_setup)
+                if (
+                    not isinstance(expected_setup, Mapping)
+                    or _canonical_binding(setup)
+                    != _canonical_binding(_canonical_operational_document(expected_setup))
+                ):
+                    mark_invalid("OPERATIONAL_SETUP_MISMATCH")
+                    continue
+                declared_setup_hash = str(
+                    spec.get("operational_setup_hash", "")
+                ).strip()
+                setup_hash = _operational_setup_hash(setup)
+                if declared_setup_hash and declared_setup_hash != setup_hash:
+                    mark_invalid("OPERATIONAL_SETUP_HASH_MISMATCH")
+                    continue
+            elif isinstance(expected_setup, Mapping):
+                setup = _canonical_operational_document(expected_setup)
+                setup_hash = _operational_setup_hash(setup)
+            else:
+                setup = None
+                setup_hash = None
             strategy_hash = _rolling_hash(strategy_document)
             candidate_id = (
                 f"{candidate_prefix}:{family}:"
@@ -5405,17 +6077,6 @@ class AutonomousResearchProcessor:
             strategy_version_id = "strategy-version-" + _rolling_hash(
                 {"strategy_hash": strategy_hash, "candidate_id": candidate_id}
             ).removeprefix("sha256:")[:40]
-            setup = _operational_setup_for_strategy(
-                strategy_document,
-                {
-                    "market_scope": scope_policy.as_dict(),
-                    "operating_policy": EXPLORATORY_LIVE_POLICY_VERSION,
-                },
-            )
-            if not isinstance(setup, Mapping):
-                continue
-            setup = _canonical_operational_document(setup)
-            setup_hash = _operational_setup_hash(setup)
             trial_id = "research-trial-" + _rolling_hash(
                 {
                     "candidate_id": candidate_id,
@@ -5426,6 +6087,16 @@ class AutonomousResearchProcessor:
                     "operational_setup_hash": setup_hash,
                 }
             ).removeprefix("sha256:")[:40]
+            source_label = (
+                "rolling-scope-draft"
+                if draft_preview
+                else "system-bootstrap-current-market"
+            )
+            draft_id = (
+                str(draft.get("draft_id", "")).strip()
+                if draft_preview and isinstance(draft, Mapping)
+                else ""
+            )
             documents.append(
                 {
                     "strategy_document": strategy_document,
@@ -5435,13 +6106,29 @@ class AutonomousResearchProcessor:
                     "candidate_id": candidate_id,
                     "strategy_version_id": strategy_version_id,
                     "research_trial_id": trial_id,
+                    "market_bindings": [dict(binding) for binding in market_bindings],
+                    **(
+                        {
+                            "draft_id": draft_id,
+                            "draft_hash": draft_hash,
+                            "draft_bound": True,
+                        }
+                        if draft_id and draft_hash
+                        else {}
+                    ),
                     "market_scope": scope_policy.as_dict(),
                     "market_scope_hash": scope_hash,
                     "market_scope_version": scope_version,
                     "scope_resolution": resolution_mapping,
                     "scope_resolution_id": resolution_id,
-                    "operational_setup_hash": setup_hash,
-                    "operational_setup": setup,
+                    **(
+                        {
+                            "operational_setup_hash": setup_hash,
+                            "operational_setup": setup,
+                        }
+                        if isinstance(setup, Mapping)
+                        else {}
+                    ),
                     "holding_period": 1,
                     "exit_policy": {
                         "type": "fixed_holding_period",
@@ -5452,24 +6139,50 @@ class AutonomousResearchProcessor:
                         "count": 1,
                         "semantics": "per_market_observation_count",
                     },
-                    "selection_excluded": False,
-                    "model_document": {"model_required": False},
+                    "selection_excluded": bool(
+                        spec.get("selection_excluded", family == "probability_mispricing")
+                    ),
+                    "model_document": (
+                        dict(spec["model_document"])
+                        if isinstance(spec.get("model_document"), Mapping)
+                        else {"model_required": False}
+                    ),
                     "provenance": {
                         "rolling_research": True,
                         "research_mode": "ROLLING_RESEARCH",
-                        "source": "system-bootstrap-current-market",
+                        "source": source_label,
                         "candidate_id": candidate_id,
                         "scope_resolution_id": resolution_id,
                         "scope_hash": scope_hash,
                         "scope_version": scope_version,
                         "current_market_ids": list(market_ids),
+                        "market_bindings": [dict(binding) for binding in market_bindings],
                         "paper_only": True,
+                        "live_execution": False,
                         "allocation_active": False,
                         "canary_armed": False,
+                        **(
+                            {
+                                "draft_id": draft_id,
+                                "draft_hash": draft_hash,
+                                "draft_bound": True,
+                            }
+                            if draft_id and draft_hash
+                            else {}
+                        ),
                     },
                     "paper_only": True,
                     "research_only": True,
                     "execution_scope": "OBSERVATION",
+                    **(
+                        {
+                            "draft_id": draft_id,
+                            "draft_hash": draft_hash,
+                            "draft_bound": True,
+                        }
+                        if draft_id and draft_hash
+                        else {}
+                    ),
                 }
             )
         return tuple(documents[:_EXPLORATORY_MEMBER_MAX])
@@ -5936,6 +6649,36 @@ class AutonomousResearchProcessor:
             strategy_payload = decode(strategy_row.get("strategy_payload"))
             lifecycle_payload = decode(lifecycle_row.get("candidate_payload"))
             row_candidate = _binding_value(lifecycle_row.get("candidate_id"))
+            if (
+                _rolling_document_is_draft_bound(strategy_row, strategy_payload)
+                or _rolling_document_is_draft_bound(lifecycle_row, lifecycle_payload)
+            ):
+                draft_candidates, _ = _rolling_candidate_values(
+                    {
+                        "candidate_id": row_candidate,
+                        "strategy_payload": strategy_payload,
+                        "lifecycle_payload": lifecycle_payload,
+                    }
+                )
+                draft_candidate = row_candidate or (
+                    sorted(draft_candidates)[0]
+                    if len(draft_candidates) == 1
+                    else None
+                )
+                if draft_candidate:
+                    draft_origin = origin_base(
+                        candidate=draft_candidate,
+                        payload=lifecycle_payload,
+                        strategy_row=strategy_row,
+                    )
+                    draft_origin["draft_bound"] = True
+                    decision(
+                        candidate=draft_candidate,
+                        status="EXCLUDED",
+                        reason="DRAFT_BOUND_LEGACY_AUTHORITY",
+                        origin=draft_origin,
+                    )
+                return None
             # Campaign provenance is authoritative and must win before the
             # general identity walk.  Otherwise a large unrelated attestation
             # can mask the required CAMPAIGN_BOUND exclusion.
@@ -6486,6 +7229,8 @@ class AutonomousResearchProcessor:
                 payload = decode(row["payload_json"])
                 provenance = payload.get("provenance")
                 provenance = dict(provenance) if isinstance(provenance, Mapping) else {}
+                if _rolling_document_is_draft_bound(payload, provenance):
+                    continue
                 if not _rolling_document_is_marked(payload, provenance):
                     continue
                 source = payload.get("strategy_document", payload.get("canonical_strategy"))
@@ -6589,6 +7334,10 @@ class AutonomousResearchProcessor:
                     "scope_resolution",
                     "scope_resolution_id",
                     "current_market_ids",
+                    "market_bindings",
+                    "draft_id",
+                    "draft_hash",
+                    "draft_bound",
                     "plan_id",
                     "source_plan_id",
                     "plan_hash",
@@ -6597,23 +7346,31 @@ class AutonomousResearchProcessor:
                 )
                 if field_name in item and item[field_name] is not None
             }
-            explicit_setup = (
-                isinstance(item.get("operational_setup"), Mapping)
-                or item.get("operational_setup_hash") not in (None, "")
-            )
-            setup = (
-                _canonical_operational_document(
-                    _operational_setup_for_strategy(document, source_fields)
-                )
-                if explicit_setup
-                else None
-            )
+            declared_setup = item.get("operational_setup")
+            declared_setup_hash = str(item.get("operational_setup_hash", "") or "").strip()
+            expected_setup = _operational_setup_for_strategy(document, source_fields)
+            if declared_setup is not None or declared_setup_hash:
+                if not isinstance(declared_setup, Mapping):
+                    raise ValueError("OPERATIONAL_SETUP_INVALID")
+                setup = _canonical_operational_document(declared_setup)
+                if (
+                    not isinstance(expected_setup, Mapping)
+                    or _canonical_binding(setup)
+                    != _canonical_binding(_canonical_operational_document(expected_setup))
+                ):
+                    raise ValueError("OPERATIONAL_SETUP_MISMATCH")
+                setup_hash = _operational_setup_hash(setup)
+                if declared_setup_hash and declared_setup_hash != setup_hash:
+                    raise ValueError("OPERATIONAL_SETUP_HASH_MISMATCH")
+            else:
+                setup = None
+                setup_hash = None
             setup_fields = (
                 {
                     "operational_setup": setup,
-                    "operational_setup_hash": _operational_setup_hash(setup),
+                    "operational_setup_hash": setup_hash,
                 }
-                if setup is not None
+                if isinstance(setup, Mapping)
                 else {}
             )
             model_document = (
@@ -12592,6 +13349,43 @@ class AutonomousResearchProcessor:
             ),
             default=Decimal("0"),
         )
+        strategy_provenance = (
+            strategy.get("provenance")
+            if isinstance(strategy.get("provenance"), Mapping)
+            else {}
+        )
+        draft_id = str(
+            strategy.get("draft_id")
+            or strategy_provenance.get("draft_id")
+            or ""
+        ).strip()
+        draft_hash = str(
+            strategy.get("draft_hash")
+            or strategy_provenance.get("draft_hash")
+            or ""
+        ).strip()
+        scope_hash = str(
+            strategy.get("scope_hash")
+            or strategy.get("market_scope_hash")
+            or strategy_provenance.get("scope_hash")
+            or ""
+        ).strip()
+        scope_version = str(
+            strategy.get("scope_version")
+            or strategy.get("market_scope_version")
+            or strategy_provenance.get("scope_version")
+            or ""
+        ).strip()
+        draft_bound = bool(
+            strategy.get("draft_bound") is True
+            and strategy_provenance.get("draft_bound") is True
+            and draft_id
+            and draft_hash
+            and scope_hash
+            and scope_version
+        )
+        if not draft_bound:
+            draft_id = ""
         record = {
             "strategy_version_id": strategy["strategy_version_id"],
             "holding_period": evidence_holding_period,
@@ -12723,17 +13517,58 @@ class AutonomousResearchProcessor:
             ),
             "source_digest": source_digest,
             "accounting_digest": accounting_digest,
+            "portfolio_accounting": dict(canonical_accounting or {}),
+            "evaluation": dict(canonical_evaluation),
+            "operational_evidence": dict(operational_evidence),
             "metrics": {
                 "portfolio_accounting": dict(canonical_accounting or {}),
                 "evaluation": dict(canonical_evaluation),
                 "operational_evidence": dict(operational_evidence),
             },
-            "portfolio_accounting": dict(canonical_accounting or {}),
-            "evaluation": dict(canonical_evaluation),
             "paper_only": True,
             "rolling_research": True,
-            "measured_at": available_through.isoformat(),
+            **(
+                {
+                    "draft_id": draft_id,
+                    "draft_hash": draft_hash,
+                    "draft_bound": True,
+                    "scope_hash": scope_hash,
+                    "scope_version": scope_version,
+                    "operational_setup_hash": strategy.get("operational_setup_hash"),
+                    "market_bindings": list(strategy.get("market_bindings", ())),
+                }
+                if draft_bound
+                else {}
+            ),
         }
+        source_scope_resolution = next(
+            (
+                source.get("scope_resolution", source.get("market_scope_resolution"))
+                for source in (strategy, strategy_provenance)
+                if isinstance(
+                    source.get("scope_resolution", source.get("market_scope_resolution")),
+                    Mapping,
+                )
+            ),
+            None,
+        )
+        source_market_bindings = next(
+            (
+                source.get("market_bindings")
+                for source in (strategy, strategy_provenance)
+                if isinstance(source.get("market_bindings"), (list, tuple))
+            ),
+            None,
+        )
+        if isinstance(source_scope_resolution, Mapping):
+            record["scope_resolution"] = dict(source_scope_resolution)
+        if isinstance(source_market_bindings, (list, tuple)):
+            record["market_bindings"] = [
+                dict(binding) if isinstance(binding, Mapping) else binding
+                for binding in source_market_bindings
+            ]
+        if strategy_provenance:
+            record["provenance"] = dict(strategy_provenance)
         if operational_evidence:
             record["operational_evidence"] = dict(operational_evidence)
             # Direct aliases are compatibility projections only.  Never let a
@@ -12940,37 +13775,103 @@ class AutonomousResearchProcessor:
                     "observations_total": 0,
                 }
         system_bootstrap_active = system_bootstrap_authority
-        if callable(self.current_market_discoverer) and system_bootstrap_active:
+        draft_for_discovery = self._rolling_scope_draft()
+        self._rolling_last_current_discovery = {"status": "NOT_RUN"}
+        if callable(self.current_market_discoverer) and (
+            system_bootstrap_active or draft_for_discovery is not None
+        ):
             try:
-                selection_loader = getattr(
-                    self.store,
-                    "load_current_portfolio_selection",
-                    None,
+                should_discover = True
+                if system_bootstrap_active:
+                    selection_loader = getattr(
+                        self.store,
+                        "load_current_portfolio_selection",
+                        None,
+                    )
+                    selection = (
+                        selection_loader()
+                        if callable(selection_loader)
+                        else None
+                    )
+                    selected_members = (
+                        selection.get("members", ())
+                        if isinstance(selection, Mapping)
+                        else ()
+                    )
+                    should_discover = isinstance(selected_members, (list, tuple)) and not selected_members
+                if should_discover:
+                    try:
+                        parameters = inspect.signature(
+                            self.current_market_discoverer
+                        ).parameters
+                    except (TypeError, ValueError):
+                        parameters = {}
+                    accepts_draft = (
+                        "draft" in parameters
+                        or any(
+                            parameter.kind is inspect.Parameter.VAR_KEYWORD
+                            for parameter in parameters.values()
+                        )
+                    )
+                    if draft_for_discovery is not None and accepts_draft:
+                        discovery_result = self.current_market_discoverer(
+                            current,
+                            draft=draft_for_discovery,
+                        )
+                    else:
+                        discovery_result = self.current_market_discoverer(current)
+                    as_record = getattr(discovery_result, "as_record", None)
+                    recorded = as_record() if callable(as_record) else discovery_result
+                    if isinstance(recorded, Mapping):
+                        provider_failure = (
+                            int(recorded.get("provider_failures", 0) or 0) > 0
+                            or int(recorded.get("provider_timeouts", 0) or 0) > 0
+                        )
+                        result_error = (
+                            int(recorded.get("errors", 0) or 0) > 0
+                            or str(
+                                recorded.get("discovery_coverage_status", "")
+                            ).upper()
+                            == "ERROR"
+                        )
+                        self._rolling_last_current_discovery = {
+                            "status": (
+                                "PROVIDER_FAILURE"
+                                if provider_failure
+                                else ("RESULT_ERROR" if result_error else "OK")
+                            ),
+                            "cycle": dict(recorded),
+                        }
+                    else:
+                        self._rolling_last_current_discovery = {
+                            "status": "NO_RESULT",
+                            "result_type": type(discovery_result).__name__,
+                        }
+            except (AttributeError, TypeError, ValueError, RuntimeError, HTTPFetchError) as exc:
+                known_provider_failure = (
+                    isinstance(exc, HTTPFetchError)
+                    or getattr(exc, "deadline_expired", False) is True
                 )
-                selection = (
-                    selection_loader()
-                    if callable(selection_loader)
-                    else None
-                )
-                selected_members = (
-                    selection.get("members", ())
-                    if isinstance(selection, Mapping)
-                    else ()
-                )
-                if not isinstance(selected_members, (list, tuple)):
-                    selected_members = ()
-                if not selected_members:
-                    # Keep transport bounded by the collector's own
-                    # market/request budgets. This call only refreshes public
-                    # current-market evidence and never submits orders.
-                    self.current_market_discoverer(current)
-            except (AttributeError, TypeError, ValueError, RuntimeError):
-                pass
+                self._rolling_last_current_discovery = {
+                    "status": (
+                        "PROVIDER_FAILURE"
+                        if known_provider_failure
+                        else "APPLICATION_ERROR"
+                    ),
+                    "error_type": type(exc).__name__,
+                    "error": str(exc)[:512],
+                }
+        draft_documents, draft_trace = self._rolling_scope_draft_documents(current)
+        draft_preview_active = str(draft_trace.get("status", "")).upper() != "UNAVAILABLE"
         system_documents = self._rolling_system_current_market_documents(current)
         documents = (
             system_documents
             if system_bootstrap_active
-            else self._rolling_strategy_documents()
+            else (
+                draft_documents
+                if draft_preview_active
+                else self._rolling_strategy_documents()
+            )
         )
         strategies = self._rolling_persist_strategy_lineage(documents, current)
         sources = ("HISTORICAL", "REPLAY", "PAPER", "LIVE")
@@ -13033,6 +13934,7 @@ class AutonomousResearchProcessor:
             "INSUFFICIENT_EVIDENCE",
             "HISTORICAL_DATASET_EMPTY",
             "PREDECESSOR_LOOKUP_UNAVAILABLE",
+            "NO_SUITABLE_MATERIALIZED_INSTANCE",
         }
         def is_terminal_blocker(record: Mapping[str, Any]) -> bool:
             reason = str(record.get("blocker") or "")
@@ -13637,12 +14539,22 @@ class AutonomousResearchProcessor:
                 proposal_items = tuple(self._enqueue_predeclared_from_persisted_scope(current) or ())
             except (AutonomousResearchError, ResearchBusPermissionError, TypeError, ValueError, RuntimeError) as exc:
                 proposal_error = f"{type(exc).__name__}: {str(exc)[:256]}"
+            if proposal_error is not None:
+                fallback_reason = "PROPOSAL_PATH_FAILED"
+            elif draft_preview_active:
+                fallback_reason = str(
+                    draft_trace.get("reason") or "NO_SUITABLE_MATERIALIZED_INSTANCE"
+                )
+            elif proposal_items:
+                fallback_reason = "STRATEGY_DEFINITIONS_QUEUED"
+            else:
+                fallback_reason = "NO_STRATEGY_DEFINITIONS"
             fallback = {
                 "strategy_version_id": None,
                 "source_class": "ALL",
                 "requested_days": [7, 30],
                 "status": "SCHEDULED" if proposal_error is None else "ERROR",
-                "reason": "NO_STRATEGY_DEFINITIONS" if proposal_error is None else "PROPOSAL_PATH_FAILED",
+                "reason": fallback_reason,
                 "next_job": "predeclared_starting_set",
                 "proposal_queue_item_ids": [
                     str(item.item_id)
@@ -13680,6 +14592,91 @@ class AutonomousResearchProcessor:
             pending_total=pending_total,
             enrolled_strategy_version_ids=enrolled_strategy_version_ids,
         )
+        state["scope_draft_trace"] = dict(draft_trace)
+        draft_strategy_ids = {
+            str(item.get("strategy_version_id", "")).strip()
+            for item in strategies
+            if isinstance(item, Mapping)
+            and item.get("draft_bound") is True
+            and str(item.get("draft_id", "")).strip() == str(
+                draft_trace.get("draft_id", "")
+            ).strip()
+            and str(item.get("draft_hash", "")).strip() == str(
+                draft_trace.get("draft_hash", "")
+            ).strip()
+        }
+        evaluator_decisions: list[dict[str, Any]] = []
+        for item in evidence_rows:
+            if (
+                not isinstance(item, Mapping)
+                or str(item.get("strategy_version_id", "")).strip()
+                not in draft_strategy_ids
+            ):
+                continue
+            metrics = item.get("metrics")
+            metrics = metrics if isinstance(metrics, Mapping) else {}
+            evaluation = metrics.get("evaluation")
+            if not isinstance(evaluation, Mapping):
+                continue
+            base = {
+                "evaluation_run_id": item.get("evaluation_run_id"),
+                "strategy_version_id": item.get("strategy_version_id"),
+                "evaluation_kind": evaluation.get(
+                    "evaluation_kind", item.get("evaluation_kind")
+                ),
+                "evaluator_invoked": evaluation.get("evaluator_invoked"),
+                "evaluator_completed": evaluation.get("evaluator_completed"),
+                "source_class": item.get("source_class"),
+            }
+            explicit = (
+                evaluation.get("decision")
+                or evaluation.get("reason")
+                or evaluation.get("evaluator_error")
+                or evaluation.get("evaluator_prerequisite")
+            )
+            if explicit:
+                evaluator_decisions.append({**base, "decision": str(explicit)})
+            reason_counts = evaluation.get("reason_counts")
+            if isinstance(reason_counts, Mapping):
+                for reason, count in sorted(reason_counts.items(), key=lambda pair: str(pair[0])):
+                    if str(reason).strip():
+                        evaluator_decisions.append(
+                            {**base, "decision": str(reason), "count": count}
+                        )
+            if not explicit and not isinstance(reason_counts, Mapping):
+                evaluator_decisions.append(base)
+        state["strategy_discovery_trace"] = {
+            "source": (
+                "system-bootstrap"
+                if system_bootstrap_active
+                else ("scope-draft-preview" if draft_preview_active else "legacy-enrollment")
+            ),
+            "discovery": (
+                dict(draft_trace.get("discovery"))
+                if isinstance(draft_trace.get("discovery"), Mapping)
+                else {}
+            ),
+            "materialization_reason": draft_trace.get("reason"),
+            "supported_templates": list(draft_trace.get("supported_templates", ())),
+            "materialized_strategy_count": len(strategies),
+            "materialized_market_count": len(
+                {
+                    str(market.get("market_id", "")).strip()
+                    for document in documents
+                    if isinstance(document, Mapping)
+                    for market in (
+                        document.get("scope_resolution", {}).get("matched_markets", ())
+                        if isinstance(document.get("scope_resolution"), Mapping)
+                        else ()
+                    )
+                    if isinstance(market, Mapping)
+                    and str(market.get("market_id", "")).strip()
+                }
+            ),
+            "evaluator_decisions": evaluator_decisions[: _MAX_ROLLING_QUEUE_RESULTS],
+            "paper_only": True,
+            "live_execution": False,
+        }
         state["rolling_cursor"] = (
             _rolling_bound_cursor_state(cursor)
             if isinstance(cursor, Mapping)
@@ -13966,6 +14963,31 @@ class AutonomousResearchProcessor:
         bypass_due = bool(force or initialization_transition)
         if not bypass_due and due is not None and current < due and previous is not None:
             return self.rolling_portfolio_state()
+        current_draft_trace = refreshed.get("scope_draft_trace")
+        current_draft_trace = (
+            current_draft_trace if isinstance(current_draft_trace, Mapping) else {}
+        )
+        current_draft_id = str(current_draft_trace.get("draft_id", "")).strip()
+        current_draft_hash = str(current_draft_trace.get("draft_hash", "")).strip()
+
+        def evidence_is_authorized(row: Mapping[str, Any]) -> bool:
+            provenance = row.get("provenance")
+            provenance = provenance if isinstance(provenance, Mapping) else {}
+            if not _rolling_document_is_draft_bound(row, provenance):
+                return True
+            if not current_draft_id or not current_draft_hash:
+                return False
+            row_draft_id = str(
+                row.get("draft_id") or provenance.get("draft_id") or ""
+            ).strip()
+            row_draft_hash = str(
+                row.get("draft_hash") or provenance.get("draft_hash") or ""
+            ).strip()
+            return (
+                row_draft_id == current_draft_id
+                and row_draft_hash == current_draft_hash
+            )
+
         lister = getattr(self.store, "list_strategy_evidence_windows", None)
         if callable(lister):
             try:
@@ -13987,6 +15009,7 @@ class AutonomousResearchProcessor:
                 row,
                 row.get("provenance") if isinstance(row.get("provenance"), Mapping) else None,
             )
+            and evidence_is_authorized(row)
             and not _rolling_campaign_bound(row)
         )
         risk = self._rolling_risk_binding(policy)
@@ -14294,14 +15317,64 @@ class AutonomousResearchProcessor:
                         scope.get("market_scope_version") or scope.get("scope_version")
                     )
             if isinstance(row, Mapping):
+                source_provenance = row.get("provenance")
+                source_provenance = (
+                    source_provenance
+                    if isinstance(source_provenance, Mapping)
+                    else {}
+                )
+                source_candidates = (row, source_provenance, identity)
+
+                def source_value(name: str) -> Any:
+                    for source in source_candidates:
+                        if source.get(name) not in (None, ""):
+                            return source.get(name)
+                    return None
+
                 for key in (
                     "candidate_id",
                     "research_trial_id",
+                    "strategy_version_id",
                     "evidence_window_id",
                     "evidence_digest",
+                    "draft_id",
+                    "draft_hash",
+                    "draft_bound",
+                    "scope_hash",
+                    "scope_version",
+                    "operational_setup_hash",
                 ):
-                    if row.get(key) not in (None, ""):
-                        member.setdefault(key, row.get(key))
+                    value = source_value(key)
+                    if value not in (None, ""):
+                        member[key] = value
+                raw_bindings = next(
+                    (
+                        source.get("market_bindings")
+                        for source in source_candidates
+                        if isinstance(source.get("market_bindings"), (list, tuple))
+                    ),
+                    None,
+                )
+                if isinstance(raw_bindings, (list, tuple)):
+                    member["market_bindings"] = [
+                        dict(binding) if isinstance(binding, Mapping) else binding
+                        for binding in raw_bindings
+                    ]
+                source_scope_resolution = next(
+                    (
+                        source.get("scope_resolution", source.get("market_scope_resolution"))
+                        for source in source_candidates
+                        if isinstance(
+                            source.get("scope_resolution", source.get("market_scope_resolution")),
+                            Mapping,
+                        )
+                    ),
+                    None,
+                )
+                if isinstance(source_scope_resolution, Mapping):
+                    member["scope_resolution"] = dict(source_scope_resolution)
+                if source_provenance:
+                    member["provenance"] = dict(source_provenance)
             enriched_members.append(member)
         members = enriched_members
         proposed_allocation_total = sum(

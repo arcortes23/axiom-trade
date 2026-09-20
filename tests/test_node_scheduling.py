@@ -1331,6 +1331,243 @@ class ExploratoryRollingProgressionTests(unittest.TestCase):
                 )
                 self.assertEqual(bindings[0]["book_depth"], "SUITABLE")
 
+    def test_scope_draft_preview_requires_valid_depth_on_both_sides(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = str(Path(directory) / "scope-draft-preview.sqlite")
+            with AxiomStore(db) as store:
+                processor = self._processor(db, store)
+                policy = normalize_market_scope(
+                    {
+                        "schema_version": "1",
+                        "mode": "RULE_BASED_MARKETS",
+                        "instrument": "POLYMARKET",
+                        "categories": [],
+                        "market_ids": [],
+                        "filters": {},
+                        "regime_restrictions": {},
+                        "provenance": "canonical",
+                    }
+                )
+                draft = {
+                    "draft_id": "rolling-exploratory-scope-draft:test:v1",
+                    "status": "DRAFT",
+                    "scope": policy.as_dict(),
+                    "scope_hash": policy.scope_hash,
+                    "scope_version": policy.scope_version,
+                    "supported_market_types": ["prediction"],
+                    "paper_only": True,
+                    "live_execution": False,
+                    "allocation_active": False,
+                    "canary_armed": False,
+                }
+                draft["draft_hash"] = _rolling_hash(
+                    {key: value for key, value in draft.items() if key != "draft_hash"}
+                )
+                store.set_operator_config("rolling_exploratory_scope_draft", draft)
+                payload = {
+                    "market_id": "draft-market",
+                    "provider": "polymarket",
+                    "source_type": "CURRENT",
+                    "condition_id": "condition-draft-market",
+                    "yes_token_id": "yes-draft-market",
+                    "no_token_id": "no-draft-market",
+                    "active": True,
+                    "closed": False,
+                    "accepting_orders": True,
+                    "enable_order_book": True,
+                    "metadata": {
+                        "market_id": "draft-market",
+                        "condition_id": "condition-draft-market",
+                        "yes_token_id": "yes-draft-market",
+                        "no_token_id": "no-draft-market",
+                        "active": True,
+                        "closed": False,
+                        "accepting_orders": True,
+                        "enable_order_book": True,
+                    },
+                    "snapshot": {
+                        "market_id": "draft-market",
+                        "condition_id": "condition-draft-market",
+                        "yes_token_id": "yes-draft-market",
+                        "no_token_id": "no-draft-market",
+                        "active": True,
+                        "closed": False,
+                        "accepting_orders": True,
+                        "enable_order_book": True,
+                        "order_book": {
+                            "bids": [{"price": 0, "size": 0}],
+                            "asks": [{"price": 0.6, "size": 2}],
+                        },
+                    },
+                }
+                store.tracked_polymarket_markets = (  # type: ignore[method-assign]
+                    lambda **kwargs: [
+                        {
+                            "market_id": "draft-market",
+                            "observed_at": T0.isoformat(),
+                            "payload": payload,
+                        }
+                    ]
+                )
+                preview, trace = processor._rolling_scope_draft_documents(T0)
+                self.assertEqual(preview, ())
+                self.assertEqual(trace["status"], "NO_SUITABLE_MATERIALIZED_INSTANCE")
+
+                payload["snapshot"]["order_book"]["bids"] = [  # type: ignore[index]
+                    {"price": 0.4, "size": 2}
+                ]
+                preview, trace = processor._rolling_scope_draft_documents(T0)
+                self.assertEqual(trace["status"], "MATERIALIZED")
+                self.assertEqual(len(preview), 2)
+                self.assertTrue(all(item.get("draft_bound") is True for item in preview))
+                self.assertEqual(
+                    store.get_operator_config("rolling_exploratory_scope_draft", None),
+                    draft,
+                )
+    def test_scope_draft_continuation_isolated_from_normal_and_resumes_exact_draft(self) -> None:
+        with AxiomStore(":memory:") as store:
+            policy = normalize_market_scope(
+                {
+                    "schema_version": "1",
+                    "mode": "RULE_BASED_MARKETS",
+                    "instrument": "POLYMARKET",
+                    "categories": [],
+                    "market_ids": [],
+                    "filters": {},
+                    "regime_restrictions": {},
+                    "provenance": "canonical",
+                }
+            )
+            draft = {
+                "draft_id": "continuation-draft:v1",
+                "status": "DRAFT",
+                "scope": policy.as_dict(),
+                "scope_hash": policy.scope_hash,
+                "scope_version": policy.scope_version,
+                "paper_only": True,
+                "live_execution": False,
+                "allocation_active": False,
+                "canary_armed": False,
+            }
+            draft["draft_hash"] = _rolling_hash(
+                {key: value for key, value in draft.items() if key != "draft_hash"}
+            )
+            collector = PolymarketCollector(
+                InMemoryPredictionProvider([]),
+                store,
+                CollectorConfig(
+                    max_markets=1,
+                    discovery_budget_per_cycle=1,
+                    provider_timeout_seconds=10,
+                ),
+                clock=lambda: T0,
+                sleep=lambda _seconds: None,
+            )
+            carry_cursors: list[Any] = []
+
+            def fake_discover(
+                _observed_at: datetime,
+                _counters: dict[str, Any],
+                *,
+                budget: int,
+                carry_cursor: Any = None,
+                exclude: set[str] | None = None,
+            ) -> tuple[tuple[PredictionMarketSnapshot, ...], str, tuple[str, ...]]:
+                carry_cursors.append(carry_cursor)
+                return (), "draft-next", ()
+            def fake_resolve(
+                *_args: Any,
+            ) -> tuple[list[str], dict[str, Any], dict[str, Any], Any]:
+                collector._rolling_background_discovery_enabled = isinstance(
+                    collector._scope_draft_preview,
+                    Mapping,
+                )
+                return [], {}, {}, None
+
+            collector._resolve_market_scopes = fake_resolve  # type: ignore[method-assign]
+            collector._required_health = (  # type: ignore[method-assign]
+                lambda *_args, **_kwargs: {"fresh": [], "stale": [], "missing": []}
+            )
+            collector._discover_markets = fake_discover  # type: ignore[method-assign]
+            try:
+                collector.collect_once(now=T0, scope_draft=draft)
+                collector.collect_once(now=T0)
+                collector.collect_once(now=T0, scope_draft=draft)
+            finally:
+                collector.close()
+            self.assertEqual(carry_cursors, [0, 0, "draft-next"])
+
+    def test_draft_bound_lineage_never_falls_back_to_ordinary_rolling_authority(self) -> None:
+        with AxiomStore(":memory:") as store:
+            processor = self._processor(":memory:", store)
+            strategy_document = {
+                "version": 1,
+                "market_type": "prediction",
+                "family": "momentum",
+                "parameters": {
+                    "lookback": 1,
+                    "threshold": 0.05,
+                    "entry_predicate": {
+                        "version": "absolute-move-v1",
+                        "minimum_move": 0.05,
+                        "units": "probability",
+                        "boundary": "inclusive",
+                    },
+                },
+                "probability_model": "market-history",
+                "resolution_aware": True,
+                "resolution_inputs": ["market_history"],
+            }
+            strategy_hash = _rolling_hash(strategy_document)
+            draft_id = "authority-bound-draft:v1"
+            draft_hash = _rolling_hash(
+                {"draft_id": draft_id, "scope_hash": "scope-hash", "scope_version": "scope-v1"}
+            )
+            candidate_id = "authority-bound-candidate"
+            strategy_version_id = "strategy-version-authority-bound"
+            trial_id = "research-trial-authority-bound"
+            persisted = processor._rolling_persist_strategy_lineage(
+                (
+                    {
+                        "strategy_document": strategy_document,
+                        "strategy_hash": strategy_hash,
+                        "strategy_id": str(strategy_document["family"]),
+                        "version": "1",
+                        "candidate_id": candidate_id,
+                        "strategy_version_id": strategy_version_id,
+                        "research_trial_id": trial_id,
+                        "draft_id": draft_id,
+                        "draft_hash": draft_hash,
+                        "draft_bound": True,
+                        "scope_hash": "scope-hash",
+                        "scope_version": "scope-v1",
+                        "provenance": {
+                            "candidate_id": candidate_id,
+                            "draft_id": draft_id,
+                            "draft_hash": draft_hash,
+                            "draft_bound": True,
+                            "scope_hash": "scope-hash",
+                            "scope_version": "scope-v1",
+                        },
+                    },
+                ),
+                T0,
+            )
+            self.assertEqual(len(persisted), 1)
+            accepted = store.list_rolling_enrollments(status="ACCEPTED", limit=100)
+            self.assertEqual(
+                {item.get("strategy_version_id") for item in accepted},
+                {strategy_version_id},
+            )
+            self.assertEqual(processor._rolling_strategy_documents(), ())
+
+            store.set_operator_config(
+                "rolling_exploratory_scope_draft",
+                {"status": "DRAFT", "draft_id": draft_id},
+            )
+            self.assertIsNone(processor._rolling_scope_draft())
+            self.assertEqual(processor._rolling_strategy_documents(), ())
+
     def test_paper_binding_keeps_canonical_setup_capture_and_model_resolution(self) -> None:
         strategy_document = {
             "version": 1,

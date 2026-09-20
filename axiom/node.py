@@ -1712,18 +1712,20 @@ class ResearchNode:
                 self.store.close()
         return list(self._cycles)
 
-    def _rolling_current_market_discovery(self, now: datetime) -> Any:
-        """Run one bounded disarmed current-market collection pass.
-
-        The rolling worker must never contend indefinitely with the ordinary
-        collector.  A non-blocking lock makes this an opportunistic refresh;
-        the collector itself applies provider/request deadlines and the
-        system-policy ten-market cap before any transport call.
-        """
+    def _rolling_current_market_discovery(
+        self,
+        now: datetime,
+        *,
+        draft: Mapping[str, Any] | None = None,
+    ) -> Any:
+        """Run one bounded disarmed current-market collection pass."""
         if not self._rolling_discovery_lock.acquire(blocking=False):
             return None
         try:
-            return self.collector.collect_once(now=ensure_utc(now))
+            return self.collector.collect_once(
+                now=ensure_utc(now),
+                scope_draft=draft,
+            )
         finally:
             self._rolling_discovery_lock.release()
 
@@ -2483,6 +2485,29 @@ class ResearchNode:
                     error=error,
                     extra={
                         "rolling_portfolio": result,
+                        "scope_draft_trace": (
+                            result.get("scope_draft_trace")
+                            if isinstance(result, Mapping)
+                            else None
+                        ),
+                        "strategy_discovery_trace": (
+                            result.get("strategy_discovery_trace")
+                            if isinstance(result, Mapping)
+                            else None
+                        ),
+                        "evaluator_decisions": (
+                            (
+                                result.get("strategy_discovery_trace", {}).get(
+                                    "evaluator_decisions", ()
+                                )
+                                if isinstance(
+                                    result.get("strategy_discovery_trace"), Mapping
+                                )
+                                else ()
+                            )
+                            if isinstance(result, Mapping)
+                            else ()
+                        ),
                         "observation_setup_migrations": (
                             len(migration)
                             if isinstance(migration, (list, tuple))

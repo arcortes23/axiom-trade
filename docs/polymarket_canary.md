@@ -47,10 +47,16 @@ canary activation. Deployment remains `DISARMED`.
    unresolved intents, and the candidate's current forward evidence.
 2. Review the expected price, fee reserve, slippage, and original
    strategy/version metadata for any held lot.
-3. Do not click **Enable** or attempt activation from this isolated diagnostic
+3. The production `canary.connectivity_check` action derives the current
+   selected member's persisted market/token binding through
+   `OperatorControlPlane._selected_market_readiness` and passes those server
+   values to `CanaryService.connectivity_check`; it never trusts caller-supplied
+   market or token IDs. Without a selected binding it performs only the
+   account-level connectivity check.
+4. Do not click **Enable** or attempt activation from this isolated diagnostic
    surface. It cannot authenticate, reach account/order paths, or authorize a
    live canary; no live order or fill is implied.
-4. At completion or on any emergency, use **Disable/Disarm** if a persisted
+5. At completion or on any emergency, use **Disable/Disarm** if a persisted
    control state must be cleared, reconcile UNKNOWN intents by exact client ID,
    and verify the persisted terminal state. Do not delete rows or manually
    release a reservation to make a panel look clear.
@@ -210,6 +216,48 @@ profitability-only exception never waives setup, observation, calibration,
 market, account, risk, or safety gates, and it never makes a paper result live
 evidence.
 
+## Unactivated broad scope draft and bounded trace
+
+The operator exposes a pure read projection through
+`OperatorControlPlane.rolling_exploratory_scope_draft()`. Normal production
+startup and the existing explicit authorization-review path call the
+idempotent `_prepare_rolling_exploratory_scope_draft()` callable to persist the
+same record; neither callable activates allocation, a canary, or execution.
+Dashboard/status GETs use the persisted projection only and never prepare it.
+This is a **DRAFT** record, not active authority and not a member selection. Its
+canonical normalized scope is:
+
+- `mode=RULE_BASED_MARKETS`, `instrument=POLYMARKET`;
+- no category restriction (`categories=[]`), so all supported categories are
+  considered, including sports where the market is otherwise supported;
+- `supported_market_types=["prediction"]`, meaning the existing standard
+  binary prediction-market mechanics only; and
+- canonical `scope_hash`, `scope_version`, and a separate `draft_hash`.
+
+The draft excludes `COMBO`, unsupported or non-binary markets, closed or
+non-accepting markets, markets without an order book, stale markets,
+insufficient liquidity or depth, invalid token identity or strategy setup,
+insufficient data, and failed evaluations. It records `paper_only=true`,
+`live_execution=false`, `allocation_active=false`, and `canary_armed=false`.
+The active operating scope and each selected member's frozen scope remain
+separate records with their own hashes and versions; drafting never mutates
+either one and there is no scope-activation action.
+
+One bounded paper trace consumes this draft without granting authority:
+`PolymarketCollector` discovery is capped at 10 markets, then each candidate
+must materialize fresh market metadata, selected-token order-book data, and
+token identity before evaluation. The evaluation evidence records the
+`momentum` and `mean_reversion` templates plus strategy setup, data quality,
+liquidity, depth, and sizing gates. A candidate that fails any gate is retained
+as an explicit exclusion rather than silently becoming a live selection.
+
+Official geoblock and account-readiness probes are independent read-only
+evidence. Their result must not be inferred from discovery, the absence of a
+selected member, or paper evaluation. The final review may show those
+independent blockers, but the existing `exploratory.live.review_confirm`
+confirmation remains the only final path and still coordinates the existing
+authorization, selection, risk, and safety fences without submitting an order.
+
 ## Current canary settings and finite authorization
 
 The active reviewed settings in this release are **$1.00 per all-in BUY**,
@@ -218,6 +266,11 @@ and exposure**, **3 open positions**, **5 submitted orders per day**, **100 bp
 maximum slippage**, and **$2.00 realized/equity entry-loss stops**. The
 frequently cited `$20` gross-daily / `$5` per-order values are not the active
 settings here and must not be presented as current configuration.
+The rolling policy budget and experimental enablement are disclosed separately
+under the status `economic_policy.rolling_policy` projection. A zero global
+rolling-policy budget or disabled experimental policy does not widen, replace,
+or reinterpret the unchanged financial caps above; the dashboard also exposes
+those caps under `economic_policy.financial_caps`.
 
 Each authorization requires a finite lifetime budget, explicit stop rules, and
 an expiry. Missing, stale, expired, or mismatched lifetime, settings
