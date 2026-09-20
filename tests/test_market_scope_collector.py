@@ -3274,6 +3274,148 @@ class MarketScopeCollectorTests(unittest.TestCase):
         self.assertEqual(len(requests), 4)
 
 
+    def test_actual_adapter_repairs_legacy_none_cursor_and_resumes_deduped_trades(self) -> None:
+        market_id = "real-adapter-cursor"
+        condition_id = "0x" + ("b" * 64)
+        yes_token = "yes-real-adapter-cursor"
+        no_token = "no-real-adapter-cursor"
+        trade_timestamp = T0
+        gamma_payload = {
+            "id": market_id,
+            "conditionId": condition_id,
+            "question": "Will the adapter resume this trade stream?",
+            "outcomes": ["Yes", "No"],
+            "clobTokenIds": [yes_token, no_token],
+            "updatedAt": T0.isoformat(),
+            "endDate": (T0 + timedelta(days=1)).isoformat(),
+            "active": True,
+            "closed": False,
+            "acceptingOrders": True,
+            "enableOrderBook": True,
+        }
+        book_payloads = {
+            yes_token: {
+                "asset_id": yes_token,
+                "market": condition_id,
+                "timestamp": T0.isoformat(),
+                "bids": [{"price": "0.49", "size": "10"}],
+                "asks": [{"price": "0.51", "size": "10"}],
+            },
+            no_token: {
+                "asset_id": no_token,
+                "market": condition_id,
+                "timestamp": T0.isoformat(),
+                "bids": [{"price": "0.49", "size": "10"}],
+                "asks": [{"price": "0.51", "size": "10"}],
+            },
+        }
+        trade_payload = [{
+            "conditionId": condition_id,
+            "asset": yes_token,
+            "side": "BUY",
+            "price": 0.50,
+            "size": 2,
+            "timestamp": int(trade_timestamp.timestamp()),
+            "transactionHash": "resume-tx-1",
+        }]
+        trade_responses: list[object] = [None, trade_payload, trade_payload]
+        trade_requests: list[str] = []
+
+        class Response:
+            status = 200
+            headers: dict[str, str] = {}
+
+            def __init__(self, payload: object) -> None:
+                self.payload = payload
+
+            def read(self) -> bytes:
+                return json.dumps(self.payload).encode("utf-8")
+
+            def close(self) -> None:
+                return None
+
+        def opener(request: object, timeout: float) -> Response:
+            del timeout
+            url = str(getattr(request, "full_url", request))
+            if "/markets/" in url:
+                return Response(gamma_payload)
+            if "/book?" in url:
+                token = yes_token if yes_token in url else no_token
+                return Response(book_payloads[token])
+            if "/trades?" in url:
+                trade_requests.append(url)
+                return Response(trade_responses.pop(0))
+            raise AssertionError(f"unexpected public URL: {url}")
+
+        provider = PolymarketAdapter(
+            gamma_url="https://gamma.test",
+            data_api_url="https://data.test",
+            clob_url="https://clob.test",
+            opener=opener,
+        )
+        store = _ImmutableTradeStore({})
+        state_key = f"polymarket:{market_id}"
+        store.states[state_key] = {
+            "market_id": market_id,
+            "last_trade_timestamp": (T0 - timedelta(minutes=1)).isoformat(),
+            "last_trade_cursor": "None",
+        }
+        collector = _ScopeCollector(
+            provider,
+            store,
+            CollectorConfig(
+                interval_seconds=1,
+                max_attempts=1,
+                backoff_initial_seconds=0,
+                jitter_seconds=0,
+            ),
+            candidate_ids=(),
+            clock=lambda: T0,
+            sleep=lambda _seconds: None,
+        )
+        try:
+            first = collector._collect_market(
+                market_id,
+                None,
+                T0,
+                provider=provider,
+                force=True,
+            )
+            first_state = store.get_collector_state(state_key)
+            second = collector._collect_market(
+                market_id,
+                None,
+                T0 + timedelta(seconds=1),
+                provider=provider,
+                force=True,
+            )
+            second_state = store.get_collector_state(state_key)
+            third = collector._collect_market(
+                market_id,
+                None,
+                T0 + timedelta(seconds=2),
+                provider=provider,
+                force=True,
+            )
+            third_state = store.get_collector_state(state_key)
+        finally:
+            collector.close()
+
+        self.assertEqual(first["counters"]["trade_failures"], 0)
+        self.assertEqual(first_state["last_trade_cursor"], "0")
+        self.assertEqual(
+            first_state["last_trade_timestamp"],
+            (T0 - timedelta(minutes=1)).isoformat(),
+        )
+        self.assertEqual(second["counters"]["trade_failures"], 0)
+        self.assertIsNone(second_state["last_trade_cursor"])
+        self.assertEqual(second_state["last_trade_timestamp"], trade_timestamp.isoformat())
+        self.assertEqual(third["counters"]["trade_duplicates"], 1)
+        self.assertIsNone(third_state["last_trade_cursor"])
+        self.assertEqual(len(store.trade_payloads), 1)
+        self.assertEqual(len(trade_requests), 3)
+        self.assertTrue(all("offset=0" in url and "offset=None" not in url for url in trade_requests))
+
     def test_explicit_point_in_time_collection_rejects_future_order_books(self) -> None:
         target = market("future-point-in-time")
 

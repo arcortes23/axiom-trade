@@ -535,5 +535,56 @@ class PredictionDataQualityCacheTests(unittest.TestCase):
         self.assertEqual(store.scan_calls, 0)
 
 
+    def test_polymarket_trade_cursor_keeps_incomplete_optional_offset_typed(self) -> None:
+        condition_id = "0x" + ("a" * 64)
+        market_payload = {
+            "id": "market-1",
+            "conditionId": condition_id,
+            "question": "Will it happen?",
+            "outcomes": ["Yes", "No"],
+            "clobTokenIds": ["yes-token", "no-token"],
+            "active": True,
+            "closed": False,
+            "acceptingOrders": True,
+            "enableOrderBook": True,
+        }
+        trade_payloads: list[object] = [None, None, []]
+        trade_urls: list[str] = []
+
+        def opener(request: object, timeout: float) -> _Response:
+            del timeout
+            url = str(getattr(request, "full_url", request))
+            if "/markets/market-1" in url:
+                return _Response(market_payload)
+            if "/trades?" in url:
+                trade_urls.append(url)
+                return _Response(trade_payloads.pop(0))
+            raise AssertionError(f"unexpected public URL: {url}")
+
+        adapter = PolymarketAdapter(opener=opener)
+
+        first = adapter.trades("market-1", max_pages=1)
+        self.assertEqual(first, ())
+        self.assertFalse(adapter.last_trades_complete)
+        self.assertEqual(adapter.last_trade_cursor, "0")
+
+        second = adapter.trades("market-1", max_pages=1, cursor=adapter.last_trade_cursor)
+        self.assertEqual(second, ())
+        self.assertFalse(adapter.last_trades_complete)
+        self.assertEqual(adapter.last_trade_cursor, "0")
+
+        third = adapter.trades("market-1", max_pages=1, cursor=adapter.last_trade_cursor)
+        self.assertEqual(third, ())
+        self.assertTrue(adapter.last_trades_complete)
+        self.assertIsNone(adapter.last_trade_cursor)
+        self.assertEqual(len(trade_urls), 3)
+        self.assertTrue(all("offset=0" in url for url in trade_urls))
+
+    def test_polymarket_trade_cursor_rejects_malformed_values(self) -> None:
+        adapter = PolymarketAdapter(opener=lambda _request, timeout: _Response([]))
+
+        with self.assertRaisesRegex(ValueError, "non-negative offset"):
+            adapter.trades("market-1", cursor="None")
+
 if __name__ == "__main__":
     unittest.main()
