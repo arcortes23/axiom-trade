@@ -58,6 +58,41 @@ _ROLLING_BOOTSTRAP_MARKET_CAP = 10
 _ROLLING_BOOTSTRAP_MEMBER_MAX = 3
 _ROLLING_BOOTSTRAP_REQUEST_BUDGET = 16
 _ROLLING_BOOTSTRAP_MARKET_REQUEST_RESERVE = 5
+def _validated_scope_draft(value: Any) -> Mapping[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    if str(value.get("status", "")).strip().upper() != "DRAFT":
+        return None
+    if any(
+        value.get(name) is not expected
+        for name, expected in (
+            ("paper_only", True),
+            ("live_execution", False),
+            ("allocation_active", False),
+            ("canary_armed", False),
+        )
+    ):
+        return None
+    required = (
+        str(value.get("draft_id", "")).strip(),
+        str(value.get("draft_hash", "")).strip(),
+        str(value.get("scope_hash", "")).strip(),
+        str(value.get("scope_version", "")).strip(),
+    )
+    if not all(required) or not isinstance(value.get("scope"), Mapping):
+        return None
+    unsigned = {str(key): child for key, child in value.items() if key != "draft_hash"}
+    expected = "sha256:" + hashlib.sha256(
+        json.dumps(
+            unsigned,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
+    return dict(value) if required[1] == expected else None
 
 
 class _ScopePersistenceValueError(ValueError):
@@ -463,6 +498,8 @@ class PolymarketCollector:
         self.clock = clock
         self.sleep = sleep
         self._discovery_continuation: Mapping[str, Any] | None = None
+        self._scope_draft_preview: Mapping[str, Any] | None = None
+        self._scope_draft_invalid = False
         # Set for the duration of a tick and intentionally left in place for
         # daemon workers that finish after the caller has returned.
         self._cycle_deadline_monotonic: float | None = None
@@ -658,7 +695,10 @@ class PolymarketCollector:
         market_ids: Sequence[str] | None = None,
         *,
         now: datetime | None = None,
+        scope_draft: Mapping[str, Any] | None = None,
     ) -> CollectionCycle:
+        self._scope_draft_preview = _validated_scope_draft(scope_draft)
+        self._scope_draft_invalid = scope_draft is not None and self._scope_draft_preview is None
         started = ensure_utc(now or self.clock())
         monotonic_started = time.monotonic()
         self._cycle_deadline_monotonic = monotonic_started + self.config.cycle_budget_seconds
@@ -668,9 +708,81 @@ class PolymarketCollector:
         self._scope_inventory_budget_remaining = None
         self._cycle_last_remaining_market_ids = ()
         root_state = self.store.get_collector_state(self.config.collector_name) or {}
+        draft_binding = (
+            {
+                "draft_id": str(self._scope_draft_preview.get("draft_id", "")).strip(),
+                "draft_hash": str(self._scope_draft_preview.get("draft_hash", "")).strip(),
+                "scope_hash": str(self._scope_draft_preview.get("scope_hash", "")).strip(),
+                "scope_version": str(self._scope_draft_preview.get("scope_version", "")).strip(),
+            }
+            if isinstance(self._scope_draft_preview, Mapping)
+            else None
+        )
+        draft_binding_key = (
+            hashlib.sha256(
+                json.dumps(
+                    draft_binding,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=True,
+                ).encode("utf-8")
+            ).hexdigest()
+            if isinstance(draft_binding, Mapping)
+            else None
+        )
+        persisted_draft_continuations = root_state.get("scope_draft_continuations")
+        persisted_draft_continuations = (
+            persisted_draft_continuations
+            if isinstance(persisted_draft_continuations, Mapping)
+            else {}
+        )
+        persisted_draft_progress = (
+            persisted_draft_continuations.get(draft_binding_key)
+            if draft_binding_key
+            else None
+        )
+        persisted_draft_progress = (
+            persisted_draft_progress
+            if isinstance(persisted_draft_progress, Mapping)
+            else {}
+        )
+
+        def persisted_state(name: str, default: Any = None) -> Any:
+            if draft_binding_key:
+                if name in persisted_draft_progress:
+                    return persisted_draft_progress.get(name)
+                legacy = root_state.get(name)
+                legacy_binding = (
+                    legacy.get("scope_draft_binding")
+                    if isinstance(legacy, Mapping)
+                    else None
+                )
+                if (
+                    isinstance(legacy_binding, Mapping)
+                    and all(
+                        str(legacy_binding.get(key, "")).strip()
+                        == str(draft_binding.get(key, "")).strip()
+                        for key in draft_binding
+                    )
+                ):
+                    return legacy
+                return default
+            value = root_state.get(name, default)
+            if name in {
+                "discovery_continuation",
+                "scope_inventory_continuation",
+                "cycle_continuation",
+            } and isinstance(value, Mapping) and isinstance(
+                value.get("scope_draft_binding"),
+                Mapping,
+            ):
+                return default
+            return value
+
+        previous_cycle_continuation = persisted_state("cycle_continuation", {})
         previous_cycle_continuation = (
-            root_state.get("cycle_continuation")
-            if isinstance(root_state.get("cycle_continuation"), Mapping)
+            previous_cycle_continuation
+            if isinstance(previous_cycle_continuation, Mapping)
             else {}
         )
         resume_ids = [
@@ -678,29 +790,51 @@ class PolymarketCollector:
             for item in previous_cycle_continuation.get("remaining_market_ids", ())
             if str(item).strip()
         ][:_MAX_CYCLE_CONTINUATION_IDS]
-        persisted_scope_continuation = root_state.get("scope_inventory_continuation")
+        persisted_scope_continuation = persisted_state("scope_inventory_continuation")
         self._scope_inventory_continuation = (
             self._bound_scope_continuation(persisted_scope_continuation)
             if isinstance(persisted_scope_continuation, Mapping)
             else None
         )
-        self._scope_direct_lookup_cursor = self._scope_direct_cursor(root_state)
-        self._scope_direct_priority_lookup_cursor = self._scope_direct_priority_cursor(root_state)
-        self._scope_direct_protected_lookup_cursor = self._scope_direct_protected_cursor(root_state)
-        self._scope_resolution_candidate_cursor = self._scope_resolution_candidate_cursor_value(root_state)
+        continuation_state = dict(root_state)
+        for continuation_name in (
+            "scope_inventory_continuation",
+            "scope_direct_lookup_cursor",
+            "scope_direct_priority_lookup_cursor",
+            "scope_direct_protected_lookup_cursor",
+            "scope_resolution_candidate_cursor",
+            "scope_resolution_deferred_cursor",
+            "scope_observation_refresh_candidate_ids",
+            "scope_observation_refresh_cursor",
+        ):
+            continuation_value = persisted_state(continuation_name)
+            if continuation_value is None:
+                continuation_state.pop(continuation_name, None)
+            else:
+                continuation_state[continuation_name] = continuation_value
+        self._scope_direct_lookup_cursor = self._scope_direct_cursor(continuation_state)
+        self._scope_direct_priority_lookup_cursor = self._scope_direct_priority_cursor(
+            continuation_state
+        )
+        self._scope_direct_protected_lookup_cursor = self._scope_direct_protected_cursor(
+            continuation_state
+        )
+        self._scope_resolution_candidate_cursor = (
+            self._scope_resolution_candidate_cursor_value(continuation_state)
+        )
         try:
             self._scope_resolution_deferred_cursor = max(
                 0,
-                int(root_state.get("scope_resolution_deferred_cursor", 0)),
+                int(persisted_state("scope_resolution_deferred_cursor", 0)),
             )
         except (TypeError, ValueError, OverflowError):
             self._scope_resolution_deferred_cursor = 0
         self._scope_observation_refresh_candidate_ids = tuple(
             dict.fromkeys(
                 str(item).strip()
-                for item in root_state.get(
-                    "scope_observation_refresh_candidate_ids",
-                    (),
+                for item in (
+                    persisted_state("scope_observation_refresh_candidate_ids", ())
+                    or ()
                 )
                 if str(item).strip()
             )
@@ -708,15 +842,15 @@ class PolymarketCollector:
         try:
             self._scope_observation_refresh_cursor = max(
                 0,
-                int(root_state.get("scope_observation_refresh_cursor", 0)),
+                int(persisted_state("scope_observation_refresh_cursor", 0)),
             )
         except (TypeError, ValueError, OverflowError):
             self._scope_observation_refresh_cursor = 0
-
+        persisted_discovery = persisted_state("discovery_continuation")
         self._discovery_continuation = (
-            root_state.get("discovery_continuation")
-            if isinstance(root_state.get("discovery_continuation"), Mapping)
-            else None
+            persisted_discovery
+            if isinstance(persisted_discovery, Mapping)
+            else ({"scope_draft_binding": draft_binding} if draft_binding else None)
         )
         requested = tuple(dict.fromkeys(str(item).strip() for item in (market_ids or ()) if str(item).strip()))
         superseded_candidate_ids, superseded_intent_ids = (
@@ -736,43 +870,56 @@ class PolymarketCollector:
         self._scope_observation_refresh_attempted_ids = set()
         self._scope_observation_refresh_succeeded_ids = set()
 
-        configured = requested or self.config.market_ids
+        configured = (
+            ()
+            if isinstance(self._scope_draft_preview, Mapping)
+            else (requested or self.config.market_ids)
+        )
         self._scope_suitability_cache = {}
         self._scope_refreshed_snapshots = {}
         self._scope_broad_provider_unavailable = False
         self._scope_refresh_attempted = set()
         self._scope_resolution_deferred_candidate_ids = tuple(
             str(item).strip()
-            for item in root_state.get("scope_resolution_deferred_candidate_ids", ())
+            for item in (
+                persisted_state("scope_resolution_deferred_candidate_ids", ())
+                or ()
+            )
             if str(item).strip()
         )[:_MAX_SCOPE_RESOLUTION_CANDIDATES]
         self._observation_materialization_deferred_candidate_ids = tuple(
             str(item).strip()
-            for item in root_state.get("observation_materialization_deferred_candidate_ids", ())
+            for item in (
+                persisted_state("observation_materialization_deferred_candidate_ids", ())
+                or ()
+            )
             if str(item).strip()
         )[:_MAX_SCOPE_RESOLUTION_CANDIDATES]
         self._observation_materialization_completed_ids = {
             str(item).strip()
-            for item in root_state.get("observation_materialization_completed_ids", ())
+            for item in (
+                persisted_state("observation_materialization_completed_ids", ())
+                or ()
+            )
             if str(item).strip()
         }
         try:
             self._observation_materialization_cursor = max(
                 0,
-                int(root_state.get("observation_materialization_cursor", 0)),
+                int(persisted_state("observation_materialization_cursor", 0)),
             )
         except (TypeError, ValueError, OverflowError):
             self._observation_materialization_cursor = 0
         try:
             self._observation_materialization_turn = int(
-                root_state.get("observation_materialization_turn", 0)
+                persisted_state("observation_materialization_turn", 0)
             ) % 2
         except (TypeError, ValueError, OverflowError):
             self._observation_materialization_turn = 0
         try:
             self._scope_handoff_fast_streak = max(
                 0,
-                int(root_state.get("scope_handoff_fast_streak", 0)),
+                int(persisted_state("scope_handoff_fast_streak", 0)),
             )
         except (TypeError, ValueError, OverflowError):
             self._scope_handoff_fast_streak = 0
@@ -820,7 +967,7 @@ class PolymarketCollector:
                             [*(primary_candidate_ids or ()), *paper_ids, *observation_intent_ids]
                         )
                     ),
-                    root_state,
+                    continuation_state,
                     counters,
                 )
             )
@@ -1025,7 +1172,7 @@ class PolymarketCollector:
         discovery_cursor = (
             scope_cursor
             if scope_candidate_set and not self._rolling_background_discovery_enabled
-            else root_state.get("discovery_carry_cursor", 0)
+            else persisted_state("discovery_carry_cursor", 0)
         )
         discovery_scheduled: list[str] = []
         discovered: dict[str, PredictionMarketSnapshot] = {}
@@ -1140,7 +1287,7 @@ class PolymarketCollector:
             )
             and not self._rolling_scope_blocked
             and not self._rolling_scope_member_invalid
-            and remaining > len(discovery_scheduled)
+            and not self._scope_draft_preview
         ):
             try:
                 tracked = self.store.tracked_polymarket_markets(
@@ -1608,14 +1755,28 @@ class PolymarketCollector:
             )
         except (AttributeError, TypeError, ValueError):
             pass
-        self.store.set_collector_state(
-            self.config.collector_name,
-            {
+        if isinstance(draft_binding, Mapping):
+            self._discovery_continuation = {
+                **dict(self._discovery_continuation or {}),
+                "scope_draft_binding": dict(draft_binding),
+            }
+            if isinstance(self._scope_inventory_continuation, Mapping):
+                self._scope_inventory_continuation = {
+                    **dict(self._scope_inventory_continuation),
+                    "scope_draft_binding": dict(draft_binding),
+                }
+            if isinstance(cycle_continuation, Mapping):
+                cycle_continuation = {
+                    **dict(cycle_continuation),
+                    "scope_draft_binding": dict(draft_binding),
+                }
+        state_payload = {
                 **dict(root_state),
                 "last_cycle_started_at": started.isoformat(),
                 "last_cycle_ended_at": ended.isoformat(),
                 "last_cycle_duration_seconds": cycle.duration_seconds,
                 "configured_interval_seconds": self.config.interval_seconds,
+                "scope_draft_binding": dict(draft_binding) if isinstance(draft_binding, Mapping) else None,
                 "scheduled_market_ids": planned_ids,
                 "markets_seen": len(planned_ids),
                 "stale_after_seconds": self.config.stale_after_seconds,
@@ -1704,7 +1865,81 @@ class PolymarketCollector:
                 "cycle_deadline_seconds": self.config.cycle_budget_seconds,
                 "cycle_continuation": cycle_continuation,
                 **counters,
-            },
+        }
+        if isinstance(draft_binding, Mapping):
+            draft_progress = {
+                "scope_draft_binding": dict(draft_binding),
+                **{
+                    name: state_payload.get(name)
+                    for name in (
+                        "discovery_carry_cursor",
+                        "discovery_continuation",
+                        "scope_discovery_carry_cursor",
+                        "scope_inventory_continuation",
+                        "scope_direct_lookup_cursor",
+                        "scope_direct_priority_lookup_cursor",
+                        "scope_direct_protected_lookup_cursor",
+                        "scope_resolution_candidate_cursor",
+                        "scope_resolution_deferred_cursor",
+                        "scope_observation_refresh_cursor",
+                        "scope_observation_refresh_candidate_ids",
+                        "scope_resolution_deferred_candidate_ids",
+                        "observation_materialization_deferred_candidate_ids",
+                        "observation_materialization_completed_ids",
+                        "observation_materialization_cursor",
+                        "observation_materialization_turn",
+                        "scope_handoff_fast_streak",
+                        "cycle_continuation",
+                    )
+                },
+            }
+            draft_continuations = {
+                str(key): value
+                for key, value in persisted_draft_continuations.items()
+                if isinstance(value, Mapping)
+            }
+            if draft_binding_key:
+                draft_continuations[draft_binding_key] = draft_progress
+            draft_continuations = dict(
+                list(draft_continuations.items())[-8:]
+            )
+            state_payload["scope_draft_continuations"] = draft_continuations
+            for name in (
+                "discovery_carry_cursor",
+                "discovery_continuation",
+                "scope_discovery_carry_cursor",
+                "scope_inventory_continuation",
+                "scope_direct_lookup_cursor",
+                "scope_direct_priority_lookup_cursor",
+                "scope_direct_protected_lookup_cursor",
+                "scope_resolution_candidate_cursor",
+                "scope_resolution_deferred_cursor",
+                "scope_observation_refresh_cursor",
+                "scope_observation_refresh_candidate_ids",
+                "scope_resolution_deferred_candidate_ids",
+                "observation_materialization_deferred_candidate_ids",
+                "observation_materialization_completed_ids",
+                "observation_materialization_cursor",
+                "observation_materialization_turn",
+                "scope_handoff_fast_streak",
+                "cycle_continuation",
+            ):
+                previous = root_state.get(name)
+                if name in {"discovery_continuation", "scope_inventory_continuation"}:
+                    previous_binding = (
+                        previous.get("scope_draft_binding")
+                        if isinstance(previous, Mapping)
+                        else None
+                    )
+                    if isinstance(previous_binding, Mapping):
+                        previous = None
+                if previous is None:
+                    state_payload.pop(name, None)
+                else:
+                    state_payload[name] = previous
+        self.store.set_collector_state(
+            self.config.collector_name,
+            state_payload,
         )
         return cycle
     @staticmethod
@@ -1810,6 +2045,13 @@ class PolymarketCollector:
         self._rolling_scope_documents = {}
         self._rolling_scope_policy = {}
         self._rolling_background_discovery_enabled = False
+        if self._scope_draft_invalid:
+            self._rolling_scope_blocked = True
+            return []
+        if isinstance(self._scope_draft_preview, Mapping):
+            self._rolling_scope_policy = dict(self._scope_draft_preview)
+            self._rolling_background_discovery_enabled = True
+            return []
         superseded_candidate_ids, _ = self._superseded_observation_ids()
         selection_loader = getattr(self.store, "load_current_portfolio_selection", None)
         selection: Mapping[str, Any] | None = None

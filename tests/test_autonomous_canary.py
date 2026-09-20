@@ -270,6 +270,8 @@ class AutonomousWorkflowTests(unittest.TestCase):
         )
         collector.config = SimpleNamespace(max_markets=10)
         collector._discovery_continuation = {}
+        collector._scope_draft_preview = None
+        collector._scope_draft_invalid = False
         collector._superseded_observation_ids = lambda: (set(), ())
         return collector
 

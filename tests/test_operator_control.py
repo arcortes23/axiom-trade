@@ -26,8 +26,10 @@ from axiom.operator import (
     DEFAULT_HERMES_JOB_ID,
     OperatorControlError,
     OperatorControlPlane,
+    ROLLING_EXPLORATORY_SCOPE_DRAFT_CONFIG_KEY,
     _loopback_host,
 )
+from axiom.forward import _operational_setup_hash
 from axiom.ranker import CandidateCanaryRanker
 from axiom.experiment_plan import normalize_market_scope
 from axiom.market_scope import resolve_market_scope
@@ -2988,6 +2990,7 @@ class OperatorControlTests(unittest.TestCase):
             "setup_version": "exploratory-live-v1",
             "setup_policy": policy_document,
         }
+        draft = self.control._prepare_rolling_exploratory_scope_draft()
         member = {
             "strategy_version_id": "strategy-proposed",
             "research_trial_id": "trial-proposed",
@@ -3000,10 +3003,36 @@ class OperatorControlTests(unittest.TestCase):
             "score": "1",
             "reason": "ELIGIBLE",
             "operational_setup": setup,
-            "operational_setup_hash": "setup-hash",
+            "operational_setup_hash": _operational_setup_hash(setup),
+            "draft_bound": True,
+            "draft_id": draft["draft_id"],
+            "draft_hash": draft["draft_hash"],
+            "scope_hash": draft["scope_hash"],
+            "scope_version": draft["scope_version"],
+            "market_bindings": [
+                {
+                    "market_id": "MARKET-1",
+                    "condition_id": "MARKET-1-CONDITION",
+                    "yes_token_id": "MARKET-1-YES",
+                    "no_token_id": "MARKET-1-NO",
+                }
+            ],
             "paper_only": True,
             "allocation_active": False,
             "canary_armed": False,
+        }
+        member["scope_resolution"] = {
+            "scope_hash": draft["scope_hash"],
+            "scope_version": draft["scope_version"],
+            "resolution_id": "resolution-proposed",
+            "matched_markets": [
+                {
+                    "market_id": "MARKET-1",
+                    "condition_id": "MARKET-1-CONDITION",
+                    "yes_token_id": "MARKET-1-YES",
+                    "no_token_id": "MARKET-1-NO",
+                }
+            ],
         }
         self.store.save_strategy_version(
             {
@@ -3013,6 +3042,24 @@ class OperatorControlTests(unittest.TestCase):
                 "code_hash": "strategy-hash",
                 "config_hash": "strategy-config-hash",
             }
+        )
+        candidate_payload = {
+            "candidate_id": "candidate-proposed",
+            "strategy_version_id": "strategy-proposed",
+            "scope_hash": draft["scope_hash"],
+            "scope_version": draft["scope_version"],
+            "market_scope": draft["scope"],
+        }
+        self.store.save_candidate_lifecycle(
+            "candidate-proposed",
+            "IDEA",
+            candidate_payload,
+        )
+        self.store.save_candidate_lifecycle(
+            "candidate-proposed",
+            "FROZEN",
+            candidate_payload,
+            from_stage="IDEA",
         )
         self.store.save_research_trial(
             {
@@ -3251,6 +3298,139 @@ class OperatorControlTests(unittest.TestCase):
             restarted.store.get_operator_job("rolling_admission_policy_active"),
             before_job,
         )
+
+    def test_rolling_scope_draft_is_unactivated_and_idempotent(self) -> None:
+        active_before = self.store.get_operator_config(
+            "rolling_admission_policy_active", None
+        )
+        draft_before = self.store.get_operator_config(
+            ROLLING_EXPLORATORY_SCOPE_DRAFT_CONFIG_KEY, None
+        )
+        first = self.control.rolling_exploratory_scope_draft()
+        second = self.control.rolling_exploratory_scope_draft()
+        self.assertEqual(first, second)
+        self.assertEqual(
+            self.store.get_operator_config(
+                ROLLING_EXPLORATORY_SCOPE_DRAFT_CONFIG_KEY, None
+            ),
+            draft_before,
+        )
+        self.assertEqual(first, second)
+        self.assertEqual(first["status"], "DRAFT")
+        self.assertEqual(first["draft_id"], "rolling-exploratory-scope-draft:polymarket:standard:v1")
+        self.assertEqual(first["scope"]["mode"], "RULE_BASED_MARKETS")
+        self.assertEqual(first["scope"]["instrument"], "POLYMARKET")
+        self.assertEqual(first["scope"]["categories"], [])
+        self.assertEqual(first["scope"]["market_ids"], [])
+        self.assertEqual(first["supported_market_types"], ["prediction"])
+        self.assertEqual(first["category_restriction"], {"mode": "UNRESTRICTED", "categories": []})
+        self.assertTrue(first["paper_only"])
+        self.assertFalse(first["live_execution"])
+        self.assertFalse(first["allocation_active"])
+        self.assertFalse(first["canary_armed"])
+        self.assertIn("COMBO", first["exclusions"])
+        self.assertEqual(first["trace_requirements"]["discovery"]["pool_cap"], 10)
+        self.assertEqual(
+            self.store.get_operator_config("rolling_admission_policy_active", None),
+            active_before,
+        )
+
+    def test_rolling_scope_draft_mismatch_fails_closed_without_overwrite(self) -> None:
+        self.control._prepare_rolling_exploratory_scope_draft()
+        draft = self.control.rolling_exploratory_scope_draft()
+        altered = dict(draft)
+        altered["draft_hash"] = "sha256:altered"
+        self.store.set_operator_config(
+            ROLLING_EXPLORATORY_SCOPE_DRAFT_CONFIG_KEY, altered
+        )
+        with self.assertRaisesRegex(
+            OperatorControlError, "^EXPLORATORY_SCOPE_DRAFT_MISMATCH$"
+        ):
+            self.control.rolling_exploratory_scope_draft()
+        self.assertEqual(
+            self.store.get_operator_config(
+                ROLLING_EXPLORATORY_SCOPE_DRAFT_CONFIG_KEY, None
+            ),
+            altered,
+        )
+    def test_old_scope_active_or_proposed_member_fails_closed(self) -> None:
+        self._seed_proposed_selection()
+        for case in ("ACTIVE", "PROPOSED"):
+            selection = self.store.load_current_portfolio_selection()
+            self.assertIsInstance(selection, dict)
+            assert isinstance(selection, dict)
+            old_member = dict(selection["members"][0])
+            for key in (
+                "draft_bound",
+                "draft_id",
+                "draft_hash",
+                "scope_hash",
+                "scope_version",
+                "market_bindings",
+            ):
+                old_member.pop(key, None)
+            successor_id = f"selection-old-scope-{case.lower()}"
+            selection["portfolio_selection_id"] = successor_id
+            selection["selection_id"] = successor_id
+            if case == "ACTIVE":
+                old_member.pop("proposed_allocation", None)
+                old_member["status"] = "ACTIVE"
+                old_member["allocation"] = "1.00"
+                old_member["allocation_active"] = True
+                old_member["paper_only"] = False
+                old_member["canary_armed"] = True
+                selection["k"] = 1
+                selection["status"] = "ACTIVE"
+                selection["paper_only"] = False
+                selection["allocation_active"] = True
+                selection["canary_armed"] = True
+            else:
+                old_member["status"] = "PAPER"
+                old_member["allocation"] = "0"
+                old_member["proposed_allocation"] = "1.00"
+                old_member["allocation_active"] = False
+                old_member["paper_only"] = True
+                old_member["canary_armed"] = False
+                selection["k"] = 0
+                selection["status"] = "PAPER"
+                selection["paper_only"] = True
+                selection["allocation_active"] = False
+                selection["canary_armed"] = False
+            self.store.commit_portfolio_selection(selection, [old_member])
+            with self.assertRaisesRegex(
+                OperatorControlError,
+                "^EXPLORATORY_SCOPE_DRAFT_MEMBER_BINDING_REQUIRED$",
+            ):
+                self.control._prepare_reviewed_proposed_selection()
+
+    def test_genuine_draft_member_exact_binding_is_reviewable(self) -> None:
+        self._seed_proposed_selection()
+        persisted = self.store.load_current_portfolio_selection()
+        self.assertIsInstance(persisted, dict)
+        assert isinstance(persisted, dict)
+        persisted_member = persisted["members"][0]
+        self.assertEqual(
+            persisted_member["market_bindings"][0]["market_id"], "MARKET-1"
+        )
+        context = self.control._authorization_context(require_draft_members=True)
+        bindings = context["draft_member_bindings"]
+        self.assertEqual(len(bindings), 1)
+        binding = bindings[0]
+        self.assertTrue(binding["draft_bound"])
+        self.assertEqual(binding["draft_id"], context["scope_draft_id"])
+        self.assertEqual(binding["draft_hash"], context["scope_draft_hash"])
+        self.assertEqual(binding["scope_hash"], context["scope_hash"])
+        self.assertEqual(binding["scope_version"], context["scope_version"])
+        self.assertEqual(binding["market_bindings"][0]["market_id"], "MARKET-1")
+
+    def test_execution_authorization_rejects_unknown_caller_fields(self) -> None:
+        with self.assertRaisesRegex(
+            OperatorControlError,
+            "^UNSUPPORTED_EXECUTION_AUTHORIZATION_FIELDS$",
+        ):
+            self.control.review_execution_authorization({"unexpected": "value"})
+
+
 
     def test_system_bootstrap_rejects_altered_exploratory_hash(self) -> None:
         operating = dict(

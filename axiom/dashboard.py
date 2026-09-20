@@ -8824,6 +8824,19 @@ class DashboardData:
             draft = None
         draft = dict(draft) if isinstance(draft, Mapping) else None
         try:
+            rolling_scope_draft = (
+                get_config("rolling_exploratory_scope_draft", None)
+                if callable(get_config)
+                else None
+            )
+        except Exception:
+            rolling_scope_draft = None
+        rolling_scope_draft = (
+            dict(rolling_scope_draft)
+            if isinstance(rolling_scope_draft, Mapping)
+            else None
+        )
+        try:
             workers = (
                 getattr(self.store, "list_worker_states", lambda **_: [])(limit=32)
             )
@@ -8941,6 +8954,16 @@ class DashboardData:
                 if isinstance(authorization, Mapping)
                 else None,
                 "authorization_id": str(authorization_id).strip() if authorization_id else None,
+                "rolling_exploratory_scope_draft": (
+                    _safe_value(rolling_scope_draft)
+                    if rolling_scope_draft is not None
+                    else None
+                ),
+                "scope_draft": (
+                    _safe_value(rolling_scope_draft)
+                    if rolling_scope_draft is not None
+                    else None
+                ),
                 "controller_lease": _safe_value(lease),
                 "draft": _safe_value(draft) if draft is not None else None,
                 "identity": _safe_value(identity),
@@ -9003,6 +9026,22 @@ class DashboardData:
         if not isinstance(authorization, Mapping):
             authorization = self.execution_authorization_data()
         result["execution_authorization"] = _bounded_value(authorization)
+        scope_draft = controls.get(
+            "rolling_exploratory_scope_draft",
+            controls.get("scope_draft"),
+        )
+        if not isinstance(scope_draft, Mapping):
+            auth_scope = (
+                authorization.get("rolling_exploratory_scope_draft")
+                if isinstance(authorization, Mapping)
+                else None
+            )
+            scope_draft = auth_scope if isinstance(auth_scope, Mapping) else {}
+        result["rolling_exploratory_scope_draft"] = _bounded_value(scope_draft)
+        result["scope_draft"] = result["rolling_exploratory_scope_draft"]
+        result["active_scope"] = _bounded_value(
+            controls.get("active_scope") or controls.get("market_scope_funnel") or {}
+        )
         result["identity"] = _bounded_value(
             controls.get("identity")
             or authorization.get("identity")
@@ -9861,6 +9900,7 @@ def _dashboard_html(
     <article id="canary-recovery-form" class="panel"><div class="section-title"><h2>UNKNOWN ENTRY RECOVERY</h2><span class="badge warn">READ-ONLY · PRODUCTION PROFILE</span></div><p class="page-note">Attach only an operator-supplied canonical exchange order ID. This does not post, retry, activate, or release an entry.</p><div class="three-col"><label>Event ID<input id="canary-recovery-event" autocomplete="off"></label><label>Signal ID<input id="canary-recovery-signal" autocomplete="off"></label><label>Canonical exchange order ID<input id="canary-recovery-order" autocomplete="off"></label></div><label>Exact confirmation<input id="canary-recovery-confirm" placeholder="RECOVER UNKNOWN ENTRY" autocomplete="off"></label><p class="page-note"><button id="canary-recovery-submit" class="link">Recover and reconcile</button> <span id="canary-recovery-result"></span></p></article>
     <article id="execution-authorization-panel" class="panel" style="border-color:var(--amber)"><div class="section-title"><h2>EXPLORATORY MICRO-CANARY AUTHORIZATION</h2><span class="badge warn">REVIEWED · DISARMED BY DEFAULT</span></div><div id="execution-auth-state" class="page-note">Loading authorization state…</div><pre id="execution-auth-details" class="scroll"></pre><div class="three-col"><label>Purpose<input id="execution-auth-purpose" value="Exploratory micro-canary review" maxlength="120" autocomplete="off"></label><label>Lifetime budget (USD)<input id="execution-auth-budget" value="10" inputmode="decimal" maxlength="16"></label><label>Expires at (UTC, optional)<input id="execution-auth-expires" placeholder="2025-01-01T00:00:00Z" maxlength="32" autocomplete="off"></label></div><label class="page-note"><input id="execution-auth-adverse-evidence" type="checkbox"> I acknowledge the adverse evidence; this review remains paper-only and disarmed.</label><p class="page-note">Review binds the current evidence-selected strategy versions, selection policy, risk settings, scope, and stop rules. The browser never accepts or asks for a private authorization ID.</p><p><button id="execution-auth-review" class="link">Review exploratory authorization</button> <button id="execution-auth-activate" class="link">Activate reviewed authorization</button> <button id="execution-auth-revoke" class="link">Revoke active authorization</button> <span id="execution-auth-result"></span></p></article>
     <article id="exploratory-live-review-panel" class="panel" style="border-color:var(--red)"><div class="section-title"><h2>EXPLORATORY LIVE FINAL REVIEW</h2><span class="badge bad">PROFITABILITY UNPROVEN · DISARMED BY DEFAULT</span></div><p class="page-note">One confirmation coordinates the existing reviewed authorization, bounded allocation, arm, and autonomous-enable fences. It never submits an order.</p><div id="exploratory-live-review" class="scroll">Loading final review…</div><label>Exact confirmation<input id="exploratory-live-confirm" placeholder="CONFIRM EXPLORATORY LIVE" autocomplete="off"></label><button id="exploratory-live-confirm-action" type="button">Review and confirm EXPLORATORY LIVE</button><div id="exploratory-live-result" class="page-note"></div></article>
+    <p class="page-note"><strong>Unactivated broad scope draft:</strong> canonical RULE_BASED_MARKETS / POLYMARKET with all categories, standard binary prediction markets only. COMBO, unsupported/non-binary/closed/not-accepting/no-book/stale/insufficient-liquidity-or-depth/invalid-token-or-setup/data/evaluation failures remain excluded; the active operating scope and each selected member's frozen scope are shown separately. Discovery and evaluation stay paper-only; no scope activation or order submission is available here.</p>
     <p class="page-note">Review disclosure: setup entry predicate/direction/sizing/exit/lookback · bounded scope and ≤3 members · $1 all-in, $0.01 fee reserve, $5 gross daily, $5 aggregate exposure and independent open-cost · 3 positions · 5 submissions/day · $2 realized/equity stops · 100bp slippage · authoritative pending/UNKNOWN usage and reserved exit capacity · explicit finite lifetime budget and expiration · stop rules · trusted account/geoblock/balance/allowance · selected-market book/minimum/depth readiness. Optional 20 submissions/day remains reviewed-only and is never auto-set.</p>
     <section id="view-binance-canary" class="view binance-view"><article class="panel" style="border-color:var(--amber)"><div class="section-title"><h2>BINANCE SPOT CANARY</h2><span class="badge warn">DEVELOPMENT / PAPER|TESTNET</span></div><p class="page-note">Separate from the Polymarket canary. <strong>POLYMARKET TRANSPORT: DISABLED</strong> · Binance Spot only · no implicit control-plane construction.</p><div id="binance-action-result" class="page-note"></div><div id="binance-identity"></div><div id="binance-connectivity"></div><div id="binance-qualification"></div><div id="binance-risk"></div><div id="binance-controls"></div><div id="binance-records" class="scroll"></div><details><summary>Full Binance projection and identifiers</summary><pre id="binance-raw"></pre></details><p class="notice">Credentials are never displayed. Connectivity checks are read-only; order validation is an explicit test action. No browser action can place an order.</p></article></section>
     <div id="binance-testnet-static-labels" hidden>BINANCE SPOT TESTNET · TESTNET CONNECTIVITY · ORDER VALIDATION · TESTNET EXECUTION PROBE · AUTONOMOUS TESTNET · localhost</div>
@@ -10637,7 +10677,7 @@ def _dashboard_html(
     function renderExecutionAuthorization(value) {
       const payload=value&&typeof value==="object"?value:{}, auth=payload.execution_authorization&&typeof payload.execution_authorization==="object"?payload.execution_authorization:{}, active=auth.active&&typeof auth.active==="object"?auth.active:null, draft=auth.draft&&typeof auth.draft==="object"?auth.draft:null, row=active||draft||auth.authorization||{}, status=String(auth.status||row.status||"DISABLED").toUpperCase(), id=row.authorization_id||row.id||"", activeId=active?.authorization_id||active?.id||"", draftId=draft?.authorization_id||draft?.id||"", generationValue=row.generation??auth.generation, generation=Number.isInteger(Number(generationValue))&&Number(generationValue)>0?Number(generationValue):null;
       const adverseEvidenceAcknowledged=row.adverse_evidence_ack===true||row.adverse_evidence_ack?.acknowledged===true||row.adverse_evidence_ack?.accepted===true;
-      const details={status,authorization_id:id,generation,mode:row.mode||auth.mode||"EXPLORATORY_MICRO_CANARY",purpose:row.purpose||"—",strategy_versions:row.exact_strategy_versions||row.strategy_version_ids||"—",selection_policy_hash:row.reviewed_selection_policy_hash||row.selection_policy_hash||"—",selection_id:row.selection_id||"—",selection_hash:row.selection_hash||"—",adverse_evidence_ack:adverseEvidenceAcknowledged?(row.adverse_evidence_ack_required===false?"NOT REQUIRED":"ACKNOWLEDGED"):"NOT ACKNOWLEDGED",adverse_evidence_ack_required:row.adverse_evidence_ack_required!==false,lifetime_budget:row.lifetime_budget||"—",stop_rules:row.stop_rules||"—",expires_at:row.expires_at||"—",scope_hash:row.scope_hash||"—",scope_version:row.scope_version||"—",active_settings_hash:row.active_settings_hash||"—",active_settings_generation:row.active_settings_generation||"—"};
+      const details={status,authorization_id:id,generation,mode:row.mode||auth.mode||"EXPLORATORY_MICRO_CANARY",purpose:row.purpose||"—",strategy_versions:row.exact_strategy_versions||row.strategy_version_ids||"—",selection_policy_hash:row.reviewed_selection_policy_hash||row.selection_policy_hash||"—",selection_id:row.selection_id||"—",selection_hash:row.selection_hash||"—",adverse_evidence_ack:adverseEvidenceAcknowledged?(row.adverse_evidence_ack_required===false?"NOT REQUIRED":"ACKNOWLEDGED"):"NOT ACKNOWLEDGED",adverse_evidence_ack_required:row.adverse_evidence_ack_required!==false,lifetime_budget:row.lifetime_budget||"—",stop_rules:row.stop_rules||"—",expires_at:row.expires_at||"—",scope_hash:row.scope_hash||"—",scope_version:row.scope_version||"—",scope_draft_id:row.scope_draft_id||payload.scope_draft?.draft_id||"—",scope_draft_hash:row.scope_draft_hash||payload.scope_draft?.draft_hash||"—",scope_draft_version:row.scope_draft_version||payload.scope_draft?.scope_version||"—",supported_market_types:row.supported_market_types||payload.scope_draft?.supported_market_types||"—",category_restriction:row.category_restriction||payload.scope_draft?.category_restriction||"—",scope_exclusions:row.scope_exclusions||payload.scope_draft?.exclusions||"—",active_scope_hash:row.active_scope_hash||"—",active_scope_version:row.active_scope_version||"—",frozen_scope_hash:row.frozen_scope_hash||"—",frozen_scope_version:row.frozen_scope_version||"—",active_settings_hash:row.active_settings_hash||"—",active_settings_generation:row.active_settings_generation||"—"};
       details.instance=payload.identity||payload.instance||auth.identity||"—";
       details.operator_mode=payload.mode||auth.operator_mode||"observing";
       details.economic_policy=payload.economic_policy||auth.economic_policy||"—";

@@ -10553,7 +10553,7 @@ class AxiomStore:
             "predecessor_enrollment_id",
             "predecessor_id",
         )
-        if predecessor_enrollment_id == _rolling_optional_text(data, "enrollment_id"):
+        if predecessor_enrollment_id and predecessor_enrollment_id == _rolling_optional_text(data, "enrollment_id"):
             raise ValueError("rolling enrollment cannot precede itself")
         provenance = data.get("provenance", data.get("provenance_json", {}))
         if isinstance(provenance, str):
