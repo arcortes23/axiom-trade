@@ -244,12 +244,18 @@ separate records with their own hashes and versions; drafting never mutates
 either one and there is no scope-activation action.
 
 One bounded paper trace consumes this draft without granting authority:
+
 `PolymarketCollector` discovery is capped at 10 markets, then each candidate
 must materialize fresh market metadata, selected-token order-book data, and
 token identity before evaluation. The evaluation evidence records the
 `momentum` and `mean_reversion` templates plus strategy setup, data quality,
 liquidity, depth, and sizing gates. A candidate that fails any gate is retained
 as an explicit exclusion rather than silently becoming a live selection.
+Rolling current-market callbacks use the collector's live clock at the actual
+request and response boundary; the scheduling tick is not a point-in-time
+capture cutoff. Explicit `collect_once(now=...)` calls retain their historical
+point-in-time semantics, so genuinely future provider observations remain
+rejected.
 
 Each explicit draft tick keeps the request budget honest: at most **11** public
 requests are available to draft discovery and scope preparation, reserving **5**

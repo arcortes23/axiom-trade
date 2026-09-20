@@ -1741,10 +1741,11 @@ class ResearchNode:
                 "retryable": True,
             }
         try:
-            return self.collector.collect_once(
-                now=ensure_utc(now),
-                scope_draft=draft,
-            )
+            # ``now`` belongs to the rolling cadence, not to the capture
+            # clock.  Omitting it keeps this callback in the collector's
+            # live mode, where request and receipt timestamps come from the
+            # injected local clock at the actual collection boundary.
+            return self.collector.collect_once(scope_draft=draft)
         finally:
             self._rolling_discovery_lock.release()
 

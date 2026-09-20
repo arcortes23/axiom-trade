@@ -521,6 +521,10 @@ class TestRollingPortfolio(unittest.TestCase):
         self.assertEqual(persisted_scope["scope_version"], scope_trace["scope_version"])
         self.assertEqual(persisted_scope["materialized_member_count"], 0)
         self.assertEqual(persisted_scope["materialized_market_count"], 0)
+        self.assertEqual(
+            persisted_scope["invalid_strategy_reasons"],
+            ["INVALID_STRATEGY_DEFINITIONS"],
+        )
         self.assertNotIn("metadata_matched_count", persisted_scope)
         self.assertEqual(
             persisted_scope["discovery"]["cycle"]["deferred_market_ids"],

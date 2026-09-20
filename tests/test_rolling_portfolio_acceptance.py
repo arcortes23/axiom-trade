@@ -4490,6 +4490,217 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
             self.assertEqual(payload["evaluation_counts"]["successful"], 0)
             self.assertEqual(payload["evaluation_counts"]["pending"], 1)
 
+    def test_completed_collection_cutoff_admits_fresh_current_evidence(self) -> None:
+        market_id = "market-post-discovery"
+        captured_at = NOW + timedelta(seconds=5)
+        completed_at = NOW + timedelta(seconds=10)
+
+        def seed_current_market(store: AxiomStore) -> None:
+            store.save_admission_policy(_policy().as_dict())
+            scope = normalize_market_scope(
+                {
+                    "schema_version": "1",
+                    "mode": "EXACT_MARKETS",
+                    "instrument": "POLYMARKET",
+                    "categories": [],
+                    "market_ids": [market_id],
+                    "filters": {},
+                    "regime_restrictions": {},
+                    "provenance": "canonical",
+                }
+            )
+            draft: dict[str, object] = {
+                "draft_id": "rolling-exploratory-scope-draft:post-discovery:v1",
+                "status": "DRAFT",
+                "scope": scope.as_dict(),
+                "scope_hash": scope.scope_hash,
+                "scope_version": scope.scope_version,
+                "supported_market_types": ["prediction"],
+                "paper_only": True,
+                "live_execution": False,
+                "allocation_active": False,
+                "canary_armed": False,
+            }
+            draft["draft_hash"] = _rolling_hash(draft)
+            store.set_operator_config("rolling_exploratory_scope_draft", draft)
+            metadata = {
+                "market_id": market_id,
+                "condition_id": "condition:post-discovery",
+                "yes_token_id": "yes-post-discovery",
+                "no_token_id": "no-post-discovery",
+                "active": True,
+                "closed": False,
+                "settlement": "open",
+                "accepting_orders": True,
+                "enable_order_book": True,
+                "provider": "polymarket",
+                "source_type": "FORWARD_COLLECTED",
+            }
+            snapshot = {
+                **metadata,
+                "timestamp": captured_at.isoformat(),
+                "yes_mid": "0.45",
+                "no_mid": "0.55",
+                "yes_bid": "0.44",
+                "yes_ask": "0.46",
+                "no_bid": "0.54",
+                "no_ask": "0.56",
+                "order_book": {
+                    "bids": [{"price": "0.44", "size": "100"}],
+                    "asks": [{"price": "0.46", "size": "100"}],
+                    "timestamp": captured_at.isoformat(),
+                    "token_id": "yes-post-discovery",
+                },
+                "no_order_book": {
+                    "bids": [{"price": "0.54", "size": "100"}],
+                    "asks": [{"price": "0.56", "size": "100"}],
+                    "timestamp": captured_at.isoformat(),
+                    "token_id": "no-post-discovery",
+                },
+            }
+            store.save_polymarket_market_metadata(
+                market_id,
+                {
+                    **metadata,
+                    "metadata": metadata,
+                },
+                observed_at=captured_at,
+                source_type="FORWARD_COLLECTED",
+            )
+            store.save_polymarket_snapshot(
+                "snapshot:post-discovery",
+                market_id,
+                captured_at,
+                captured_at,
+                {
+                    "provider": "polymarket",
+                    "source_type": "FORWARD_COLLECTED",
+                    "snapshot": snapshot,
+                },
+                source_type="FORWARD_COLLECTED",
+            )
+            for index, historical_at in enumerate(
+                (
+                    NOW - timedelta(days=3),
+                    NOW - timedelta(days=2),
+                    NOW - timedelta(days=1),
+                ),
+                start=1,
+            ):
+                historical_snapshot = dict(snapshot)
+                historical_snapshot["timestamp"] = historical_at.isoformat()
+                historical_snapshot["order_book"] = {
+                    **dict(snapshot["order_book"]),
+                    "timestamp": historical_at.isoformat(),
+                }
+                historical_snapshot["no_order_book"] = {
+                    **dict(snapshot["no_order_book"]),
+                    "timestamp": historical_at.isoformat(),
+                }
+                store.save_polymarket_snapshot(
+                    f"snapshot:post-discovery:historical:{index}",
+                    market_id,
+                    historical_at,
+                    historical_at,
+                    {
+                        "provider": "polymarket",
+                        "source_type": "FORWARD_COLLECTED",
+                        "snapshot": historical_snapshot,
+                    },
+                    source_type="FORWARD_COLLECTED",
+                )
+
+        def refresh(
+            name: str,
+            *,
+            completion: datetime,
+            local_clock: datetime,
+            discovery_result: object | None = None,
+        ) -> tuple[Mapping[str, object], list[Mapping[str, object]]]:
+            with self._store(name) as store:
+                seed_current_market(store)
+
+                def discover(_now: datetime, **_kwargs: object) -> object:
+                    if discovery_result is not None:
+                        return discovery_result
+                    return CollectionCycle(
+                        NOW,
+                        completion,
+                        markets_seen=1,
+                        markets_attempted=1,
+                        markets_successful=1,
+                        markets_failed=0,
+                        metadata_inserted=1,
+                        snapshots_inserted=1,
+                        requests=1,
+                        discovery_coverage_status="COMPLETE",
+                        discovery_complete=True,
+                    )
+
+                processor = AutonomousResearchProcessor(
+                    store,
+                    clock=lambda: local_clock,
+                    current_market_discoverer=discover,
+                )
+                state = processor.refresh_rolling_evidence(
+                    now=NOW,
+                    skip_observation_setup_migration=True,
+                )
+                evidence = [
+                    item
+                    for strategy_version_id in state.get("strategy_versions", ())
+                    for item in store.list_strategy_evidence_windows(
+                        str(strategy_version_id),
+                        limit=64,
+                    )
+                ]
+                return state, evidence
+
+        admitted_state, admitted_evidence = refresh(
+            "rolling-post-discovery-cutoff.sqlite3",
+            completion=completed_at,
+            local_clock=completed_at,
+        )
+        admitted_trace = admitted_state["strategy_discovery_trace"]
+        self.assertGreater(admitted_trace["materialized_member_count"], 0)
+        self.assertGreater(admitted_state["evaluation_counts"]["successful"], 0)
+        self.assertTrue(
+            any(item.get("evaluator_invoked") is True for item in admitted_evidence)
+        )
+        raw_state, raw_evidence = refresh(
+            "rolling-raw-discovery-record.sqlite3",
+            completion=completed_at,
+            local_clock=completed_at,
+            discovery_result={
+                "started_at": NOW.isoformat(),
+                "ended_at": completed_at.isoformat(),
+                "markets_seen": 1,
+                "markets_attempted": 1,
+                "markets_successful": 1,
+                "markets_failed": 0,
+                "discovery_coverage_status": "COMPLETE",
+                "discovery_complete": True,
+            },
+        )
+        raw_trace = raw_state["strategy_discovery_trace"]
+        self.assertEqual(raw_trace["materialized_member_count"], 0)
+        self.assertEqual(raw_state["evaluation_counts"]["successful"], 0)
+        self.assertFalse(
+            any(item.get("evaluator_invoked") is True for item in raw_evidence)
+        )
+
+        future_state, future_evidence = refresh(
+            "rolling-future-discovery-cutoff.sqlite3",
+            completion=NOW + timedelta(days=1),
+            local_clock=NOW,
+        )
+        future_trace = future_state["strategy_discovery_trace"]
+        self.assertEqual(future_trace["materialized_member_count"], 0)
+        self.assertEqual(future_state["evaluation_counts"]["successful"], 0)
+        self.assertFalse(
+            any(item.get("evaluator_invoked") is True for item in future_evidence)
+        )
+
     def test_refresh_trace_preserves_partial_collection_outcome(self) -> None:
         def refresh_with_result(name: str, result: object) -> Mapping[str, object]:
             with self._store(name) as store:
