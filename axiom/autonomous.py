@@ -2884,6 +2884,10 @@ def _rolling_fit_trace_payload(
             for key in collection_priority:
                 child = item.get(key)
                 if isinstance(child, list) and child:
+                    # Keep one concrete invalid-definition reason observable
+                    # even when the bounded trace must trim collections.
+                    if key == "invalid_strategy_reasons" and len(child) == 1:
+                        continue
                     child.pop()
                     return True
             for key in sorted(item, key=str):
@@ -2891,6 +2895,8 @@ def _rolling_fit_trace_payload(
                 if isinstance(child, dict) and trim(child):
                     return True
                 if isinstance(child, list) and child:
+                    if key == "invalid_strategy_reasons" and len(child) == 1:
+                        continue
                     child.pop()
                     return True
             for key in sorted(item, key=str):
@@ -13457,14 +13463,19 @@ class AutonomousResearchProcessor:
                     resolved_provenance = nested["model_resolution"]
                     break
         if isinstance(resolved_provenance, Mapping):
-            compact_resolution = {
+            # The evidence schema uses the three-field resolution identity.
+            # Evaluator-only markers such as model_required remain control
+            # metadata, not part of the persisted identity.  Reuse this one
+            # narrow projection everywhere so strict digest validation sees
+            # identical manifest, evaluation, and metrics values.
+            canonical_resolution = {
                 key: resolved_provenance.get(key)
                 for key in ("source_type", "plan_id", "model_hash")
             }
-            evaluation_map["model_resolution"] = compact_resolution
-            canonical_evaluation.setdefault("model_resolution", compact_resolution)
+            evaluation_map["model_resolution"] = dict(canonical_resolution)
+            canonical_evaluation["model_resolution"] = dict(canonical_resolution)
             input_manifest = dict(input_manifest)
-            input_manifest["model_resolution"] = compact_resolution
+            input_manifest["model_resolution"] = dict(canonical_resolution)
         signal_count = evaluation_map.get(
             "signal_count", canonical_evaluation.get("signal_count", 0)
         )
@@ -14244,6 +14255,10 @@ class AutonomousResearchProcessor:
                 }
         system_bootstrap_active = system_bootstrap_authority
         draft_for_discovery = self._rolling_scope_draft()
+        # ``current`` is the tick start.  A live discovery pass may complete
+        # after it, but only a completion observed by this process's clock can
+        # advance the cutoff used by the post-discovery reads below.
+        post_discovery_current = current
         self._rolling_last_current_discovery = {"status": "NOT_RUN"}
         if callable(self.current_market_discoverer) and (
             system_bootstrap_active or draft_for_discovery is not None
@@ -14289,7 +14304,8 @@ class AutonomousResearchProcessor:
                     else:
                         discovery_result = self.current_market_discoverer(current)
                     as_record = getattr(discovery_result, "as_record", None)
-                    recorded = as_record() if callable(as_record) else discovery_result
+                    is_collection_cycle = callable(as_record)
+                    recorded = as_record() if is_collection_cycle else discovery_result
                     if isinstance(recorded, Mapping):
                         provider_failure = (
                             int(recorded.get("provider_failures", 0) or 0) > 0
@@ -14307,6 +14323,23 @@ class AutonomousResearchProcessor:
                             or str(recorded.get("status", "")).strip().upper()
                             == "DEFERRED"
                         )
+                        cycle_started = _rolling_timestamp(recorded.get("started_at"))
+                        cycle_ended = _rolling_timestamp(recorded.get("ended_at"))
+                        if cycle_started is not None and cycle_ended is not None:
+                            try:
+                                locally_observed_at = _rolling_timestamp(self.clock())
+                            except (TypeError, ValueError, OverflowError, RuntimeError):
+                                locally_observed_at = None
+                            if (
+                                is_collection_cycle
+                                and not deferred
+                                and cycle_started >= current
+                                and cycle_ended >= cycle_started
+                                and cycle_ended >= current
+                                and locally_observed_at is not None
+                                and cycle_ended <= locally_observed_at
+                            ):
+                                post_discovery_current = cycle_ended
                         self._rolling_last_current_discovery = {
                             "status": (
                                 "DEFERRED"
@@ -14343,10 +14376,12 @@ class AutonomousResearchProcessor:
                     "error_type": type(exc).__name__,
                     "error": str(exc)[:512],
                 }
-        draft_documents, draft_trace = self._rolling_scope_draft_documents(current)
+        draft_documents, draft_trace = self._rolling_scope_draft_documents(
+            post_discovery_current
+        )
         draft_preview_active = str(draft_trace.get("status", "")).upper() != "UNAVAILABLE"
         system_documents = (
-            self._rolling_system_current_market_documents(current)
+            self._rolling_system_current_market_documents(post_discovery_current)
             if not draft_preview_active
             else ()
         )
@@ -14359,7 +14394,10 @@ class AutonomousResearchProcessor:
                 else self._rolling_strategy_documents()
             )
         )
-        strategies = self._rolling_persist_strategy_lineage(documents, current)
+        strategies = self._rolling_persist_strategy_lineage(
+            documents,
+            post_discovery_current,
+        )
         sources = ("HISTORICAL", "REPLAY", "PAPER", "LIVE")
         queue_payload = _rolling_hermes_payload(strategies, sources, current)
         queue_identity = dict(queue_payload)
@@ -14613,11 +14651,11 @@ class AutonomousResearchProcessor:
                         if source == "PAPER":
                             current_bindings = self._rolling_current_market_bindings(
                                 strategy,
-                                current,
+                                post_discovery_current,
                             )
                             binding_result = self._ensure_rolling_paper_observation(
                                 strategy,
-                                current,
+                                post_discovery_current,
                                 market_ids=tuple(
                                     item["market_id"]
                                     for item in current_bindings
@@ -14646,11 +14684,11 @@ class AutonomousResearchProcessor:
                                 rows = []
                             else:
                                 source_cache[cache_key] = self._rolling_source_rows(
-                                    source_payload, source, current
+                                    source_payload, source, post_discovery_current
                                 )
                         else:
                             source_cache[cache_key] = self._rolling_source_rows(
-                                source_payload, source, current
+                                source_payload, source, post_discovery_current
                             )
                     except Exception as exc:
                         error = f"{type(exc).__name__}: {str(exc)[:256]}"
@@ -14703,7 +14741,7 @@ class AutonomousResearchProcessor:
                 window_rows, timestamp_rejections = _rolling_window_rows(
                     rows,
                     days,
-                    current,
+                    post_discovery_current,
                 )
                 remaining = max(0, _MAX_ROLLING_TOTAL_ROWS - total_rows)
                 bounded_rows = list(window_rows[:remaining]) if remaining else []
@@ -14868,7 +14906,7 @@ class AutonomousResearchProcessor:
                             bounded_rows,
                             source,
                             days,
-                            current,
+                            post_discovery_current,
                             evaluation=evaluation,
                         )
                     except AutonomousResearchError as exc:

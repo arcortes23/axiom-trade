@@ -1014,9 +1014,132 @@ class RollingDiscoveryHandoffTests(unittest.TestCase):
 
             self.assertIs(actual, cycle)
             node.collector.collect_once.assert_called_once_with(  # type: ignore[attr-defined]
-                now=T0,
                 scope_draft={"status": "DRAFT"},
             )
+
+    def test_draft_discovery_uses_live_clock_for_late_current_books(self) -> None:
+        """A rolling callback must not freeze a live capture at tick start."""
+
+        class AdvancingClock:
+            def __init__(self) -> None:
+                self._next = T0 + timedelta(seconds=10)
+
+            def __call__(self) -> datetime:
+                current = self._next
+                self._next += timedelta(seconds=1)
+                return current
+
+        class AdvancingProvider(InMemoryPredictionProvider):
+            provider_name = "polymarket"
+
+            def __init__(self, clock: AdvancingClock) -> None:
+                self._live_clock = clock
+                super().__init__([self._dynamic_snapshot(T0)])
+
+            @staticmethod
+            def _book(timestamp: datetime, token_id: str) -> OrderBookSnapshot:
+                return OrderBookSnapshot(
+                    timestamp,
+                    (OrderBookLevel(0.49, 10.0),),
+                    (OrderBookLevel(0.51, 10.0),),
+                    token_id=token_id,
+                    condition_id="condition-late-current",
+                    min_order_size=0.01,
+                    tick_size=0.01,
+                    neg_risk=False,
+                    source="polymarket",
+                )
+
+            @classmethod
+            def _dynamic_snapshot(cls, timestamp: datetime) -> PredictionMarketSnapshot:
+                return PredictionMarketSnapshot(
+                    timestamp=timestamp,
+                    market_id="late-current",
+                    question="Will the late current book be captured?",
+                    yes_bid=0.49,
+                    yes_ask=0.51,
+                    yes_mid=0.50,
+                    no_bid=0.49,
+                    no_ask=0.51,
+                    no_mid=0.50,
+                    volume=1_000.0,
+                    liquidity=100.0,
+                    expiry=timestamp + timedelta(days=1),
+                    order_book=cls._book(timestamp, "yes-late-current"),
+                    yes_token_id="yes-late-current",
+                    no_token_id="no-late-current",
+                    condition_id="condition-late-current",
+                    active=True,
+                    closed=False,
+                    accepting_orders=True,
+                    enable_order_book=True,
+                )
+
+            def markets(self, active: bool = True):
+                snapshot = self._dynamic_snapshot(self._live_clock())
+                return (snapshot,) if not active or snapshot.settlement.value == "open" else ()
+
+
+            def market(self, market_id: str):
+                if str(market_id) != "late-current":
+                    return None
+                return self._dynamic_snapshot(self._live_clock())
+
+            def order_books(self, market_id: str, depth: int = 20):
+                if str(market_id) != "late-current":
+                    return {}
+                timestamp = self._live_clock()
+                return {
+                    "yes": self._book(timestamp, "yes-late-current"),
+                    "no": self._book(timestamp, "no-late-current"),
+                }
+
+        clock = AdvancingClock()
+        provider = AdvancingProvider(clock)
+        with AxiomStore(":memory:") as store:
+            node = ResearchNode(
+                NodeConfig(
+                    ":memory:",
+                    mutation_enabled=False,
+                    crypto_enabled=False,
+                    max_markets=1,
+                    discovery_budget_per_cycle=1,
+                    max_attempts=1,
+                    provider_timeout_seconds=1.0,
+                ),
+                provider=provider,
+                store=store,
+                clock=clock,
+                sleep=lambda _seconds: None,
+            )
+            try:
+                cycle = node._rolling_current_market_discovery(T0)
+                self.assertIsInstance(cycle, CollectionCycle)
+                assert isinstance(cycle, CollectionCycle)
+                self.assertEqual(cycle.markets_successful, 1)
+                self.assertEqual(cycle.snapshots_inserted, 1)
+                self.assertEqual(cycle.errors, 0)
+
+                rows = store.load_polymarket_snapshots("late-current")
+                self.assertEqual(len(rows), 1)
+                row = rows[0]
+                self.assertEqual(row["source_type"], "FORWARD_COLLECTED")
+                self.assertGreater(row["source_timestamp"], T0)
+                self.assertGreaterEqual(row["observed_at"], row["source_timestamp"])
+                payload = row["payload"]
+                self.assertEqual(payload["source_type"], "FORWARD_COLLECTED")
+                self.assertEqual(payload["source_timestamp"], row["source_timestamp"].isoformat())
+                self.assertEqual(payload["research_quality"], "ORDER_BOOK_SIMULATED")
+                self.assertEqual(
+                    payload["yes_order_book"]["token_id"],
+                    "yes-late-current",
+                )
+                self.assertGreater(
+                    datetime.fromisoformat(payload["yes_order_book"]["timestamp"]),
+                    T0,
+                )
+            finally:
+                node.collector.close()
 
 
 class ExploratoryRollingProgressionTests(unittest.TestCase):

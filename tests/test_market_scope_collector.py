@@ -3273,6 +3273,49 @@ class MarketScopeCollectorTests(unittest.TestCase):
         self.assertEqual(counters["errors"], 0)
         self.assertEqual(len(requests), 4)
 
+
+    def test_explicit_point_in_time_collection_rejects_future_order_books(self) -> None:
+        target = market("future-point-in-time")
+
+        class FutureBookProvider(_RecordingProvider):
+            def order_books(self, market_id: str, depth: int = 20):
+                books = super().order_books(market_id, depth=depth)
+                return {
+                    side: replace(
+                        book,
+                        timestamp=T0 + timedelta(minutes=1),
+                    )
+                    for side, book in books.items()
+                }
+
+        provider = FutureBookProvider((target,))
+        store = _ScopeStore({})
+        collector = self._collector(
+            provider,
+            store,
+            (),
+            market_ids=(target.market_id,),
+        )
+        try:
+            cycle = collector.collect_once(now=T0)
+        finally:
+            collector.close()
+
+        self.assertEqual(cycle.started_at, T0)
+        self.assertEqual(cycle.ended_at, T0)
+
+        self.assertEqual(cycle.markets_attempted, 1)
+        self.assertEqual(cycle.markets_successful, 0)
+        self.assertEqual(cycle.snapshots_inserted, 0)
+        future_errors = [
+            error
+            for error in store.errors
+            if error[0] == target.market_id and error[2] == "future_observation"
+        ]
+        self.assertEqual(len(future_errors), 1)
+        self.assertEqual(future_errors[0][1], T0)
+        self.assertIn("yes order book", future_errors[0][3])
+
     def test_uncaught_capture_error_retains_partial_provider_accounting(self) -> None:
         target = market("partial-accounting")
 
