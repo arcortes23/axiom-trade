@@ -9358,11 +9358,39 @@ class AxiomStore:
         job_prefix: str,
         limit: int = 32,
     ) -> list[dict[str, Any]]:
-        """Return bounded campaign progress fields without hydrating payloads."""
+        """Return bounded campaign progress fields without hydrating payloads.
+
+        Terminal trial status alone is not an economic classification: a
+        frozen unresolved forward market is a separate read-model outcome.
+        The classification is derived from each capped trial's authoritative
+        reason/evidence fields while leaving the durable payload untouched.
+        """
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
             raise ValueError("limit must be a non-negative integer")
         prefix = str(job_prefix)
         escaped_prefix = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        resolution_failure = (
+            "CASE "
+            "WHEN UPPER(COALESCE(json_extract(trial.value,'$.reason_code'),''))="
+            "'NEGATIVE_VALIDATION_EXPECTANCY' THEN 0 "
+            "WHEN UPPER(COALESCE(json_extract(trial.value,'$.reason_code'),''))="
+            "'CANDIDATE_FORWARD_MARKET_UNRESOLVED' THEN 1 "
+            "WHEN UPPER(COALESCE(json_extract(trial.value,'$.result.reason_code'),''))="
+            "'NEGATIVE_VALIDATION_EXPECTANCY' THEN 0 "
+            "WHEN UPPER(COALESCE(json_extract(trial.value,'$.result.reason_code'),''))="
+            "'CANDIDATE_FORWARD_MARKET_UNRESOLVED' THEN 1 "
+            "WHEN UPPER(COALESCE("
+            "json_extract(trial.value,'$.result.evidence.reason_code'),"
+            "json_extract(trial.value,'$.result.evidence.authority_reason_code'),''"
+            "))='CANDIDATE_FORWARD_MARKET_UNRESOLVED' THEN 1 "
+            "WHEN EXISTS ("
+            "SELECT 1 FROM json_each(trial.value,'$.result.candidate_results') AS candidate "
+            "WHERE candidate.key<32 AND UPPER(COALESCE("
+            "json_extract(candidate.value,'$.reason_code'),''"
+            "))='CANDIDATE_FORWARD_MARKET_UNRESOLVED'"
+            ") THEN 1 "
+            "ELSE 0 END"
+        )
         query = (
             "SELECT job_name,status,updated_at,"
             "json_extract(payload_json,'$.campaign_id') AS campaign_id,"
@@ -9386,11 +9414,22 @@ class AxiomStore:
             "CASE WHEN json_type(payload_json,'$.trials')='array' "
             "THEN MIN(json_array_length(payload_json,'$.trials'),64) END AS trial_count,"
             "CASE WHEN json_type(payload_json,'$.trials')='array' THEN ("
-            "SELECT COUNT(*) FROM json_each(payload_json,'$.trials') "
-            "WHERE key<64 AND json_extract(value,'$.status') IN "
+            "SELECT COUNT(*) FROM json_each(payload_json,'$.trials') AS trial "
+            "WHERE trial.key<64 AND json_extract(trial.value,'$.status') IN "
             "('ECONOMIC_REJECTION','DATA_INSUFFICIENT','SOFTWARE_OR_INPUT_ERROR',"
             "'VALIDATION_QUALIFIED','FINAL_ASSESSMENT')) END AS completed_trial_count,"
-            "json_extract(payload_json,'$.counts.economic_rejection') AS economic_rejection,"
+            "CASE WHEN json_type(payload_json,'$.trials')='array' THEN ("
+            "SELECT COUNT(*) FROM json_each(payload_json,'$.trials') AS trial "
+            "WHERE trial.key<64 AND json_extract(trial.value,'$.status')="
+            "'ECONOMIC_REJECTION' AND (" + resolution_failure + ")=0"
+            ") ELSE COALESCE(json_extract(payload_json,'$.counts.economic_rejection'),0) END "
+            "AS economic_rejection,"
+            "CASE WHEN json_type(payload_json,'$.trials')='array' THEN ("
+            "SELECT COUNT(*) FROM json_each(payload_json,'$.trials') AS trial "
+            "WHERE trial.key<64 AND json_extract(trial.value,'$.status')="
+            "'ECONOMIC_REJECTION' AND (" + resolution_failure + ")=1"
+            ") ELSE COALESCE(json_extract(payload_json,'$.counts.market_resolution_failure'),0) END "
+            "AS market_resolution_failure,"
             "json_extract(payload_json,'$.counts.data_insufficient') AS data_insufficient,"
             "json_extract(payload_json,'$.counts.software_or_input_error') AS software_or_input_error,"
             "json_extract(payload_json,'$.counts.validation_qualified') AS validation_qualified,"
@@ -9439,6 +9478,7 @@ class AxiomStore:
                 key: int(row[key] or 0)
                 for key in (
                     "economic_rejection",
+                    "market_resolution_failure",
                     "data_insufficient",
                     "software_or_input_error",
                     "validation_qualified",

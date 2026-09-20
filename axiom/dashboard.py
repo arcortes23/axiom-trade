@@ -273,6 +273,7 @@ _CAMPAIGN_JOB_LIMIT = 32
 _CAMPAIGN_TRIAL_TERMINAL = frozenset(
     {
         "ECONOMIC_REJECTION",
+        "MARKET_RESOLUTION_FAILURE",
         "DATA_INSUFFICIENT",
         "SOFTWARE_OR_INPUT_ERROR",
         "VALIDATION_QUALIFIED",
@@ -407,30 +408,130 @@ def _http_bound_value(
     *,
     depth: int = 0,
     stats: dict[str, int | bool],
+    key: str | None = None,
 ) -> Any:
     """Bound arbitrary GET output without recursively materializing raw JSON."""
-    if depth >= _HTTP_JSON_MAX_DEPTH:
+    if depth >= _HTTP_JSON_MAX_DEPTH or key in {
+        "market_bindings",
+        "current_market_bindings",
+    }:
+        market_fields = _HTTP_PUBLIC_SECTION_FIELDS.get("market_bindings", ())
+
+        def bounded_market_bindings(raw: Any) -> list[dict[str, Any]]:
+            if not isinstance(raw, (list, tuple, set, frozenset)):
+                return []
+            result: list[dict[str, Any]] = []
+            for binding in list(raw)[:_HTTP_JSON_MAX_ITEMS]:
+                if not isinstance(binding, Mapping):
+                    continue
+                projected: dict[str, Any] = {}
+                for field in market_fields:
+                    if field not in binding:
+                        continue
+                    child = binding[field]
+                    if field == "outcome_token_ids":
+                        if isinstance(child, (list, tuple, set, frozenset)):
+                            projected[field] = [
+                                _http_bound_value(
+                                    item,
+                                    depth=0,
+                                    stats=stats,
+                                    key=field,
+                                )
+                                for item in list(child)[:_HTTP_JSON_MAX_ITEMS]
+                            ]
+                        continue
+                    if isinstance(child, (str, int, float, bool)) or child is None:
+                        projected[field] = _http_bound_value(
+                            child,
+                            depth=0,
+                            stats=stats,
+                            key=field,
+                        )
+                result.append(projected)
+            return result
+
+        if key in {"market_bindings", "current_market_bindings"}:
+            if isinstance(value, Mapping):
+                projected: dict[str, Any] = {}
+                for field in market_fields:
+                    if field not in value:
+                        continue
+                    child = value[field]
+                    if field == "outcome_token_ids":
+                        if isinstance(child, (list, tuple, set, frozenset)):
+                            projected[field] = [
+                                _http_bound_value(
+                                    item,
+                                    depth=0,
+                                    stats=stats,
+                                    key=field,
+                                )
+                                for item in list(child)[:_HTTP_JSON_MAX_ITEMS]
+                            ]
+                        continue
+                    if isinstance(child, (str, int, float, bool)) or child is None:
+                        projected[field] = _http_bound_value(
+                            child,
+                            depth=0,
+                            stats=stats,
+                            key=field,
+                        )
+                return projected
+            return bounded_market_bindings(value)
+        if key in {"setup_bindings", "draft_member_bindings"}:
+            if not isinstance(value, (list, tuple, set, frozenset)):
+                return []
+            binding_fields = _HTTP_PUBLIC_SECTION_FIELDS.get(key, ())
+            projected_bindings: list[dict[str, Any]] = []
+            for binding in list(value)[:_HTTP_JSON_MAX_ITEMS]:
+                if not isinstance(binding, Mapping):
+                    continue
+                projected: dict[str, Any] = {}
+                for field in binding_fields:
+                    child = binding.get(field)
+                    if field == "market_bindings":
+                        projected[field] = bounded_market_bindings(child)
+                    elif isinstance(child, (str, int, float, bool)) or child is None:
+                        projected[field] = _http_bound_value(
+                            child,
+                            depth=0,
+                            stats=stats,
+                            key=field,
+                        )
+                projected_bindings.append(projected)
+            return projected_bindings
         stats["truncated"] = True
         stats["omitted_items"] = int(stats.get("omitted_items", 0)) + 1
         return "<truncated>"
     if isinstance(value, Mapping):
         result: dict[str, Any] = {}
-        for index, (key, child) in enumerate(value.items()):
+        for index, (child_key, child) in enumerate(value.items()):
             if index >= _HTTP_JSON_MAX_KEYS:
                 stats["truncated"] = True
                 stats["omitted_items"] = int(stats.get("omitted_items", 0)) + len(value) - index
                 break
             child_depth = depth + 1
-            if depth == 0 and str(key) == "operator_controls":
-                # This is already a bounded public component; do not spend
-                # the root envelope depth before its typed leaf projection.
+            if depth == 0 and str(child_key) in {"operator_controls", "control_status"}:
+                # These are already bounded public components; do not spend
+                # the root envelope depth before their typed leaf projection.
                 child_depth = depth
-            result[str(key)] = _http_bound_value(child, depth=child_depth, stats=stats)
+            result[str(child_key)] = _http_bound_value(
+                child,
+                depth=child_depth,
+                stats=stats,
+                key=str(child_key),
+            )
         return result
     if isinstance(value, (list, tuple, set, frozenset)):
         source = list(value)
         result = [
-            _http_bound_value(child, depth=depth + 1, stats=stats)
+            _http_bound_value(
+                child,
+                depth=depth + 1,
+                stats=stats,
+                key=key,
+            )
             for child in source[:_HTTP_JSON_MAX_ITEMS]
         ]
         if len(source) > _HTTP_JSON_MAX_ITEMS:
@@ -453,14 +554,24 @@ def _http_bound_value(
         return format(value, "f")[:_HTTP_JSON_MAX_STRING]
     if is_dataclass(value):
         try:
-            return _http_bound_value(to_record(value), depth=depth, stats=stats)
+            return _http_bound_value(
+                to_record(value),
+                depth=depth,
+                stats=stats,
+                key=key,
+            )
         except (TypeError, ValueError):
-            return _http_bound_value(asdict(value), depth=depth, stats=stats)
+            return _http_bound_value(
+                asdict(value),
+                depth=depth,
+                stats=stats,
+                key=key,
+            )
     try:
         converted = value.value if hasattr(value, "value") else str(value)
     except Exception:
         converted = "<unserializable>"
-    return _http_bound_value(converted, depth=depth, stats=stats)
+    return _http_bound_value(converted, depth=depth, stats=stats, key=key)
 
 _HTTP_PUBLIC_SECTION_FIELDS: dict[str, tuple[str, ...]] = {
     "risk_settings": (
@@ -502,15 +613,35 @@ _HTTP_PUBLIC_SECTION_FIELDS: dict[str, tuple[str, ...]] = {
         "status", "authorization_id", "id", "generation", "mode", "purpose",
         "exact_strategy_versions", "strategy_version_ids", "reviewed_selection_policy_hash",
         "selection_policy_hash", "selection_id", "selection_hash", "adverse_evidence_ack",
-        "lifetime_budget", "stop_rules", "expires_at", "controller_lease", "active", "draft",
-        "identity", "rolling_exploratory_scope_draft", "blockers", "paper_only", "live_execution",
+        "lifetime_budget", "stop_rules", "expires_at", "controller_lease",
+        "scope", "scope_hash", "scope_version", "scope_draft_id", "scope_draft_hash",
+        "scope_draft_version", "active_scope_hash", "active_scope_version",
+        "frozen_scope_hash", "frozen_scope_version", "active_settings_hash",
+        "active_settings_generation", "policy_id", "policy_version", "policy_hash",
+        "setup_bindings", "draft_member_bindings", "proposed_allocation_total",
+        "proposed_allocation_risk_digest", "active", "draft", "identity",
+        "rolling_exploratory_scope_draft", "blockers", "paper_only", "live_execution",
     ),
     "exploratory_live_review": (
-        "profitability", "status", "scope", "scope_binding", "blockers", "allocation",
+        "profitability", "status", "proposal_status", "proposal", "scope",
+        "scope_binding", "blockers", "no_member_reason", "allocation",
         "policy", "review", "selected_setups", "entry_predicate", "direction", "sizing",
         "exit", "lookback", "adverse_evidence", "members", "limits", "limit_blockers",
-        "readiness", "authorization", "authorization_bindings", "lifetime_budget",
-        "expires_at", "stop_rules", "accounting", "paper_only", "live_execution",
+        "readiness", "authorization", "authorization_choices", "authorization_bindings",
+        "lifetime_budget", "expires_at", "stop_rules", "accounting", "paper_only",
+        "live_execution",
+    ),
+    "proposal": (
+        "status", "selection_id", "selection_hash", "policy_id", "policy_version",
+        "policy_hash", "scope_draft_id", "scope_draft_version", "scope_draft_hash",
+        "proposed_allocation_total", "proposed_allocation_risk_digest", "members",
+    ),
+    "no_member_reason": (
+        "code", "selection_status", "selection_id", "k", "global_budget",
+        "selection_reasons", "actionable_reasons",
+    ),
+    "authorization_choices": (
+        "purpose", "lifetime_budget", "expires_at", "stop_rules", "status", "approved",
     ),
     "selected_setups": (
         "strategy_version_id", "candidate_id", "setup_id", "setup_version", "setup_hash",
@@ -6741,6 +6872,14 @@ class DashboardData:
             "budget_limit": 0,
             "budget_used": 0,
             "budget_remaining": 0,
+            "counts": {
+                "economic_rejection": 0,
+                "market_resolution_failure": 0,
+                "data_insufficient": 0,
+                "software_or_input_error": 0,
+                "validation_qualified": 0,
+                "final_assessment": 0,
+            },
             "completed": 0,
             "remaining": 0,
             "completed_trials": 0,
@@ -6794,11 +6933,12 @@ class DashboardData:
             budget_used = min(budget_used, budget_limit)
             budget_remaining = min(budget_remaining, max(0, budget_limit - budget_used))
         projected_trial_count = payload.get("_trial_count")
+        projected_completed_count = payload.get("_completed_trial_count")
         if projected_trial_count is not None:
             trial_count = self._campaign_integer(projected_trial_count, 0)
             completed = min(
                 trial_count,
-                self._campaign_integer(payload.get("_completed_trial_count"), 0),
+                self._campaign_integer(projected_completed_count, 0),
             )
             trials: list[Mapping[str, Any]] = []
         else:
@@ -6808,25 +6948,57 @@ class DashboardData:
                 for item in (raw_trials if isinstance(raw_trials, (list, tuple)) else ())
                 if isinstance(item, Mapping)
             ][:64]
-            completed = sum(
-                1
-                for item in trials
-                if str(item.get("status") or "").strip().upper() in _CAMPAIGN_TRIAL_TERMINAL
+            payload_counts = payload.get("counts")
+            payload_counts = payload_counts if isinstance(payload_counts, Mapping) else {}
+            count_names = (
+                "economic_rejection",
+                "market_resolution_failure",
+                "data_insufficient",
+                "software_or_input_error",
+                "validation_qualified",
+                "final_assessment",
             )
-            if not trials:
-                counts = payload.get("counts")
-                counts = counts if isinstance(counts, Mapping) else {}
+            campaign_counts = {
+                name: self._campaign_integer(payload_counts.get(name), 0)
+                for name in count_names
+            }
+            if trials:
+                for item in trials:
+                    trial_status = str(item.get("status") or "").strip().upper().lower()
+                    if trial_status in campaign_counts and trial_status not in payload_counts:
+                        campaign_counts[trial_status] += 1
                 completed = sum(
-                    self._campaign_integer(counts.get(name), 0)
-                    for name in (
-                        "economic_rejection",
-                        "data_insufficient",
-                        "software_or_input_error",
-                        "validation_qualified",
-                        "final_assessment",
+                    1
+                    for item in trials
+                    if str(item.get("status") or "").strip().upper()
+                    in _CAMPAIGN_TRIAL_TERMINAL
+                )
+            else:
+                completed = sum(campaign_counts.values())
+            trial_count = max(len(trials), completed)
+        if projected_trial_count is not None:
+            payload_counts = payload.get("counts")
+            payload_counts = payload_counts if isinstance(payload_counts, Mapping) else {}
+            campaign_counts = {
+                name: self._campaign_integer(payload_counts.get(name), 0)
+                for name in (
+                    "economic_rejection",
+                    "market_resolution_failure",
+                    "data_insufficient",
+                    "software_or_input_error",
+                    "validation_qualified",
+                    "final_assessment",
+                )
+            }
+            if projected_completed_count is None:
+                completed = (
+                    min(trial_count, sum(campaign_counts.values()))
+                    if payload_counts
+                    else min(
+                        trial_count,
+                        self._campaign_integer(projected_completed_count, 0),
                     )
                 )
-            trial_count = len(trials)
         remaining = max(0, trial_count - completed)
         raw_qualified = payload.get("qualified_candidate_ids", payload.get("qualified", ()))
         if isinstance(raw_qualified, Mapping):
@@ -6881,6 +7053,7 @@ class DashboardData:
             "budget_limit": budget_limit,
             "budget_used": budget_used,
             "budget_remaining": budget_remaining,
+            "counts": dict(campaign_counts),
             "completed": completed,
             "remaining": remaining,
             "completed_trials": completed,
@@ -9391,6 +9564,70 @@ class DashboardData:
                 )
             review = dict(review)
             review["authorization_bindings"] = bindings
+        raw_authorization = raw_review.get("authorization")
+        if isinstance(review, Mapping) and isinstance(raw_authorization, Mapping):
+            authorization = dict(
+                review.get("authorization")
+                if isinstance(review.get("authorization"), Mapping)
+                else {}
+            )
+            authorization_fields = (
+                "status",
+                "authorization_id",
+                "id",
+                "generation",
+                "mode",
+                "purpose",
+                "exact_strategy_versions",
+                "strategy_version_ids",
+                "reviewed_selection_policy_hash",
+                "selection_policy_hash",
+                "selection_id",
+                "selection_hash",
+                "adverse_evidence_ack",
+                "lifetime_budget",
+                "stop_rules",
+                "expires_at",
+                "scope_hash",
+                "scope_version",
+                "scope_draft_id",
+                "scope_draft_hash",
+                "scope_draft_version",
+                "scope",
+                "active_scope_hash",
+                "active_scope_version",
+                "frozen_scope_hash",
+                "frozen_scope_version",
+                "active_settings_hash",
+                "active_settings_generation",
+                "proposed_allocation_total",
+                "proposed_allocation_risk_digest",
+                "policy_id",
+                "policy_version",
+                "policy_hash",
+            )
+            for key in authorization_fields:
+                if key in raw_authorization:
+                    authorization[key] = _safe_value(raw_authorization[key])
+            for nested_key in ("active", "draft", "authorization"):
+                nested = raw_authorization.get(nested_key)
+                if not isinstance(nested, Mapping):
+                    continue
+                nested_projection: dict[str, Any] = {}
+                for key in authorization_fields:
+                    if key in nested:
+                        nested_projection[key] = _safe_value(nested[key])
+                if "setup_bindings" in nested:
+                    nested_projection["setup_bindings"] = _public_setup_bindings(
+                        nested.get("setup_bindings")
+                    )
+                if "draft_member_bindings" in nested:
+                    nested_projection["draft_member_bindings"] = _public_draft_member_bindings(
+                        nested.get("draft_member_bindings")
+                    )
+                authorization[nested_key] = nested_projection
+            review = dict(review)
+            review["authorization"] = authorization
         projected = dict(projected)
         if isinstance(review, Mapping):
             projected["exploratory_live_review"] = review
@@ -9420,7 +9657,8 @@ class DashboardData:
         # ``overview_summary`` is authoritative for every research surface.
         # Controls are additive and must never replace persisted cards, rows,
         # candidate selections, lifecycle values, or canary evidence.
-        result["operator_controls"] = self._operator_controls_projection(controls)
+        control_projection = self._operator_controls_projection(controls)
+        result["operator_controls"] = control_projection
         authorization = controls.get("execution_authorization")
         if not isinstance(authorization, Mapping):
             authorization = self.execution_authorization_data()
@@ -9662,7 +9900,7 @@ class DashboardData:
         }
         # Keep control-only status available without colliding with the
         # persisted ``raw`` research payload.
-        result.setdefault("control_status", controls)
+        result["control_status"] = control_projection
         return result
 
     def operator_data(self) -> dict[str, Any]:
@@ -10299,7 +10537,7 @@ def _dashboard_html(
     <section id="view-rolling-portfolio" class="view"><article class="panel"><div class="section-title"><h2>Rolling Portfolio</h2><span id="rolling-status" class="badge warn">paper-only · no live execution</span></div><div id="rolling-action-result" class="page-note"></div><div id="rolling-summary"></div><div id="rolling-policy-controls"></div><div id="rolling-members" class="scroll"></div><div id="rolling-reasons"></div><div id="rolling-jobs"></div><p class="page-note">Rolling membership is append-only and each displayed member is bound to its persisted strategy, research trial, candidate, and exact evidence window. Missing lineage remains non-executable. Policy/allocation review is a non-active draft; activation is separate, deliberate, and remains paper-only.</p></article></section>
     <section id="view-canary" class="view"><article class="panel" style="border-color:var(--red)"><div class="section-title"><h2>REAL CANARY MONEY</h2><span class="badge bad">PRODUCTION LIVE TRADING: DISABLED</span></div><div id="canary-action-result" class="page-note"></div><div id="canary-readiness-snapshot"></div><div id="canary-controls"></div><div id="risk-settings"></div><div id="canary-connectivity"></div><div id="canary-summary"></div><div id="canary-trades" class="scroll"></div><p class="notice">Autonomous canary is independent from paper research. No secrets are stored or displayed. It remains prediction-only, bounded by active settings, and killable from this console.</p></article></section>
     <article id="canary-recovery-form" class="panel"><div class="section-title"><h2>UNKNOWN ENTRY RECOVERY</h2><span class="badge warn">READ-ONLY · PRODUCTION PROFILE</span></div><p class="page-note">Attach only an operator-supplied canonical exchange order ID. This does not post, retry, activate, or release an entry.</p><div class="three-col"><label>Event ID<input id="canary-recovery-event" autocomplete="off"></label><label>Signal ID<input id="canary-recovery-signal" autocomplete="off"></label><label>Canonical exchange order ID<input id="canary-recovery-order" autocomplete="off"></label></div><label>Exact confirmation<input id="canary-recovery-confirm" placeholder="RECOVER UNKNOWN ENTRY" autocomplete="off"></label><p class="page-note"><button id="canary-recovery-submit" class="link">Recover and reconcile</button> <span id="canary-recovery-result"></span></p></article>
-    <article id="execution-authorization-panel" class="panel" style="border-color:var(--amber)"><div class="section-title"><h2>EXPLORATORY MICRO-CANARY AUTHORIZATION</h2><span class="badge warn">REVIEWED · DISARMED BY DEFAULT</span></div><div id="execution-auth-state" class="page-note">Loading authorization state…</div><pre id="execution-auth-details" class="scroll"></pre><div class="three-col"><label>Purpose<input id="execution-auth-purpose" value="Exploratory micro-canary review" maxlength="120" autocomplete="off"></label><label>Lifetime budget (USD)<input id="execution-auth-budget" value="10" inputmode="decimal" maxlength="16"></label><label>Expires at (UTC, optional)<input id="execution-auth-expires" placeholder="2025-01-01T00:00:00Z" maxlength="32" autocomplete="off"></label></div><label class="page-note"><input id="execution-auth-adverse-evidence" type="checkbox"> I acknowledge the adverse evidence; this review remains paper-only and disarmed.</label><p class="page-note">Review binds the current evidence-selected strategy versions, selection policy, risk settings, scope, and stop rules. The browser never accepts or asks for a private authorization ID.</p><p><button id="execution-auth-review" class="link">Review exploratory authorization</button> <button id="execution-auth-activate" class="link">Activate reviewed authorization</button> <button id="execution-auth-revoke" class="link">Revoke active authorization</button> <span id="execution-auth-result"></span></p></article>
+    <article id="execution-authorization-panel" class="panel" style="border-color:var(--amber)"><div class="section-title"><h2>EXPLORATORY MICRO-CANARY AUTHORIZATION</h2><span class="badge warn">REVIEWED · DISARMED BY DEFAULT</span></div><div id="execution-auth-state" class="page-note">Loading authorization state…</div><pre id="execution-auth-details" class="scroll"></pre><div class="three-col"><label>Purpose<input id="execution-auth-purpose" placeholder="Operator-chosen purpose" maxlength="120" autocomplete="off"></label><label>Lifetime budget (USD)<input id="execution-auth-budget" placeholder="Required" inputmode="decimal" maxlength="16"></label><label>Expires at (UTC)<input id="execution-auth-expires" placeholder="2026-01-01T00:00:00Z" maxlength="32" autocomplete="off"></label></div><label>Stop rules (JSON)<input id="execution-auth-stop-rules" placeholder='{"on_any_blocker":"STOP","halt_on_unknown_execution":true}' maxlength="512" autocomplete="off"></label><label class="page-note"><input id="execution-auth-adverse-evidence" type="checkbox"> I acknowledge the adverse evidence; this review remains paper-only and disarmed.</label><p class="page-note">Review binds the current evidence-selected strategy versions, selection policy, risk settings, scope, and stop rules. Purpose, budget, expiration, and stop rules are operator choices; nothing is silently filled or approved.</p><p><button id="execution-auth-review" class="link">Review exploratory authorization</button> <button id="execution-auth-activate" class="link">Activate reviewed authorization</button> <button id="execution-auth-revoke" class="link">Revoke active authorization</button> <span id="execution-auth-result"></span></p></article>
     <article id="exploratory-live-review-panel" class="panel" style="border-color:var(--red)"><div class="section-title"><h2>EXPLORATORY LIVE FINAL REVIEW</h2><span class="badge bad">PROFITABILITY UNPROVEN · DISARMED BY DEFAULT</span></div><p class="page-note">One confirmation coordinates the existing reviewed authorization, bounded allocation, arm, and autonomous-enable fences. It never submits an order.</p><div id="exploratory-live-review" class="scroll">Loading final review…</div><label>Exact confirmation<input id="exploratory-live-confirm" placeholder="CONFIRM EXPLORATORY LIVE" autocomplete="off"></label><button id="exploratory-live-confirm-action" type="button">Review and confirm EXPLORATORY LIVE</button><div id="exploratory-live-result" class="page-note"></div></article>
     <p class="page-note"><strong>Unactivated broad scope draft:</strong> canonical RULE_BASED_MARKETS / POLYMARKET with all categories, standard binary prediction markets only. COMBO, unsupported/non-binary/closed/not-accepting/no-book/stale/insufficient-liquidity-or-depth/invalid-token-or-setup/data/evaluation failures remain excluded; the active operating scope and each selected member's frozen scope are shown separately. Discovery and evaluation stay paper-only; no scope activation or order submission is available here.</p>
     <p class="page-note">Review disclosure: setup entry predicate/direction/sizing/exit/lookback · bounded scope and ≤3 members · $1 all-in, $0.01 fee reserve, $5 gross daily, $5 aggregate exposure and independent open-cost · 3 positions · 5 submissions/day · $2 realized/equity stops · 100bp slippage · authoritative pending/UNKNOWN usage and reserved exit capacity · explicit finite lifetime budget and expiration · stop rules · trusted account/geoblock/balance/allowance · selected-market book/minimum/depth readiness. Optional 20 submissions/day remains reviewed-only and is never auto-set.</p>
@@ -10768,6 +11006,8 @@ def _dashboard_html(
         researchFeedField("forward_observations","Forward observations",candidate.forward_observations??progress.forward_observations),
         researchFeedField("blocker","Blocker",blocker),
         researchFeedField("status","Validation status",candidateStatus),
+        researchFeedField("campaign_economic_rejections","Economic rejections",campaign.counts?.economic_rejection??"UNKNOWN"),
+        researchFeedField("campaign_market_resolution_failures","Market resolution failures",campaign.counts?.market_resolution_failure??"UNKNOWN"),
         researchFeedField("campaign_id","Synthetic campaign",campaign.campaign_id),
         researchFeedField("campaign_status","Campaign status",campaign.status),
         researchFeedField("campaign_budget","Campaign budget",`${budget.used??campaign.budget_used??0} / ${budget.limit??campaign.budget_limit??0} (${budget.remaining??campaign.budget_remaining??0} remaining)`),
@@ -11076,9 +11316,9 @@ def _dashboard_html(
     if($("crypto-symbol"))$("crypto-symbol").addEventListener("input",async()=>{const symbol=$("crypto-symbol").value.trim(),q=new URLSearchParams({page:"1",page_size:String(state.page_size),direction:state.direction});if(symbol)q.set("symbol",symbol);const response=await fetch(`/api/v2/crypto-research?${q}`,{cache:"no-store"});if(response.ok)renderCrypto(await response.json());});
     const executionAuthPanel=$("execution-authorization-panel"),executionCanaryView=$("view-canary"); if(executionAuthPanel&&executionCanaryView)executionCanaryView.appendChild(executionAuthPanel);
     function renderExecutionAuthorization(value) {
-      const payload=value&&typeof value==="object"?value:{}, auth=payload.execution_authorization&&typeof payload.execution_authorization==="object"?payload.execution_authorization:{}, active=auth.active&&typeof auth.active==="object"?auth.active:null, draft=auth.draft&&typeof auth.draft==="object"?auth.draft:null, row=active||draft||auth.authorization||{}, status=String(auth.status||row.status||"DISABLED").toUpperCase(), id=row.authorization_id||row.id||"", activeId=active?.authorization_id||active?.id||"", draftId=draft?.authorization_id||draft?.id||"", generationValue=row.generation??auth.generation, generation=Number.isInteger(Number(generationValue))&&Number(generationValue)>0?Number(generationValue):null;
-      const adverseEvidenceAcknowledged=row.adverse_evidence_ack===true||row.adverse_evidence_ack?.acknowledged===true||row.adverse_evidence_ack?.accepted===true;
-      const details={status,authorization_id:id,generation,mode:row.mode||auth.mode||"EXPLORATORY_MICRO_CANARY",purpose:row.purpose||"—",strategy_versions:row.exact_strategy_versions||row.strategy_version_ids||"—",selection_policy_hash:row.reviewed_selection_policy_hash||row.selection_policy_hash||"—",selection_id:row.selection_id||"—",selection_hash:row.selection_hash||"—",adverse_evidence_ack:adverseEvidenceAcknowledged?(row.adverse_evidence_ack_required===false?"NOT REQUIRED":"ACKNOWLEDGED"):"NOT ACKNOWLEDGED",adverse_evidence_ack_required:row.adverse_evidence_ack_required!==false,lifetime_budget:row.lifetime_budget||"—",stop_rules:row.stop_rules||"—",expires_at:row.expires_at||"—",scope_hash:row.scope_hash||"—",scope_version:row.scope_version||"—",scope_draft_id:row.scope_draft_id||payload.scope_draft?.draft_id||"—",scope_draft_hash:row.scope_draft_hash||payload.scope_draft?.draft_hash||"—",scope_draft_version:row.scope_draft_version||payload.scope_draft?.scope_version||"—",supported_market_types:row.supported_market_types||payload.scope_draft?.supported_market_types||"—",category_restriction:row.category_restriction||payload.scope_draft?.category_restriction||"—",scope_exclusions:row.scope_exclusions||payload.scope_draft?.exclusions||"—",active_scope_hash:row.active_scope_hash||"—",active_scope_version:row.active_scope_version||"—",frozen_scope_hash:row.frozen_scope_hash||"—",frozen_scope_version:row.frozen_scope_version||"—",active_settings_hash:row.active_settings_hash||"—",active_settings_generation:row.active_settings_generation||"—"};
+      const payload=value&&typeof value==="object"?value:{}, legacyAuth=payload.execution_authorization&&typeof payload.execution_authorization==="object"?payload.execution_authorization:{}, review=payload.exploratory_live_review&&typeof payload.exploratory_live_review==="object"?payload.exploratory_live_review:{}, reviewedAuthorization=review.authorization&&typeof review.authorization==="object"?review.authorization:null, auth=reviewedAuthorization?Object.assign({},legacyAuth,reviewedAuthorization):legacyAuth, active=auth.active&&typeof auth.active==="object"?auth.active:null, draft=auth.draft&&typeof auth.draft==="object"?auth.draft:null, row=active||draft||auth.authorization||{}, status=String(auth.status||row.status||"DISABLED").toUpperCase(), id=row.authorization_id||row.id||"", activeId=active?.authorization_id||active?.id||"", draftId=draft?.authorization_id||draft?.id||"", generationValue=row.generation??auth.generation, generation=Number.isInteger(Number(generationValue))&&Number(generationValue)>0?Number(generationValue):null;
+      const adverseEvidence=row.adverse_evidence_ack, adverseEvidenceRequired=Object.prototype.hasOwnProperty.call(row,"adverse_evidence_ack_required")?row.adverse_evidence_ack_required!==false:!(adverseEvidence&&typeof adverseEvidence==="object"&&adverseEvidence.required===false), adverseEvidenceAcknowledged=adverseEvidence===true||adverseEvidence?.acknowledged===true||adverseEvidence?.accepted===true;
+      const details={status,authorization_id:id,generation,mode:row.mode||auth.mode||"EXPLORATORY_MICRO_CANARY",purpose:row.purpose||"—",strategy_versions:row.exact_strategy_versions||row.strategy_version_ids||"—",selection_policy_hash:row.reviewed_selection_policy_hash||row.selection_policy_hash||"—",selection_id:row.selection_id||"—",selection_hash:row.selection_hash||"—",adverse_evidence_ack:!adverseEvidenceRequired?"NOT REQUIRED":adverseEvidenceAcknowledged?"ACKNOWLEDGED":"NOT ACKNOWLEDGED",adverse_evidence_ack_required:adverseEvidenceRequired,lifetime_budget:row.lifetime_budget||"—",stop_rules:row.stop_rules||"—",expires_at:row.expires_at||"—",scope_hash:row.scope_hash||"—",scope_version:row.scope_version||"—",scope_draft_id:row.scope_draft_id||payload.scope_draft?.draft_id||"—",scope_draft_hash:row.scope_draft_hash||payload.scope_draft?.draft_hash||"—",scope_draft_version:row.scope_draft_version||payload.scope_draft?.scope_version||"—",supported_market_types:row.supported_market_types||payload.scope_draft?.supported_market_types||"—",category_restriction:row.category_restriction||payload.scope_draft?.category_restriction||"—",scope_exclusions:row.scope_exclusions||payload.scope_draft?.exclusions||"—",active_scope_hash:row.active_scope_hash||"—",active_scope_version:row.active_scope_version||"—",frozen_scope_hash:row.frozen_scope_hash||"—",frozen_scope_version:row.frozen_scope_version||"—",active_settings_hash:row.active_settings_hash||"—",active_settings_generation:row.active_settings_generation||"—"};
       details.instance=payload.identity||payload.instance||auth.identity||"—";
       details.operator_mode=payload.mode||auth.operator_mode||"observing";
       details.economic_policy=payload.economic_policy||auth.economic_policy||"—";
@@ -11106,11 +11346,13 @@ def _dashboard_html(
       const button=event.target.closest?.("#execution-auth-review,#execution-auth-activate,#execution-auth-revoke"); if(!button)return;
       const result=$("execution-auth-result"), current=renderExecutionAuthorization(lastGood.controls||lastGood.canary||lastGood.overview||{}), action=button.id;
       if(action==="execution-auth-review"){
-        const purpose=$("execution-auth-purpose")?.value.trim()||"", budget=$("execution-auth-budget")?.value.trim()||"", expires=$("execution-auth-expires")?.value.trim()||"", adverseEvidence=$("execution-auth-adverse-evidence")?.checked===true;
-        if(!purpose||!budget){if(result)result.textContent="Review blocked: purpose and lifetime budget are required";return;}
-        const values={purpose,lifetime_budget:budget,stop_rules:{max_daily_loss_usd:"5",max_lifetime_loss_usd:"10",on_any_blocker:"STOP"}};
+        const purpose=$("execution-auth-purpose")?.value.trim()||"", budget=$("execution-auth-budget")?.value.trim()||"", expires=$("execution-auth-expires")?.value.trim()||"", stopText=$("execution-auth-stop-rules")?.value.trim()||"", adverseEvidence=$("execution-auth-adverse-evidence")?.checked===true;
+        if(!purpose||!budget||!expires||!stopText){if(result)result.textContent="Review blocked: purpose, lifetime budget, expiration, and stop rules are required";return;}
+        let stopRules;
+        try { stopRules=JSON.parse(stopText); } catch(error) { if(result)result.textContent="Review blocked: stop rules must be valid JSON"; return; }
+        if(!stopRules||typeof stopRules!=="object"||Array.isArray(stopRules)||!Object.keys(stopRules).length){if(result)result.textContent="Review blocked: stop rules must be a non-empty JSON object";return;}
+        const values={purpose,lifetime_budget:budget,expires_at:expires,stop_rules:stopRules};
         if(adverseEvidence)values.adverse_evidence_ack=true;
-        if(expires)values.expires_at=expires;
         const response=await controlPost("execution_authorization.review","", "REVIEW EXPLORATORY AUTHORIZATION",{values});
         if(result)result.textContent=response.ok?"Review saved as DRAFT · paper-only":"Review blocked: "+(response.reason||"CONTROL_FAILED");
         await refreshExecutionAuthorization(); return;

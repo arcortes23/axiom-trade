@@ -2690,11 +2690,31 @@ class OperatorControlPlane:
         if not isinstance(policy_identity, Mapping):
             policy_identity = rolling.get("policy_identity")
         policy_identity = dict(policy_identity) if isinstance(policy_identity, Mapping) else {}
+        policy_document: Mapping[str, Any] = {}
+        selection_policy = selection.get("operating_policy") or selection.get(
+            "exploratory_policy"
+        )
+        if isinstance(selection_policy, Mapping):
+            policy_document = selection_policy
+        else:
+            active_document = rolling.get("active_policy") or rolling.get("policy")
+            if isinstance(active_document, Mapping):
+                nested_policy = (
+                    active_document.get("operating_policy")
+                    or active_document.get("exploratory_policy")
+                )
+                policy_document = (
+                    nested_policy
+                    if isinstance(nested_policy, Mapping)
+                    else active_document
+                )
         policy_hash = (
             str(
                 policy_identity.get("config_hash")
                 or policy_identity.get("policy_hash")
                 or selection.get("policy_hash")
+                or policy_document.get("config_hash")
+                or policy_document.get("policy_hash")
                 or ""
             ).strip()
             or None
@@ -2704,6 +2724,8 @@ class OperatorControlPlane:
             or policy_identity.get("id")
             or selection.get("policy_id")
             or selection.get("admission_policy_id")
+            or policy_document.get("policy_id")
+            or policy_document.get("id")
             or ""
         ).strip() or None
         policy_version = str(
@@ -2711,6 +2733,8 @@ class OperatorControlPlane:
             or policy_identity.get("version")
             or selection.get("policy_version")
             or selection.get("admission_policy_version")
+            or policy_document.get("policy_version")
+            or policy_document.get("version")
             or ""
         ).strip() or None
         setup_bindings: list[dict[str, Any]] = []
@@ -2862,6 +2886,8 @@ class OperatorControlPlane:
             "policy_id": policy_id,
             "policy_version": policy_version,
             "policy_hash": policy_hash or None,
+            "operating_policy": _safe_value(policy_document),
+            "exploratory_policy": _safe_value(policy_document),
             "setup_bindings": _public_setup_bindings(setup_bindings),
             "draft_member_bindings": _public_draft_member_bindings(
                 draft_member_bindings
@@ -2884,6 +2910,9 @@ class OperatorControlPlane:
             "active_settings_hash": settings_hash,
             "active_settings_generation": settings_generation,
             "proposed_allocation_total": selection.get("proposed_allocation_total"),
+            "selection_actionable_reasons": _safe_value(
+                rolling.get("actionable_reasons", {})
+            ),
             "proposed_allocation_risk_digest": selection.get(
                 "proposed_allocation_risk_digest"
             ),
@@ -2891,8 +2920,10 @@ class OperatorControlPlane:
             "selection": selection,
             "scope": scope,
         }
-    def execution_authorization_snapshot(self) -> dict[str, Any]:
-        """Return active and latest reviewed exploratory authorization state."""
+    def execution_authorization_snapshot(
+        self, *, bounded: bool = True
+    ) -> dict[str, Any]:
+        """Return active and latest authorization, optionally from raw storage."""
         loader = getattr(self.store, "load_active_execution_authorization", None)
         active: Mapping[str, Any] | None = None
         if callable(loader):
@@ -3057,12 +3088,15 @@ class OperatorControlPlane:
             if isinstance(authorization, Mapping)
             else ""
         ) or "EXPLORATORY_MICRO_CANARY"
+        def projected(value: Mapping[str, Any] | None) -> Any:
+            if value is None:
+                return None
+            return _safe_value(value) if bounded else dict(value)
+
         return {
-            "active": _safe_value(active) if active is not None else None,
-            "draft": _safe_value(draft) if draft is not None else None,
-            "authorization": _safe_value(authorization)
-            if authorization is not None
-            else None,
+            "active": projected(active),
+            "draft": projected(draft),
+            "authorization": projected(authorization),
             "authorization_id": str(authorization_id).strip()
             if authorization_id
             else None,
@@ -3109,8 +3143,28 @@ class OperatorControlPlane:
         unknown = set(raw) - allowed
         if unknown:
             raise OperatorControlError("UNSUPPORTED_EXECUTION_AUTHORIZATION_FIELDS")
-        self._prepare_rolling_exploratory_scope_draft()
-        context = self._authorization_context()
+        selection_loader = getattr(self.store, "load_current_portfolio_selection", None)
+        selection_for_prep = (
+            selection_loader() if callable(selection_loader) else None
+        )
+        prep_members = (
+            selection_for_prep.get(
+                "members", selection_for_prep.get("selected_members", ())
+            )
+            if isinstance(selection_for_prep, Mapping)
+            else ()
+        )
+        has_proposed_members = isinstance(prep_members, (list, tuple)) and any(
+            isinstance(member, Mapping) and _canary_selection_member_is_proposed(member)
+            for member in prep_members
+        )
+        if has_proposed_members:
+            self._prepare_reviewed_proposed_selection()
+        else:
+            self._prepare_rolling_exploratory_scope_draft()
+        context = self._authorization_context(
+            require_draft_members=has_proposed_members
+        )
         for field, context_key in (
             ("scope_hash", "scope_hash"),
             ("scope_version", "scope_version"),
@@ -3150,9 +3204,7 @@ class OperatorControlPlane:
                     ) from None
             elif str(supplied or "") != str(expected or ""):
                 raise OperatorControlError("EXECUTION_AUTHORIZATION_BINDING_STALE")
-        purpose = self._authorization_text(
-            raw.get("purpose", "exploratory micro-canary review"), "purpose"
-        )
+        purpose = self._authorization_text(raw.get("purpose"), "purpose")
         actor_value = _safe_identifier(actor, "actor")
         actor_version = self._authorization_text(
             raw.get("actor_version", os.environ.get("AXIOM_OPERATOR_VERSION", "operator-v1")),
@@ -3200,6 +3252,11 @@ class OperatorControlPlane:
             raise OperatorControlError("EXECUTION_AUTHORIZATION_BINDING_STALE")
         policy_hash = supplied_policy_hash or context_policy_hash
         policy_only = not strategy_versions and bool(policy_hash)
+        if policy_only and (
+            not str(context.get("selection_id") or "").strip()
+            or not str(context.get("selection_hash") or "").strip()
+        ):
+            raise OperatorControlError("EXECUTION_AUTHORIZATION_BINDING_STALE")
         funding_rejected_strategy = bool(
             rejected_strategy_versions.intersection(strategy_versions)
         )
@@ -3220,23 +3277,9 @@ class OperatorControlPlane:
         )
         if funding_rejected_strategy and not rejected_acknowledged:
             raise OperatorControlError("EXECUTION_AUTHORIZATION_ADVERSE_EVIDENCE_ACK_REQUIRED")
-        if (
-            policy_only
-            and (
-                not context.get("selection_id")
-                or not context.get("selection_hash")
-            )
-        ):
-            raise OperatorControlError(
-                "EXECUTION_AUTHORIZATION_SELECTION_BINDING_REQUIRED"
-            )
-        # The storage contract requires an explicit acknowledgment object for
-        # every durable row.  For accepted strategies this is an internal
-        # non-required marker; rejected strategies must carry the operator's
-        # explicit acknowledgment above.
-        persisted_ack = ack if acknowledged else {
-            "acknowledged": True,
-            "required": False,
+        persisted_ack = {
+            "acknowledged": True if not funding_rejected_strategy else bool(acknowledged),
+            "required": bool(funding_rejected_strategy),
         }
         lifetime_budget = self._authorization_decimal(
             raw.get("lifetime_budget"), "lifetime_budget"
@@ -3244,26 +3287,19 @@ class OperatorControlPlane:
         now = context["now"]
         expires_value = raw.get("expires_at")
         if expires_value is None:
-            expires_at = now.replace(microsecond=0) + timedelta(hours=24)
-        else:
-            expires_text = self._authorization_timestamp(expires_value, "expires_at")
-            try:
-                expires_at = datetime.fromisoformat(expires_text)
-            except (TypeError, ValueError):
-                raise OperatorControlError(
-                    "EXECUTION_AUTHORIZATION_EXPIRES_AT_INVALID"
-                ) from None
+            raise OperatorControlError("EXECUTION_AUTHORIZATION_EXPIRES_AT_REQUIRED")
+        expires_text = self._authorization_timestamp(expires_value, "expires_at")
+        try:
+            expires_at = datetime.fromisoformat(expires_text)
+        except (TypeError, ValueError):
+            raise OperatorControlError(
+                "EXECUTION_AUTHORIZATION_EXPIRES_AT_INVALID"
+            ) from None
         if expires_at <= now:
             raise OperatorControlError("EXECUTION_AUTHORIZATION_EXPIRED")
-        expires_text = expires_at.isoformat()
-        stop_rules = raw.get(
-            "stop_rules",
-            {
-                "max_submissions": 1,
-                "max_loss_usd": "0.25",
-                "halt_on_unknown_execution": True,
-            },
-        )
+        stop_rules = raw.get("stop_rules")
+        if stop_rules is None:
+            raise OperatorControlError("EXECUTION_AUTHORIZATION_STOP_RULES_REQUIRED")
         if not isinstance(stop_rules, Mapping) or not stop_rules:
             raise OperatorControlError("EXECUTION_AUTHORIZATION_STOP_RULES_REQUIRED")
         stop_rules = _safe_value(dict(stop_rules))
@@ -3552,7 +3588,8 @@ class OperatorControlPlane:
             first_member = next(
                 (item for item in members if isinstance(item, Mapping))
                 if isinstance(members, (list, tuple))
-                else iter(())
+                else iter(()),
+                {},
             )
         first_member = first_member if isinstance(first_member, Mapping) else {}
         canonical_scope = first_member.get("market_scope")
@@ -4547,28 +4584,95 @@ class OperatorControlPlane:
             selection.get("operating_policy")
             or selection.get("exploratory_policy")
             or selection.get("setup_policy")
+            or context.get("operating_policy")
+            or context.get("exploratory_policy")
         )
         if self._exploratory_live_policy_mode(policy) != "EXPLORATORY_LIVE":
             raise OperatorControlError("EXPLORATORY_LIVE_POLICY_REQUIRED")
         members_raw = selection.get("members", selection.get("selected_members", ()))
-        members = [item for item in members_raw if isinstance(item, Mapping)] if isinstance(members_raw, (list, tuple)) else []
+        members = (
+            [item for item in members_raw if isinstance(item, Mapping)]
+            if isinstance(members_raw, (list, tuple))
+            else []
+        )
         funded: list[Mapping[str, Any]] = []
+        proposed: list[Mapping[str, Any]] = []
         rejected: list[Mapping[str, Any]] = []
         for member in members[:10]:
             status = str(member.get("status") or member.get("stage") or "").upper()
             if bool(member.get("rejected")) or status == "REJECTED":
                 rejected.append(member)
-            elif (
-                _canary_selection_member_is_funded(member)
-                or _canary_selection_member_is_proposed(member)
-            ):
+            elif _canary_selection_member_is_proposed(member):
+                proposed.append(member)
+                funded.append(member)
+            elif _canary_selection_member_is_funded(member):
                 funded.append(member)
         reviewed_candidate = str(raw.get("candidate_id") or "").strip()
         server_candidate = (
             str(funded[0].get("candidate_id") or "").strip() if funded else ""
         )
-        if reviewed_candidate and reviewed_candidate != server_candidate:
+        if (
+            reviewed_candidate
+            and server_candidate
+            and reviewed_candidate != server_candidate
+        ):
             raise OperatorControlError("EXPLORATORY_LIVE_AUTHORIZATION_BINDING_STALE")
+        selection_status = str(selection.get("status") or "NONE").strip().upper()
+        selection_reasons = selection.get("reasons")
+        selection_reasons = (
+            [str(reason) for reason in selection_reasons[:16]]
+            if isinstance(selection_reasons, (list, tuple))
+            else []
+        )
+        no_member_reason: Mapping[str, Any] | None = None
+        if not funded:
+            no_member_reason = {
+                "code": (
+                    "EXPLORATORY_LIVE_NO_ELIGIBLE_PROPOSED_MEMBERS"
+                    if selection
+                    else "EXPLORATORY_LIVE_PORTFOLIO_SELECTION_REQUIRED"
+                ),
+                "selection_status": selection_status,
+                "selection_id": context.get("selection_id"),
+                "k": selection.get("k", 0),
+                "global_budget": selection.get("global_budget"),
+                "selection_reasons": selection_reasons,
+                "actionable_reasons": _safe_value(
+                    selection.get(
+                        "actionable_reasons",
+                        context.get("selection_actionable_reasons", {}),
+                    )
+                ),
+            }
+        proposal_risk_blockers: list[str] = []
+        proposed_total = Decimal("0")
+        positive_proposal = False
+        for member in proposed:
+            amount = _rolling_decimal(member.get("proposed_allocation"))
+            if amount is None or amount <= 0:
+                continue
+            positive_proposal = True
+            proposed_total += amount
+        if positive_proposal:
+            declared_total = _rolling_decimal(selection.get("proposed_allocation_total"))
+            if declared_total is None:
+                proposal_risk_blockers.append(
+                    "EXPLORATORY_LIVE_PROPOSED_ALLOCATION_TOTAL_REQUIRED"
+                )
+            elif declared_total != proposed_total:
+                proposal_risk_blockers.append("EXPLORATORY_LIVE_RISK_BINDING_STALE")
+            risk_digest = str(
+                selection.get("proposed_allocation_risk_digest") or ""
+            ).strip()
+            risk_snapshot = selection.get("proposed_allocation_risk_snapshot")
+            if not risk_digest:
+                proposal_risk_blockers.append(
+                    "EXPLORATORY_LIVE_PROPOSED_ALLOCATION_RISK_DIGEST_REQUIRED"
+                )
+            elif not isinstance(risk_snapshot, Mapping) or (
+                self._rolling_canonical_hash(risk_snapshot) != risk_digest
+            ):
+                proposal_risk_blockers.append("EXPLORATORY_LIVE_RISK_BINDING_STALE")
         limits = self._rolling_effective_limits()
         expected_limits = {
             "max_all_in_buy_usd": "1.00",
@@ -4583,7 +4687,8 @@ class OperatorControlPlane:
             "max_slippage_bps": 100,
         }
         limit_blockers = [
-            name for name, expected in expected_limits.items()
+            name
+            for name, expected in expected_limits.items()
             if str(limits.get(name)) != str(expected)
         ]
         binding_blockers: list[str] = []
@@ -4611,6 +4716,37 @@ class OperatorControlPlane:
                 binding_blockers.append("EXPLORATORY_SETUP_BINDING_REQUIRED")
                 break
         setups = []
+        review_members = []
+        for item in funded[:3]:
+            proposed_value = item.get("proposed_allocation")
+            actual_value = item.get("allocation")
+            review_members.append(
+                {
+                    "strategy_version_id": item.get("strategy_version_id"),
+                    "candidate_id": item.get("candidate_id"),
+                    "status": item.get("status") or item.get("stage"),
+                    "allocation": _safe_value(actual_value),
+                    "proposed_allocation": _safe_value(proposed_value),
+                    "allocation_active": _safe_value(item.get("allocation_active")),
+                    "setup_binding": _safe_value(
+                        next(
+                            (
+                                binding
+                                for binding in context.get("setup_bindings", [])
+                                if isinstance(binding, Mapping)
+                                and str(binding.get("strategy_version_id") or "")
+                                == str(item.get("strategy_version_id") or "")
+                            ),
+                            {},
+                        )
+                    ),
+                }
+            )
+        proposal_status = (
+            "UNACTIVATED"
+            if proposed
+            else ("ACTIVE" if funded else "NONE")
+        )
         for member in funded[:3]:
             setup = member.get("operational_setup")
             setup = setup if isinstance(setup, Mapping) else {}
@@ -4652,9 +4788,10 @@ class OperatorControlPlane:
             scope=scope,
             target_candidate_id=server_candidate or None,
         )
-        authorization_snapshot = self.execution_authorization_snapshot()
+        authorization_snapshot = self.execution_authorization_snapshot(bounded=False)
         authorization = authorization_snapshot.get("authorization")
         authorization = authorization if isinstance(authorization, Mapping) else {}
+        persisted_purpose = authorization.get("purpose")
         persisted_lifetime = authorization.get(
             "lifetime_budget", authorization.get("lifetime_budget_json")
         )
@@ -4664,6 +4801,8 @@ class OperatorControlPlane:
         )
         settings_snapshot = self.risk_settings_snapshot()
         authorization_blockers: list[str] = []
+        if persisted_purpose in (None, ""):
+            authorization_blockers.append("EXPLORATORY_LIVE_PURPOSE_REQUIRED")
         if persisted_lifetime in (None, "", {}):
             authorization_blockers.append("EXPLORATORY_LIVE_LIFETIME_BUDGET_REQUIRED")
         if persisted_expiry in (None, ""):
@@ -4685,6 +4824,25 @@ class OperatorControlPlane:
             "paper_only": True,
             "live_execution": False,
             "policy": _safe_value(policy),
+            "proposal_status": proposal_status,
+            "proposal": {
+                "status": proposal_status,
+                "selection_id": context.get("selection_id"),
+                "selection_hash": context.get("selection_hash"),
+                "policy_id": context.get("policy_id"),
+                "policy_version": context.get("policy_version"),
+                "policy_hash": context.get("policy_hash"),
+                "scope_draft_id": context.get("scope_draft_id"),
+                "scope_draft_version": context.get("scope_draft_version"),
+                "scope_draft_hash": context.get("scope_draft_hash"),
+                "proposed_allocation_total": selection.get(
+                    "proposed_allocation_total"
+                ),
+                "proposed_allocation_risk_digest": selection.get(
+                    "proposed_allocation_risk_digest"
+                ),
+                "members": _safe_value(review_members),
+            },
             "selected_setups": setups,
             "entry_predicate": [item.get("entry_predicate") for item in setups],
             "direction": [item.get("direction") for item in setups],
@@ -4732,14 +4890,8 @@ class OperatorControlPlane:
                     "scope": _public_scope_projection(context.get("frozen_scope", {})),
                 },
             },
-            "members": [
-                {
-                    "strategy_version_id": item.get("strategy_version_id"),
-                    "candidate_id": item.get("candidate_id"),
-                    "allocation": item.get("sizing"),
-                }
-                for item in setups
-            ],
+            "members": _safe_value(review_members),
+            "no_member_reason": _safe_value(no_member_reason),
             "limits": dict(limits),
             "limit_blockers": limit_blockers,
             "scope_binding": {
@@ -4755,8 +4907,13 @@ class OperatorControlPlane:
             },
             "allocation": {
                 "selected_members": len(funded),
+                "proposed_members": len(proposed),
                 "maximum_members": 3,
                 "bounded": 1 <= len(funded) <= 3,
+                "proposed_total": selection.get("proposed_allocation_total"),
+                "proposed_risk_digest": selection.get(
+                    "proposed_allocation_risk_digest"
+                ),
             },
             "readiness": readiness,
             "authorization": authorization_snapshot,
@@ -4779,6 +4936,15 @@ class OperatorControlPlane:
                     "proposed_allocation_risk_digest"
                 ),
             },
+            "authorization_choices": {
+                "purpose": authorization.get("purpose"),
+                "lifetime_budget": _safe_value(persisted_lifetime),
+                "expires_at": persisted_expiry,
+                "stop_rules": _safe_value(persisted_stops),
+                "status": authorization.get("status") or "UNREVIEWED",
+                "approved": str(authorization.get("status") or "").upper()
+                in {"ACTIVE"},
+            },
             "lifetime_budget": _safe_value(persisted_lifetime),
             "expires_at": persisted_expiry,
             "stop_rules": _safe_value(persisted_stops),
@@ -4800,9 +4966,19 @@ class OperatorControlPlane:
                     [
                         *authorization_blockers,
                         *limit_blockers,
+                        *proposal_risk_blockers,
                         *binding_blockers,
                         *readiness.get("blockers", []),
-                        *([] if 1 <= len(funded) <= 3 else ["BOUNDED_ALLOCATION_REQUIRED"]),
+                        *(
+                            [str(no_member_reason.get("code"))]
+                            if isinstance(no_member_reason, Mapping)
+                            else []
+                        ),
+                        *(
+                            []
+                            if 1 <= len(funded) <= 3
+                            else ["BOUNDED_ALLOCATION_REQUIRED"]
+                        ),
                     ]
                 )
             ),
@@ -4864,6 +5040,21 @@ class OperatorControlPlane:
         proposal_risk_digest = str(
             current.get("proposed_allocation_risk_digest") or ""
         ).strip()
+        positive_proposal = any(
+            _canary_selection_member_is_proposed(member)
+            and (_rolling_decimal(member.get("proposed_allocation")) or Decimal("0")) > 0
+            for member in raw_members
+            if isinstance(member, Mapping)
+        )
+        if positive_proposal:
+            if current.get("proposed_allocation_total") in (None, ""):
+                raise OperatorControlError(
+                    "EXPLORATORY_LIVE_PROPOSED_ALLOCATION_TOTAL_REQUIRED"
+                )
+            if not proposal_risk_digest:
+                raise OperatorControlError(
+                    "EXPLORATORY_LIVE_PROPOSED_ALLOCATION_RISK_DIGEST_REQUIRED"
+                )
         if proposal_risk_digest:
             if not isinstance(proposal_risk_snapshot, Mapping):
                 raise OperatorControlError("EXPLORATORY_LIVE_RISK_BINDING_STALE")
@@ -4936,7 +5127,12 @@ class OperatorControlPlane:
         declared_total = current.get("proposed_allocation_total")
         if declared_total not in (None, ""):
             try:
-                if self._authorization_decimal(declared_total, "proposed_allocation_total") != proposal_total:
+                declared_amount = Decimal(
+                    self._authorization_decimal(
+                        declared_total, "proposed_allocation_total"
+                    )
+                )
+                if declared_amount != proposal_total:
                     raise OperatorControlError("EXPLORATORY_LIVE_RISK_BINDING_STALE")
             except OperatorControlError:
                 raise
@@ -5169,7 +5365,7 @@ class OperatorControlPlane:
                 or "EXPLORATORY_LIVE_SELECTION_RECONCILIATION_REQUIRED"
             )
         raw = dict(values or {})
-        snapshot = self.execution_authorization_snapshot()
+        snapshot = self.execution_authorization_snapshot(bounded=False)
         active = snapshot.get("active")
         draft = snapshot.get("draft")
         active = dict(active) if isinstance(active, Mapping) else None
@@ -5185,7 +5381,7 @@ class OperatorControlPlane:
         status = str(auth.get("status") or "").upper()
         if status not in {"DRAFT", "ACTIVE"}:
             raise OperatorControlError("EXPLORATORY_LIVE_AUTHORIZATION_REQUIRED")
-        for field in ("lifetime_budget", "expires_at", "stop_rules"):
+        for field in ("purpose", "lifetime_budget", "expires_at", "stop_rules"):
             if auth.get(field) in (None, "", {}):
                 raise OperatorControlError(f"EXPLORATORY_LIVE_{field.upper()}_REQUIRED")
         lifetime = self._authorization_decimal(auth["lifetime_budget"], "lifetime_budget")

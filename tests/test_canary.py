@@ -229,6 +229,10 @@ class FakeVenue:
         balance="10",
         accepting=True,
         fee_bps="0",
+        fee_rate=None,
+        fee_exponent=None,
+        tick_size="0.01",
+        context_overrides=None,
     ):
         self.blocked = blocked
         self.close_only = close_only
@@ -238,6 +242,10 @@ class FakeVenue:
         self._balance = balance
         self.accepting = accepting
         self.fee_bps = fee_bps
+        self.fee_rate = fee_rate
+        self.fee_exponent = fee_exponent
+        self.tick_size = tick_size
+        self.context_overrides = dict(context_overrides or {})
         self.submissions = []
 
     def geoblock(self):
@@ -252,18 +260,25 @@ class FakeVenue:
         return True
 
     def market_context(self, market_id, token_id):
-        return {
+        context = {
             "market_id": market_id,
             "token_id": token_id,
             "asset_id": token_id,
             "neg_risk": False,
             "accepting_orders": self.accepting,
             "min_order_size": self.minimum,
-            "tick_size": "0.01",
+            "tick_size": self.tick_size,
             "bids": [{"price": "0.49", "size": "100"}],
             "asks": self.asks,
             "fee_bps": self.fee_bps,
         }
+        if self.fee_rate is not None:
+            context["fee_rate"] = str(self.fee_rate)
+            context["fee_bps"] = str(Decimal(str(self.fee_rate)) * Decimal("10000"))
+        if self.fee_exponent is not None:
+            context["fee_exponent"] = str(self.fee_exponent)
+        context.update(self.context_overrides)
+        return context
 
     def balance(self):
         return Decimal(self._balance)
@@ -962,6 +977,27 @@ class CanaryTests(unittest.TestCase):
         candidate_id = kwargs.pop("candidate_id", "C123")
         self._ensure_direct_signal(signal, candidate_id)
         return self.service.submit(signal_id=signal,candidate_id=candidate_id,market_id="m",token_id="yes",side="BUY",paper_expected_price=Decimal("0.50"),venue=kwargs.pop("venue",self.venue),allow_test_venue=kwargs.pop("allow_test_venue",True),**kwargs)
+    def submit_expected(self, signal, expected, **kwargs):
+        candidate_id = kwargs.pop("candidate_id", "C123")
+        venue = kwargs.pop("venue", self.venue)
+        allow_test_venue = kwargs.pop("allow_test_venue", True)
+        self._ensure_direct_signal(signal, candidate_id)
+        with self.store.connection:
+            self.store.connection.execute(
+                "UPDATE canary_signals SET paper_expected_price=? WHERE signal_id=?",
+                (str(expected), signal),
+            )
+        return self.service.submit(
+            signal_id=signal,
+            candidate_id=candidate_id,
+            market_id="m",
+            token_id="yes",
+            side="BUY",
+            paper_expected_price=Decimal(str(expected)),
+            venue=venue,
+            allow_test_venue=allow_test_venue,
+            **kwargs,
+        )
     def assertBlocked(self, code, fn):
         with self.assertRaisesRegex(CanaryBlocked,code): fn()
 
@@ -2854,6 +2890,150 @@ class CanaryTests(unittest.TestCase):
     def test_exposure_limit_includes_worst_case_fees(self):
         self.arm(limits=CanaryLimits(max_exposure_usd=Decimal("1")))
         self.assertBlocked("EXPOSURE_LIMIT", self.submit)
+    def test_limit_order_fee_bound_handles_price_improvement_and_rounding(self):
+        self.arm()
+        venue = FakeVenue(
+            fee_rate="0.002",
+            fee_exponent="1",
+            asks=[{"price": "0.50", "size": "100"}],
+        )
+        self.submit("fee-price-improvement", venue=venue)
+        evidence = json.loads(
+            self.store.connection.execute(
+                "SELECT evidence_json FROM canary_ledger WHERE signal_id=?",
+                ("fee-price-improvement",),
+            ).fetchone()[0]
+        )
+        # At the tick-aligned .50 BUY limit (the raw .505 adverse limit
+        # floors to .50), the legal range includes the .50 maximum fee point;
+        # a cheaper legal execution would remain covered.  The 5dp
+        # denomination envelope is ceil(2 * (1 * .002 * .25) / .00001)
+        # * .00001 = .001.
+        self.assertEqual(Decimal(evidence["estimated_fees"]), Decimal("0.001"))
+        self.assertEqual(venue.submissions[0]["price"], Decimal("0.50"))
+    def test_expected_price_one_is_invalid_before_order_submission(self):
+        self.arm()
+        venue = FakeVenue(ask="0.50", fee_bps="0")
+        signal_id = "invalid-expected-price-one"
+        self.assertBlocked(
+            "INVALID_CANARY_PARAMETERS",
+            lambda: self.submit_expected(
+                signal_id,
+                Decimal("1"),
+                venue=venue,
+            ),
+        )
+        self.assertFalse(venue.submissions)
+    def test_five_shares_at_two_mills_uses_legal_fee_bound(self):
+        self.arm()
+        venue = FakeVenue(
+            minimum="5",
+            fee_rate="0.04",
+            fee_exponent="1",
+            tick_size="0.001",
+            ask="0.002",
+        )
+        signal_id = "fee-five-shares-two-mills"
+        self.submit_expected(signal_id, Decimal("0.002"), venue=venue)
+        evidence = json.loads(
+            self.store.connection.execute(
+                "SELECT evidence_json FROM canary_ledger WHERE signal_id=?",
+                (signal_id,),
+            ).fetchone()[0]
+        )
+        # max_price=.002 is tick-aligned: raw fee is
+        # 5*.04*.002*.998=.0003992; its conservative 5dp envelope is .00080.
+        self.assertEqual(Decimal(evidence["estimated_fees"]), Decimal("0.00080"))
+        self.assertEqual(venue.submissions[0]["price"], Decimal("0.002"))
+        self.assertEqual(venue.submissions[0]["size"], Decimal("5.00"))
+
+    def test_limit_order_fee_exponent_zero_is_supported_for_low_price_range(self):
+        self.arm()
+        venue = FakeVenue(
+            fee_rate="0.002",
+            fee_exponent="0",
+            ask="0.05",
+        )
+        signal_id = "fee-exponent-zero"
+        self.submit_expected(signal_id, Decimal("0.05"), venue=venue)
+        evidence = json.loads(
+            self.store.connection.execute(
+                "SELECT evidence_json FROM canary_ledger WHERE signal_id=?",
+                (signal_id,),
+            ).fetchone()[0]
+        )
+        self.assertEqual(Decimal(evidence["estimated_fees"]), Decimal("0.004"))
+        self.assertEqual(venue.submissions[0]["price"], Decimal("0.05"))
+
+    def test_high_buy_limit_is_legal_and_uses_price_improvement_fee_bound(self):
+        self.arm()
+        venue = FakeVenue(
+            fee_rate="0.002",
+            fee_exponent="1",
+            tick_size="0.001",
+            ask="0.50",
+        )
+        signal_id = "fee-high-limit"
+        self.submit_expected(signal_id, Decimal("0.99"), venue=venue)
+        self.assertEqual(venue.submissions[0]["price"], Decimal("0.999"))
+        evidence = json.loads(
+            self.store.connection.execute(
+                "SELECT evidence_json FROM canary_ledger WHERE signal_id=?",
+                (signal_id,),
+            ).fetchone()[0]
+        )
+        self.assertEqual(Decimal(evidence["estimated_fees"]), Decimal("0.001"))
+
+    def test_best_ask_above_intersected_high_limit_stays_slippage_blocked(self):
+        self.arm()
+        venue = FakeVenue(
+            fee_rate="0.002",
+            fee_exponent="1",
+            tick_size="0.001",
+            ask="0.9995",
+        )
+        signal_id = "fee-high-limit-slippage"
+        self._ensure_direct_signal(signal_id)
+        self.assertBlocked(
+            "SLIPPAGE_LIMIT",
+            lambda: self.submit_expected(
+                signal_id,
+                Decimal("0.99"),
+                venue=venue,
+            ),
+        )
+        self.assertFalse(venue.submissions)
+
+    def test_five_share_no_at_high_limit_stays_over_canary_target(self):
+        self.arm()
+        venue = FakeVenue(
+            minimum="5",
+            fee_rate="0.002",
+            fee_exponent="1",
+            tick_size="0.001",
+            ask="0.999",
+        )
+        signal_id = "fee-five-share-no"
+        self.assertBlocked(
+            "VENUE_MINIMUM_EXCEEDS_CANARY_TARGET",
+            lambda: self.submit_expected(
+                signal_id,
+                Decimal("0.99"),
+                venue=venue,
+            ),
+        )
+        self.assertFalse(venue.submissions)
+
+    def test_nonzero_builder_fee_is_rejected_without_builder_attribution(self):
+        self.arm()
+        venue = FakeVenue(
+            context_overrides={"builder_fee_bps": "1"},
+        )
+        self.assertBlocked(
+            "CANARY_MARKET_RULES_UNAVAILABLE",
+            lambda: self.submit("unsupported-builder-fee", venue=venue),
+        )
+        self.assertFalse(venue.submissions)
 
     def test_official_venue_rejects_plaintext_credential_mapping(self):
         with self.assertRaises(TypeError):

@@ -936,6 +936,199 @@ class DashboardScaleFixtureTests(unittest.TestCase):
                 self.assertEqual(progress["budget_remaining"], 3)
             finally:
                 store.close()
+    def test_campaign_progress_reclassifies_frozen_resolution_without_mutating_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "dashboard-campaign-classification.sqlite3"
+            store = AxiomStore(str(database_path))
+            try:
+                trials = []
+                for index in range(9):
+                    result = {
+                        "evidence": {"immutable_marker": f"economic-{index}"},
+                    }
+                    if index:
+                        result["reason_code"] = "NEGATIVE_VALIDATION_EXPECTANCY"
+                    if index == 1:
+                        # The terminal trial reason is authoritative even when
+                        # a nested candidate diagnostic mentions resolution.
+                        result["candidate_results"] = [
+                            {"reason_code": "CANDIDATE_FORWARD_MARKET_UNRESOLVED"}
+                        ]
+                    trials.append(
+                        {
+                            "trial_id": f"trial-economic-{index}",
+                            "status": "ECONOMIC_REJECTION",
+                            "result": result,
+                        }
+                    )
+                trials.extend(
+                    [
+                        {
+                            "trial_id": "trial-resolution",
+                            "status": "ECONOMIC_REJECTION",
+                            "result": {
+                                "reason_code": "CANDIDATE_FORWARD_MARKET_UNRESOLVED",
+                                "candidate_results": [
+                                    {
+                                        "reason_code": "CANDIDATE_FORWARD_MARKET_UNRESOLVED",
+                                        "stage": "FROZEN",
+                                        "evidence": {"immutable_marker": "resolution"},
+                                    }
+                                ],
+                            },
+                        },
+                        {
+                            "trial_id": "trial-data",
+                            "status": "DATA_INSUFFICIENT",
+                            "result": {
+                                "reason_code": "CANDIDATE_FORWARD_MARKET_UNRESOLVED"
+                            },
+                        },
+                        {"trial_id": "trial-software", "status": "SOFTWARE_OR_INPUT_ERROR"},
+                        {"trial_id": "trial-qualified", "status": "VALIDATION_QUALIFIED"},
+                        {"trial_id": "trial-final", "status": "FINAL_ASSESSMENT"},
+                        {
+                            "trial_id": "trial-running",
+                            "status": "RUNNING",
+                            "result": {
+                                "candidate_results": [
+                                    {"reason_code": "CANDIDATE_FORWARD_MARKET_UNRESOLVED"}
+                                ]
+                            },
+                        },
+                    ]
+                )
+                payload = {
+                    "campaign_id": "mixed-classification-campaign",
+                    "status": "CAMPAIGN_EXHAUSTED_NO_QUALIFIED_STRATEGY",
+                    "budget_limit": 24,
+                    "budget_used": 15,
+                    "budget_remaining": 9,
+                    "counts": {
+                        "economic_rejection": 10,
+                        "data_insufficient": 1,
+                        "software_or_input_error": 1,
+                        "validation_qualified": 1,
+                        "final_assessment": 1,
+                    },
+                    "trials": trials,
+                }
+                store.set_operator_job(
+                    "polymarket-research-campaign:mixed-classification-campaign",
+                    "CAMPAIGN_EXHAUSTED_NO_QUALIFIED_STRATEGY",
+                    payload,
+                    timestamp=T0,
+                )
+                before = store.connection.execute(
+                    "SELECT payload_json FROM operator_jobs "
+                    "WHERE job_name=?",
+                    ("polymarket-research-campaign:mixed-classification-campaign",),
+                ).fetchone()[0]
+
+                records = store.list_operator_job_progress(
+                    job_prefix="polymarket-research-campaign:",
+                    limit=1,
+                )
+
+                after = store.connection.execute(
+                    "SELECT payload_json FROM operator_jobs "
+                    "WHERE job_name=?",
+                    ("polymarket-research-campaign:mixed-classification-campaign",),
+                ).fetchone()[0]
+                self.assertEqual(after, before)
+                self.assertEqual(len(records), 1)
+                projected = records[0]["payload"]
+                self.assertEqual(projected["counts"]["economic_rejection"], 9)
+                self.assertEqual(projected["counts"]["market_resolution_failure"], 1)
+                self.assertEqual(projected["counts"]["data_insufficient"], 1)
+                self.assertEqual(projected["counts"]["software_or_input_error"], 1)
+                self.assertEqual(projected["counts"]["validation_qualified"], 1)
+                self.assertEqual(projected["counts"]["final_assessment"], 1)
+                self.assertEqual(projected["_trial_count"], 15)
+                self.assertEqual(projected["_completed_trial_count"], 14)
+            finally:
+                store.close()
+
+    def test_campaign_projection_uses_sql_terminal_count_for_trials_only_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "dashboard-campaign-trials-only.sqlite3"
+            store = AxiomStore(str(database_path))
+            try:
+                store.set_operator_job(
+                    "polymarket-research-campaign:trials-only",
+                    "RUNNING",
+                    {
+                        "campaign_id": "trials-only",
+                        "status": "RUNNING",
+                        "budget_limit": 4,
+                        "budget_used": 1,
+                        "budget_remaining": 3,
+                        "trials": [
+                            {
+                                "trial_id": "trial-data",
+                                "status": "DATA_INSUFFICIENT",
+                            }
+                        ],
+                    },
+                    timestamp=T0,
+                )
+                progress = DashboardData(store=store)._campaign_progress_projection()
+
+                self.assertEqual(progress["campaign_id"], "trials-only")
+                self.assertEqual(progress["completed"], 1)
+                self.assertEqual(progress["completed_trials"], 1)
+                self.assertEqual(progress["remaining"], 0)
+                self.assertEqual(progress["remaining_trials"], 0)
+            finally:
+                store.close()
+
+    def test_campaign_projection_hydrated_partial_counts_preserves_terminal_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "dashboard-campaign-partial-counts.sqlite3"
+            store = AxiomStore(str(database_path))
+            try:
+                job_name = "polymarket-research-campaign:partial-counts"
+                store.set_operator_job(
+                    job_name,
+                    "RUNNING",
+                    {
+                        "campaign_id": "partial-counts",
+                        "status": "RUNNING",
+                        "budget_limit": 4,
+                        "budget_used": 1,
+                        "budget_remaining": 3,
+                        "counts": {"economic_rejection": 0},
+                        "trials": [
+                            {
+                                "trial_id": "trial-data",
+                                "status": "DATA_INSUFFICIENT",
+                            }
+                        ],
+                    },
+                    timestamp=T0,
+                )
+                record = store.get_operator_job(job_name)
+                self.assertIsNotNone(record)
+                assert record is not None
+                progress = DashboardData(
+                    data={
+                        "campaign_progress": {
+                            "campaign_id": record["payload"]["campaign_id"],
+                            "job_name": record["job_name"],
+                            "status": record["status"],
+                            "payload": record["payload"],
+                        }
+                    },
+                    store=store,
+                )._campaign_progress_projection()
+
+                self.assertEqual(progress["campaign_id"], "partial-counts")
+                self.assertEqual(progress["completed"], 1)
+                self.assertEqual(progress["completed_trials"], 1)
+                self.assertEqual(progress["remaining"], 0)
+                self.assertEqual(progress["remaining_trials"], 0)
+            finally:
+                store.close()
 
 
     def test_overview_skips_deserializing_oversized_worker_payloads(self) -> None:
