@@ -701,6 +701,10 @@ class PolymarketCollector:
         self._scope_draft_preview = _validated_scope_draft(scope_draft)
         self._draft_market_request_limit = None
         self._scope_draft_invalid = scope_draft is not None and self._scope_draft_preview is None
+        # Suitability assessments are current-pass evidence.  Persisted
+        # continuations/history are loaded below and must not be reclassified
+        # as fresh exclusions when a normal tick is followed by a draft tick.
+        self._suitable_market_evidence = []
         started = ensure_utc(now or self.clock())
         monotonic_started = time.monotonic()
         self._cycle_deadline_monotonic = monotonic_started + self.config.cycle_budget_seconds
@@ -1483,9 +1487,15 @@ class PolymarketCollector:
 
         def failed_task(identifier: str, exc: Exception) -> tuple[str, dict[str, Any]]:
             local_counters = self._new_counters()
+            partial_counters = getattr(exc, "_collector_counters", None)
+            if isinstance(partial_counters, Mapping):
+                self._merge_counters(local_counters, partial_counters)
             local_counters["markets_attempted"] = 1
+            local_counters["markets_successful"] = 0
             local_counters["markets_failed"] = 1
-            local_counters["errors"] = 1
+            # The uncaught exception itself is the failed capture error, but
+            # preserve any earlier accounting already recorded by the task.
+            local_counters["errors"] = max(1, int(local_counters.get("errors", 0)))
             try:
                 self.store.save_collection_error(identifier, started, "collector", str(exc))
             except Exception:
@@ -8661,6 +8671,7 @@ class PolymarketCollector:
                         counters,
                         provider=provider,
                         market_id=market_id,
+                        charge_request=False,
                     )
                 except _ProviderDeadlineExceeded as exc:
                     counters["errors"] += 1
@@ -8771,6 +8782,7 @@ class PolymarketCollector:
                     counters,
                     provider=provider,
                     market_id=market_id,
+                    charge_request=False,
                 )
             else:
                 stamp = read_stamp()
@@ -9249,6 +9261,7 @@ class PolymarketCollector:
         provider: Any | None = None,
         market_id: str | None = None,
         pool_name: str | None = None,
+        charge_request: bool = True,
     ) -> Any:
         provider = provider or self.provider
         provider_pool = pool_name or ("scope" if self._scope_phase_active else "collection")
@@ -9265,30 +9278,45 @@ class PolymarketCollector:
             provider_pool == "scope_direct" and provider is not self.provider
         )
         timeout = float(self.config.provider_timeout_seconds)
+        def record_accounting(exc: BaseException) -> BaseException:
+            # Preserve partial market work when a bounded operation fails
+            # before _collect_market can take its normal error-return path.
+            try:
+                setattr(exc, "_collector_counters", counters)
+            except Exception:
+                pass
+            return exc
+
         for attempt in range(self.config.max_attempts):
-            request_limit = self._draft_precollection_request_limit(
-                endpoint,
-                provider_pool=provider_pool,
-            )
-            if (
-                request_limit is None
-                and isinstance(self._scope_draft_preview, Mapping)
-                and provider_pool == "collection"
-            ):
-                request_limit = self._draft_market_request_limit
-            if request_limit is None and self._rolling_background_discovery_enabled:
-                request_limit = _ROLLING_BOOTSTRAP_REQUEST_BUDGET
-            if (
-                request_limit is not None
-                and int(counters.get("requests", 0)) >= request_limit
-            ):
-                counters["_bootstrap_request_budget_exhausted"] = True
-                counters["_bootstrap_request_budget_endpoint"] = endpoint
-                raise _BootstrapRequestBudgetExceeded(
-                    f"BOOTSTRAP_REQUEST_BUDGET_EXHAUSTED: {endpoint}"
+            request_limit = None
+            if charge_request:
+                request_limit = self._draft_precollection_request_limit(
+                    endpoint,
+                    provider_pool=provider_pool,
                 )
-            self._cycle_budget_available(endpoint, observed_at, counters)
-            counters["requests"] += 1
+                if (
+                    request_limit is None
+                    and isinstance(self._scope_draft_preview, Mapping)
+                    and provider_pool == "collection"
+                ):
+                    request_limit = self._draft_market_request_limit
+                if request_limit is None and self._rolling_background_discovery_enabled:
+                    request_limit = _ROLLING_BOOTSTRAP_REQUEST_BUDGET
+                if (
+                    request_limit is not None
+                    and int(counters.get("requests", 0)) >= request_limit
+                ):
+                    counters["_bootstrap_request_budget_exhausted"] = True
+                    counters["_bootstrap_request_budget_endpoint"] = endpoint
+                    raise record_accounting(_BootstrapRequestBudgetExceeded(
+                        f"BOOTSTRAP_REQUEST_BUDGET_EXHAUSTED: {endpoint}"
+                    ))
+            try:
+                self._cycle_budget_available(endpoint, observed_at, counters)
+            except BaseException as exc:
+                raise record_accounting(exc)
+            if charge_request:
+                counters["requests"] += 1
             request_started = time.monotonic()
             try:
                 try:
@@ -9313,11 +9341,11 @@ class PolymarketCollector:
                     if exc.cycle_expired:
                         self._cycle_deadline_exhausted = True
                     counters["provider_failures"] += 1
-                    raise deadline_error
-                except BaseException:
+                    raise record_accounting(deadline_error)
+                except BaseException as exc:
                     if ephemeral_scope_provider:
                         self._close_scope_direct_provider(provider)
-                    raise
+                    raise record_accounting(exc)
                 remaining = self._cycle_remaining_seconds()
                 effective_timeout = timeout
                 if (
@@ -9352,7 +9380,7 @@ class PolymarketCollector:
                                 self._drain_provider_advisories_now(provider)
                             if ephemeral_scope_provider:
                                 self._close_scope_direct_provider(provider)
-                            raise worker_exception
+                            raise record_accounting(worker_exception)
                         self._release_provider_call(_key)
                         self._consume_transport_errors(provider)
                         if provider_pool == "scope_direct":
@@ -9375,10 +9403,10 @@ class PolymarketCollector:
                     if cycle_expired:
                         self._cycle_deadline_exhausted = True
                     counters["provider_failures"] += 1
-                    raise deadline_error
-                except BaseException:
+                    raise record_accounting(deadline_error)
+                except BaseException as exc:
                     self._release_provider_call(_key)
-                    raise
+                    raise record_accounting(exc)
                 self._release_provider_call(_key)
                 transport_errors = self._consume_transport_errors(provider)
                 if provider_pool == "scope_direct":
@@ -9398,7 +9426,9 @@ class PolymarketCollector:
                         if delay is not None:
                             remaining = self._cycle_remaining_seconds()
                             if remaining is not None and remaining <= delay:
-                                raise self._cycle_budget_error(endpoint, observed_at, counters)
+                                raise record_accounting(
+                                    self._cycle_budget_error(endpoint, observed_at, counters)
+                                )
                             counters["retries"] += 1
                             self.sleep(delay)
                             continue
@@ -9407,11 +9437,12 @@ class PolymarketCollector:
                 if ephemeral_scope_provider:
                     self._close_scope_direct_provider(provider)
                 return result
-            except _ProviderDeadlineExceeded:
+            except _ProviderDeadlineExceeded as exc:
                 if scope_failfast:
                     self._scope_broad_provider_unavailable = True
-                raise
+                raise record_accounting(exc)
             except Exception as exc:
+                record_accounting(exc)
                 last_error = exc
                 transport_errors = self._consume_transport_errors(provider)
                 if provider_pool == "scope_direct":
@@ -9434,7 +9465,9 @@ class PolymarketCollector:
                     if delay is not None:
                         remaining = self._cycle_remaining_seconds()
                         if remaining is not None and remaining <= delay:
-                            raise self._cycle_budget_error(endpoint, observed_at, counters)
+                            raise record_accounting(
+                                self._cycle_budget_error(endpoint, observed_at, counters)
+                            )
                         counters["retries"] += 1
                         self.sleep(delay)
                         continue

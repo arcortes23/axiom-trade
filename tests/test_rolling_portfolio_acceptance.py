@@ -20,6 +20,7 @@ from axiom.autonomous import (
     _rolling_overlap_key,
     _rolling_window_rows,
 )
+from axiom.collector import CollectionCycle
 from axiom.auto_canary import AutonomousCanaryWorker
 from axiom.canary import CanaryService, CredentialStore, credential_fingerprint
 from axiom.canary_positions import CanaryPositionManager, list_positions
@@ -4488,6 +4489,138 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
             self.assertEqual(payload["evaluation_counts"]["attempted"], 0)
             self.assertEqual(payload["evaluation_counts"]["successful"], 0)
             self.assertEqual(payload["evaluation_counts"]["pending"], 1)
+
+    def test_refresh_trace_preserves_partial_collection_outcome(self) -> None:
+        def refresh_with_result(name: str, result: object) -> Mapping[str, object]:
+            with self._store(name) as store:
+                processor = AutonomousResearchProcessor(
+                    store,
+                    clock=lambda: NOW,
+                    current_market_discoverer=lambda _now, **_kwargs: result,
+                )
+
+                def draft_documents(
+                    _now: datetime,
+                ) -> tuple[tuple[object, ...], dict[str, object]]:
+                    return (
+                        (),
+                        {
+                            "status": "NO_SUITABLE_MATERIALIZED_INSTANCE",
+                            "reason": "NO_SUITABLE_MATERIALIZED_INSTANCE",
+                            "discovery": dict(processor._rolling_last_current_discovery),
+                        },
+                    )
+
+                with patch.object(
+                    processor,
+                    "_rolling_scope_draft",
+                    return_value={"draft_id": "fixture-draft"},
+                ), patch.object(
+                    processor,
+                    "_rolling_scope_draft_documents",
+                    side_effect=draft_documents,
+                ):
+                    processor.refresh_rolling_evidence(
+                        now=NOW,
+                        skip_observation_setup_migration=True,
+                    )
+                record = store.get_operator_job("rolling-research-evidence")
+                self.assertIsNotNone(record)
+                assert record is not None
+                payload = record.get("payload")
+                self.assertIsInstance(payload, Mapping)
+                assert isinstance(payload, Mapping)
+                return payload
+
+        partial_error = CollectionCycle(
+            NOW,
+            NOW + timedelta(seconds=1),
+            markets_seen=2,
+            markets_attempted=2,
+            markets_successful=1,
+            markets_failed=1,
+            errors=1,
+            requests=2,
+            discovery_deferred=("market-partial",),
+            discovery_coverage_status="PARTIAL",
+            discovery_complete=False,
+        )
+        error_payload = refresh_with_result(
+            "rolling-partial-result-error.sqlite3",
+            partial_error,
+        )
+        error_discovery = error_payload["scope_draft_trace"]["discovery"]
+        self.assertEqual(error_discovery["status"], "RESULT_ERROR")
+        self.assertEqual(error_discovery["cycle"]["errors"], 1)
+        self.assertEqual(
+            error_discovery["cycle"]["discovery_deferred"],
+            ["market-partial"],
+        )
+        self.assertEqual(
+            error_discovery["cycle"]["discovery_coverage_status"],
+            "PARTIAL",
+        )
+        self.assertIsNone(error_discovery["reason"])
+        self.assertEqual(
+            error_payload["strategy_discovery_trace"]["evaluator_decisions"],
+            [],
+        )
+
+        partial_provider_failure = CollectionCycle(
+            NOW,
+            NOW + timedelta(seconds=1),
+            markets_seen=2,
+            markets_attempted=2,
+            markets_successful=1,
+            markets_failed=1,
+            requests=2,
+            provider_failures=1,
+            discovery_deferred=("market-partial",),
+            discovery_coverage_status="PARTIAL",
+            discovery_complete=False,
+        )
+        provider_payload = refresh_with_result(
+            "rolling-partial-provider-failure.sqlite3",
+            partial_provider_failure,
+        )
+        self.assertEqual(
+            provider_payload["scope_draft_trace"]["discovery"]["status"],
+            "PROVIDER_FAILURE",
+        )
+
+        partial_ok = CollectionCycle(
+            NOW,
+            NOW + timedelta(seconds=1),
+            markets_seen=2,
+            markets_attempted=2,
+            markets_successful=2,
+            markets_failed=0,
+            errors=0,
+            requests=2,
+            discovery_deferred=("market-partial",),
+            discovery_coverage_status="PARTIAL",
+            discovery_complete=False,
+        )
+        ok_payload = refresh_with_result("rolling-partial-result-ok.sqlite3", partial_ok)
+        self.assertEqual(ok_payload["scope_draft_trace"]["discovery"]["status"], "OK")
+        self.assertEqual(
+            ok_payload["scope_draft_trace"]["discovery"]["cycle"]["discovery_deferred"],
+            ["market-partial"],
+        )
+
+        lock_payload = refresh_with_result(
+            "rolling-discovery-lock-deferred.sqlite3",
+            {
+                "status": "DEFERRED",
+                "reason": "ROLLING_DISCOVERY_LOCK_BUSY",
+                "discovery_deferred": True,
+                "retryable": True,
+            },
+        )
+        lock_discovery = lock_payload["scope_draft_trace"]["discovery"]
+        self.assertEqual(lock_discovery["status"], "DEFERRED")
+        self.assertEqual(lock_discovery["reason"], "ROLLING_DISCOVERY_LOCK_BUSY")
+
 
     def test_hermes_rolling_research_request_is_bounded_and_deduplicated(self) -> None:
         from axiom.operator import HermesOperatorAdapter

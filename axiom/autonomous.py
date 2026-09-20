@@ -14303,7 +14303,7 @@ class AutonomousResearchProcessor:
                             == "ERROR"
                         )
                         deferred = (
-                            bool(recorded.get("discovery_deferred"))
+                            recorded.get("discovery_deferred") is True
                             or str(recorded.get("status", "")).strip().upper()
                             == "DEFERRED"
                         )

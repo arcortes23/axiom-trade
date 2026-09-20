@@ -255,8 +255,11 @@ Each explicit draft tick keeps the request budget honest: at most **11** public
 requests are available to draft discovery and scope preparation, reserving **5**
 requests for at least one fresh market metadata/order-book capture. Fresh draft
 work is scheduled ahead of unrelated frozen normal-cycle maintenance, while
-that maintenance remains in its own continuation. Suitable IDs that do not fit
-the capture window are retained in the draft's binding-specific
+that maintenance remains in its own continuation. Cache-only provider timestamp
+and trade-provenance reads do not consume this public-request budget, but still
+remain inside the provider and cycle-deadline guards; actual network operations
+and their retries are charged normally. Suitable IDs that do not fit the
+capture window are retained in the draft's binding-specific
 `deferred_market_ids` continuation and retried on a later tick; they are not
 reported as provider failures or suitability exclusions.
 
