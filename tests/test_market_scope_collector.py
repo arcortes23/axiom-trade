@@ -8,6 +8,7 @@ import json
 import threading
 import time
 import sqlite3
+import hashlib
 
 import unittest
 
@@ -3224,6 +3225,257 @@ class MarketScopeCollectorTests(unittest.TestCase):
             collector._discovery_continuation["partial_reason"],
             "BOOTSTRAP_REQUEST_BUDGET_EXHAUSTED",
         )
+        collector.close()
+    def test_draft_fresh_discovery_capture_and_deferred_resume_isolated_from_legacy(self) -> None:
+        legacy = market("legacy-maintenance")
+        fresh = tuple(market(f"fresh-market-{index}") for index in range(10))
+        pages = (
+            {
+                "snapshots": fresh,
+                "next_cursor": "fresh-cursor-next",
+            },
+        )
+        provider = _PagedProvider(
+            (*fresh, legacy),
+            pages + pages,
+        )
+        store = _ScopeStore(
+            {
+                "legacy-candidate": {
+                    "experiment_plan": {
+                        "market_scope": scope(
+                            "EXACT_MARKETS",
+                            market_ids=("legacy-maintenance",),
+                        )
+                    }
+                }
+            }
+        )
+        store.states["polymarket"] = {
+            "cycle_continuation": {
+                "remaining_market_ids": ["legacy-maintenance"],
+            }
+        }
+        collector = _ScopeCollector(
+            provider,
+            store,
+            CollectorConfig(
+                max_markets=10,
+                discovery_budget_per_cycle=10,
+                max_suitable_pages_per_cycle=10,
+                max_attempts=1,
+                max_concurrency=2,
+                backoff_initial_seconds=0,
+                jitter_seconds=0,
+            ),
+            candidate_ids=("legacy-candidate",),
+            clock=lambda: T0,
+            sleep=lambda _seconds: None,
+        )
+        draft = {
+            "status": "DRAFT",
+            "draft_id": "fresh-draft",
+            "scope_hash": "sha256:fresh-scope",
+            "scope_version": "v1",
+            "scope": {"mode": "RULE_BASED_MARKETS", "categories": []},
+            "paper_only": True,
+            "live_execution": False,
+            "allocation_active": False,
+            "canary_armed": False,
+        }
+        draft["draft_hash"] = "sha256:" + hashlib.sha256(
+            json.dumps(
+                draft,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        binding_key = hashlib.sha256(
+            json.dumps(
+                {
+                    "draft_id": draft["draft_id"],
+                    "draft_hash": draft["draft_hash"],
+                    "scope_hash": draft["scope_hash"],
+                    "scope_version": draft["scope_version"],
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            ).encode("utf-8")
+        ).hexdigest()
+
+        first = collector.collect_once(now=T0, scope_draft=draft)
+        first_continuation = store.states["polymarket"][
+            "scope_draft_continuations"
+        ][binding_key]["discovery_continuation"]
+        first_deferred = tuple(first_continuation["deferred_market_ids"])
+        self.assertLessEqual(first.requests, 16)
+        self.assertGreaterEqual(first.snapshots_inserted, 1)
+        self.assertNotIn("legacy-maintenance", provider.market_calls)
+        first_captured_ids = {
+            identifier
+            for identifier in provider.market_calls
+            if identifier.startswith("fresh-market-")
+        }
+        self.assertTrue(first_captured_ids)
+        self.assertTrue(set(first_deferred).difference(first_captured_ids))
+        self.assertTrue(
+            set(first_deferred).issubset({snapshot.market_id for snapshot in fresh})
+        )
+        second = collector.collect_once(
+            now=T0 + timedelta(minutes=1),
+            scope_draft=draft,
+        )
+        second_continuation = store.states["polymarket"][
+            "scope_draft_continuations"
+        ][binding_key]["discovery_continuation"]
+        second_deferred = tuple(second_continuation["deferred_market_ids"])
+        self.assertTrue(first_captured_ids.isdisjoint(second_deferred))
+        self.assertLessEqual(second.requests, 16)
+        self.assertGreaterEqual(second.snapshots_inserted, 1)
+        self.assertTrue(set(first_deferred).difference(second_deferred))
+        self.assertTrue(set(first_deferred).intersection(second_deferred))
+
+        normal = collector.collect_once(now=T0 + timedelta(minutes=2))
+        self.assertIn("legacy-maintenance", provider.market_calls)
+        self.assertGreaterEqual(normal.snapshots_inserted, 1)
+        collector.close()
+    def test_draft_capture_request_quota_retains_failed_work(self) -> None:
+        legacy = market("legacy-maintenance")
+        discovered = tuple(
+            market(f"draft-market-{index}") for index in range(10)
+        ) + (legacy,)
+
+        class RetryingProvider(_PagedProvider):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.failures = 0
+                self.failed_market_ids = set()
+                self.provider_attempts = 0
+                self.healthy_market_id = None
+                self.fail_enabled = True
+
+            def market(self, market_id: str):
+                identifier = str(market_id)
+                self.provider_attempts += 1
+                if self.healthy_market_id is None:
+                    self.healthy_market_id = identifier
+                if self.fail_enabled and identifier != self.healthy_market_id:
+                    self.failures += 1
+                    self.failed_market_ids.add(identifier)
+                    raise OSError("transient market read")
+                return super().market(identifier)
+
+        provider = RetryingProvider(
+            discovered,
+            (
+                {"snapshots": discovered, "next_cursor": None},
+                {"snapshots": discovered, "next_cursor": None},
+            ),
+        )
+        store = _ScopeStore(
+            {
+                "legacy-candidate": {
+                    "experiment_plan": {
+                        "market_scope": scope(
+                            "EXACT_MARKETS",
+                            market_ids=("legacy-maintenance",),
+                        )
+                    }
+                }
+            }
+        )
+        store.states["polymarket"] = {
+            "cycle_continuation": {
+                "remaining_market_ids": ["legacy-maintenance"],
+            }
+        }
+        collector = _ScopeCollector(
+            provider,
+            store,
+            CollectorConfig(
+                max_markets=10,
+                discovery_budget_per_cycle=0,
+                max_attempts=8,
+                max_concurrency=2,
+                jitter_seconds=0,
+            ),
+            candidate_ids=("legacy-candidate",),
+            clock=lambda: T0,
+            sleep=lambda _seconds: None,
+        )
+        draft = {
+            "status": "DRAFT",
+            "draft_id": "rolling-draft",
+            "scope_hash": "sha256:scope",
+            "scope_version": "v1",
+            "scope": {"mode": "RULE_BASED_MARKETS", "categories": []},
+            "paper_only": True,
+            "live_execution": False,
+            "allocation_active": False,
+            "canary_armed": False,
+        }
+        draft["draft_hash"] = "sha256:" + hashlib.sha256(
+            json.dumps(
+                draft,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        draft_binding_key = hashlib.sha256(
+            json.dumps(
+                {
+                    "draft_id": draft["draft_id"],
+                    "draft_hash": draft["draft_hash"],
+                    "scope_hash": draft["scope_hash"],
+                    "scope_version": draft["scope_version"],
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        store.states["polymarket"]["scope_draft_continuations"] = {
+            draft_binding_key: {
+                "discovery_continuation": {
+                    "deferred_market_ids": [
+                        f"draft-market-{index}" for index in range(6)
+                    ],
+                }
+            }
+        }
+        first = collector.collect_once(now=T0, scope_draft=draft)
+        first_continuation = store.states["polymarket"][
+            "scope_draft_continuations"
+        ][draft_binding_key]["discovery_continuation"]
+        first_deferred = tuple(first_continuation["deferred_market_ids"])
+        self.assertLessEqual(first.requests, 16)
+        self.assertLessEqual(provider.provider_attempts, 16)
+        self.assertGreaterEqual(provider.failures, 10)
+        self.assertGreaterEqual(first.snapshots_inserted, 1)
+        self.assertNotIn(provider.healthy_market_id, first_deferred)
+        self.assertTrue(provider.failed_market_ids.intersection(first_deferred))
+        self.assertNotIn("legacy-maintenance", provider.market_calls)
+        self.assertEqual(
+            first_continuation["market_validation_request_reserve"],
+            5,
+        )
+
+        provider.fail_enabled = False
+        second = collector.collect_once(now=T0 + timedelta(minutes=1), scope_draft=draft)
+        second_continuation = store.states["polymarket"][
+            "scope_draft_continuations"
+        ][draft_binding_key]["discovery_continuation"]
+        second_deferred = tuple(second_continuation["deferred_market_ids"])
+        self.assertLessEqual(second.requests, 16)
+        self.assertGreaterEqual(second.snapshots_inserted, 1)
+        self.assertTrue(set(first_deferred).difference(second_deferred))
+        self.assertTrue(set(first_deferred).intersection(second_deferred))
+        normal = collector.collect_once(now=T0 + timedelta(minutes=2))
+        self.assertIn("legacy-maintenance", provider.market_calls)
+        self.assertGreaterEqual(normal.snapshots_inserted, 1)
         collector.close()
     def test_bootstrap_budget_counter_keys_are_not_unpacked_into_cycle(self) -> None:
         target = market("cycle-budget")

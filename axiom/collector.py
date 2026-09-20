@@ -499,6 +499,7 @@ class PolymarketCollector:
         self.sleep = sleep
         self._discovery_continuation: Mapping[str, Any] | None = None
         self._scope_draft_preview: Mapping[str, Any] | None = None
+        self._draft_market_request_limit: int | None = None
         self._scope_draft_invalid = False
         # Set for the duration of a tick and intentionally left in place for
         # daemon workers that finish after the caller has returned.
@@ -698,6 +699,7 @@ class PolymarketCollector:
         scope_draft: Mapping[str, Any] | None = None,
     ) -> CollectionCycle:
         self._scope_draft_preview = _validated_scope_draft(scope_draft)
+        self._draft_market_request_limit = None
         self._scope_draft_invalid = scope_draft is not None and self._scope_draft_preview is None
         started = ensure_utc(now or self.clock())
         monotonic_started = time.monotonic()
@@ -947,6 +949,14 @@ class PolymarketCollector:
             for candidate_id in self._active_observation_intent_ids()
             if candidate_id not in superseded_candidate_ids
         ]
+        if isinstance(self._scope_draft_preview, Mapping):
+            # A preview is an isolated public-current pass.  Existing selected,
+            # paper, and observation candidates belong to the normal worker;
+            # carrying them here would spend the draft's bounded discovery
+            # window and leak their capture bindings into fresh targets.
+            primary_candidate_ids = []
+            paper_ids = []
+            observation_intent_ids = []
 
         primary_candidate_set = set(primary_candidate_ids)
         paper_set = set(paper_ids)
@@ -1177,6 +1187,17 @@ class PolymarketCollector:
         discovery_scheduled: list[str] = []
         discovered: dict[str, PredictionMarketSnapshot] = {}
         discovery_deferred: list[str] = []
+        draft_deferred_ids = [
+            str(item).strip()
+            for item in (
+                (self._discovery_continuation or {}).get("deferred_market_ids", ())
+                if isinstance(self._discovery_continuation, Mapping)
+                else ()
+            )
+            if str(item).strip()
+        ]
+        draft_deferred_ids = list(dict.fromkeys(draft_deferred_ids))[:_MAX_CYCLE_CONTINUATION_IDS]
+        draft_pending_queue = list(draft_deferred_ids)
         raw_discovery_coverage = (
             (self._discovery_continuation or {}).get("coverage_status")
             if isinstance(self._discovery_continuation, Mapping)
@@ -1234,10 +1255,60 @@ class PolymarketCollector:
                         discovered[snapshot.market_id] = snapshot
                 discovery_scheduled = list(discovered)
                 discovery_deferred = [
-                    identifier
-                    for identifier in deferred
-                    if identifier not in known_candidate and identifier not in paper_markets
+                    *draft_deferred_ids,
+                    *(
+                        identifier
+                        for identifier in deferred
+                        if identifier not in draft_deferred_ids
+                        and identifier not in known_candidate
+                        and identifier not in paper_markets
+                    ),
                 ]
+                if isinstance(self._discovery_continuation, Mapping):
+                    continuation_queue = self._discovery_continuation.get(
+                        "deferred_market_ids",
+                        _UNSET,
+                    )
+                    if continuation_queue is not _UNSET:
+                        if not isinstance(continuation_queue, (list, tuple)):
+                            continuation_queue = ()
+                        draft_pending_queue = list(dict.fromkeys(
+                            str(item).strip()
+                            for item in continuation_queue
+                            if str(item).strip()
+                        ))[:_MAX_CYCLE_CONTINUATION_IDS]
+                    else:
+                        terminal_deferred_ids = {
+                            str(item.get("market_id", "")).strip()
+                            for item in (
+                                self._discovery_continuation.get(
+                                    "suitability_exclusions",
+                                    (),
+                                )
+                                if isinstance(self._discovery_continuation, Mapping)
+                                else ()
+                            )
+                            if isinstance(item, Mapping)
+                            and str(item.get("market_id", "")).strip()
+                        }
+                        draft_pending_queue = list(dict.fromkeys(
+                            [
+                                *draft_pending_queue,
+                                *(
+                                    str(identifier).strip()
+                                    for identifier in deferred
+                                    if str(identifier).strip()
+                                    and str(identifier).strip()
+                                    not in terminal_deferred_ids
+                                    and str(identifier).strip()
+                                    not in known_candidate
+                                    and str(identifier).strip()
+                                    not in paper_markets
+                                ),
+                            ]
+                        ))[:_MAX_CYCLE_CONTINUATION_IDS]
+                if isinstance(self._scope_draft_preview, Mapping):
+                    discovery_deferred = list(draft_pending_queue)
                 raw_discovery_coverage = (
                     (self._discovery_continuation or {}).get("coverage_status")
                     if isinstance(self._discovery_continuation, Mapping)
@@ -1318,12 +1389,23 @@ class PolymarketCollector:
         }
         tier_by_market.update({market_id: "paper_forward" for market_id in paper_scheduled})
         tier_by_market.update({market_id: "discovery" for market_id in discovery_scheduled})
-        all_planned_ids = list(dict.fromkeys([
-            *resume_ids,
-            *candidate_scheduled,
-            *paper_scheduled,
-            *discovery_scheduled,
-        ]))
+        if isinstance(self._scope_draft_preview, Mapping):
+            # Draft work gets a fair first slot; frozen normal-cycle resumes
+            # remain queued behind it rather than consuming the whole pass.
+            all_planned_ids = list(dict.fromkeys([
+                *candidate_scheduled,
+                *paper_scheduled,
+                *draft_pending_queue,
+                *discovery_scheduled,
+                *resume_ids,
+            ]))
+        else:
+            all_planned_ids = list(dict.fromkeys([
+                *resume_ids,
+                *candidate_scheduled,
+                *paper_scheduled,
+                *discovery_scheduled,
+            ]))
         planned_limit = capacity
         request_budget_remaining: int | None = None
         request_budget_exhausted = False
@@ -1350,9 +1432,28 @@ class PolymarketCollector:
                 )
                 discovery_coverage_status = "PARTIAL"
         planned_ids = all_planned_ids[:planned_limit]
+        if (
+            isinstance(self._scope_draft_preview, Mapping)
+            and request_budget_exhausted
+        ):
+            draft_pending_queue = list(dict.fromkeys([
+                *draft_pending_queue,
+                *all_planned_ids[planned_limit:],
+            ]))[:_MAX_CYCLE_CONTINUATION_IDS]
+        if isinstance(self._scope_draft_preview, Mapping):
+            self._draft_market_request_limit = (
+                request_budget_remaining // planned_limit
+                if request_budget_remaining is not None and planned_limit > 0
+                else 0
+            )
         if self._rolling_background_discovery_enabled:
             self._discovery_continuation = {
                 **dict(self._discovery_continuation or {}),
+                **(
+                    {"deferred_market_ids": list(draft_pending_queue)}
+                    if isinstance(self._scope_draft_preview, Mapping)
+                    else {}
+                ),
                 "request_budget": _ROLLING_BOOTSTRAP_REQUEST_BUDGET,
                 "requests_used_before_market_validation": int(
                     counters.get("requests", 0)
@@ -1482,11 +1583,17 @@ class PolymarketCollector:
                     remaining_after_deadline = list(planned_ids[index + 1:])
                     break
 
+        captured_ids: set[str] = set()
         tier_attempts = {"candidate": 0, "paper_forward": 0, "discovery": 0}
         tier_successes = {"candidate": 0, "paper_forward": 0, "discovery": 0}
         tier_failures = {"candidate": 0, "paper_forward": 0, "discovery": 0}
+        attempted_capture_ids: set[str] = set()
         for identifier, local in results:
             local_counters = local.get("counters", {})
+            if int(local_counters.get("markets_attempted", 0)) > 0:
+                attempted_capture_ids.add(identifier)
+            if int(local_counters.get("snapshots_inserted", 0)) > 0:
+                captured_ids.add(identifier)
             self._merge_counters(counters, local_counters)
             tier = tier_by_market.get(identifier, "discovery")
             tier_attempts[tier] += int(local.get("attempted", 0))
@@ -1495,12 +1602,51 @@ class PolymarketCollector:
                     tier_successes[tier] += 1
                 else:
                     tier_failures[tier] += 1
+        if isinstance(self._scope_draft_preview, Mapping):
+            discovery_deferred = [
+                identifier
+                for identifier in discovery_deferred
+                if identifier not in captured_ids
+            ]
         if self._rolling_background_discovery_enabled:
             budget_exhausted = bool(
                 counters.get("_bootstrap_request_budget_exhausted")
             ) or int(counters.get("requests", 0)) >= _ROLLING_BOOTSTRAP_REQUEST_BUDGET
+            continuation_draft_queue = (
+                self._discovery_continuation.get("deferred_market_ids", ())
+                if isinstance(self._discovery_continuation, Mapping)
+                else ()
+            )
+            queued_draft_ids = [
+                identifier
+                for identifier in dict.fromkeys([
+                    *draft_pending_queue,
+                    *(
+                        str(item).strip()
+                        for item in continuation_draft_queue
+                        if str(item).strip()
+                    ),
+                ])
+                if identifier not in captured_ids
+            ]
+            remaining_draft_queue = [
+                identifier
+                for identifier in queued_draft_ids
+                if identifier not in attempted_capture_ids
+            ]
+            remaining_draft_queue.extend(
+                identifier
+                for identifier in queued_draft_ids
+                if identifier in attempted_capture_ids
+            )
+            remaining_draft_queue = remaining_draft_queue[:_MAX_CYCLE_CONTINUATION_IDS]
             self._discovery_continuation = {
                 **dict(self._discovery_continuation or {}),
+                **(
+                    {"deferred_market_ids": remaining_draft_queue}
+                    if isinstance(self._scope_draft_preview, Mapping)
+                    else {}
+                ),
                 "request_budget": _ROLLING_BOOTSTRAP_REQUEST_BUDGET,
                 "requests_used": int(counters.get("requests", 0)),
                 "request_budget_remaining": max(
@@ -4564,7 +4710,7 @@ class PolymarketCollector:
             and self._cycle_remaining_seconds() <= 0
         ):
             self._mark_cycle_exhaustion("scope_exact_lookup")
-        if protected_priority_exact_ids and self._scope_direct_budget_available():
+        if protected_priority_exact_ids and self._scope_direct_budget_available(counters):
             protected_probe_ids = [
                 protected_priority_exact_ids[
                     (protected_cursor + offset) % len(protected_priority_exact_ids)
@@ -4578,7 +4724,7 @@ class PolymarketCollector:
                 if remaining is not None and remaining <= 0:
                     self._mark_cycle_exhaustion("scope_exact_lookup")
                     break
-                if not self._scope_direct_budget_available():
+                if not self._scope_direct_budget_available(counters):
                     break
                 pre_direct_attempted_ids.add(market_id)
                 try:
@@ -4803,7 +4949,7 @@ class PolymarketCollector:
                 if remaining is not None and remaining <= 0:
                     self._mark_cycle_exhaustion("scope_exact_lookup")
                     break
-                if not self._scope_direct_budget_available():
+                if not self._scope_direct_budget_available(counters):
                     break
                 direct_attempted_ids.add(market_id)
                 direct_loop_attempted_ids.add(market_id)
@@ -5708,8 +5854,44 @@ class PolymarketCollector:
             return True
         return remaining > self._scope_phase_reserve_seconds() + 1e-6
 
-    def _scope_direct_budget_available(self) -> bool:
+    def _draft_precollection_request_limit(
+        self,
+        endpoint: str | None = None,
+        *,
+        provider_pool: str | None = None,
+    ) -> int | None:
+        """Keep draft preparation bounded while reserving one capture window."""
+        if not isinstance(self._scope_draft_preview, Mapping):
+            return None
+        if provider_pool in {"scope", "scope_direct"}:
+            return max(
+                0,
+                _ROLLING_BOOTSTRAP_REQUEST_BUDGET
+                - _ROLLING_BOOTSTRAP_MARKET_REQUEST_RESERVE,
+            )
+        endpoint_text = str(endpoint or "").strip().lower()
+        if endpoint_text.startswith(("discovery", "suitability_")):
+            return max(
+                0,
+                _ROLLING_BOOTSTRAP_REQUEST_BUDGET
+                - _ROLLING_BOOTSTRAP_MARKET_REQUEST_RESERVE,
+            )
+        return None
+
+    def _scope_direct_budget_available(
+        self,
+        counters: Mapping[str, Any] | None = None,
+    ) -> bool:
         """Allow exact lookups their independent phase share without overrunning collection."""
+        if counters is not None:
+            request_limit = self._draft_precollection_request_limit(
+                provider_pool="scope_direct",
+            )
+            if (
+                request_limit is not None
+                and int(counters.get("requests", 0)) >= request_limit
+            ):
+                return False
         remaining = self._cycle_remaining_seconds()
         if remaining is None:
             return True
@@ -7295,6 +7477,14 @@ class PolymarketCollector:
                             depth=self.config.depth,
                         ),
                     )
+                except _BootstrapRequestBudgetExceeded:
+                    evidence.update(
+                        category="REQUEST_BUDGET",
+                        reason="REQUEST_BUDGET_RESERVED",
+                        resolver="resume_draft_validation",
+                        next_action="retry_next_collection_tick",
+                    )
+                    return evidence
                 except _ProviderDeadlineExceeded as exc:
                     evidence.update(
                         category="PROVIDER_TIMEOUT",
@@ -7325,6 +7515,14 @@ class PolymarketCollector:
                             if candidate is not None and self._book_token_id(candidate) == str(token_id).strip():
                                 book = candidate
                                 break
+                except _BootstrapRequestBudgetExceeded:
+                    evidence.update(
+                        category="REQUEST_BUDGET",
+                        reason="REQUEST_BUDGET_RESERVED",
+                        resolver="resume_draft_validation",
+                        next_action="retry_next_collection_tick",
+                    )
+                    return evidence
                 except _ProviderDeadlineExceeded as exc:
                     evidence.update(
                         category="PROVIDER_TIMEOUT",
@@ -7680,6 +7878,16 @@ class PolymarketCollector:
         # pages inspected.  A small budget must still be able to advance past
         # an arbitrary bounded run of unsuitable pages.
         max_pages = max(1, int(self.config.max_suitable_pages_per_cycle))
+        draft_request_limit = self._draft_precollection_request_limit(
+            "discovery_keyset:/markets/keyset",
+            provider_pool="collection",
+        )
+        draft_request_budget_exhausted = False
+        validated_deferred_ids = [
+            str(item).strip()
+            for item in previous.get("deferred_market_ids", ())
+            if str(item).strip()
+        ]
         selected: list[PredictionMarketSnapshot] = []
         suitable_evidence: list[dict[str, Any]] = []
         deferred: list[str] = []
@@ -7691,7 +7899,14 @@ class PolymarketCollector:
         page_count = 0
         seen_cursors: list[str] = []
         raw_total = unique_total = duplicate_total = malformed_total = 0
+        page_status = "BUDGET_EXHAUSTED"
         while page_count < max_pages:
+            if (
+                draft_request_limit is not None
+                and int(counters.get("requests", 0)) >= draft_request_limit
+            ):
+                draft_request_budget_exhausted = True
+                break
             kwargs: dict[str, Any] = {
                 "limit": limit,
                 "after_cursor": cursor,
@@ -7713,6 +7928,9 @@ class PolymarketCollector:
                     counters,
                     provider=provider,
                 )
+            except _BootstrapRequestBudgetExceeded:
+                draft_request_budget_exhausted = True
+                break
             except Exception as exc:
                 counters["errors"] += 1
                 timeout_fields = (
@@ -7833,6 +8051,14 @@ class PolymarketCollector:
             for snapshot in unique_page:
                 if snapshot.market_id in exclude:
                     continue
+                if (
+                    draft_request_limit is not None
+                    and int(counters.get("requests", 0)) >= draft_request_limit
+                ):
+                    draft_request_budget_exhausted = True
+                    deferred.append(snapshot.market_id)
+                    validated_deferred_ids.append(snapshot.market_id)
+                    continue
                 assessment = self._suitable_market_assessment(
                     snapshot,
                     observed_at,
@@ -7842,7 +8068,15 @@ class PolymarketCollector:
                 self._suitable_market_evidence.append(assessment)
                 if assessment.get("action") == "SUITABLE":
                     candidates.append((snapshot, assessment))
+                elif assessment.get("reason") == "REQUEST_BUDGET_RESERVED":
+                    deferred.append(snapshot.market_id)
+                    validated_deferred_ids.append(snapshot.market_id)
                 else:
+                    validated_deferred_ids = [
+                        identifier
+                        for identifier in validated_deferred_ids
+                        if identifier != snapshot.market_id
+                    ]
                     deferred.append(snapshot.market_id)
                     exclusions.append(assessment)
             candidates.sort(
@@ -7859,6 +8093,7 @@ class PolymarketCollector:
             for snapshot, assessment in candidates:
                 if len(selected) >= budget:
                     deferred.append(snapshot.market_id)
+                    validated_deferred_ids.append(snapshot.market_id)
                     continue
                 selected.append(snapshot)
                 suitable_evidence.append(dict(assessment))
@@ -7866,11 +8101,20 @@ class PolymarketCollector:
             cursor = next_cursor if isinstance(next_cursor, str) and next_cursor.strip() else None
             if selected or cursor is None:
                 break
-            seen_cursors.append(cursor)
         status = (
-            page_status
-            if cursor is None and page_status in {"PARTIAL", "BUDGET_EXHAUSTED"}
-            else ("COMPLETE" if cursor is None else "BUDGET_EXHAUSTED")
+            "BUDGET_EXHAUSTED"
+            if (
+                draft_request_budget_exhausted
+                or (
+                    draft_request_limit is not None
+                    and bool(validated_deferred_ids)
+                )
+            )
+            else (
+                page_status
+                if cursor is None and page_status in {"PARTIAL", "BUDGET_EXHAUSTED"}
+                else ("COMPLETE" if cursor is None else "BUDGET_EXHAUSTED")
+            )
         )
         if malformed_total:
             counters["errors"] += malformed_total
@@ -7893,6 +8137,15 @@ class PolymarketCollector:
             "suitability_exclusions": exclusions[-256:],
             "suitable_market_ids": [item.market_id for item in selected],
             "suitable_market_evidence": suitable_evidence[-256:],
+            **(
+                {
+                    "deferred_market_ids": list(dict.fromkeys(
+                        validated_deferred_ids
+                    ))[:_MAX_CYCLE_CONTINUATION_IDS]
+                }
+                if draft_request_limit is not None
+                else {}
+            ),
             "updated_at": observed_at.isoformat(),
         }
         return tuple(selected), cursor, tuple(dict.fromkeys(deferred))
@@ -8814,9 +9067,21 @@ class PolymarketCollector:
         counters: dict[str, Any],
     ) -> Any:
         """Run one exact operation on a fresh clone for every attempt."""
+        request_limit = self._draft_precollection_request_limit(
+            provider_pool="scope_direct",
+        )
         last_error: Exception | None = None
         timeout = float(self.config.provider_timeout_seconds)
         for attempt in range(self.config.max_attempts):
+            if (
+                request_limit is not None
+                and int(counters.get("requests", 0)) >= request_limit
+            ):
+                counters["_bootstrap_request_budget_exhausted"] = True
+                counters["_bootstrap_request_budget_endpoint"] = endpoint
+                raise _BootstrapRequestBudgetExceeded(
+                    f"BOOTSTRAP_REQUEST_BUDGET_EXHAUSTED: {endpoint}"
+                )
             self._cycle_budget_available(endpoint, observed_at, counters)
             counters["requests"] += 1
             request_started = time.monotonic()
@@ -9001,10 +9266,21 @@ class PolymarketCollector:
         )
         timeout = float(self.config.provider_timeout_seconds)
         for attempt in range(self.config.max_attempts):
+            request_limit = self._draft_precollection_request_limit(
+                endpoint,
+                provider_pool=provider_pool,
+            )
             if (
-                self._rolling_background_discovery_enabled
-                and int(counters.get("requests", 0))
-                >= _ROLLING_BOOTSTRAP_REQUEST_BUDGET
+                request_limit is None
+                and isinstance(self._scope_draft_preview, Mapping)
+                and provider_pool == "collection"
+            ):
+                request_limit = self._draft_market_request_limit
+            if request_limit is None and self._rolling_background_discovery_enabled:
+                request_limit = _ROLLING_BOOTSTRAP_REQUEST_BUDGET
+            if (
+                request_limit is not None
+                and int(counters.get("requests", 0)) >= request_limit
             ):
                 counters["_bootstrap_request_budget_exhausted"] = True
                 counters["_bootstrap_request_budget_endpoint"] = endpoint

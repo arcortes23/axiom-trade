@@ -2564,16 +2564,364 @@ def _rolling_bound_cursor_state(cursor: Mapping[str, Any]) -> dict[str, Any]:
     return bounded
 
 
+_ROLLING_TRACE_ENTRY_FIELDS = (
+    "code",
+    "reason",
+    "status",
+    "message",
+    "source",
+    "selector",
+    "count",
+    "strategy_version_id",
+    "research_trial_id",
+    "candidate_id",
+    "market_id",
+    "scope_hash",
+    "scope_version",
+    "draft_id",
+    "draft_hash",
+    "evaluation_run_id",
+    "evaluation_kind",
+    "evaluator_invoked",
+    "evaluator_completed",
+    "decision",
+    "evaluator_error",
+    "evaluator_prerequisite",
+)
+
+_ROLLING_TRACE_CYCLE_FIELDS = (
+    "cycle_id",
+    "collection_cycle_id",
+    "draft_id",
+    "draft_hash",
+    "scope_hash",
+    "scope_version",
+    "started_at",
+    "ended_at",
+    "duration_seconds",
+    "markets_seen",
+    "markets_attempted",
+    "markets_successful",
+    "markets_failed",
+    "metadata_inserted",
+    "snapshots_inserted",
+    "trades_inserted",
+    "errors",
+    "requests",
+    "rate_limits",
+    "retries",
+    "provider_failures",
+    "provider_timeouts",
+    "cooldowns",
+    "skipped_markets",
+    "metadata_failures",
+    "order_book_failures",
+    "trade_failures",
+    "inventory_coverage",
+    "capacity_reason",
+    "discovery_coverage_status",
+    "discovery_cursor",
+    "discovery_complete",
+    "current_stage",
+    "current_endpoint",
+)
+
+_ROLLING_TRACE_CYCLE_COLLECTIONS = (
+    "candidate_bound_markets",
+    "candidate_bound_scheduled",
+    "candidate_bound_fresh",
+    "candidate_bound_stale",
+    "candidate_bound_missing",
+    "paper_forward_markets",
+    "paper_forward_scheduled",
+    "discovery_scheduled",
+    "discovery_deferred",
+    "deferred_market_ids",
+    "suitable_market_scheduled",
+    "suitable_market_deferred",
+    "discovery_exclusions",
+    "provider_timeout_evidence",
+)
+
+
+def _rolling_trace_scalar(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return value[:_MAX_ROLLING_STATE_ID_LENGTH]
+    return str(value)[:_MAX_ROLLING_STATE_ID_LENGTH]
+
+
+def _rolling_trace_collection(value: Any) -> list[Any] | None:
+    if not isinstance(value, (list, tuple, set, frozenset)):
+        return None
+    values = (
+        sorted(value, key=str)
+        if isinstance(value, (set, frozenset))
+        else list(value)
+    )
+    result: list[Any] = []
+    for item in values[:_MAX_ROLLING_QUEUE_RESULTS]:
+        if isinstance(item, Mapping):
+            result.append(
+                {
+                    key: _rolling_trace_scalar(item[key])
+                    for key in _ROLLING_TRACE_ENTRY_FIELDS
+                    if key in item
+                    and not isinstance(
+                        item[key],
+                        (Mapping, list, tuple, set, frozenset),
+                    )
+                }
+            )
+        else:
+            result.append(_rolling_trace_scalar(item))
+    return result
+
+
+def _rolling_trace_scalar_map(value: Any, *, depth: int = 0) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    result: dict[str, Any] = {}
+    for raw_key in sorted(value, key=str)[:_MAX_ROLLING_QUEUE_RESULTS]:
+        key = str(raw_key)[:_MAX_ROLLING_STATE_ID_LENGTH]
+        item = value[raw_key]
+        if isinstance(item, Mapping) and depth < 1:
+            result[key] = _rolling_trace_scalar_map(item, depth=depth + 1)
+        elif isinstance(item, (list, tuple, set, frozenset)):
+            collection = _rolling_trace_collection(item)
+            if collection is not None:
+                result[key] = collection
+        elif item is None or isinstance(item, (bool, int, float, str)):
+            result[key] = _rolling_trace_scalar(item)
+    return result
+
+
+def _rolling_trace_mapping(
+    value: Any,
+    scalar_fields: Sequence[str],
+    collection_fields: Sequence[str] = (),
+    mapping_fields: Sequence[str] = (),
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    result: dict[str, Any] = {}
+    for key in scalar_fields:
+        if key not in value:
+            continue
+        item = value[key]
+        if item is None or isinstance(item, (bool, int, float, str)):
+            result[key] = _rolling_trace_scalar(item)
+    for key in collection_fields:
+        if key not in value:
+            continue
+        collection = _rolling_trace_collection(value[key])
+        if collection is not None:
+            result[key] = collection
+    for key in mapping_fields:
+        if key in value and isinstance(value[key], Mapping):
+            result[key] = _rolling_trace_scalar_map(value[key])
+    return result
+
+
+def _rolling_trace_discovery(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    result = _rolling_trace_mapping(
+        value,
+        ("status", "reason", "result_type", "error_type", "error"),
+        ("rejection_summaries", "deferred_market_ids", "discovery_exclusions"),
+    )
+    cycle = value.get("cycle")
+    if isinstance(cycle, Mapping):
+        result["cycle"] = _rolling_trace_mapping(
+            cycle,
+            _ROLLING_TRACE_CYCLE_FIELDS,
+            _ROLLING_TRACE_CYCLE_COLLECTIONS,
+            ("candidate_references", "tier_attempts", "tier_successes", "tier_failures"),
+        )
+    return result
+
+
+def _rolling_bound_scope_draft_trace(value: Mapping[str, Any]) -> dict[str, Any]:
+    result = _rolling_trace_mapping(
+        value,
+        (
+            "status",
+            "reason",
+            "validation_status",
+            "present",
+            "draft_id",
+            "draft_hash",
+            "scope_hash",
+            "scope_version",
+            "paper_only",
+            "live_execution",
+            "allocation_active",
+            "canary_armed",
+            "strategy_spec_count",
+            "supported_strategy_definition_count",
+            "valid_strategy_definition_count",
+            "invalid_strategy_count",
+            "direct_market_count",
+            "compatible_binding_count",
+            "materialized_members",
+            "materialized_member_count",
+            "materialized_market_count",
+        ),
+        (
+            "supported_templates",
+            "invalid_strategy_reasons",
+            "rejection_summaries",
+            "materialized_market_ids",
+        ),
+        ("evidence_attribution",),
+    )
+    if isinstance(value.get("discovery"), Mapping):
+        result["discovery"] = _rolling_trace_discovery(value["discovery"])
+    if isinstance(value.get("effective_category_filters"), Mapping):
+        result["effective_category_filters"] = _rolling_trace_mapping(
+            value["effective_category_filters"],
+            (
+                "category_mode",
+                "effective_category_filter",
+                "selector_labels_applied",
+                "gamma_tag_id_applied",
+                "profitability_filters_inherited",
+                "active_frozen_historical_scope",
+            ),
+            ("declared_categories", "effective_categories", "inherited_category_sources_ignored"),
+            ("effective_noncategory_filters", "active_frozen_historical_scope"),
+        )
+    return result
+
+
+def _rolling_bound_strategy_discovery_trace(value: Mapping[str, Any]) -> dict[str, Any]:
+    result = _rolling_trace_mapping(
+        value,
+        (
+            "source",
+            "status",
+            "reason",
+            "materialization_reason",
+            "draft_id",
+            "draft_hash",
+            "scope_hash",
+            "scope_version",
+            "supported_strategy_definition_count",
+            "valid_strategy_definition_count",
+            "invalid_strategy_count",
+            "materialized_strategy_count",
+            "compatible_binding_count",
+            "materialized_member_count",
+            "materialized_market_count",
+            "paper_only",
+            "live_execution",
+            "evaluator_invoked",
+            "evaluator_completed",
+        ),
+        (
+            "supported_templates",
+            "invalid_strategy_reasons",
+            "rejection_summaries",
+            "materialized_market_ids",
+        ),
+    )
+    decisions = _rolling_trace_collection(value.get("evaluator_decisions"))
+    if decisions is not None:
+        result["evaluator_decisions"] = decisions
+        raw_decisions = value["evaluator_decisions"]
+        if (
+            isinstance(raw_decisions, (list, tuple, set, frozenset))
+            and len(raw_decisions) > len(decisions)
+        ):
+            result["evaluator_decisions_total"] = len(raw_decisions)
+            result["evaluator_decisions_truncated"] = True
+    if isinstance(value.get("discovery"), Mapping):
+        result["discovery"] = _rolling_trace_discovery(value["discovery"])
+    return result
+
+
+def _rolling_bound_evaluation_counts(value: Mapping[str, Any]) -> dict[str, Any]:
+    return _rolling_trace_mapping(
+        value,
+        (
+            "attempted",
+            "successful",
+            "pending",
+            "evaluated",
+            "completed",
+            "failed",
+            "deferred",
+            "errors",
+            "requested",
+            "available",
+            "valid",
+            "invalid",
+        ),
+    )
+
+
+def _rolling_fit_trace_payload(
+    value: Mapping[str, Any],
+    *,
+    max_bytes: int = 4_096,
+) -> dict[str, Any]:
+    """Keep one typed trace small enough to coexist with protected identity."""
+    bounded = dict(value)
+    collection_priority = (
+        "supported_templates",
+        "invalid_strategy_reasons",
+        "materialized_market_ids",
+        "deferred_market_ids",
+        "discovery_deferred",
+        "discovery_exclusions",
+        "evaluator_decisions",
+    )
+
+    def trim(item: Any) -> bool:
+        if isinstance(item, dict):
+            for key in collection_priority:
+                child = item.get(key)
+                if isinstance(child, list) and child:
+                    child.pop()
+                    return True
+            for key in sorted(item, key=str):
+                child = item[key]
+                if isinstance(child, dict) and trim(child):
+                    return True
+                if isinstance(child, list) and child:
+                    child.pop()
+                    return True
+            for key in sorted(item, key=str):
+                child = item[key]
+                if isinstance(child, str) and len(child) > 1:
+                    item[key] = child[: max(1, len(child) // 2)]
+                    return True
+        return False
+
+    while len(_canonical_binding(bounded).encode("utf-8")) > max_bytes:
+        if not trim(bounded):
+            break
+    return bounded
+
+
 def _rolling_bound_operator_state(state: Mapping[str, Any]) -> dict[str, Any]:
     """Keep operator state within Hermes' byte limit without losing identity.
 
     ``strategy_versions`` and ``candidate_ids`` are the restart identity
-    samples.  They are normalized once, kept in deterministic first-seen order,
-    and never cardinality-reduced.  Everything else is telemetry or retry
-    detail and may be collapsed to its authoritative total/truncated marker.
+    samples.  Typed rolling traces are projected before generic collections are
+    collapsed, so draft/cycle binding and observed decisions remain durable.
+    Everything else is telemetry or retry detail and may be collapsed to its
+    authoritative total/truncated marker.
     """
     bounded = dict(state)
     protected = {"strategy_versions", "candidate_ids"}
+    trace_projectors = {
+        "scope_draft_trace": _rolling_bound_scope_draft_trace,
+        "strategy_discovery_trace": _rolling_bound_strategy_discovery_trace,
+        "evaluation_counts": _rolling_bound_evaluation_counts,
+    }
 
     def values_as_list(value: Any) -> list[Any] | None:
         if isinstance(value, (list, tuple)):
@@ -2587,6 +2935,23 @@ def _rolling_bound_operator_state(state: Mapping[str, Any]) -> dict[str, Any]:
             bounded[f"{name}_total"] = total
         bounded[f"{name}_truncated"] = True
         bounded["truncated"] = True
+
+    def compact_trace_fields() -> bool:
+        changed = False
+        for name, projector in trace_projectors.items():
+            value = bounded.get(name)
+            if not isinstance(value, Mapping):
+                continue
+            projected = _rolling_fit_trace_payload(projector(value))
+            if f"{name}_total" not in bounded:
+                bounded[f"{name}_total"] = len(value)
+                changed = True
+            if projected != value:
+                bounded[name] = projected
+                mark_truncated(name)
+                changed = True
+            protected.add(name)
+        return changed
 
     def compact_identity(name: str) -> None:
         values = values_as_list(bounded.get(name))
@@ -2734,6 +3099,9 @@ def _rolling_bound_operator_state(state: Mapping[str, Any]) -> dict[str, Any]:
         if changed:
             continue
         changed = any(drop_detail(name) for name in detail_fields)
+        if changed:
+            continue
+        changed = compact_trace_fields()
         if changed:
             continue
 

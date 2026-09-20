@@ -251,6 +251,15 @@ token identity before evaluation. The evaluation evidence records the
 liquidity, depth, and sizing gates. A candidate that fails any gate is retained
 as an explicit exclusion rather than silently becoming a live selection.
 
+Each explicit draft tick keeps the request budget honest: at most **11** public
+requests are available to draft discovery and scope preparation, reserving **5**
+requests for at least one fresh market metadata/order-book capture. Fresh draft
+work is scheduled ahead of unrelated frozen normal-cycle maintenance, while
+that maintenance remains in its own continuation. Suitable IDs that do not fit
+the capture window are retained in the draft's binding-specific
+`deferred_market_ids` continuation and retried on a later tick; they are not
+reported as provider failures or suitability exclusions.
+
 Official geoblock and account-readiness probes are independent read-only
 evidence. Their result must not be inferred from discovery, the absence of a
 selected member, or paper evaluation. The final review may show those

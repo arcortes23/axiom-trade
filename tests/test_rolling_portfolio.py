@@ -33,6 +33,7 @@ from axiom.storage import AxiomStore
 from axiom.autonomous import (
     AutonomousResearchProcessor,
     _MAX_ROLLING_REPLAY_PAYLOAD_BYTES,
+    _rolling_bound_operator_state,
     _rolling_cursor_index,
     _rolling_cursor_record,
     _rolling_hash,
@@ -429,6 +430,112 @@ class TestRollingPortfolio(unittest.TestCase):
         self.assertEqual(cursor["next_requested_days"], items[0][1])
         self.assertEqual(cursor["next_source_class"], items[0][2])
         self.assertEqual(next(iter(cursor["attempts"].values())), 1)
+
+    def test_operator_compaction_preserves_current_draft_trace_under_pressure(self) -> None:
+        scope_trace = {
+            "status": "NO_SUITABLE_MATERIALIZED_INSTANCE",
+            "reason": "NO_SUITABLE_MATERIALIZED_INSTANCE",
+            "validation_status": "VALID",
+            "present": True,
+            "draft_id": "rolling-exploratory-scope-draft:polymarket:standard:v1",
+            "draft_hash": "sha256:" + ("d" * 64),
+            "scope_hash": "sha256:" + ("s" * 64),
+            "scope_version": "v1",
+            "paper_only": True,
+            "live_execution": False,
+            "allocation_active": False,
+            "canary_armed": False,
+            "strategy_spec_count": 2,
+            "supported_strategy_definition_count": 1,
+            "valid_strategy_definition_count": 1,
+            "invalid_strategy_count": 1,
+            "invalid_strategy_reasons": ["INVALID_STRATEGY_DEFINITIONS"],
+            "materialized_member_count": 0,
+            "materialized_market_count": 0,
+            "materialized_market_ids": [],
+            "metadata_matched_count": 99,
+            "discovery": {
+                "status": "OK",
+                "reason": None,
+                "cycle": {
+                    "scope_hash": "sha256:" + ("s" * 64),
+                    "scope_version": "v1",
+                    "discovery_coverage_status": "COMPLETE",
+                    "discovery_complete": True,
+                    "deferred_market_ids": ["market-deferred"],
+                    "discovery_exclusions": [
+                        {"reason": "CATEGORY_UNSUPPORTED", "market_id": "market-old"}
+                    ],
+                },
+            },
+            "filler": "x" * 20_000,
+        }
+        strategy_trace = {
+            "source": "scope-draft-preview",
+            "materialization_reason": "NO_SUITABLE_MATERIALIZED_INSTANCE",
+            "supported_templates": ["probability_mispricing"],
+            "supported_strategy_definition_count": 1,
+            "valid_strategy_definition_count": 1,
+            "invalid_strategy_count": 1,
+            "compatible_binding_count": 0,
+            "materialized_member_count": 0,
+            "materialized_market_count": 0,
+            "materialized_market_ids": [],
+            "evaluator_decisions": [
+                {
+                    "evaluation_run_id": "evaluation-1",
+                    "strategy_version_id": "strategy-1",
+                    "evaluation_kind": "CANONICAL_SIMULATION",
+                    "evaluator_invoked": True,
+                    "evaluator_completed": False,
+                    "decision": "EVALUATOR_DEFERRED",
+                }
+            ],
+        }
+        evaluation_counts = {"attempted": 1, "successful": 0, "pending": 1}
+        bounded = _rolling_bound_operator_state(
+            {
+                "strategy_versions": ["strategy-1"],
+                "candidate_ids": ["candidate-1"],
+                "scope_draft_trace": scope_trace,
+                "strategy_discovery_trace": strategy_trace,
+                "evaluation_counts": evaluation_counts,
+                "unrecognized_payload": {"blob": "y" * 20_000},
+            }
+        )
+        encoded = json.dumps(bounded, sort_keys=True, separators=(",", ":")).encode()
+        self.assertLess(len(encoded), 16_384)
+        self.assertEqual(bounded["scope_draft_trace_total"], len(scope_trace))
+        self.assertEqual(
+            bounded["strategy_discovery_trace_total"],
+            len(strategy_trace),
+        )
+        self.assertEqual(bounded["evaluation_counts_total"], len(evaluation_counts))
+        persisted_scope = bounded["scope_draft_trace"]
+        persisted_strategy = bounded["strategy_discovery_trace"]
+        self.assertEqual(
+            persisted_scope["draft_id"],
+            scope_trace["draft_id"],
+        )
+        self.assertEqual(persisted_scope["scope_hash"], scope_trace["scope_hash"])
+        self.assertEqual(persisted_scope["scope_version"], scope_trace["scope_version"])
+        self.assertEqual(persisted_scope["materialized_member_count"], 0)
+        self.assertEqual(persisted_scope["materialized_market_count"], 0)
+        self.assertNotIn("metadata_matched_count", persisted_scope)
+        self.assertEqual(
+            persisted_scope["discovery"]["cycle"]["deferred_market_ids"],
+            ["market-deferred"],
+        )
+        self.assertEqual(persisted_strategy["materialized_member_count"], 0)
+        self.assertEqual(persisted_strategy["materialized_market_count"], 0)
+        self.assertEqual(
+            persisted_strategy["evaluator_decisions"][0]["evaluator_invoked"],
+            True,
+        )
+        self.assertEqual(
+            persisted_strategy["evaluator_decisions"][0]["evaluator_completed"],
+            False,
+        )
 
     def test_blocker_skip_is_scoped_to_immutable_prerequisite_fingerprint(self) -> None:
         record = {
