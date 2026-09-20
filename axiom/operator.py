@@ -912,6 +912,46 @@ def _safe_value(value: Any, *, depth: int = 0) -> Any:
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value if not isinstance(value, str) or len(value) <= 1024 else value[:1021] + "..."
     return str(value)[:1024]
+_PUBLIC_SCOPE_NESTED_KEYS = frozenset(
+    {
+        "scope",
+        "configuration",
+        "settings",
+        "setup",
+        "operational_setup",
+        "setup_policy",
+        "market_bindings",
+        "market_binding",
+        "filters",
+        "regime_restrictions",
+        "category_restriction",
+        "exclusions",
+        "provenance",
+        "members",
+    }
+)
+
+
+def _public_scope_projection(value: Any) -> Any:
+    """Project public scope/configuration data without outer review depth loss."""
+    projected = _safe_value(value)
+    if not isinstance(value, Mapping) or not isinstance(projected, Mapping):
+        return projected
+    projected = dict(projected)
+    for key in _PUBLIC_SCOPE_NESTED_KEYS:
+        child = value.get(key)
+        if isinstance(child, Mapping):
+            projected_child = _safe_value(child)
+        elif isinstance(child, (list, tuple, set, frozenset)):
+            projected_child = [
+                _safe_value(item) for item in list(child)[:32]
+            ]
+        else:
+            continue
+        projected[key] = projected_child
+    return projected
+
+
 _PUBLIC_MARKET_BINDING_FIELDS = (
     "market_id",
     "condition_id",
@@ -2833,14 +2873,14 @@ class OperatorControlPlane:
             "scope_draft_id": scope_draft.get("draft_id"),
             "scope_draft_hash": scope_draft.get("draft_hash"),
             "scope_draft_version": scope_draft.get("scope_version"),
-            "scope_draft": _safe_value(scope_draft),
-            "draft_scope": _safe_value(draft_scope),
+            "scope_draft": _public_scope_projection(scope_draft),
+            "draft_scope": _public_scope_projection(draft_scope),
             "active_scope_hash": active_scope_hash,
             "active_scope_version": active_scope_version,
-            "active_scope": _safe_value(scope),
+            "active_scope": _public_scope_projection(scope),
             "frozen_scope_hash": frozen_scope_hash,
             "frozen_scope_version": frozen_scope_version,
-            "frozen_scope": _safe_value(frozen_scope),
+            "frozen_scope": _public_scope_projection(frozen_scope),
             "active_settings_hash": settings_hash,
             "active_settings_generation": settings_generation,
             "proposed_allocation_total": selection.get("proposed_allocation_total"),
@@ -4661,7 +4701,7 @@ class OperatorControlPlane:
                 "draft": {
                     "draft_id": context.get("scope_draft_id"),
                     "status": "DRAFT",
-                    "scope": _safe_value(context.get("draft_scope", {})),
+                    "scope": _public_scope_projection(context.get("draft_scope", {})),
                     "scope_hash": context.get("scope_hash"),
                     "scope_version": context.get("scope_version"),
                     "draft_hash": context.get("scope_draft_hash"),
@@ -4684,12 +4724,12 @@ class OperatorControlPlane:
                 "active": {
                     "scope_hash": context.get("active_scope_hash"),
                     "scope_version": context.get("active_scope_version"),
-                    "scope": _safe_value(context.get("active_scope", {})),
+                    "scope": _public_scope_projection(context.get("active_scope", {})),
                 },
                 "frozen": {
                     "scope_hash": context.get("frozen_scope_hash"),
                     "scope_version": context.get("frozen_scope_version"),
-                    "scope": _safe_value(context.get("frozen_scope", {})),
+                    "scope": _public_scope_projection(context.get("frozen_scope", {})),
                 },
             },
             "members": [

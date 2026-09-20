@@ -4213,6 +4213,24 @@ class OperatorControlTests(unittest.TestCase):
         self.assertEqual(draft["status"], "DRAFT")
         self.assertFalse(review["blockers"])
         self.assertTrue(context["setup_bindings"])
+
+    def test_operator_data_preserves_real_nested_exploratory_review_projection(self) -> None:
+        payload = DashboardData(store=self.store, control=self.control).operator_data()
+        controls = payload.get("operator_controls")
+        self.assertIsInstance(controls, dict)
+        review = controls["exploratory_live_review"]
+        self.assertEqual(review["status"], "BLOCKED")
+        self.assertEqual(
+            review["scope"]["draft"]["draft_id"],
+            "rolling-exploratory-scope-draft:polymarket:standard:v1",
+        )
+        self.assertEqual(
+            review["scope"]["draft"]["scope"]["mode"],
+            "RULE_BASED_MARKETS",
+        )
+        self.assertNotEqual(review["scope"]["draft"]["scope"], "<truncated>")
+        self.assertIn("EXPLORATORY_LIVE_SELECTION_REQUIRED", review["blockers"])
+
     def test_selected_market_preflight_requires_authoritative_provider_identity_and_suitable_depth(self) -> None:
         selection = {
             "members": [

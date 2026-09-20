@@ -976,6 +976,49 @@ class NodeIdentityPersistenceTests(unittest.TestCase):
                     node._stop_heartbeat_watchdog()
 
 
+class RollingDiscoveryHandoffTests(unittest.TestCase):
+    def test_busy_draft_discovery_defers_then_next_pass_returns_collection_cycle(self) -> None:
+        with AxiomStore(":memory:") as store:
+            node = ResearchNode(
+                NodeConfig(
+                    ":memory:",
+                    mutation_enabled=False,
+                    crypto_enabled=False,
+                    interval_seconds=1.0,
+                    provider_timeout_seconds=0.01,
+                ),
+                provider=InMemoryPredictionProvider([]),
+                store=store,
+                clock=lambda: T0,
+            )
+            cycle = CollectionCycle(T0, T0, 0, 0, 0, 0)
+            node.collector.collect_once = Mock(return_value=cycle)  # type: ignore[method-assign]
+            self.assertTrue(node._rolling_discovery_lock.acquire())
+            try:
+                deferred = node._rolling_current_market_discovery(
+                    T0,
+                    draft={"status": "DRAFT"},
+                )
+            finally:
+                node._rolling_discovery_lock.release()
+
+            self.assertIsInstance(deferred, Mapping)
+            assert isinstance(deferred, Mapping)
+            self.assertEqual(deferred["reason"], "ROLLING_DISCOVERY_LOCK_BUSY")
+            self.assertTrue(deferred["discovery_deferred"])
+
+            actual = node._rolling_current_market_discovery(
+                T0,
+                draft={"status": "DRAFT"},
+            )
+
+            self.assertIs(actual, cycle)
+            node.collector.collect_once.assert_called_once_with(  # type: ignore[attr-defined]
+                now=T0,
+                scope_draft={"status": "DRAFT"},
+            )
+
+
 class ExploratoryRollingProgressionTests(unittest.TestCase):
 
     def test_production_node_bootstraps_before_rolling_worker(self) -> None:

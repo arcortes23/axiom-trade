@@ -1832,6 +1832,11 @@ class DashboardScaleFixtureTests(unittest.TestCase):
             },
         }
 
+        payload["operator_controls"] = {
+            "exploratory_live_review": payload.pop("exploratory_live_review"),
+            "rolling_exploratory_scope_draft": payload["rolling_exploratory_scope_draft"],
+        }
+
         body = _http_json_bytes(payload)
         self.assertLessEqual(len(body), 1_048_576)
         projected = json.loads(body.decode("utf-8"))
@@ -1848,7 +1853,7 @@ class DashboardScaleFixtureTests(unittest.TestCase):
             projected["execution_authorization"]["draft"]["authorization_id"],
             "authorization-draft",
         )
-        review = projected["exploratory_live_review"]
+        review = projected["operator_controls"]["exploratory_live_review"]
         self.assertEqual(review["status"], "BLOCKED")
         self.assertEqual(review["scope"]["draft"]["draft_id"], "scope-draft")
         self.assertEqual(review["scope"]["draft"]["draft_hash"], "scope-draft-hash")
