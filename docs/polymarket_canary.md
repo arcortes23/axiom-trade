@@ -289,6 +289,26 @@ under the status `economic_policy.rolling_policy` projection. A zero global
 rolling-policy budget or disabled experimental policy does not widen, replace,
 or reinterpret the unchanged financial caps above; the dashboard also exposes
 those caps under `economic_policy.financial_caps`.
+Fee sizing remains the unchanged `$1.00` all-in BUY policy with a `$0.01` fee
+reserve. For a fixed-share limit BUY, the executable bound spans the
+tick-to-legal-limit price range, including any improvement; conservative
+five-decimal rounding and fragment bounds are implementation details, not a
+separate approved limit. At quantity `q=5`, price `p=0.002`, fee rate `r=0.04`,
+and reserve `e=1`, the raw fee term is `q*p*r*e = 0.00039920`, the bounded
+fee is `0.00080`, and the displayed total is `0.01080`; five shares at
+`0.999` cost `4.995` before fees. See the official [fee
+documentation](https://docs.polymarket.com/developers/CLOB/fees),
+[place-order documentation](https://docs.polymarket.com/developers/CLOB/orders/create-order),
+and [builder-fee documentation](https://docs.polymarket.com/developers/builders/builder-fees).
+
+`execution_authorization.review` requires an explicit purpose, a finite
+lifetime budget, a UTC expiry, and nonempty stop-rule choices. It persists the
+exact proposed selection, policy/setup binding, allocation, and selected
+market/token bindings as an unactivated `DRAFT`; it does not require an
+active authorization and does not approve or submit an order. The existing
+`exploratory.live.review_confirm` action remains the only continuation after
+genuine readiness and explicit confirmation.
+
 
 Each authorization requires a finite lifetime budget, explicit stop rules, and
 an expiry. Missing, stale, expired, or mismatched lifetime, settings

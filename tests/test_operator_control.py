@@ -2549,6 +2549,7 @@ class OperatorControlTests(unittest.TestCase):
             "exact_strategy_versions": ["accepted-strategy"],
             "lifetime_budget": "1.00",
             "stop_rules": {"max_submissions": 1},
+            "expires_at": "2026-01-03T12:00:00+00:00",
         }
         with patch.object(self.control, "_authorization_context", return_value=base_context), patch.object(
             self.store,
@@ -2642,6 +2643,135 @@ class OperatorControlTests(unittest.TestCase):
         ):
             acknowledged = self.control.review_execution_authorization(rejected_values)
         self.assertTrue(acknowledged["draft"]["adverse_evidence_ack_required"])
+    def test_execution_authorization_requires_explicit_expiry_and_stop_rules(self) -> None:
+        context = {
+            "now": datetime(2026, 1, 2, 12, tzinfo=timezone.utc),
+            "selection_id": "selection-auth-review",
+            "selection_hash": "selection-hash",
+            "strategy_versions": ["accepted-strategy"],
+            "rejected_strategy_versions": [],
+            "selection_policy_hash": "policy-hash",
+            "scope_hash": "scope-hash",
+            "scope_version": "scope-v1",
+            "active_settings_hash": "settings-hash",
+            "active_settings_generation": 4,
+        }
+        values = {
+            "purpose": "review accepted strategy",
+            "exact_strategy_versions": ["accepted-strategy"],
+            "lifetime_budget": "1.00",
+        }
+        with patch.object(self.control, "_authorization_context", return_value=context), patch.object(
+            self.store, "register_execution_authorization_draft"
+        ) as register:
+            with self.assertRaisesRegex(
+                OperatorControlError,
+                "^EXECUTION_AUTHORIZATION_EXPIRES_AT_REQUIRED$",
+            ):
+                self.control.review_execution_authorization(values)
+        register.assert_not_called()
+
+        values["expires_at"] = "2026-01-03T12:00:00+00:00"
+        with patch.object(self.control, "_authorization_context", return_value=context), patch.object(
+            self.store, "register_execution_authorization_draft"
+        ) as register:
+            with self.assertRaisesRegex(
+                OperatorControlError,
+                "^EXECUTION_AUTHORIZATION_STOP_RULES_REQUIRED$",
+            ):
+                self.control.review_execution_authorization(values)
+        register.assert_not_called()
+
+    def test_exploratory_live_review_snapshot_explains_missing_proposal_members(self) -> None:
+        context = {
+            "selection_id": "selection-observe",
+            "selection_hash": "selection-hash",
+            "selection": {
+                "status": "OBSERVE",
+                "k": 0,
+                "global_budget": "0",
+                "members": [],
+                "reasons": ["NO_ELIGIBLE_PROPOSED_MEMBERS"],
+                "operating_policy": {"mode": "EXPLORATORY_LIVE"},
+            },
+            "policy_id": "policy-live",
+            "policy_version": "policy-v1",
+            "policy_hash": "policy-hash",
+            "scope": {},
+            "scope_draft": {},
+            "draft_scope": {},
+            "setup_bindings": [],
+            "draft_member_bindings": [],
+            "active_settings_hash": "settings-hash",
+            "active_settings_generation": 1,
+            "selection_actionable_reasons": {"NO_ELIGIBLE_PROPOSED_MEMBERS": "Run paper evaluation"},
+        }
+        limits = {
+            "max_all_in_buy_usd": "1.00",
+            "max_fee_reserve_usd": "0.01",
+            "max_gross_daily_buy_usd": "5.00",
+            "max_aggregate_open_cost_usd": "5.00",
+            "max_aggregate_exposure_usd": "5.00",
+            "max_positions": 3,
+            "max_submitted_orders_per_day": 5,
+            "realized_loss_entry_stop_usd": "2.00",
+            "equity_loss_entry_stop_usd": "2.00",
+            "max_slippage_bps": 100,
+        }
+        with patch.object(self.control, "_prepare_reviewed_proposed_selection"), patch.object(
+            self.control, "_authorization_context", return_value=context
+        ), patch.object(self.control, "_rolling_effective_limits", return_value=limits), patch.object(
+            self.control,
+            "_selected_market_readiness",
+            return_value={"status": "BLOCKED", "blockers": ["MARKET_SELECTION_REQUIRED"]},
+        ), patch.object(
+            self.control,
+            "execution_authorization_snapshot",
+            return_value={"authorization": {"status": "DRAFT"}},
+        ), patch.object(
+            self.control,
+            "risk_settings_snapshot",
+            return_value={"usage": {}},
+        ):
+            snapshot = self.control.exploratory_live_review_snapshot()
+        self.assertEqual(snapshot["proposal_status"], "NONE")
+        self.assertEqual(
+            snapshot["no_member_reason"]["code"],
+            "EXPLORATORY_LIVE_NO_ELIGIBLE_PROPOSED_MEMBERS",
+        )
+        self.assertEqual(snapshot["no_member_reason"]["k"], 0)
+        self.assertEqual(snapshot["allocation"]["proposed_members"], 0)
+        self.assertIn("EXPLORATORY_LIVE_PURPOSE_REQUIRED", snapshot["blockers"])
+    def test_real_snapshot_requires_proposal_risk_metadata(self) -> None:
+        self._seed_proposed_selection()
+        selection = self.store.load_current_portfolio_selection()
+        self.assertIsNotNone(selection)
+        assert selection is not None
+        successor = dict(selection)
+        successor.pop("proposed_allocation_total", None)
+        successor.pop("proposed_allocation_risk_snapshot", None)
+        successor.pop("proposed_allocation_risk_digest", None)
+        successor.pop("allocation_activation", None)
+        successor.pop("supersedes_portfolio_selection_id", None)
+        successor.pop("selection_hash", None)
+        successor.update(
+            {
+                "selection_id": "selection-risk-omission",
+                "portfolio_selection_id": "selection-risk-omission",
+            }
+        )
+        self.store.commit_portfolio_selection(successor, successor["members"])
+        snapshot = self.control.exploratory_live_review_snapshot()
+        self.assertIn(
+            "EXPLORATORY_LIVE_PROPOSED_ALLOCATION_TOTAL_REQUIRED",
+            snapshot["blockers"],
+        )
+        self.assertIn(
+            "EXPLORATORY_LIVE_PROPOSED_ALLOCATION_RISK_DIGEST_REQUIRED",
+            snapshot["blockers"],
+        )
+
+
 
     def test_dashboard_authorization_actions_forward_server_id_and_generation(self) -> None:
         assert self.server._server is not None
@@ -2936,6 +3066,7 @@ class OperatorControlTests(unittest.TestCase):
             "authorization_id": "auth-live",
             "generation": 1,
             "status": "DRAFT",
+            "purpose": "test exploratory review",
             "exact_strategy_versions": ["strategy-live"],
             "lifetime_budget": "1.00",
             "expires_at": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
@@ -3098,6 +3229,44 @@ class OperatorControlTests(unittest.TestCase):
         evidence["execution_feasibility"] = "True"
         evidence["evidence_digest"] = RollingEvidence.from_mapping(evidence).evidence_digest
         self.store.save_strategy_evidence_window(evidence)
+        CanaryService(
+            self.store,
+            credentials=_configured_credentials(),
+            initialize=True,
+        )
+        risk_settings = self.control.risk_settings_snapshot()
+        selection.update(
+            {
+                "risk_config_id": risk_settings.get(
+                    "risk_config_id", risk_settings.get("config_id")
+                ),
+                "active_risk_config_id": risk_settings.get(
+                    "risk_config_id", risk_settings.get("config_id")
+                ),
+                "risk_config_generation": risk_settings.get(
+                    "risk_config_generation", risk_settings.get("generation")
+                ),
+                "active_risk_config_generation": risk_settings.get(
+                    "risk_config_generation", risk_settings.get("generation")
+                ),
+                "risk_config_hash": risk_settings.get(
+                    "risk_config_hash", risk_settings.get("config_hash")
+                ),
+                "active_risk_config_hash": risk_settings.get(
+                    "risk_config_hash", risk_settings.get("config_hash")
+                ),
+            }
+        )
+        risk_snapshot = self.control._fresh_proposed_risk_capacity(selection)
+        selection.update(
+            {
+                "proposed_allocation_total": member["proposed_allocation"],
+                "proposed_allocation_risk_snapshot": risk_snapshot,
+                "proposed_allocation_risk_digest": self.control._rolling_canonical_hash(
+                    risk_snapshot
+                ),
+            }
+        )
         self.store.commit_portfolio_selection(selection, [member])
         context = {
             "selection_id": "selection-proposed",
@@ -3108,6 +3277,257 @@ class OperatorControlTests(unittest.TestCase):
             "active_settings_generation": 1,
         }
         return context, member
+
+
+
+    def test_real_store_review_snapshot_shows_unactivated_proposal_without_auth(self) -> None:
+        self._seed_proposed_selection()
+        snapshot = self.control.exploratory_live_review_snapshot()
+        self.assertEqual(snapshot["proposal_status"], "UNACTIVATED")
+        self.assertEqual(snapshot["authorization_choices"]["status"], "UNREVIEWED")
+        self.assertEqual(snapshot["proposal"]["status"], "UNACTIVATED")
+        self.assertEqual(snapshot["members"][0]["allocation"], "1.00")
+        self.assertEqual(snapshot["members"][0]["proposed_allocation"], "1.00")
+        self.assertFalse(snapshot["members"][0]["allocation_active"])
+        self.assertIsNotNone(snapshot["proposal"]["proposed_allocation_total"])
+        self.assertIsNotNone(snapshot["proposal"]["proposed_allocation_risk_digest"])
+        self.assertNotIn(
+            "EXPLORATORY_LIVE_PROPOSED_ALLOCATION_TOTAL_REQUIRED",
+            snapshot["blockers"],
+        )
+        self.assertNotIn(
+            "EXPLORATORY_LIVE_PROPOSED_ALLOCATION_RISK_DIGEST_REQUIRED",
+            snapshot["blockers"],
+        )
+        self.assertNotIn("EXPLORATORY_LIVE_RISK_BINDING_STALE", snapshot["blockers"])
+        self.assertIsNone(
+            self.store.load_active_execution_authorization(
+                mode="EXPLORATORY_MICRO_CANARY",
+                now=datetime.now(timezone.utc),
+            )
+        )
+    def test_real_http_draft_review_preserves_public_market_bindings(self) -> None:
+        self._seed_proposed_selection()
+        assert self.server._server is not None
+        status, result = self._post(
+            {
+                "action": "execution_authorization.review",
+                "target": "",
+                "confirm": "REVIEW EXPLORATORY AUTHORIZATION",
+                "payload": {
+                    "values": {
+                        "purpose": "HTTP DRAFT binding review",
+                        "lifetime_budget": "1.00",
+                        "expires_at": (
+                            datetime.now(timezone.utc) + timedelta(days=1)
+                        ).isoformat(),
+                        "stop_rules": {"on_any_blocker": "STOP"},
+                    }
+                },
+            },
+            token=self.server._server.control_token,
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            result["result"]["execution_authorization"]["status"],
+            "DRAFT",
+        )
+        assert self.server.url is not None
+        with urlopen(self.server.url + "/api/operator", timeout=3) as response:
+            payload = json.loads(response.read())
+        review = payload["control_status"]["exploratory_live_review"]
+        bindings = review["authorization_bindings"]
+        expected_market = {
+            "market_id": "MARKET-1",
+            "condition_id": "MARKET-1-CONDITION",
+            "yes_token_id": "MARKET-1-YES",
+            "no_token_id": "MARKET-1-NO",
+        }
+        public_member = bindings["draft_member_bindings"][0]
+        self.assertEqual(public_member["market_bindings"][0], expected_market)
+        public_setup = bindings["setup_bindings"][0]
+        self.assertEqual(public_setup["market_bindings"][0], expected_market)
+        persisted_draft = review["authorization"]["draft"]
+        self.assertEqual(persisted_draft["status"], "DRAFT")
+        self.assertEqual(
+            persisted_draft["draft_member_bindings"][0]["market_bindings"][0],
+            expected_market,
+        )
+
+
+    def test_real_store_selection_reason_drives_no_member_root(self) -> None:
+        self._seed_proposed_selection()
+        prepared = self.control._prepare_reviewed_proposed_selection()
+        self.assertIsNotNone(prepared)
+        assert prepared is not None
+        selection = dict(prepared)
+        selection.pop("allocation_activation", None)
+        selection.pop("supersedes_portfolio_selection_id", None)
+        selection.pop("selection_hash", None)
+        selection.update(
+            {
+                "selection_id": "selection-no-member-root",
+                "portfolio_selection_id": "selection-no-member-root",
+                "status": "PAPER",
+                "k": 0,
+                "global_budget": "0",
+                "members": [],
+                "selected_members": [],
+                "reasons": ["NO_ELIGIBLE_PROPOSED_MEMBERS"],
+                "actionable_reasons": {
+                    "NO_ELIGIBLE_PROPOSED_MEMBERS": "Run paper evaluation first"
+                },
+            }
+        )
+        self.store.commit_portfolio_selection(selection, [])
+        snapshot = self.control.exploratory_live_review_snapshot()
+        reason = snapshot["no_member_reason"]
+        self.assertEqual(
+            reason["code"],
+            "EXPLORATORY_LIVE_NO_ELIGIBLE_PROPOSED_MEMBERS",
+        )
+        self.assertEqual(reason["k"], 0)
+        self.assertEqual(reason["global_budget"], "0")
+        self.assertEqual(
+            reason["selection_reasons"],
+            ["NO_ELIGIBLE_PROPOSED_MEMBERS"],
+        )
+        self.assertEqual(
+            reason["actionable_reasons"]["NO_ELIGIBLE_PROPOSED_MEMBERS"],
+            "Run paper evaluation first",
+        )
+        self.assertEqual(snapshot["proposal_status"], "NONE")
+
+    def test_real_store_review_persists_draft_without_activation(self) -> None:
+        self._seed_proposed_selection()
+        reviewed = self.control.review_execution_authorization(
+            {
+                "purpose": "isolated transition review",
+                "lifetime_budget": "1.00",
+                "expires_at": (datetime.now(timezone.utc) + timedelta(days=1)).isoformat(),
+                "stop_rules": {
+                    "on_any_blocker": "STOP",
+                    "halt_on_unknown_execution": True,
+                },
+            },
+            actor="transition-test",
+        )
+        self.assertEqual(reviewed["status"], "DRAFT")
+        self.assertEqual(reviewed["draft"]["status"], "DRAFT")
+        self.assertEqual(reviewed["draft"]["purpose"], "isolated transition review")
+        self.assertIsNone(
+            self.store.load_active_execution_authorization(
+                mode="EXPLORATORY_MICRO_CANARY",
+                now=datetime.now(timezone.utc),
+            )
+        )
+        persisted_selection = self.store.load_current_portfolio_selection()
+        self.assertIsNotNone(persisted_selection)
+        assert persisted_selection is not None
+        self.assertEqual(persisted_selection["members"][0]["allocation"], "1.00")
+        self.assertEqual(persisted_selection["members"][0]["proposed_allocation"], "1.00")
+        self.assertFalse(persisted_selection["members"][0]["allocation_active"])
+    def test_real_store_review_confirm_exact_then_stale_binding_stays_safe(self) -> None:
+        self._seed_proposed_selection()
+        reviewed = self.control.review_execution_authorization(
+            {
+                "purpose": "same-fixture final review",
+                "lifetime_budget": "1.00",
+                "expires_at": (datetime.now(timezone.utc) + timedelta(days=1)).isoformat(),
+                "stop_rules": {"on_any_blocker": "STOP"},
+            },
+            actor="transition-test",
+        )
+        draft = reviewed["draft"]
+        disclosure = self.control.exploratory_live_review_snapshot()
+        self.assertEqual(disclosure["proposal_status"], "UNACTIVATED")
+        self.assertEqual(
+            disclosure["authorization_bindings"]["selection_id"],
+            draft["selection_id"],
+        )
+        self.assertEqual(
+            disclosure["authorization_bindings"]["selection_hash"],
+            draft["selection_hash"],
+        )
+        with self.assertRaisesRegex(
+            OperatorControlError,
+            "^CONNECTIVITY_NOT_READY$",
+        ):
+            self.control.confirm_exploratory_live(
+                {"confirmation": "CONFIRM EXPLORATORY LIVE"}
+            )
+        self.assertEqual(
+            self.store.get_operator_config("execution_authorization_review", {})["status"],
+            "DRAFT",
+        )
+        self.assertIsNone(
+            self.store.load_active_execution_authorization(
+                mode="EXPLORATORY_MICRO_CANARY",
+                now=datetime.now(timezone.utc),
+            )
+        )
+
+        stale = self.store.load_current_portfolio_selection()
+        self.assertIsNotNone(stale)
+        assert stale is not None
+        stale = dict(stale)
+        stale.update(
+            {
+                "selection_id": "selection-stale-after-review",
+                "portfolio_selection_id": "selection-stale-after-review",
+            }
+        )
+        self.store.commit_portfolio_selection(stale, stale["members"])
+        with patch.object(
+            self.control,
+            "_selected_market_readiness",
+            return_value={"status": "READY", "blockers": []},
+        ):
+            with self.assertRaisesRegex(
+                OperatorControlError,
+                "^EXPLORATORY_LIVE_AUTHORIZATION_BINDING_STALE$",
+            ):
+                self.control.confirm_exploratory_live(
+                    {"confirmation": "CONFIRM EXPLORATORY LIVE"}
+                )
+        self.assertEqual(
+            self.store.get_operator_config("execution_authorization_review", {})["status"],
+            "DRAFT",
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM canary_ledger WHERE status IN ('SUBMITTING','SUBMITTED')"
+            ).fetchone()[0],
+            0,
+        )
+
+
+    def test_real_store_confirm_without_auth_does_not_arm_or_submit(self) -> None:
+        self._seed_proposed_selection()
+        CanaryService(
+            self.store,
+            credentials=_configured_credentials(),
+            initialize=True,
+        )
+        with self.assertRaisesRegex(
+            OperatorControlError,
+            "^EXPLORATORY_LIVE_AUTHORIZATION_REQUIRED$",
+        ):
+            self.control.confirm_exploratory_live(
+                {"confirmation": "CONFIRM EXPLORATORY LIVE"}
+            )
+        control_row = self.store.connection.execute(
+            "SELECT state FROM canary_control WHERE singleton=1"
+        ).fetchone()
+        if control_row is not None:
+            self.assertNotEqual(str(control_row["state"]).upper(), "ARMED")
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM canary_ledger WHERE status IN ('SUBMITTING','SUBMITTED')"
+            ).fetchone()[0],
+            0,
+        )
 
     def test_proposed_allocation_is_paper_before_confirm_and_active_after_restart(self) -> None:
         context, _ = self._seed_proposed_selection()
@@ -4248,7 +4668,7 @@ class OperatorControlTests(unittest.TestCase):
         controls = payload.get("operator_controls")
         self.assertIsInstance(controls, dict)
         review = controls["exploratory_live_review"]
-        self.assertEqual(review["status"], "BLOCKED")
+        self.assertEqual(review["proposal_status"], "NONE")
         self.assertEqual(
             review["scope"]["draft"]["draft_id"],
             "rolling-exploratory-scope-draft:polymarket:standard:v1",

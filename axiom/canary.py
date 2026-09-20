@@ -1310,6 +1310,84 @@ def _best_ask_price(asks: Any) -> Decimal:
         prices.append(price)
     return min(prices)
 
+_CANARY_FEE_QUANTUM_USD = Decimal("0.00001")
+_CANARY_BUILDER_FEE_FIELDS = (
+    "builder_fee_rate",
+    "builder_fee_bps",
+    "builder_taker_fee_rate",
+    "builder_taker_fee_bps",
+)
+_CANARY_EXTRA_FEE_FIELDS = (
+    "extra_fee_rate",
+    "extra_fee_bps",
+    "additional_fee_rate",
+    "additional_fee_bps",
+)
+
+
+def _canary_decimal_field(
+    context: Mapping[str, Any],
+    name: str,
+    *,
+    scale: Decimal = Decimal("1"),
+) -> Decimal:
+    raw = context[name]
+    if isinstance(raw, bool):
+        raise ValueError(f"{name} must be decimal")
+    value = Decimal(str(raw)) * scale
+    if not value.is_finite() or value < 0:
+        raise ValueError(f"{name} must be finite and non-negative")
+    return value
+
+
+def _canary_fee_bound(
+    *,
+    quantity: Decimal,
+    max_price: Decimal,
+    tick_size: Decimal,
+    fee_rate: Decimal,
+    fee_exponent: Decimal,
+) -> tuple[Decimal, Decimal]:
+    """Bound rounded platform fees for the exact signed BUY order.
+
+    A limit BUY can fill at any legal price at or below its limit, including
+    price improvement.  The official fee contract says fees are denominated in
+    USDC and rounded to five decimal places, with a sub-minimum result charging
+    zero; it does not pin a rounding direction or implementation.  For every
+    fragment that can charge a fee, the five-decimal rounding overhead is at
+    most that fragment's raw fee under nearest, floor, or ceiling rounding
+    consistent with the sub-minimum-zero guarantee.  Therefore the sum of all
+    rounded fragments is at most twice the sum of unrounded fees, independent
+    of fill fragmentation; the final ceiling reserves a denomination quantum.
+    """
+    legal_min = tick_size
+    legal_max = Decimal("1") - tick_size
+    if max_price < legal_min or max_price > legal_max:
+        raise ValueError("max_price is outside the legal price range")
+    if fee_rate == 0:
+        return Decimal("0"), Decimal("0")
+    if fee_exponent == 0:
+        curve = Decimal("1")
+    else:
+        curve_price = max_price if max_price <= Decimal("0.5") else Decimal("0.5")
+        curve = (curve_price * (Decimal("1") - curve_price)) ** fee_exponent
+    max_unit_fee = fee_rate * curve
+    if not max_unit_fee.is_finite() or max_unit_fee < 0:
+        raise ValueError("fee bound is invalid")
+    raw_total = quantity * max_unit_fee
+    if not raw_total.is_finite() or raw_total < 0:
+        raise ValueError("fee total is invalid")
+    if raw_total == 0:
+        return Decimal("0"), max_unit_fee
+    rounded_bound = (
+        (raw_total * Decimal("2") / _CANARY_FEE_QUANTUM_USD).to_integral_value(
+            rounding=ROUND_UP
+        )
+        * _CANARY_FEE_QUANTUM_USD
+    )
+    return rounded_bound, max_unit_fee
+
+
 def _canary_buy_order_parameters(
     context: Mapping[str, Any],
     *,
@@ -1317,22 +1395,76 @@ def _canary_buy_order_parameters(
     expected_price: Any,
     max_slippage_bps: Any,
 ) -> dict[str, Any]:
-    """Apply the canonical Polymarket BUY rules and selected-token depth."""
+    """Apply canonical BUY rules to the exact limit-order consumer.
+
+    The order sink submits ``size`` as shares (not a cash amount), and the
+    pinned SDK signs that quantity in six-decimal base units.  Only the
+    platform fee is applicable because this canary omits ``builder_code``.
+    """
     try:
         rules = parse_polymarket_rules(context)
         target = Decimal(str(target_notional))
         expected = Decimal(str(expected_price))
         slippage_bps = Decimal(str(max_slippage_bps))
         best = _best_ask_price(context.get("asks") or [])
-        fee_rate = Decimal(
-            str(
-                context.get(
-                    "fee_rate",
-                    Decimal(str(context.get("fee_bps", 0))) / Decimal("10000"),
+
+        rate_values: list[Decimal] = []
+        if "fee_rate" in context:
+            rate_values.append(_canary_decimal_field(context, "fee_rate"))
+        if "fee_bps" in context:
+            rate_values.append(
+                _canary_decimal_field(
+                    context,
+                    "fee_bps",
+                    scale=Decimal("0.0001"),
                 )
             )
+        if "platform_fee_rate" in context:
+            rate_values.append(
+                _canary_decimal_field(context, "platform_fee_rate")
+            )
+        if "platform_fee_bps" in context:
+            rate_values.append(
+                _canary_decimal_field(
+                    context,
+                    "platform_fee_bps",
+                    scale=Decimal("0.0001"),
+                )
+            )
+        if rate_values and any(value != rate_values[0] for value in rate_values[1:]):
+            raise ValueError("platform fee aliases disagree")
+        fee_rate = rate_values[0] if rate_values else Decimal("0")
+
+        exponent_values: list[Decimal] = []
+        for name in ("fee_exponent", "platform_fee_exponent"):
+            if name in context:
+                exponent_values.append(_canary_decimal_field(context, name))
+        if exponent_values and any(
+            value != exponent_values[0] for value in exponent_values[1:]
+        ):
+            raise ValueError("platform fee exponent aliases disagree")
+        # The pinned SDK's absent ``fd`` object means (rate=0, exponent=0);
+        # legacy fee_bps-only test/adapter contexts retain exponent one.
+        fee_exponent = (
+            exponent_values[0]
+            if exponent_values
+            else (Decimal("1") if rate_values else Decimal("0"))
         )
-        fee_exponent = Decimal(str(context.get("fee_exponent", 1)))
+        for name in _CANARY_BUILDER_FEE_FIELDS + _CANARY_EXTRA_FEE_FIELDS:
+            if name in context and _canary_decimal_field(
+                context,
+                name,
+                scale=(
+                    Decimal("0.0001")
+                    if name.endswith("_bps")
+                    else Decimal("1")
+                ),
+            ) != 0:
+                raise ValueError(
+                    "nonzero builder/additional fee is unsupported by this order"
+                )
+        if "builder_code" in context and str(context["builder_code"] or "").strip():
+            raise ValueError("builder attribution is unsupported by this order")
     except (PolymarketRuleError, TypeError, ValueError, ArithmeticError) as exc:
         raise CanaryBlocked("CANARY_MARKET_RULES_UNAVAILABLE") from exc
     if (
@@ -1340,6 +1472,7 @@ def _canary_buy_order_parameters(
         or target <= 0
         or not expected.is_finite()
         or expected <= 0
+        or expected >= Decimal("1")
         or not slippage_bps.is_finite()
         or slippage_bps < 0
         or not best.is_finite()
@@ -1350,67 +1483,80 @@ def _canary_buy_order_parameters(
         or fee_exponent < 0
     ):
         raise CanaryBlocked("INVALID_CANARY_PARAMETERS")
-    max_price = (
-        expected * (Decimal("1") + slippage_bps / Decimal("10000"))
-    )
-    max_price = (
-        max_price / rules.tick_size
-    ).to_integral_value(rounding=ROUND_DOWN) * rules.tick_size
-    if (
-        not max_price.is_finite()
-        or max_price < rules.tick_size
-        or max_price > Decimal("1") - rules.tick_size
-    ):
-        raise CanaryBlocked("INVALID_CANARY_PARAMETERS")
-    if best > max_price:
-        raise CanaryBlocked("SLIPPAGE_LIMIT")
+    try:
+        max_price = (
+            expected * (Decimal("1") + slippage_bps / Decimal("10000"))
+        )
+        max_price = (
+            max_price / rules.tick_size
+        ).to_integral_value(rounding=ROUND_DOWN) * rules.tick_size
+        # Intersect the adverse limit with the SDK's legal tick-aligned range;
+        # never manufacture a price above the caller's adverse limit.
+        max_price = min(max_price, Decimal("1") - rules.tick_size)
+        if (
+            not max_price.is_finite()
+            or max_price < rules.tick_size
+            or max_price > Decimal("1") - rules.tick_size
+        ):
+            raise CanaryBlocked("INVALID_CANARY_PARAMETERS")
+        if best > max_price:
+            raise CanaryBlocked("SLIPPAGE_LIMIT")
 
-    # Polymarket's documented quantity precision is exactly two decimals.
-    # The canary submits the venue minimum, ceiled to cents; legacy sizing
-    # fields cannot increase this bounded exploratory order.
-    cent = Decimal("0.01")
-    minimum_quantity = (
-        rules.min_order_size / cent
-    ).to_integral_value(rounding=ROUND_UP) * cent
-    curve = max_price * (Decimal("1") - max_price)
-    unit_fee = max(
-        fee_rate * (curve ** fee_exponent),
-        fee_rate * (Decimal("0.25") ** fee_exponent),
-    )
-    if not unit_fee.is_finite() or unit_fee < 0:
-        raise CanaryBlocked("INVALID_CANARY_PARAMETERS")
-    if (
-        minimum_quantity <= 0
-        or minimum_quantity * (max_price + unit_fee) > target
-    ):
-        raise CanaryBlocked("VENUE_MINIMUM_EXCEEDS_CANARY_TARGET")
-    quantity = minimum_quantity
-
-    assessment = assess_selected_token_depth(
-        context,
-        rules,
-        side="BUY",
-        quantity=quantity,
-        max_price=max_price,
-        cap_usd=target,
-        venue_fee_rate=fee_rate,
-    )
-    if not assessment.suitable:
-        reason = str(assessment.reason or "").upper()
-        if reason == "INSUFFICIENT_DEPTH":
-            raise CanaryBlocked("CANARY_INSUFFICIENT_DEPTH")
-        if reason == "CAP_EXCEEDED":
+        cent = Decimal("0.01")
+        minimum_quantity = (
+            rules.min_order_size / cent
+        ).to_integral_value(rounding=ROUND_UP) * cent
+        estimated_fees, max_unit_fee = _canary_fee_bound(
+            quantity=minimum_quantity,
+            max_price=max_price,
+            tick_size=rules.tick_size,
+            fee_rate=fee_rate,
+            fee_exponent=fee_exponent,
+        )
+        if (
+            minimum_quantity <= 0
+            or minimum_quantity * max_price + estimated_fees > target
+        ):
             raise CanaryBlocked("VENUE_MINIMUM_EXCEEDS_CANARY_TARGET")
-        if reason in {"MALFORMED_BOOK", "NO_DEPTH", "QUANTITY_PRECISION", "MIN_ORDER_SIZE"}:
-            raise CanaryBlocked("CANARY_MARKET_RULES_INVALID")
-        raise CanaryBlocked("CANARY_MARKET_RULES_UNAVAILABLE")
-    estimated_fees = quantity * unit_fee
-    notional = quantity * max_price
-    if (
-        notional + estimated_fees > target
-        or not estimated_fees.is_finite()
-    ):
-        raise CanaryBlocked("VENUE_MINIMUM_EXCEEDS_CANARY_TARGET")
+        quantity = minimum_quantity
+
+        # The depth model's percentage fee is not the SDK's exponent fee.
+        # Carry the authoritative conservative bound as its documented caller
+        # reserve instead of fabricating a price-dependent percentage.
+        assessment = assess_selected_token_depth(
+            context,
+            rules,
+            side="BUY",
+            quantity=quantity,
+            max_price=max_price,
+            cap_usd=target,
+            venue_fee_rate=Decimal("0"),
+            fee_reserve=estimated_fees,
+        )
+        if not assessment.suitable:
+            reason = str(assessment.reason or "").upper()
+            if reason == "INSUFFICIENT_DEPTH":
+                raise CanaryBlocked("CANARY_INSUFFICIENT_DEPTH")
+            if reason == "CAP_EXCEEDED":
+                raise CanaryBlocked("VENUE_MINIMUM_EXCEEDS_CANARY_TARGET")
+            if reason in {
+                "MALFORMED_BOOK",
+                "NO_DEPTH",
+                "QUANTITY_PRECISION",
+                "MIN_ORDER_SIZE",
+            }:
+                raise CanaryBlocked("CANARY_MARKET_RULES_INVALID")
+            raise CanaryBlocked("CANARY_MARKET_RULES_UNAVAILABLE")
+        notional = quantity * max_price
+        if (
+            notional + estimated_fees > target
+            or not estimated_fees.is_finite()
+        ):
+            raise CanaryBlocked("VENUE_MINIMUM_EXCEEDS_CANARY_TARGET")
+    except CanaryBlocked:
+        raise
+    except (TypeError, ValueError, ArithmeticError) as exc:
+        raise CanaryBlocked("INVALID_CANARY_PARAMETERS") from exc
     return {
         "rules": rules,
         "best": best,
@@ -1420,6 +1566,7 @@ def _canary_buy_order_parameters(
         "fee_rate": fee_rate,
         "fee_exponent": fee_exponent,
         "estimated_fees": estimated_fees,
+        "fee_unit_bound": max_unit_fee,
         "depth": assessment,
     }
 
@@ -13305,15 +13452,8 @@ class CanaryService:
                             diagnostics["book"]["depth_assessment"] = parameters[
                                 "depth"
                             ].to_dict()
-                            fee_rate = parameters["fee_rate"]
-                            fee_exponent = parameters["fee_exponent"]
                             if diagnostics["balance"].get("status") == "OK":
-                                conservative_fee = (
-                                    target
-                                    * fee_rate
-                                    * (Decimal("0.25") ** fee_exponent)
-                                )
-                                if available < target + conservative_fee:
+                                if available < target + parameters["estimated_fees"]:
                                     failures.append("INSUFFICIENT_BALANCE")
                         except CanaryBlocked as exc:
                             failures.append(str(exc))

@@ -5629,6 +5629,7 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
                 accepted_selection["members"],
             )
             operator = OperatorControlPlane(store, settings_service=settings)
+            future_expiry = (datetime.now(UTC) + timedelta(days=1)).isoformat()
 
             reviewed = operator.review_execution_authorization(
                 {
@@ -5636,6 +5637,7 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
                     "exact_strategy_versions": ["accepted-strategy"],
                     "lifetime_budget": "1.00",
                     "stop_rules": {"on_any_blocker": "STOP"},
+                    "expires_at": future_expiry,
                 },
                 actor="reviewer",
             )
@@ -5686,6 +5688,7 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
                         "exact_strategy_versions": ["rejected-strategy"],
                         "lifetime_budget": "1.00",
                         "stop_rules": {"on_any_blocker": "STOP"},
+                        "expires_at": future_expiry,
                     },
                     actor="reviewer",
                 )
@@ -5703,6 +5706,7 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
                     "lifetime_budget": "1.00",
                     "adverse_evidence_ack": True,
                     "stop_rules": {"on_any_blocker": "STOP"},
+                    "expires_at": future_expiry,
                 },
                 actor="reviewer",
             )
