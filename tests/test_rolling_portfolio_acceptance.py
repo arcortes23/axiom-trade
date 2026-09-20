@@ -4398,6 +4398,97 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
             assert lot is not None
             self.assertEqual(lot["status"], "EXIT_PENDING")
 
+    def test_persisted_completed_job_keeps_current_trace_after_refresh_pressure(self) -> None:
+        with self._store("rolling-trace-pressure.sqlite3") as store:
+            store.save_admission_policy(_policy("policy-trace-pressure").as_dict())
+            processor = AutonomousResearchProcessor(store, clock=lambda: NOW)
+            scope_trace = {
+                "status": "NO_SUITABLE_MATERIALIZED_INSTANCE",
+                "reason": "NO_SUITABLE_MATERIALIZED_INSTANCE",
+                "validation_status": "VALID",
+                "present": True,
+                "draft_id": "rolling-exploratory-scope-draft:polymarket:standard:v1",
+                "draft_hash": "sha256:" + ("d" * 64),
+                "scope_hash": "sha256:" + ("s" * 64),
+                "scope_version": "v1",
+                "paper_only": True,
+                "live_execution": False,
+                "allocation_active": False,
+                "canary_armed": False,
+                "strategy_spec_count": 2,
+                "supported_strategy_definition_count": 1,
+                "valid_strategy_definition_count": 1,
+                "invalid_strategy_count": 1,
+                "invalid_strategy_reasons": ["INVALID_STRATEGY_DEFINITIONS"],
+                "materialized_member_count": 0,
+                "materialized_market_count": 0,
+                "materialized_market_ids": [],
+                "discovery": {
+                    "status": "OK",
+                    "cycle": {
+                        "scope_hash": "sha256:" + ("s" * 64),
+                        "scope_version": "v1",
+                        "discovery_coverage_status": "COMPLETE",
+                        "discovery_complete": True,
+                        "deferred_market_ids": ["market-deferred"],
+                    },
+                },
+                "filler": "x" * 20_000,
+            }
+            with patch.object(
+                processor,
+                "_rolling_scope_draft_documents",
+                return_value=((), scope_trace),
+            ), patch.object(
+                processor,
+                "_enqueue_predeclared_from_persisted_scope",
+                return_value=(),
+            ):
+                refreshed = processor.refresh_rolling_evidence(
+                    now=NOW,
+                    skip_observation_setup_migration=True,
+                )
+            self.assertEqual(refreshed["scope_draft_trace"]["reason"], scope_trace["reason"])
+            record = store.get_operator_job("rolling-research-evidence")
+            self.assertIsNotNone(record)
+            assert record is not None
+            store.set_operator_job(
+                "rolling-research-evidence",
+                "COMPLETED",
+                record["payload"],
+                resumable=False,
+                timestamp=NOW,
+            )
+            completed = store.get_operator_job("rolling-research-evidence")
+            self.assertIsNotNone(completed)
+            assert completed is not None
+            payload = completed["payload"]
+            encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+            self.assertLess(len(encoded), 16_384)
+            self.assertEqual(completed["status"], "COMPLETED")
+            persisted_scope = payload["scope_draft_trace"]
+            self.assertEqual(persisted_scope["draft_id"], scope_trace["draft_id"])
+            self.assertEqual(persisted_scope["draft_hash"], scope_trace["draft_hash"])
+            self.assertEqual(persisted_scope["scope_hash"], scope_trace["scope_hash"])
+            self.assertEqual(persisted_scope["scope_version"], scope_trace["scope_version"])
+            self.assertEqual(
+                persisted_scope["discovery"]["cycle"]["deferred_market_ids"],
+                ["market-deferred"],
+            )
+            persisted_strategy = payload["strategy_discovery_trace"]
+            self.assertEqual(
+                persisted_strategy["materialization_reason"],
+                "NO_SUITABLE_MATERIALIZED_INSTANCE",
+            )
+            self.assertEqual(persisted_strategy["valid_strategy_definition_count"], 1)
+            self.assertEqual(persisted_scope["invalid_strategy_count"], 1)
+            self.assertEqual(persisted_strategy["materialized_member_count"], 0)
+            self.assertEqual(persisted_strategy["materialized_market_count"], 0)
+            self.assertEqual(persisted_strategy["evaluator_decisions"], [])
+            self.assertEqual(payload["evaluation_counts"]["attempted"], 0)
+            self.assertEqual(payload["evaluation_counts"]["successful"], 0)
+            self.assertEqual(payload["evaluation_counts"]["pending"], 1)
+
     def test_hermes_rolling_research_request_is_bounded_and_deduplicated(self) -> None:
         from axiom.operator import HermesOperatorAdapter
 
