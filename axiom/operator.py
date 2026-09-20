@@ -7969,10 +7969,8 @@ class OperatorControlPlane:
                 "canary_armed": False,
                 "blocker": type(draft_exc).__name__.upper(),
             }
-        try:
-            exploratory_live_review = self.exploratory_live_review_snapshot()
-        except Exception as exc:
-            exploratory_live_review = {
+        def blocked_exploratory_review(code: str) -> dict[str, Any]:
+            return {
                 "profitability": "UNPROVEN",
                 "status": "BLOCKED",
                 "scope": {
@@ -7980,14 +7978,22 @@ class OperatorControlPlane:
                     "active": {},
                     "frozen": {},
                 },
-                "blockers": [
-                    type(exc).__name__.upper(),
-                    "EXPLORATORY_LIVE_MARKET_MATERIALIZATION_REQUIRED",
-                    "EXPLORATORY_LIVE_SELECTION_REQUIRED",
-                ],
+                "blockers": [code],
                 "paper_only": True,
                 "live_execution": False,
             }
+
+        try:
+            exploratory_live_review = self.exploratory_live_review_snapshot()
+        except OperatorControlError as exc:
+            code = str(exc.code).strip().upper()
+            if not code or _SAFE_IDENTIFIER.fullmatch(code) is None:
+                code = "EXPLORATORY_LIVE_REVIEW_UNAVAILABLE"
+            exploratory_live_review = blocked_exploratory_review(code)
+        except Exception:
+            exploratory_live_review = blocked_exploratory_review(
+                "EXPLORATORY_LIVE_REVIEW_UNAVAILABLE"
+            )
         exploratory_live_enabled = (
             str(control_state or "").upper() in {"AUTONOMOUS_MICRO_LIVE", "LIVE"}
             or exploratory_live_review.get("live_execution") is True

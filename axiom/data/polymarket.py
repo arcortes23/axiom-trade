@@ -787,10 +787,13 @@ class PolymarketAdapter(PredictionMarketDataProvider):
         *,
         max_pages: int = 100,
         cursor: str | None = None,
+        allow_market_lookup: bool = True,
     ) -> Sequence[TradePrint]:
         """Read public market trades from the credential-free Data API."""
         if isinstance(max_pages, bool) or not isinstance(max_pages, int) or max_pages <= 0:
             raise ValueError("max_pages must be a positive integer")
+        if not isinstance(allow_market_lookup, bool):
+            raise ValueError("allow_market_lookup must be a boolean")
         identifier = _text(market_id)
         if identifier is None:
             raise ValueError("market_id is required")
@@ -854,6 +857,12 @@ class PolymarketAdapter(PredictionMarketDataProvider):
         if isinstance(snapshot, Mapping):
             condition_id = _text(snapshot.get("conditionId", snapshot.get("condition_id")))
         if condition_id is None:
+            if not allow_market_lookup:
+                self._last_trades_complete = False
+                self._last_trade_cursor = cursor_text or None
+                raise ValueError(
+                    "market metadata is not cached for bounded trade collection"
+                )
             loaded = self.market(identifier)
             condition_id = loaded.condition_id if loaded is not None else None
         # Data API validates market as a 0x-prefixed 64-hex condition id.
@@ -983,6 +992,10 @@ class PolymarketAdapter(PredictionMarketDataProvider):
             if len(payload) < limit:
                 if coverage_gap and gap_boundary is not None:
                     continuation_cursor = f"gap:{gap_boundary.timestamp():.6f}"
+                else:
+                    # A short page, including an empty terminal page after
+                    # one or more full pages, proves this window is complete.
+                    complete = True
                 break
             complete = False
             if next_offset > 10_000:

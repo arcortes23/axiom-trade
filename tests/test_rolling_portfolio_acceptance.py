@@ -4500,10 +4500,10 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
             scope = normalize_market_scope(
                 {
                     "schema_version": "1",
-                    "mode": "EXACT_MARKETS",
+                    "mode": "RULE_BASED_MARKETS",
                     "instrument": "POLYMARKET",
                     "categories": [],
-                    "market_ids": [market_id],
+                    "market_ids": [],
                     "filters": {},
                     "regime_restrictions": {},
                     "provenance": "canonical",
@@ -4516,6 +4516,16 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
                 "scope_hash": scope.scope_hash,
                 "scope_version": scope.scope_version,
                 "supported_market_types": ["prediction"],
+                "strategy_definitions": [
+                    {
+                        "template": "momentum",
+                        "parameters": {"lookback": 1, "threshold": 0.05},
+                    },
+                    {
+                        "template": "momentum",
+                        "parameters": {"lookback": 2, "threshold": 0.05},
+                    },
+                ],
                 "paper_only": True,
                 "live_execution": False,
                 "allocation_active": False,
@@ -4646,6 +4656,67 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
                     now=NOW,
                     skip_observation_setup_migration=True,
                 )
+                strategy_versions = list(state.get("strategy_versions", ()))
+                persisted_versions: list[Mapping[str, object]] = []
+                for strategy_version_id in strategy_versions:
+                    version = store.load_strategy_version(str(strategy_version_id))
+                    self.assertIsNotNone(version)
+                    assert version is not None
+                    persisted_versions.append(version)
+                    candidate_id = str(version["candidate_id"])
+                    resolution = store.load_market_scope_resolution(candidate_id)
+                    self.assertIsNotNone(resolution)
+                    assert resolution is not None
+                    self.assertEqual(resolution["candidate_id"], candidate_id)
+                    self.assertEqual(resolution["status"], "MATCHED")
+                    self.assertEqual(
+                        resolution["scope_hash"],
+                        version["market_scope_hash"],
+                    )
+                    self.assertEqual(
+                        resolution["scope_version"],
+                        version["market_scope_version"],
+                    )
+                    proof = resolution["provenance"]["member_binding"]
+                    self.assertEqual(proof["candidate_id"], candidate_id)
+                    self.assertEqual(
+                        proof["market_bindings"],
+                        version["market_bindings"],
+                    )
+                    enrollments = store.list_rolling_enrollments(
+                        candidate_id=candidate_id,
+                        status="ACCEPTED",
+                        limit=16,
+                    )
+                    self.assertTrue(enrollments)
+                    self.assertEqual(
+                        enrollments[0]["strategy_version_id"],
+                        version["strategy_version_id"],
+                    )
+                if len(persisted_versions) == 2:
+                    self.assertEqual(
+                        len({item["candidate_id"] for item in persisted_versions}),
+                        1,
+                    )
+                    self.assertEqual(
+                        len(
+                            {
+                                item["strategy_version_id"]
+                                for item in persisted_versions
+                            }
+                        ),
+                        2,
+                    )
+                    self.assertEqual(
+                        len(
+                            {
+                                item["research_trial_id"]
+                                for item in persisted_versions
+                            }
+                        ),
+                        2,
+                    )
+
                 evidence = [
                     item
                     for strategy_version_id in state.get("strategy_versions", ())
@@ -4664,8 +4735,16 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
         admitted_trace = admitted_state["strategy_discovery_trace"]
         self.assertGreater(admitted_trace["materialized_member_count"], 0)
         self.assertGreater(admitted_state["evaluation_counts"]["successful"], 0)
+        self.assertEqual(
+            {
+                str(item.get("strategy_version_id"))
+                for item in admitted_evidence
+            },
+            {str(item) for item in admitted_state["strategy_versions"]},
+        )
+        self.assertTrue(admitted_evidence)
         self.assertTrue(
-            any(item.get("evaluator_invoked") is True for item in admitted_evidence)
+            all(item.get("evaluator_invoked") is True for item in admitted_evidence)
         )
         raw_state, raw_evidence = refresh(
             "rolling-raw-discovery-record.sqlite3",
