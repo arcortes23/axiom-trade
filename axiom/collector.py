@@ -49,6 +49,23 @@ from .rolling_portfolio import (
     validate_system_exploratory_admission_policy,
 )
 _UNSET = object()
+def _normalized_trade_cursor(value: Any, *, repair_legacy_none: bool = False) -> Any:
+    """Keep an optional provider cursor optional without coercing bad values.
+
+    Collector state is JSON-backed, so a historic ``str(None)`` artifact needs
+    one narrow repair at this application boundary.  Other values are left
+    untouched for the provider's own validation instead of being converted
+    into a plausible-looking cursor.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        cursor = value.strip()
+        if not cursor or (repair_legacy_none and cursor == "None"):
+            return None
+        return cursor
+    return value
+
 _MAX_SCOPE_REQUEST_PATH_LENGTH = 512
 _MAX_SCOPE_QUERY_DEPTH = 8
 _MAX_SCOPE_QUERY_ITEMS = 128
@@ -8629,10 +8646,9 @@ class PolymarketCollector:
             counters["snapshot_duplicates"] += 1
         last_trade = _parse_iso(state.get("last_trade_timestamp"))
         raw_trade_cursor = state.get("last_trade_cursor")
-        last_trade_cursor = (
-            str(raw_trade_cursor).strip()
-            if raw_trade_cursor not in (None, "")
-            else None
+        last_trade_cursor = _normalized_trade_cursor(
+            raw_trade_cursor,
+            repair_legacy_none=True,
         )
         trade_fetch_failed = False
         try:
@@ -8714,13 +8730,16 @@ class PolymarketCollector:
             else:
                 counters["trade_duplicates"] += 1
             latest_trade = max(latest_trade, trade.timestamp) if latest_trade else trade.timestamp
-        trade_cursor: str | None = None
+        trade_cursor: Any = None
         if trade_fetch_failed:
             latest_trade = last_trade
             trade_cursor = last_trade_cursor
         elif not getattr(provider, "last_trades_complete", True):
             latest_trade = last_trade
-            provider_cursor = str(getattr(provider, "last_trade_cursor", "")).strip() or None
+            provider_cursor = _normalized_trade_cursor(
+                getattr(provider, "last_trade_cursor", None),
+                repair_legacy_none=True,
+            )
             trade_cursor = provider_cursor or last_trade_cursor
         self._save_market_state(
             state_key,
@@ -8804,7 +8823,7 @@ class PolymarketCollector:
         observed_at: datetime,
         counters: dict[str, Any],
         *,
-        cursor: str | None = None,
+        cursor: Any = None,
         provider: Any | None = None,
     ) -> Sequence[TradePrint]:
         provider = provider or self.provider
@@ -9550,7 +9569,7 @@ class PolymarketCollector:
         *,
         source_timestamp: datetime | None = None,
         latest_trade: datetime | None = None,
-        trade_cursor: str | None | object = _UNSET,
+        trade_cursor: Any = _UNSET,
         cooldown: bool = False,
     ) -> None:
         payload = {
@@ -9561,7 +9580,10 @@ class PolymarketCollector:
             "last_observed_at": observed_at.isoformat(),
             "last_source_timestamp": source_timestamp.isoformat() if source_timestamp else state.get("last_source_timestamp"),
             "last_trade_timestamp": latest_trade.isoformat() if latest_trade else state.get("last_trade_timestamp"),
-            "last_trade_cursor": state.get("last_trade_cursor") if trade_cursor is _UNSET else trade_cursor,
+            "last_trade_cursor": _normalized_trade_cursor(
+                state.get("last_trade_cursor") if trade_cursor is _UNSET else trade_cursor,
+                repair_legacy_none=True,
+            ),
             "polls": int(state.get("polls", 0)) + (0 if cooldown else 1),
             "errors": int(state.get("errors", 0)) + int(counters["errors"]) - cycle_errors_before,
             "cooldown_until": self._cooldown_until(observed_at).isoformat() if cooldown else None,

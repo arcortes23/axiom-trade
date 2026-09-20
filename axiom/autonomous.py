@@ -5993,10 +5993,13 @@ class AutonomousResearchProcessor:
             scope_policy = normalize_market_scope(scope_for_resolution)
         except (ImportError, AttributeError, TypeError, ValueError):
             return ()
+        current_cutoff = ensure_utc(now)
         try:
             tracked = tracked_loader(
                 active_only=True,
-                now=ensure_utc(now),
+                now=current_cutoff,
+                fresh_since=current_cutoff
+                - timedelta(seconds=_EXPLORATORY_MARKET_FRESHNESS_SECONDS),
                 include_payload=True,
                 limit=_EXPLORATORY_POOL_CAP,
             )
@@ -6012,7 +6015,25 @@ class AutonomousResearchProcessor:
             metadata = dict(metadata) if isinstance(metadata, Mapping) else {}
             snapshot = payload.get("snapshot")
             snapshot = dict(snapshot) if isinstance(snapshot, Mapping) else {}
-            record = {**payload, **metadata, **snapshot}
+            # Metadata is the current lifecycle/identity authority. The
+            # persisted snapshot envelope and its root books remain the fresh
+            # executable proof even when metadata was observed later.
+            record = {**payload, **snapshot, **metadata}
+            for key, value in payload.items():
+                if (
+                    key == "snapshot"
+                    or key.endswith("_order_book")
+                    or key in {
+                        "order_book",
+                        "book",
+                        "books",
+                        "order_books",
+                        "source_timestamp",
+                        "source_snapshot_id",
+                        "snapshot_id",
+                    }
+                ):
+                    record[key] = value
             record["market_id"] = item.get("market_id", record.get("market_id"))
             record["observed_at"] = (
                 item.get("observed_at", record.get("observed_at"))
@@ -6218,6 +6239,45 @@ class AutonomousResearchProcessor:
                 or str(metadata.get("market_id", "")).strip() != market_id
             ):
                 return False
+
+            def identity_value(source: Mapping[str, Any], *names: str) -> str:
+                for name in names:
+                    value = source.get(name)
+                    if value not in (None, "") and not isinstance(value, (Mapping, list, tuple)):
+                        return str(value).strip()
+                return ""
+
+            for source in (metadata, snapshot):
+                if not isinstance(source, Mapping):
+                    continue
+                source_market_id = identity_value(source, "market_id", "id", "market")
+                source_condition_id = identity_value(
+                    source,
+                    "condition_id",
+                    "conditionId",
+                    "condition",
+                )
+                source_yes_token_id = identity_value(
+                    source,
+                    "yes_token_id",
+                    "yesTokenId",
+                    "yes_token",
+                    "yes",
+                )
+                source_no_token_id = identity_value(
+                    source,
+                    "no_token_id",
+                    "noTokenId",
+                    "no_token",
+                    "no",
+                )
+                if (
+                    (source_market_id and source_market_id != market_id)
+                    or (source_condition_id and source_condition_id != condition_id)
+                    or (source_yes_token_id and source_yes_token_id != yes_token_id)
+                    or (source_no_token_id and source_no_token_id != no_token_id)
+                ):
+                    return False
             books = token_books(record, item)
             return len(books) == 2 and all(
                 depth_valid(book, token_id) for token_id, book in books

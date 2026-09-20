@@ -17007,6 +17007,7 @@ class AxiomStore:
         include_payload: bool = False,
         limit: int = 1000,
         market_ids: Sequence[str] | None = None,
+        fresh_since: datetime | None = None,
     ) -> list[Any]:
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
             raise ValueError("limit must be a non-negative integer")
@@ -17018,6 +17019,9 @@ class AxiomStore:
         if market_ids is not None and not requested_ids:
             return []
         current = ensure_utc(now or utc_now())
+        fresh_cutoff = ensure_utc(fresh_since) if fresh_since is not None else None
+        if fresh_cutoff is not None and limit == 0:
+            return []
         snapshot = self._snapshot_read_connection()
         try:
             metadata_where = "source_type='FORWARD_COLLECTED' AND observed_at<=?"
@@ -17030,39 +17034,106 @@ class AxiomStore:
                 metadata_values.extend(requested_ids)
                 snapshot_where += f" AND market_id IN ({placeholders})"
                 snapshot_values.extend(requested_ids)
-            metadata_rows = snapshot.execute(
-                "WITH "
-                + _recent_rowid_cte(
-                    "polymarket_markets",
-                    "rowid AS row_id,market_id,observed_at,metadata_hash,payload_json,source_type",
-                    alias="recent_markets",
-                )
-                + ", latest_keys AS ("
-                "SELECT row_id,market_id,observed_at,metadata_hash,payload_json,source_type,"
-                "ROW_NUMBER() OVER (PARTITION BY market_id ORDER BY observed_at DESC,metadata_hash DESC) AS row_number "
-                f"FROM recent_markets WHERE {metadata_where}) "
-                "SELECT market_id,observed_at,metadata_hash,payload_json,source_type "
-                "FROM latest_keys "
-                "WHERE row_number=1 ORDER BY market_id LIMIT ?",
-                [_MAX_EVIDENCE_SCAN_ROWS, *metadata_values, int(limit)],
-            ).fetchall()
-            snapshot_rows = snapshot.execute(
-                "WITH "
-                + _recent_rowid_cte(
-                    "polymarket_snapshots",
-                    "rowid AS row_id,market_id,observed_at,source_timestamp,snapshot_id,payload_json,source_type",
-                    alias="recent_snapshots",
-                )
-                + ", latest_keys AS ("
-                "SELECT row_id,market_id,observed_at,source_timestamp,snapshot_id,payload_json,source_type,"
-                "ROW_NUMBER() OVER (PARTITION BY market_id "
-                "ORDER BY observed_at DESC,source_timestamp DESC,snapshot_id DESC) AS row_number "
-                f"FROM recent_snapshots WHERE {snapshot_where}) "
-                "SELECT market_id,observed_at,source_timestamp,snapshot_id,payload_json,source_type "
-                "FROM latest_keys "
-                "WHERE row_number=1 ORDER BY market_id LIMIT ?",
-                [_MAX_EVIDENCE_SCAN_ROWS, *snapshot_values, int(limit)],
-            ).fetchall()
+            if fresh_cutoff is None:
+                metadata_rows = snapshot.execute(
+                    "WITH "
+                    + _recent_rowid_cte(
+                        "polymarket_markets",
+                        "rowid AS row_id,market_id,observed_at,metadata_hash,payload_json,source_type",
+                        alias="recent_markets",
+                    )
+                    + ", latest_keys AS ("
+                    "SELECT row_id,market_id,observed_at,metadata_hash,payload_json,source_type,"
+                    "ROW_NUMBER() OVER (PARTITION BY market_id ORDER BY observed_at DESC,metadata_hash DESC) AS row_number "
+                    f"FROM recent_markets WHERE {metadata_where}) "
+                    "SELECT market_id,observed_at,metadata_hash,payload_json,source_type "
+                    "FROM latest_keys "
+                    "WHERE row_number=1 ORDER BY market_id LIMIT ?",
+                    [_MAX_EVIDENCE_SCAN_ROWS, *metadata_values, int(limit)],
+                ).fetchall()
+                snapshot_rows = snapshot.execute(
+                    "WITH "
+                    + _recent_rowid_cte(
+                        "polymarket_snapshots",
+                        "rowid AS row_id,market_id,observed_at,source_timestamp,snapshot_id,payload_json,source_type",
+                        alias="recent_snapshots",
+                    )
+                    + ", latest_keys AS ("
+                    "SELECT row_id,market_id,observed_at,source_timestamp,snapshot_id,payload_json,source_type,"
+                    "ROW_NUMBER() OVER (PARTITION BY market_id "
+                    "ORDER BY observed_at DESC,source_timestamp DESC,snapshot_id DESC) AS row_number "
+                    f"FROM recent_snapshots WHERE {snapshot_where}) "
+                    "SELECT market_id,observed_at,source_timestamp,snapshot_id,payload_json,source_type "
+                    "FROM latest_keys "
+                    "WHERE row_number=1 ORDER BY market_id LIMIT ?",
+                    [_MAX_EVIDENCE_SCAN_ROWS, *snapshot_values, int(limit)],
+                ).fetchall()
+            else:
+                # Snapshot evidence is the admission proof. Obtain the
+                # bounded fresh keys first, then hydrate metadata only for
+                # those keys; stale metadata cannot consume the pool or its
+                # payload-decoding budget.
+                fresh_snapshot_where = snapshot_where + " AND observed_at>=?"
+                fresh_snapshot_values = [
+                    *snapshot_values,
+                    fresh_cutoff.isoformat(),
+                ]
+                snapshot_rows = snapshot.execute(
+                    "WITH "
+                    + _recent_rowid_cte(
+                        "polymarket_snapshots",
+                        "rowid AS row_id,market_id,observed_at,source_timestamp,snapshot_id,payload_json,source_type",
+                        alias="recent_snapshots",
+                    )
+                    + ", latest_keys AS ("
+                    "SELECT row_id,market_id,observed_at,source_timestamp,snapshot_id,payload_json,source_type,"
+                    "ROW_NUMBER() OVER (PARTITION BY market_id "
+                    "ORDER BY observed_at DESC,source_timestamp DESC,snapshot_id DESC) AS row_number "
+                    f"FROM recent_snapshots WHERE {fresh_snapshot_where}) "
+                    "SELECT market_id,observed_at,source_timestamp,snapshot_id,payload_json,source_type "
+                    "FROM latest_keys WHERE row_number=1 ORDER BY market_id",
+                    [_MAX_EVIDENCE_SCAN_ROWS, *fresh_snapshot_values],
+                ).fetchall()
+                if snapshot_rows:
+                    metadata_rows = snapshot.execute(
+                        "WITH "
+                        + _recent_rowid_cte(
+                            "polymarket_snapshots",
+                            "market_id,observed_at,source_timestamp,snapshot_id,source_type",
+                            alias="recent_snapshot_keys",
+                        )
+                        + ", fresh_snapshot_keys AS ("
+                        "SELECT market_id FROM ("
+                        "SELECT market_id,observed_at,source_timestamp,snapshot_id,"
+                        "ROW_NUMBER() OVER (PARTITION BY market_id "
+                        "ORDER BY observed_at DESC,source_timestamp DESC,snapshot_id DESC) AS row_number "
+                        f"FROM recent_snapshot_keys WHERE {fresh_snapshot_where}) "
+                        "WHERE row_number=1"
+                        "), "
+                        + _recent_rowid_cte(
+                            "polymarket_markets",
+                            "rowid AS row_id,market_id,observed_at,metadata_hash,payload_json,source_type",
+                            alias="recent_markets",
+                        )
+                        + ", latest_keys AS ("
+                        "SELECT recent_markets.row_id,recent_markets.market_id,"
+                        "recent_markets.observed_at,recent_markets.metadata_hash,"
+                        "recent_markets.payload_json,recent_markets.source_type,"
+                        "ROW_NUMBER() OVER (PARTITION BY recent_markets.market_id "
+                        "ORDER BY recent_markets.observed_at DESC,recent_markets.metadata_hash DESC) AS row_number "
+                        f"FROM recent_markets JOIN fresh_snapshot_keys USING (market_id) "
+                        f"WHERE {metadata_where}) "
+                        "SELECT market_id,observed_at,metadata_hash,payload_json,source_type "
+                        "FROM latest_keys WHERE row_number=1 ORDER BY market_id",
+                        [
+                            _MAX_EVIDENCE_SCAN_ROWS,
+                            *fresh_snapshot_values,
+                            _MAX_EVIDENCE_SCAN_ROWS,
+                            *metadata_values,
+                        ],
+                    ).fetchall()
+                else:
+                    metadata_rows = []
         finally:
             snapshot.close()
         metadata_latest: dict[str, tuple[datetime | None, Any]] = {}
@@ -17089,16 +17160,79 @@ class AxiomStore:
                 else _dashboard_payload_projection(row["payload_json"])[0]
             )
             snapshot_latest[identifier] = (stamp, payload)
+        if fresh_cutoff is not None:
+            fresh_market_ids = {
+                market_id
+                for market_id, (stamp, _payload) in snapshot_latest.items()
+                if stamp is not None and stamp >= fresh_cutoff
+            }
+            # Fresh mode is snapshot-proofed: metadata alone cannot admit a
+            # stale market, even when its metadata was recently deduplicated.
+            snapshot_latest = {
+                market_id: pair
+                for market_id, pair in snapshot_latest.items()
+                if market_id in fresh_market_ids
+            }
+            metadata_latest = {
+                market_id: pair
+                for market_id, pair in metadata_latest.items()
+                if market_id in fresh_market_ids
+            }
         result: list[dict[str, Any]] = []
         terminal = {
             SettlementState.RESOLVED_YES.value,
             SettlementState.RESOLVED_NO.value,
             SettlementState.VOID.value,
         }
-        for market_id in sorted(set(metadata_latest) | set(snapshot_latest)):
+        ordered_market_ids = (
+            sorted(
+                set(metadata_latest) | set(snapshot_latest),
+                key=lambda market_id: (
+                    snapshot_latest[market_id][0]
+                    if market_id in snapshot_latest
+                    else metadata_latest[market_id][0],
+                    market_id,
+                ),
+                reverse=True,
+            )
+            if fresh_cutoff is not None
+            else sorted(set(metadata_latest) | set(snapshot_latest))
+        )
+        for market_id in ordered_market_ids:
             metadata_stamp, metadata_payload = metadata_latest.get(market_id, (None, None))
             snapshot_stamp, snapshot_payload = snapshot_latest.get(market_id, (None, None))
-            if snapshot_stamp is not None and (metadata_stamp is None or snapshot_stamp >= metadata_stamp):
+            if (
+                fresh_cutoff is not None
+                and snapshot_stamp is not None
+                and isinstance(snapshot_payload, Mapping)
+            ):
+                # A newer metadata envelope supplies lifecycle/identity, but
+                # the fresh collector snapshot remains the executable-book
+                # proof. Preserve its canonical snapshot and root books.
+                payload = (
+                    dict(metadata_payload)
+                    if isinstance(metadata_payload, Mapping)
+                    and (metadata_stamp is None or metadata_stamp > snapshot_stamp)
+                    else dict(snapshot_payload)
+                )
+                for key, value in snapshot_payload.items():
+                    if (
+                        key == "snapshot"
+                        or key.endswith("_order_book")
+                        or key in {
+                            "order_book",
+                            "book",
+                            "books",
+                            "order_books",
+                            "source_timestamp",
+                            "source_snapshot_id",
+                            "snapshot_id",
+                        }
+                    ):
+                        payload[key] = value
+            elif snapshot_stamp is not None and (
+                metadata_stamp is None or snapshot_stamp >= metadata_stamp
+            ):
                 payload = dict(snapshot_payload) if isinstance(snapshot_payload, Mapping) else {}
             else:
                 payload = dict(metadata_payload) if isinstance(metadata_payload, Mapping) else {}

@@ -4701,6 +4701,222 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
             any(item.get("evaluator_invoked") is True for item in future_evidence)
         )
 
+    def test_fresh_current_pool_precedes_stale_ids_and_requires_executable_books(self) -> None:
+        fresh_market_id = "999-fresh-valid"
+        bad_depth_market_id = "559678"
+        stale_book_market_id = "998-fresh-metadata-stale-book"
+        future_market_id = "997-future"
+        fresh_since = NOW - timedelta(seconds=900)
+
+        def persist_market(
+            store: AxiomStore,
+            market_id: str,
+            *,
+            metadata_at: datetime,
+            snapshot_at: datetime,
+            unilateral_depth: bool = False,
+        ) -> None:
+            identity = {
+                "market_id": market_id,
+                "condition_id": f"condition:{market_id}",
+                "yes_token_id": f"yes:{market_id}",
+                "no_token_id": f"no:{market_id}",
+            }
+            metadata = {
+                **identity,
+                "question": f"Will {market_id} resolve YES?",
+                "category": "politics",
+                "active": True,
+                "open": True,
+                "closed": False,
+                "accepting_orders": True,
+                "enable_order_book": True,
+                "order_book_available": True,
+                "settlement": "OPEN",
+                "expiry": (NOW + timedelta(days=1)).isoformat(),
+                "yes_bid": "0.45",
+                "yes_ask": "0.46",
+                "yes_mid": "0.455",
+                "no_bid": "0.54",
+                "no_ask": "0.55",
+                "no_mid": "0.545",
+                "volume": "1000",
+                "liquidity": "100",
+                "source": "polymarket",
+                "provider": "polymarket",
+                "venue": "POLYMARKET",
+                "instrument": "POLYMARKET",
+                "source_type": "FORWARD_COLLECTED",
+            }
+            store.save_polymarket_market_metadata(
+                market_id,
+                {
+                    **metadata,
+                    "metadata": metadata,
+                    "snapshot": {
+                        **metadata,
+                        "timestamp": metadata_at.isoformat(),
+                    },
+                },
+                observed_at=metadata_at,
+                source_type="FORWARD_COLLECTED",
+            )
+            yes_book = {
+                "timestamp": snapshot_at.isoformat(),
+                "bids": (
+                    []
+                    if unilateral_depth
+                    else [{"price": "0.45", "size": "100"}]
+                ),
+                "asks": [{"price": "0.46", "size": "100"}],
+                "token_id": identity["yes_token_id"],
+            }
+            no_book = {
+                "timestamp": snapshot_at.isoformat(),
+                "bids": [{"price": "0.54", "size": "100"}],
+                "asks": (
+                    []
+                    if unilateral_depth
+                    else [{"price": "0.55", "size": "100"}]
+                ),
+                "token_id": identity["no_token_id"],
+            }
+            canonical_snapshot = {
+                **metadata,
+                "timestamp": snapshot_at.isoformat(),
+                "order_book": yes_book,
+            }
+            store.save_polymarket_snapshot(
+                f"snapshot:{market_id}:{snapshot_at.isoformat()}",
+                market_id,
+                snapshot_at,
+                snapshot_at,
+                {
+                    "provider": "polymarket",
+                    "source_type": "FORWARD_COLLECTED",
+                    "source_timestamp": snapshot_at.isoformat(),
+                    "observed_at": snapshot_at.isoformat(),
+                    "snapshot": canonical_snapshot,
+                    "yes_order_book": yes_book,
+                    "no_order_book": no_book,
+                },
+                source_type="FORWARD_COLLECTED",
+            )
+
+        with self._store("fresh-current-pool.sqlite3") as store:
+            stale_at = NOW - timedelta(hours=2)
+            for index in range(10):
+                persist_market(
+                    store,
+                    f"{index:03d}-stale-active",
+                    metadata_at=stale_at,
+                    snapshot_at=stale_at,
+                )
+            persist_market(
+                store,
+                fresh_market_id,
+                metadata_at=NOW - timedelta(seconds=5),
+                snapshot_at=NOW - timedelta(seconds=10),
+            )
+            persist_market(
+                store,
+                bad_depth_market_id,
+                metadata_at=NOW - timedelta(seconds=20),
+                snapshot_at=NOW - timedelta(seconds=20),
+                unilateral_depth=True,
+            )
+            persist_market(
+                store,
+                stale_book_market_id,
+                metadata_at=NOW - timedelta(seconds=20),
+                snapshot_at=stale_at,
+            )
+            persist_market(
+                store,
+                future_market_id,
+                metadata_at=NOW - timedelta(seconds=20),
+                snapshot_at=NOW + timedelta(seconds=30),
+            )
+
+            legacy_pool = store.tracked_polymarket_markets(
+                active_only=True,
+                now=NOW,
+                include_payload=True,
+                limit=10,
+            )
+            self.assertEqual(len(legacy_pool), 10)
+            self.assertNotIn(fresh_market_id, {row["market_id"] for row in legacy_pool})
+
+            fresh_pool = store.tracked_polymarket_markets(
+                active_only=True,
+                now=NOW,
+                fresh_since=fresh_since,
+                include_payload=True,
+                limit=10,
+            )
+            fresh_ids = [str(row["market_id"]) for row in fresh_pool]
+            self.assertEqual(fresh_ids[0], fresh_market_id)
+            self.assertIn(bad_depth_market_id, fresh_ids)
+            self.assertNotIn(stale_book_market_id, fresh_ids)
+            self.assertNotIn(future_market_id, fresh_ids)
+            self.assertLessEqual(len(fresh_pool), 10)
+            self.assertEqual(
+                fresh_pool[0]["payload"]["snapshot"]["market_id"],
+                fresh_market_id,
+            )
+            self.assertIn("yes_order_book", fresh_pool[0]["payload"])
+            self.assertIn("no_order_book", fresh_pool[0]["payload"])
+            self.assertEqual(
+                fresh_pool[0]["payload"]["snapshot"]["timestamp"],
+                (NOW - timedelta(seconds=10)).isoformat(),
+            )
+            self.assertEqual(
+                fresh_pool[0]["payload"]["yes_order_book"]["timestamp"],
+                (NOW - timedelta(seconds=10)).isoformat(),
+            )
+
+            scope = normalize_market_scope(
+                {
+                    "schema_version": "1",
+                    "mode": "EXACT_MARKETS",
+                    "instrument": "POLYMARKET",
+                    "categories": [],
+                    "market_ids": [
+                        fresh_market_id,
+                        bad_depth_market_id,
+                        stale_book_market_id,
+                        future_market_id,
+                    ],
+                    "filters": {},
+                    "regime_restrictions": {},
+                    "provenance": "canonical",
+                }
+            )
+            draft = {
+                "draft_id": "rolling-fresh-current-pool-regression",
+                "scope": scope.as_dict(),
+                "strategy_definitions": [
+                    {
+                        "template": "momentum",
+                        "parameters": {"lookback": 1, "threshold": 0.05},
+                    }
+                ],
+            }
+            processor = AutonomousResearchProcessor(store, clock=lambda: NOW)
+            documents = processor._rolling_system_current_market_documents(
+                NOW,
+                draft=draft,
+            )
+            self.assertGreater(processor._rolling_last_current_direct_market_count, 0)
+            self.assertTrue(documents)
+            bound_ids = {
+                binding["market_id"]
+                for document in documents
+                for binding in document["market_bindings"]
+            }
+            self.assertEqual(bound_ids, {fresh_market_id})
+            self.assertNotIn(bad_depth_market_id, bound_ids)
+
     def test_refresh_trace_preserves_partial_collection_outcome(self) -> None:
         def refresh_with_result(name: str, result: object) -> Mapping[str, object]:
             with self._store(name) as store:
