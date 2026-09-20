@@ -5457,6 +5457,8 @@ class AutonomousResearchProcessor:
                     in trace.get("invalid_strategy_reasons", ())
                     else "INVALID_STRATEGY_DEFINITIONS"
                 )
+            elif discovery_status == "DEFERRED":
+                trace["reason"] = "DISCOVERY_DEFERRED"
             elif discovery_status == "PROVIDER_FAILURE":
                 trace["reason"] = "DISCOVERY_PROVIDER_FAILURE"
             elif discovery_status == "APPLICATION_ERROR":
@@ -13932,11 +13934,25 @@ class AutonomousResearchProcessor:
                             ).upper()
                             == "ERROR"
                         )
+                        deferred = (
+                            bool(recorded.get("discovery_deferred"))
+                            or str(recorded.get("status", "")).strip().upper()
+                            == "DEFERRED"
+                        )
                         self._rolling_last_current_discovery = {
                             "status": (
-                                "PROVIDER_FAILURE"
-                                if provider_failure
-                                else ("RESULT_ERROR" if result_error else "OK")
+                                "DEFERRED"
+                                if deferred
+                                else (
+                                    "PROVIDER_FAILURE"
+                                    if provider_failure
+                                    else ("RESULT_ERROR" if result_error else "OK")
+                                )
+                            ),
+                            "reason": (
+                                str(recorded.get("reason")).strip()
+                                if deferred and recorded.get("reason")
+                                else None
                             ),
                             "cycle": dict(recorded),
                         }

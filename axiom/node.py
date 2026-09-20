@@ -1718,9 +1718,28 @@ class ResearchNode:
         *,
         draft: Mapping[str, Any] | None = None,
     ) -> Any:
-        """Run one bounded disarmed current-market collection pass."""
-        if not self._rolling_discovery_lock.acquire(blocking=False):
-            return None
+        """Run one bounded disarmed current-market collection pass.
+
+        The normal collector and rolling draft preview share one mutation
+        boundary.  Wait briefly for an in-flight normal cycle so a draft pass
+        can hand off fairly; if that bounded window expires, return an
+        explicit deferred record for the existing rolling cadence to retry.
+        """
+        try:
+            handoff_timeout = (
+                float(self.collector.config.cycle_budget_seconds)
+                + float(self.collector.config.provider_timeout_seconds)
+            )
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            handoff_timeout = 0.001
+        handoff_timeout = max(0.001, handoff_timeout)
+        if not self._rolling_discovery_lock.acquire(timeout=handoff_timeout):
+            return {
+                "status": "DEFERRED",
+                "reason": "ROLLING_DISCOVERY_LOCK_BUSY",
+                "discovery_deferred": True,
+                "retryable": True,
+            }
         try:
             return self.collector.collect_once(
                 now=ensure_utc(now),

@@ -28,6 +28,8 @@ from .operator import (
     CANARY_CONNECTIVITY_CONFIG_KEY,
     OperatorControlError,
     OperatorControlPlane,
+    _public_draft_member_bindings,
+    _public_setup_bindings,
     _rolling_policy_identity,
     _safe_value,
     _stored_connectivity_projection,
@@ -418,7 +420,12 @@ def _http_bound_value(
                 stats["truncated"] = True
                 stats["omitted_items"] = int(stats.get("omitted_items", 0)) + len(value) - index
                 break
-            result[str(key)] = _http_bound_value(child, depth=depth + 1, stats=stats)
+            child_depth = depth + 1
+            if depth == 0 and str(key) == "operator_controls":
+                # This is already a bounded public component; do not spend
+                # the root envelope depth before its typed leaf projection.
+                child_depth = depth
+            result[str(key)] = _http_bound_value(child, depth=child_depth, stats=stats)
         return result
     if isinstance(value, (list, tuple, set, frozenset)):
         source = list(value)
@@ -9336,6 +9343,60 @@ class DashboardData:
         )
 
 
+    def _operator_controls_projection(self, value: Any) -> Any:
+        """Bound controls while preserving the already-public nested review scope."""
+        projected = _safe_value(value)
+        if not isinstance(value, Mapping) or not isinstance(projected, Mapping):
+            return projected
+        raw_review = value.get("exploratory_live_review")
+        if not isinstance(raw_review, Mapping):
+            return projected
+        review = _safe_value(raw_review)
+        raw_scope = raw_review.get("scope")
+        if isinstance(review, Mapping) and isinstance(raw_scope, Mapping):
+            scope = _safe_value(raw_scope)
+            if isinstance(scope, Mapping):
+                scope = dict(scope)
+                for section_name in ("draft", "active", "frozen"):
+                    section = raw_scope.get(section_name)
+                    if not isinstance(section, Mapping):
+                        continue
+                    section_projection = _safe_value(section)
+                    if isinstance(section_projection, Mapping):
+                        scope[section_name] = section_projection
+                review = dict(review)
+                review["scope"] = scope
+        if isinstance(review, Mapping) and isinstance(raw_review.get("authorization_bindings"), Mapping):
+            raw_bindings = raw_review["authorization_bindings"]
+            bindings: dict[str, Any] = {
+                key: _safe_value(raw_bindings[key])
+                for key in (
+                    "selection_id",
+                    "selection_hash",
+                    "policy_id",
+                    "policy_version",
+                    "policy_hash",
+                    "proposed_allocation_total",
+                    "proposed_allocation_risk_digest",
+                )
+                if key in raw_bindings
+            }
+            if "setup_bindings" in raw_bindings:
+                bindings["setup_bindings"] = _public_setup_bindings(
+                    raw_bindings.get("setup_bindings")
+                )
+            if "draft_member_bindings" in raw_bindings:
+                bindings["draft_member_bindings"] = _public_draft_member_bindings(
+                    raw_bindings.get("draft_member_bindings")
+                )
+            review = dict(review)
+            review["authorization_bindings"] = bindings
+        projected = dict(projected)
+        if isinstance(review, Mapping):
+            projected["exploratory_live_review"] = review
+        return projected
+
+
     def _operator_control_data(self) -> dict[str, Any]:
         """Merge responsive controls into the bounded persisted overview."""
         controls = self.control.status() if self.control is not None else {}
@@ -9359,7 +9420,7 @@ class DashboardData:
         # ``overview_summary`` is authoritative for every research surface.
         # Controls are additive and must never replace persisted cards, rows,
         # candidate selections, lifecycle values, or canary evidence.
-        result["operator_controls"] = _safe_value(controls)
+        result["operator_controls"] = self._operator_controls_projection(controls)
         authorization = controls.get("execution_authorization")
         if not isinstance(authorization, Mapping):
             authorization = self.execution_authorization_data()
@@ -9628,7 +9689,9 @@ class DashboardData:
                 if coverage_key not in result:
                     result[coverage_key] = persisted_coverage.get(coverage_key, 0)
             if self.control is not None:
-                result["operator_controls"] = self.control.status()
+                result["operator_controls"] = self._operator_controls_projection(
+                    self.control.status()
+                )
                 controls = result["operator_controls"]
                 authorization = controls.get("execution_authorization")
                 if not isinstance(authorization, Mapping):
@@ -11031,9 +11094,10 @@ def _dashboard_html(
         const response=await fetch("/api/operator",{cache:"no-store"});
         if(!response.ok)throw new Error(`HTTP ${response.status}`);
         const payload=await response.json();
-        const finalReview=$("exploratory-live-review"); if(finalReview&&payload.exploratory_live_review)finalReview.textContent=json(payload.exploratory_live_review);
-        lastGood.controls=payload;
-        renderExecutionAuthorization(payload);
+        const controls=payload?.operator_controls&&typeof payload.operator_controls==="object"&&!Array.isArray(payload.operator_controls)?payload.operator_controls:payload;
+        const finalReview=$("exploratory-live-review"); if(finalReview&&controls?.exploratory_live_review)finalReview.textContent=json(controls.exploratory_live_review);
+        lastGood.controls=controls;
+        renderExecutionAuthorization(controls);
       } catch(error) {
         const state=$("execution-auth-state"); if(state)state.textContent=`Authorization status unavailable: ${error?.message||"request failed"}`;
       }
