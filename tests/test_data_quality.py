@@ -248,6 +248,42 @@ class PredictionDataQualityCacheTests(unittest.TestCase):
             self.assertIsNone(adapter.order_book_for_token("yes-token"))
             self.assertIsNone(adapter.provider_timestamp_for("market-1", kind="yes_order_book"))
 
+    def test_provider_timestamp_accessor_is_cache_only_and_missing_is_none(self) -> None:
+        stamp = datetime(2025, 1, 1, tzinfo=timezone.utc)
+        responses = [
+            _Response(
+                {
+                    "id": " market-cache-only ",
+                    "conditionId": "condition-cache-only",
+                    "question": "Will it happen?",
+                    "outcomes": ["Yes", "No"],
+                    "clobTokenIds": ["yes-cache-only", "no-cache-only"],
+                    "updatedAt": stamp.isoformat(),
+                }
+            )
+        ]
+        calls = 0
+
+        def opener(_request: object, timeout: float) -> _Response:
+            nonlocal calls
+            del timeout
+            calls += 1
+            return responses.pop(0)
+
+        adapter = PolymarketAdapter(opener=opener)
+        self.assertIsNone(adapter.provider_timestamp_for("uncached", kind="yes_order_book"))
+        self.assertEqual(calls, 0)
+        self.assertIsNotNone(adapter.market("market-cache-only"))
+        self.assertEqual(adapter.provider_timestamp_for("market-cache-only"), stamp)
+        self.assertIsNone(
+            adapter.provider_timestamp_for("market-cache-only", kind="yes_order_book")
+        )
+        self.assertIsNone(
+            adapter.provider_timestamp_for("market-cache-only", kind="no_order_book")
+        )
+        self.assertEqual(calls, 1)
+
+
     def test_market_provider_timestamp_clears_after_unusable_response(self) -> None:
         stamp = datetime(2025, 1, 1, tzinfo=timezone.utc)
         valid = {

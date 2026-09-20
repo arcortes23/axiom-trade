@@ -24,7 +24,7 @@ from axiom.collector import (
 from axiom.experiment_plan import normalize_market_scope
 from axiom.forward import ForwardTestRegistry, ForwardTestSpec
 from axiom.lifecycle import CandidateStage
-from axiom.data import InMemoryPredictionProvider
+from axiom.data import InMemoryPredictionProvider, PolymarketAdapter
 from axiom.storage import AxiomStore, _COLLECTOR_STATE_MAX_BYTES
 from axiom.polymarket_rules import assess_selected_token_depth, parse_polymarket_rules
 from axiom.domain import (
@@ -3180,7 +3180,130 @@ class MarketScopeCollectorTests(unittest.TestCase):
         self.assertEqual(generic_counters["retries"], 1)
         collector.close()
 
+    def test_actual_collect_market_cache_timestamps_leave_capture_reserve(self) -> None:
+        market_id = "real-adapter-budget"
+        condition_id = "0x" + ("a" * 64)
+        yes_token = "yes-real-adapter-budget"
+        no_token = "no-real-adapter-budget"
+        gamma_payload = {
+            "id": market_id,
+            "conditionId": condition_id,
+            "question": "Will the real adapter capture this?",
+            "outcomes": ["Yes", "No"],
+            "clobTokenIds": [yes_token, no_token],
+            "updatedAt": T0.isoformat(),
+            "endDate": (T0 + timedelta(days=1)).isoformat(),
+            "active": True,
+            "closed": False,
+            "acceptingOrders": True,
+            "enableOrderBook": True,
+            "volume": "1000",
+            "liquidity": "100",
+        }
+        book_payloads = {
+            yes_token: {
+                "asset_id": yes_token,
+                "market": condition_id,
+                "timestamp": T0.isoformat(),
+                "bids": [{"price": "0.49", "size": "10"}],
+                "asks": [{"price": "0.51", "size": "10"}],
+            },
+            no_token: {
+                "asset_id": no_token,
+                "market": condition_id,
+                "timestamp": T0.isoformat(),
+                "bids": [{"price": "0.49", "size": "10"}],
+                "asks": [{"price": "0.51", "size": "10"}],
+            },
+        }
+        requests: list[str] = []
+
+        class Response:
+            status = 200
+            headers: dict[str, str] = {}
+
+            def __init__(self, payload: object) -> None:
+                self.payload = payload
+
+            def read(self) -> bytes:
+                return json.dumps(self.payload).encode("utf-8")
+
+            def close(self) -> None:
+                return None
+
+        def opener(request: object, timeout: float) -> Response:
+            del timeout
+            url = str(getattr(request, "full_url", request))
+            requests.append(url)
+            if "/markets/" in url:
+                return Response(gamma_payload)
+            if "/book?" in url:
+                token = yes_token if yes_token in url else no_token
+                return Response(book_payloads[token])
+            if "/trades?" in url:
+                return Response([])
+            raise AssertionError(f"unexpected public URL: {url}")
+
+        provider = PolymarketAdapter(
+            gamma_url="https://gamma.test",
+            data_api_url="https://data.test",
+            clob_url="https://clob.test",
+            opener=opener,
+        )
+        store = _ScopeStore({})
+        collector = self._collector(provider, store, ())
+        collector._rolling_background_discovery_enabled = True
+        collector._scope_draft_preview = {"draft_id": "cache-only-budget"}
+        collector._draft_market_request_limit = 5
+        try:
+            local = collector._collect_market(
+                market_id,
+                None,
+                T0,
+                provider=provider,
+                force=True,
+            )
+        finally:
+            collector.close()
+
+        counters = local["counters"]
+        self.assertEqual(local["attempted"], 1)
+        self.assertEqual(counters["requests"], 4)
+        self.assertEqual(counters["snapshots_inserted"], 1)
+        self.assertEqual(counters["errors"], 0)
+        self.assertEqual(len(requests), 4)
+
+    def test_uncaught_capture_error_retains_partial_provider_accounting(self) -> None:
+        target = market("partial-accounting")
+
+        class TimestampFailureProvider(_RecordingProvider):
+            def provider_timestamp_for(self, market_id: str, kind: str = "market"):
+                del market_id
+                if kind == "no_order_book":
+                    raise RuntimeError("timestamp cache read failed")
+                return None
+
+        provider = TimestampFailureProvider((target,))
+        collector = self._collector(
+            provider,
+            _ScopeStore({}),
+            (),
+            market_ids=(target.market_id,),
+        )
+        try:
+            cycle = collector.collect_once(now=T0)
+        finally:
+            collector.close()
+
+        self.assertEqual(cycle.markets_attempted, 1)
+        self.assertEqual(cycle.markets_failed, 1)
+        self.assertEqual(cycle.requests, 3)
+        self.assertGreaterEqual(cycle.provider_failures, 1)
+        self.assertGreaterEqual(cycle.errors, 1)
+
+
     def test_bootstrap_retry_budget_stops_before_retry_and_persists_partial_state(self) -> None:
+
         provider = _PagedProvider((market("retry-budget"),), ())
         collector = self._collector(provider, _ScopeStore({}), ())
         collector.config = replace(
@@ -3225,6 +3348,53 @@ class MarketScopeCollectorTests(unittest.TestCase):
             collector._discovery_continuation["partial_reason"],
             "BOOTSTRAP_REQUEST_BUDGET_EXHAUSTED",
         )
+        collector.close()
+    def test_normal_suitability_evidence_does_not_leak_into_later_draft_exclusions(self) -> None:
+        old_unsuitable = replace(market("normal-old"), order_book=None)
+        current_draft = market("draft-current")
+        provider = _PagedProvider(
+            (old_unsuitable, current_draft),
+            (
+                {"snapshots": (old_unsuitable,), "next_cursor": None},
+                {"snapshots": (current_draft,), "next_cursor": None},
+            ),
+        )
+        store = _ScopeStore({})
+        collector = self._collector(provider, store, (), max_markets=1)
+        normal = collector.collect_once(now=T0)
+        self.assertIn(
+            "normal-old",
+            {str(item.get("market_id")) for item in normal.discovery_exclusions},
+        )
+
+        draft = {
+            "status": "DRAFT",
+            "draft_id": "leakage-draft",
+            "scope_hash": "sha256:leakage-scope",
+            "scope_version": "v1",
+            "scope": {"mode": "RULE_BASED_MARKETS", "categories": []},
+            "paper_only": True,
+            "live_execution": False,
+            "allocation_active": False,
+            "canary_armed": False,
+        }
+        draft["draft_hash"] = "sha256:" + hashlib.sha256(
+            json.dumps(
+                draft,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        draft_cycle = collector.collect_once(
+            now=T0 + timedelta(minutes=1),
+            scope_draft=draft,
+        )
+        draft_exclusion_ids = {
+            str(item.get("market_id")) for item in draft_cycle.discovery_exclusions
+        }
+        self.assertNotIn("normal-old", draft_exclusion_ids)
+        self.assertIn("draft-current", draft_cycle.discovery_scheduled)
         collector.close()
     def test_draft_fresh_discovery_capture_and_deferred_resume_isolated_from_legacy(self) -> None:
         legacy = market("legacy-maintenance")

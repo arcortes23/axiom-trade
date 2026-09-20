@@ -133,11 +133,18 @@ class PolymarketAdapter(PredictionMarketDataProvider):
         return create
 
     def provider_timestamp_for(self, market_id: str, kind: str = "market") -> datetime | None:
+        identifier = str(market_id).strip()
         if kind in {"yes_order_book", "no_order_book", "order_book"}:
-            tokens = self.token_ids(str(market_id))
+            # Book timestamps need the cached Gamma identity/token mapping;
+            # never let bookkeeping trigger token_ids' lazy metadata fetch.
+            if not identifier or identifier not in self._raw_cache:
+                return None
+            tokens = self.token_ids(identifier)
             token = tokens.get("yes" if kind == "yes_order_book" else "no" if kind == "no_order_book" else "yes")
             return self._book_provider_timestamps.get(str(token)) if token else None
-        return self._provider_timestamps.get((str(kind), str(market_id)))
+        # Market timestamps are already keyed cache evidence and do not need
+        # the raw payload/token identity path above.
+        return self._provider_timestamps.get((str(kind), identifier))
 
     def consume_validation_errors(self) -> tuple[PolymarketPayloadError, ...]:
         errors = tuple(self._validation_errors)
