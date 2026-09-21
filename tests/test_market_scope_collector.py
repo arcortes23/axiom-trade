@@ -3464,6 +3464,76 @@ class MarketScopeCollectorTests(unittest.TestCase):
         self.assertEqual(len(requests), 4)
 
 
+
+    def test_scope_request_pressure_preserves_native_capture(self) -> None:
+        target = market("scope-pressure-target", category="politics")
+        scope_members = (
+            target,
+            *tuple(
+                market(f"scope-pressure-member-{index}", category="politics")
+                for index in range(19)
+            ),
+        )
+        scope_ids = tuple(snapshot.market_id for snapshot in scope_members)
+
+        class DirectClone(_PagedProvider):
+            def scope_market(self, market_id: str):
+                return self._markets.get(str(market_id))
+
+        class BackgroundScopeCollector(_ScopeCollector):
+            def _rolling_scope_market_ids(self):
+                self._rolling_background_discovery_enabled = True
+                self._rolling_scope_candidate_ids = ()
+                self._rolling_scope_documents = {}
+                return []
+
+        class PressureProvider(_PagedProvider):
+            def isolated_worker_factory(self):
+                return DirectClone(scope_members, ())
+
+        provider = PressureProvider(scope_members, ())
+        store = _ScopeStore(
+            {
+                "scope-pressure-candidate": {
+                    "experiment_plan": {
+                        "market_scope": scope(
+                            "EXACT_MARKETS",
+                            market_ids=scope_ids,
+                        ),
+                    }
+                }
+            }
+        )
+        collector = BackgroundScopeCollector(
+            provider,
+            store,
+            CollectorConfig(
+                max_markets=1,
+                discovery_budget_per_cycle=1,
+                max_attempts=1,
+                backoff_initial_seconds=0,
+                jitter_seconds=0,
+            ),
+            candidate_ids=("scope-pressure-candidate",),
+            clock=lambda: T0,
+            sleep=lambda _seconds: None,
+        )
+        try:
+            cycle = collector.collect_once(
+                now=T0,
+                market_ids=(target.market_id,),
+            )
+        finally:
+            collector.close()
+
+        self.assertEqual(
+            list(cycle.candidate_bound_scheduled),
+            [target.market_id],
+        )
+        self.assertGreaterEqual(cycle.snapshots_inserted, 1)
+        self.assertIn(target.market_id, provider.market_calls)
+        self.assertLessEqual(cycle.requests, 16)
+
     def test_actual_adapter_repairs_legacy_none_cursor_and_resumes_deduped_trades(self) -> None:
         market_id = "real-adapter-cursor"
         condition_id = "0x" + ("b" * 64)
