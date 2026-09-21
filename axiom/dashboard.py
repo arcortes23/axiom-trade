@@ -786,21 +786,24 @@ _HTTP_PUBLIC_SECTION_FIELDS: dict[str, tuple[str, ...]] = {
     ),
 }
 _HTTP_PUBLIC_SECTION_PRIORITY = (
-    "risk_settings",
-    "rolling_portfolio",
+    # Controls contain the operator's actionable proposal, blockers, and
+    # execution-authorization bindings.  Reserve this bounded surface before
+    # verbose rolling history can consume the hard response byte cap.
+    "operator_controls",
     "execution_authorization",
     "exploratory_live_review",
     "rolling_exploratory_scope_draft",
     "scope_draft",
     "controller_lease",
     "canary",
-    "operator_controls",
     "status_report",
     "control",
     "readiness",
     "worker",
     "execution",
     "market_scope_funnel",
+    "risk_settings",
+    "rolling_portfolio",
 )
 
 

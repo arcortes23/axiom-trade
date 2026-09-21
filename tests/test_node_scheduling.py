@@ -1791,6 +1791,7 @@ class ExploratoryRollingProgressionTests(unittest.TestCase):
                 return (), "draft-next", ()
             def fake_resolve(
                 *_args: Any,
+                **_kwargs: Any,
             ) -> tuple[list[str], dict[str, Any], dict[str, Any], Any]:
                 collector._rolling_background_discovery_enabled = isinstance(
                     collector._scope_draft_preview,

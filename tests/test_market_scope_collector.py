@@ -2549,6 +2549,40 @@ class MarketScopeCollectorTests(unittest.TestCase):
         self.assertTrue(invalid_evidence)
         self.assertEqual(invalid_evidence[-1]["reason"], "SUITABILITY_ASSUMPTIONS_UNKNOWN")
 
+    def test_requested_rule_market_is_directly_resolved_before_broad_inventory(self) -> None:
+        requested = market("requested-rule-market", category="politics")
+        unrelated = market("unrelated-inventory-market", category="economics")
+        provider = _PagedProvider(
+            (requested, unrelated),
+            ({"snapshots": (unrelated,), "next_cursor": None},),
+        )
+        store = _ScopeStore(
+            {
+                "rule-candidate": {
+                    "experiment_plan": {
+                        "market_scope": scope("RULE_BASED_MARKETS", category="politics"),
+                    }
+                }
+            }
+        )
+        cycle = self._collector(
+            provider,
+            store,
+            ("rule-candidate",),
+            max_markets=1,
+            market_ids=("requested-rule-market",),
+        ).collect_once(now=T0)
+
+        self.assertEqual(list(cycle.candidate_bound_scheduled), ["requested-rule-market"])
+        self.assertNotIn("unrelated-inventory-market", cycle.candidate_bound_scheduled)
+        self.assertIn("requested-rule-market", provider.market_calls)
+        self.assertGreaterEqual(cycle.markets_attempted, 1)
+        self.assertGreaterEqual(cycle.snapshots_inserted, 1)
+        self.assertEqual(
+            [item.market_id for item in store.resolutions[-1].matched_markets],
+            ["requested-rule-market"],
+        )
+
     def test_full_cycle_reserves_collection_after_scope_authorization(self) -> None:
         base = market("collect-after-scope")
         selected_book = base.order_book

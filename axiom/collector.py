@@ -876,6 +876,14 @@ class PolymarketCollector:
             else ({"scope_draft_binding": draft_binding} if draft_binding else None)
         )
         requested = tuple(dict.fromkeys(str(item).strip() for item in (market_ids or ()) if str(item).strip()))
+        requested_scope_ids = (
+            ()
+            if isinstance(self._scope_draft_preview, Mapping)
+            else tuple(dict.fromkeys([
+                *requested,
+                *(self.config.market_ids if not requested else ()),
+            ]))
+        )
         superseded_candidate_ids, superseded_intent_ids = (
             self._superseded_observation_ids()
         )
@@ -1000,6 +1008,7 @@ class PolymarketCollector:
                     ),
                     continuation_state,
                     counters,
+                    requested_market_ids=requested_scope_ids,
                 )
             )
             scope_authorized_market_ids = {
@@ -4388,6 +4397,8 @@ class PolymarketCollector:
         candidate_ids: Sequence[str],
         root_state: Mapping[str, Any],
         counters: dict[str, Any],
+        *,
+        requested_market_ids: Sequence[str] = (),
     ) -> tuple[list[str], dict[str, list[str]], dict[str, PredictionMarketSnapshot], Any]:
         """Resolve all frozen market policies against one shared inventory.
 
@@ -4728,6 +4739,21 @@ class PolymarketCollector:
             for _, document in documents
             for market_id in self._scope_exact_market_ids((document,))
         ))[:_MAX_SCOPE_INVENTORY]
+        requested_values = list(dict.fromkeys(
+            str(item).strip()
+            for item in (requested_market_ids or ())
+            if str(item).strip()
+        ))
+        rule_scope_present = any(
+            str(getattr(self._scope_policy(document), "mode", "")).strip().upper()
+            == "RULE_BASED_MARKETS"
+            for _, document in documents
+        )
+        requested_rule_ids = [
+            market_id
+            for market_id in requested_values
+            if market_id not in set(exact_ids) and rule_scope_present
+        ]
         protected_priority_exact_ids = list(dict.fromkeys(
             market_id
             for candidate_id, document in documents
@@ -4802,6 +4828,46 @@ class PolymarketCollector:
                 self._scope_direct_protected_lookup_cursor = (
                     protected_cursor + len(pre_direct_attempted_ids)
                 ) % len(protected_priority_exact_ids)
+        if requested_rule_ids and self._scope_direct_budget_available(counters):
+            for market_id in requested_rule_ids[:_MAX_SCOPE_DIRECT_LOOKUPS]:
+                remaining = self._cycle_remaining_seconds()
+                if remaining is not None and remaining <= 0:
+                    self._mark_cycle_exhaustion("scope_requested_lookup")
+                    break
+                if not self._scope_direct_budget_available(counters):
+                    break
+                pre_direct_attempted_ids.add(market_id)
+                try:
+                    direct_snapshot = self._call_scope_direct(
+                        f"scope_requested:/markets/{market_id}",
+                        lambda operation_provider, identifier=market_id: self._scope_market_operation(
+                            operation_provider,
+                            identifier,
+                        ),
+                        observed_at,
+                        counters,
+                    )
+                except _ProviderDeadlineExceeded as exc:
+                    if exc.cycle_expired:
+                        self._mark_cycle_exhaustion("scope_requested_lookup")
+                    break
+                except Exception as exc:
+                    counters["errors"] += 1
+                    try:
+                        self.store.save_collection_error(
+                            market_id,
+                            observed_at,
+                            "scope_requested_lookup",
+                            str(exc),
+                        )
+                    except Exception:
+                        pass
+                    continue
+                if not isinstance(direct_snapshot, PredictionMarketSnapshot):
+                    continue
+                if str(direct_snapshot.market_id).strip() != market_id:
+                    continue
+                pre_direct_snapshots[market_id] = direct_snapshot
         carry_cursor = self._scope_cursor(root_state)
         needs_inventory = any(
             self._scope_document_needs_inventory(document)
