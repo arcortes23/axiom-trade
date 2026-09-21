@@ -1003,5 +1003,274 @@
       ],
       "fixture_final_status": "prepared, DISARMED, execution authorization REVOKED, action_stats total/completed/pending 0"
     }
+  },
+  "new_risk_reuse_closure": {
+    "scope": "Isolated current Home/Live/Settings risk-reuse acceptance; synthetic loopback fixture only; discover and Cancel only.",
+    "source_hashes": {
+      "axiom/ui/app.js": "6408b9ff37f542ef8439c9c13eff7b5936ada296f5d9baeaf96e9c0223af931f",
+      "axiom/ui/pages.js": "45d35a60d3b519327bf168e41602a30b61f587229f2cabbc463b660e0bf5f36f",
+      "tests/ui_fixture_server.py": "1e9cb07c958958a99f47fdbc501a424989ac5cbbcfd55c6f26d89dd3d7f34ba2",
+      "axiom/dashboard.py": "22e3c22dfa8d96f68a005a44ea71e2407d238d2bc81fb774750df0fb7cbc2a98",
+      "axiom/storage.py": "8d779dc63260a4eb4e989299b54fe067edc5e999bf6d5322bc13471a0a1edfc8"
+    },
+    "fixture": {
+      "url": "http://127.0.0.1:52331",
+      "admin_url": "http://127.0.0.1:52333",
+      "upstream_url": "http://127.0.0.1:52330",
+      "processes": [
+        "RiskReuseFixture",
+        "RiskReuseChrome",
+        "RiskReviewChrome"
+      ],
+      "cdp_ports": [
+        52370,
+        50150
+      ],
+      "scenario": "prepared"
+    },
+    "home_context": {
+      "route": "http://127.0.0.1:52331/?view=home&closure=risk-reuse",
+      "screenshot": "C:/Users/User/projects/axiom-ui/reports/ui-release/risk-reuse-home-valid.png",
+      "actual_requests": [
+        "GET /api/ui-state 200",
+        "GET /api/v2/canary 200"
+      ],
+      "context_error": false,
+      "observed": [
+        "Home rendered without TypeError/undefined context error",
+        "Session budget $5.00",
+        "Max buy $0.73",
+        "Duration 86,400 seconds (1 days)",
+        "Mode Exploratory Micro Canary",
+        "Members1 rendered",
+        "Review and start rendered",
+        "Stop canary rendered",
+        "Canonical session context loaded"
+      ]
+    },
+    "live_context": {
+      "route": "http://127.0.0.1:52331/?view=live&section=polymarket&closure=risk-reuse",
+      "screenshot": "C:/Users/User/projects/axiom-ui/reports/ui-release/risk-reuse-live-valid.png",
+      "context_error": false,
+      "observed": [
+        "Live trading · Polymarket rendered without TypeError/undefined context error",
+        "Session budget and 86,400-second duration rendered",
+        "Review and start rendered",
+        "Stop canary rendered",
+        "Polymarket canary decision boundary rendered"
+      ]
+    },
+    "settings_context": {
+      "route": "http://127.0.0.1:52331/?view=settings&closure=risk-reuse",
+      "valid_screenshot": "C:/Users/User/projects/axiom-ui/reports/ui-release/risk-reuse-settings-valid.png",
+      "natural_poll_screenshot": "C:/Users/User/projects/axiom-ui/reports/ui-release/risk-reuse-settings-natural-poll.png",
+      "context_error": false,
+      "observed": [
+        "Valid Settings context loaded without TypeError/undefined context error",
+        "Risk limits rendered",
+        "After natural 60-second /api/system fault poll, draft Maximum all-in buy 0.61 retained",
+        "Selection max_submitted_orders_per_day 10 retained",
+        "Focus Maximum all-in buy retained",
+        "System unavailable rendered",
+        "Loading false after poll settled"
+      ]
+    },
+    "review_discovery_cancel": {
+      "screenshot": "C:/Users/User/projects/axiom-ui/reports/ui-release/risk-reuse-review-dialog.png",
+      "observed": [
+        "Home review dialog opened with no context error",
+        "Purpose, lifetime budget, scope, exact current proposed members and stop rules rendered",
+        "Review phrase label Type REVIEW EXPLORATORY AUTHORIZATION",
+        "Final phrase label Type CONFIRM EXPLORATORY LIVE present disabled before Step 2",
+        "Cancel closed the dialog",
+        "No stage-one submit was performed"
+      ]
+    },
+    "delayed_review_cancel": {
+      "screenshot": "C:/Users/User/projects/axiom-ui/reports/ui-release/risk-reuse-review-cancel-delayed.png",
+      "method": "Fixture delay_ms=10000 delayed actual fresh /api/ui-state and /api/v2/canary GETs after review discovery. The review phrase was entered and the read was started, then Cancel was clicked while both GETs were pending; no stage-one response was allowed to submit.",
+      "observed": [
+        "Both fresh GETs were pending in the browser network view",
+        "Cancel returned to Home",
+        "After delayed GET responses released, no stale dialog/result resurfaced",
+        "No POST in the browser network view",
+        "No final confirmation or authority transition"
+      ]
+    },
+    "final_admin_status": {
+      "action_stats": {
+        "total": 0,
+        "completed": 0,
+        "pending": 0
+      },
+      "armed_state": "DISARMED",
+      "execution_authorization": "REVOKED",
+      "scenario": "prepared"
+    },
+    "honest_limits": [
+      "No stage-one submit, final confirmation, trading, production, credentials, venue, database, Store, or real-money operation was performed in this new risk-reuse acceptance.",
+      "Previous history and the separately recorded incidental synthetic probe remain untouched."
+    ],
+    "cleanup": {
+      "processes_stopped": [
+        "RiskReuseChrome",
+        "RiskReviewChrome",
+        "RiskReuseFixture"
+      ],
+      "profiles_removed": [
+        "C:/Users/User/AppData/Local/Temp/axiom-risk-reuse-chrome",
+        "C:/Users/User/AppData/Local/Temp/axiom-risk-review-chrome"
+      ]
+    }
+  },
+  "native_shape_correction_closure": {
+    "scope": "Isolated current Home/Live/Settings native-context recheck after autonomous_canary restoration; fixture only; discovery and Cancel only.",
+    "source_hashes": {
+      "axiom/ui/app.js": "6408b9ff37f542ef8439c9c13eff7b5936ada296f5d9baeaf96e9c0223af931f",
+      "axiom/ui/pages.js": "45d35a60d3b519327bf168e41602a30b61f587229f2cabbc463b660e0bf5f36f",
+      "tests/ui_fixture_server.py": "1e9cb07c958958a99f47fdbc501a424989ac5cbbcfd55c6f26d89dd3d7f34ba2",
+      "axiom/dashboard.py": "42d1f783b34f0e5cb24ce1525032702a0aa693e9a30e0ff88117749ff21f8649",
+      "axiom/storage.py": "8d779dc63260a4eb4e989299b54fe067edc5e999bf6d5322bc13471a0a1edfc8"
+    },
+    "fixture": {
+      "url": "http://127.0.0.1:59079",
+      "admin_url": "http://127.0.0.1:59080",
+      "upstream_url": "http://127.0.0.1:59078",
+      "processes": [
+        "NativeShapeFixture",
+        "NativeShapeChrome",
+        "NativeReviewChrome"
+      ],
+      "cdp_ports": [
+        59108,
+        52775
+      ],
+      "scenario": "prepared"
+    },
+    "home_context": {
+      "screenshot": "C:/Users/User/projects/axiom-ui/reports/ui-release/native-shape-home-valid.png",
+      "observed": [
+        "Home rendered without TypeError/undefined context error",
+        "Session budget $5.00",
+        "Max buy $0.73",
+        "Duration 86,400 seconds (1 days)",
+        "Mode Exploratory Micro Canary",
+        "Members1 rendered",
+        "Review and start and Stop canary rendered",
+        "Actual GET /api/ui-state and /api/v2/canary completed"
+      ],
+      "native_payload_check": {
+        "fixture": true,
+        "ui_state_risk_keys": [
+          "active",
+          "config_hash",
+          "config_id",
+          "control_generation",
+          "cumulative_buy_cap_usd",
+          "cumulative_buy_over_limit_reason",
+          "effective_limits",
+          "generation",
+          "remaining",
+          "remaining_cumulative_buy_usd",
+          "status",
+          "usage"
+        ],
+        "canary_risk_keys": [
+          "active",
+          "config_hash",
+          "config_id",
+          "control_generation",
+          "cumulative_buy_cap_usd",
+          "cumulative_buy_over_limit_reason",
+          "effective_limits",
+          "generation",
+          "remaining",
+          "remaining_cumulative_buy_usd",
+          "status",
+          "usage"
+        ],
+        "risk_snapshot_ui_state": null,
+        "risk_snapshot_canary": null
+      }
+    },
+    "live_context": {
+      "screenshot": "C:/Users/User/projects/axiom-ui/reports/ui-release/native-shape-live-valid.png",
+      "observed": [
+        "Live trading · Polymarket rendered without TypeError/undefined context error",
+        "Session budget and 86,400-second duration rendered",
+        "Review and start and Stop canary rendered",
+        "Polymarket canary decision boundary rendered"
+      ]
+    },
+    "settings_context": {
+      "screenshot": "C:/Users/User/projects/axiom-ui/reports/ui-release/native-shape-settings-valid.png",
+      "observed": [
+        "Settings & system rendered without TypeError/undefined context error",
+        "Risk limits rendered",
+        "Maximum all-in buy field present",
+        "Actual Settings read context completed"
+      ]
+    },
+    "review_discovery_cancel": {
+      "screenshot": "C:/Users/User/projects/axiom-ui/reports/ui-release/native-shape-review-dialog.png",
+      "observed": [
+        "Review dialog opened without TypeError/undefined context error",
+        "Purpose, lifetime budget, scope, exact current proposed members and stop rules rendered",
+        "Type REVIEW EXPLORATORY AUTHORIZATION label rendered",
+        "Type CONFIRM EXPLORATORY LIVE label present disabled before Step 2",
+        "Cancel closed dialog",
+        "No stage-one submit performed"
+      ]
+    },
+    "delayed_review_cancel": {
+      "screenshot": "C:/Users/User/projects/axiom-ui/reports/ui-release/native-shape-review-cancel-delayed.png",
+      "method": "Fixture delay_ms=10000 delayed actual fresh /api/ui-state and /api/v2/canary GETs after review phrase entry; Cancel clicked while pending.",
+      "observed": [
+        "Both fresh GETs pending in network view",
+        "Cancel returned to Home",
+        "After delayed reads released, no stale dialog/result resurfaced",
+        "No POST in browser network view",
+        "No final confirmation or authority transition"
+      ]
+    },
+    "retained_settings_natural_poll": {
+      "screenshot": "C:/Users/User/projects/axiom-ui/reports/ui-release/risk-reuse-settings-natural-poll.png",
+      "measured_under_dashboard_hash": "22e3c22dfa8d96f68a005a44ea71e2407d238d2bc81fb774750df0fb7cbc2a98",
+      "ui_hash": "6408b9ff37f542ef8439c9c13eff7b5936ada296f5d9baeaf96e9c0223af931f",
+      "fixture_hash": "1e9cb07c958958a99f47fdbc501a424989ac5cbbcfd55c6f26d89dd3d7f34ba2",
+      "observed": [
+        "Natural 60-second /api/system fault preserved draft Maximum all-in buy 0.61",
+        "Selection 10 retained",
+        "Focus Maximum all-in buy retained",
+        "System unavailable rendered",
+        "Loading false"
+      ],
+      "rerun_after_dashboard_correction": false
+    },
+    "final_admin_status": {
+      "action_stats": {
+        "total": 0,
+        "completed": 0,
+        "pending": 0
+      },
+      "armed_state": "DISARMED",
+      "execution_authorization": "REVOKED",
+      "scenario": "prepared"
+    },
+    "honest_limits": [
+      "This is measured evidence, not a final current-pass claim; parent native gates remain authoritative.",
+      "No stage-one submit, final confirmation, trading, production, credentials, venue, database, Store, or real-money operation was performed."
+    ],
+    "cleanup": {
+      "processes_stopped": [
+        "NativeShapeChrome",
+        "NativeReviewChrome",
+        "NativeShapeFixture"
+      ],
+      "profiles_removed": [
+        "C:/Users/User/AppData/Local/Temp/axiom-native-shape-chrome",
+        "C:/Users/User/AppData/Local/Temp/axiom-native-review-chrome"
+      ]
+    }
   }
 }

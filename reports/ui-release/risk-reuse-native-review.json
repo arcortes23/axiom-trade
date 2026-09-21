@@ -1,0 +1,111 @@
+{
+  "review": "risk-reuse-native-review",
+  "status": "passed",
+  "scope": "isolated local AxiomStore and native DashboardServer only; no LIVE, venue, operator, or production access",
+  "source": {
+    "dashboard_sha256": "42d1f783b34f0e5cb24ce1525032702a0aa693e9a30e0ff88117749ff21f8649",
+    "storage_sha256": "8d779dc63260a4eb4e989299b54fe067edc5e999bf6d5322bc13471a0a1edfc8",
+    "app_js_sha256": "6408b9ff37f542ef8439c9c13eff7b5936ada296f5d9baeaf96e9c0223af931f",
+    "dashboard_ui_test_sha256": "7bc72751acd99c318bd4a2b760f060931ca96743d77ba5ef34e2392336f40ab9",
+    "canary_doc_sha256": "f27dd27b348dedc71637ab1fd20def2f74516fd0d8f7aecd92cc8929ade9e546"
+  },
+  "actual_17a_comparison": {
+    "baseline_revision": "17a8650252eeab35f73993ac9810db1830ec2d07",
+    "fixture": "DashboardData.ui_state_data on the actual 17a archived package versus the frozen 42d source, each with an isolated initialized AxiomStore and CanarySettingsService",
+    "baseline_settings_snapshot_calls": 5,
+    "frozen_settings_snapshot_calls": 1,
+    "baseline_ui_state_json_bytes": 32275,
+    "frozen_ui_state_json_bytes": 32267,
+    "baseline_top_level_autonomous_canary": false,
+    "frozen_canary_endpoint_top_level_autonomous_canary": true
+  },
+  "successive_native_read": {
+    "first": {
+      "active_max_exposure": "5.00",
+      "draft_max_exposure": null
+    },
+    "after_save_draft": {
+      "active_max_exposure": "5.00",
+      "draft_max_exposure": "6.00"
+    },
+    "successive_change_observed": true,
+    "active_unchanged": true,
+    "read_isolation": "same request-local snapshot only; no cross-request/global cache"
+  },
+  "http": {
+    "base_url": "http://127.0.0.1:51513",
+    "ui_state": {
+      "status": 200,
+      "bytes": 48835,
+      "risk_status": "CURRENT",
+      "draft_max_exposure": "6.00",
+      "live_execution": false,
+      "canonical_status_report_present": true
+    },
+    "risk_settings": {
+      "status": 200,
+      "bytes": 6796
+    },
+    "canary": {
+      "status": 200,
+      "bytes": 76690,
+      "top_level_autonomous_canary": true,
+      "canary_object": true,
+      "autonomous_canary_object": true,
+      "canary_selection_status": "UNKNOWN",
+      "autonomous_selection_status": "UNKNOWN",
+      "required_actionable_scan_fields_present_in_both": true
+    },
+    "system": {
+      "status": 200
+    },
+    "safety": {
+      "operator_api_requests": 0,
+      "live_execution": false,
+      "production_access": false
+    }
+  },
+  "browser": {
+    "profile": "C:/Users/User/AppData/Local/Temp/axiom-risk-reuse-corrected-profile",
+    "home": {
+      "route": "?view=home",
+      "heading": "Home",
+      "current_authority_visible": true,
+      "no_active_authorization_visible": true,
+      "horizontal_overflow": false,
+      "api_paths": [
+        "/api/ui-state",
+        "/api/v2/canary"
+      ],
+      "api_durations_ms": [
+        36,
+        27
+      ],
+      "operator_requests": 0,
+      "screenshot": "risk-reuse-native-home.png"
+    },
+    "settings": {
+      "route": "?view=settings",
+      "heading": "Settings & system",
+      "risk_form_present": true,
+      "advanced_visible": true,
+      "storage_visible": true,
+      "draft_value_visible": true,
+      "horizontal_overflow": false,
+      "api_paths": [
+        "/api/risk-settings",
+        "/api/ui-state",
+        "/api/system",
+        "/api/status"
+      ],
+      "operator_requests": 0,
+      "screenshot": "risk-reuse-native-settings.png"
+    }
+  },
+  "findings": [],
+  "artifacts": [
+    "risk-reuse-native-review.json",
+    "risk-reuse-native-home.png",
+    "risk-reuse-native-settings.png"
+  ]
+}

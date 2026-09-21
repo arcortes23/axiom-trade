@@ -737,6 +737,99 @@ class DashboardReadLatencyFixture(unittest.TestCase):
         )
         self.assertEqual(candidate_zero["stage"], "REJECTED")
 
+    def test_successive_ui_state_reads_observe_new_risk_draft(self) -> None:
+        dashboard = DashboardData(
+            store=self.dashboard_store,
+            clock=lambda: T0,
+        )
+        before = dashboard.ui_state_data()
+        before_risk = before["risk_settings"]
+        before_auth = before["execution_authorization"]
+        observed = self.service.settings.snapshot(now=T0)
+        self.service.settings.save_draft(
+            {"max_submitted_orders_per_day": 17},
+            "dashboard-risk-reuse",
+        )
+
+        after = dashboard.ui_state_data()
+        after_risk = after["risk_settings"]
+        after_auth = after["execution_authorization"]
+        self.assertEqual(before_risk["generation"], observed["generation"])
+        self.assertEqual(after_risk["generation"], observed["generation"])
+        self.assertEqual(after_risk["config_id"], before_risk["config_id"])
+        self.assertEqual(
+            after_risk["effective_limits"]["max_submitted_orders_per_day"],
+            before_risk["effective_limits"]["max_submitted_orders_per_day"],
+        )
+        self.assertEqual(
+            after_risk["draft"]["values"]["max_submitted_orders_per_day"],
+            17,
+        )
+        self.assertEqual(
+            after_auth["economic_policy"]["limits"]["max_submitted_orders_per_day"],
+            before_auth["economic_policy"]["limits"]["max_submitted_orders_per_day"],
+        )
+
+    def test_ui_state_keeps_native_authority_when_risk_is_display_overridden(self) -> None:
+        observed = self.service.settings.snapshot(now=T0)
+        authorization = self.store.register_execution_authorization_draft(
+            authorization_id="dashboard-risk-reuse-auth",
+            purpose="dashboard risk reuse",
+            exact_strategy_versions=(),
+            reviewed_selection_policy_hash="0" * 64,
+            adverse_evidence_ack=True,
+            lifetime_budget={"max_notional_usd": "1000", "max_orders": 100},
+            stop_rules={"max_loss_usd": "1000"},
+            expires_at=T0 + timedelta(days=1),
+            scope_hash="dashboard-scope",
+            scope_version="v1",
+            active_settings_hash=observed["config_hash"],
+            active_settings_generation=int(observed["generation"]),
+            actor="dashboard-risk-reuse",
+            timestamp=T0,
+        )
+        active = self.store.activate_execution_authorization(
+            authorization["authorization_id"],
+            "dashboard-risk-reuse",
+            expected_generation=int(authorization["generation"]),
+            timestamp=T0,
+        )
+        dashboard = DashboardData(
+            data={
+                "operator": {
+                    "risk_settings": {
+                        "status": "DISPLAY_OVERRIDE",
+                        "effective_limits": {"max_submitted_orders_per_day": 999},
+                    }
+                }
+            },
+            store=self.dashboard_store,
+            clock=lambda: T0,
+        )
+
+        state = dashboard.ui_state_data()
+        self.assertEqual(state["risk_settings"]["status"], "DISPLAY_OVERRIDE")
+        self.assertEqual(
+            state["canary"]["risk_settings"]["config_id"],
+            observed["config_id"],
+        )
+        self.assertEqual(
+            state["execution_authorization"]["authorization_id"],
+            active["authorization_id"],
+        )
+        self.assertEqual(
+            state["execution_authorization"]["authorization"][
+                "active_settings_generation"
+            ],
+            observed["generation"],
+        )
+        self.assertEqual(
+            state["execution_authorization"]["economic_policy"]["limits"][
+                "max_submitted_orders_per_day"
+            ],
+            observed["effective_limits"]["max_submitted_orders_per_day"],
+        )
+
     def test_canary_enable_and_decision_signal_updates_projection(self) -> None:
         settings = self.service.settings.snapshot(now=T0)
         enabled = self.service.enable_autonomous_micro_live(

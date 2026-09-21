@@ -121,6 +121,14 @@ When authoritative equity evidence is missing or stale, the snapshot reports
 `equity_status` as `UNKNOWN`/`STALE` rather than treating it as zero and keeps
 new entries blocked. The projection labels collateral as pUSD and reserves
 venue base units separately from the human-readable decimal settings.
+Dashboard `ui-state` reads capture one native risk-settings snapshot for the
+request and reuse that same payload while projecting authorization, canary, and
+rolling-portfolio sections. This reuse is request-local only: standalone
+dashboard endpoints acquire a fresh native snapshot on each invocation, and
+there is no cross-request cache. The reuse does not change economic accounting,
+canonical status-report accounting, authority bindings, or freshness gates.
+Missing or failed native settings remain unavailable/blocked; the projection
+does not fabricate zero-valued risk or authority data.
 
 ## Budget units and accounting
 

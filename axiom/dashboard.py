@@ -3306,7 +3306,11 @@ class DashboardData:
             result = self._binance_testnet_projection(result, status_raw)
         return _binance_safe_value(result)
 
-    def rolling_portfolio_data(self) -> dict[str, Any]:
+    def rolling_portfolio_data(
+        self,
+        *,
+        risk_snapshot: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Project bounded rolling controller/evidence/selection state."""
         empty = {
             "status": "UNKNOWN",
@@ -4662,7 +4666,11 @@ class DashboardData:
             active_policy = {**active_policy, "policy": dict(active_policy_document)}
         if reviewed_policy_document:
             reviewed_policy = {**reviewed_policy, "policy": dict(reviewed_policy_document)}
-        risk = self.risk_settings_data()
+        risk = (
+            risk_snapshot
+            if risk_snapshot is not None
+            else self.risk_settings_data()
+        )
         effective_limits = (
             risk.get("effective_limits")
             if isinstance(risk, Mapping)
@@ -9099,8 +9107,16 @@ class DashboardData:
             "live_execution": False,
         }
 
-    def canary_data(self) -> dict[str, Any]:
-        settings_snapshot = self.risk_settings_data()
+    def canary_data(
+        self,
+        *,
+        risk_snapshot: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        settings_snapshot = (
+            risk_snapshot
+            if risk_snapshot is not None
+            else self.risk_settings_data()
+        )
         canary_report: dict[str, Any] = {}
         if self.store is None:
             canary: Mapping[str, Any] = {
@@ -9388,8 +9404,12 @@ class DashboardData:
                 else {}
             ),
             "autonomous_canary": autonomous,
-            "rolling_portfolio": self.rolling_portfolio_data(),
-            "execution_authorization": self.execution_authorization_data(),
+            "rolling_portfolio": self.rolling_portfolio_data(
+                risk_snapshot=settings_snapshot
+            ),
+            "execution_authorization": self.execution_authorization_data(
+                risk_snapshot=settings_snapshot
+            ),
             "canary_signal": signal,
             "connectivity": connectivity,
             "research_cards": {
@@ -9409,7 +9429,11 @@ class DashboardData:
         }
         projection.update({name: canary[name] for name in _CANARY_STATUS_FIELDS})
         return projection
-    def execution_authorization_data(self) -> dict[str, Any]:
+    def execution_authorization_data(
+        self,
+        *,
+        risk_snapshot: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Return bounded authorization/identity metadata from shared storage."""
         active: Mapping[str, Any] | None = None
         latest: Mapping[str, Any] | None = None
@@ -9505,7 +9529,11 @@ class DashboardData:
             "pid": pid,
             "process_identity": process_identity,
         }
-        risk = self.risk_settings_data()
+        risk = (
+            risk_snapshot
+            if risk_snapshot is not None
+            else self.risk_settings_data()
+        )
         limits = risk.get("effective_limits", risk.get("active_limits", {}))
         limits = dict(limits) if isinstance(limits, Mapping) else {}
         usage = risk.get("usage", {}) if isinstance(risk, Mapping) else {}
@@ -10047,9 +10075,14 @@ class DashboardData:
             if isinstance(configured_controls, Mapping)
             else {}
         )
-        authorization = _bounded_value(self.execution_authorization_data())
-        risk_settings = _bounded_value(self.risk_settings_data())
-        canary = _bounded_value(self.canary_data())
+        native_risk_settings = self.risk_settings_data()
+        authorization = _bounded_value(
+            self.execution_authorization_data(risk_snapshot=native_risk_settings)
+        )
+        risk_settings = _bounded_value(native_risk_settings)
+        canary = _bounded_value(
+            self.canary_data(risk_snapshot=native_risk_settings)
+        )
         if isinstance(configured_operator.get("execution_authorization"), Mapping):
             authorization = _bounded_value(configured_operator["execution_authorization"])
         if isinstance(configured_operator.get("risk_settings"), Mapping):

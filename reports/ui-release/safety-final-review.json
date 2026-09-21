@@ -1,57 +1,86 @@
 {
-  "reviewer": "UiSafetyReview",
-  "overall_correctness": "correct",
-  "explanation": "Final UI-root and bounded system closure review is clean. Frozen app.js 6408b9ff removes only the unused Home overview-summary request/error plumbing while preserving ui-state/canary rendering, canonical status/risk/canary/action ownership, aborts, and pending recovery. Frozen dashboard.py 061f0a1f and storage.py 8d779dc6 replace the system full-health path with read-only SQLite metadata plus an exact health-monitor worker projection carrying row heartbeat_at/updated_at provenance; historical scans, lazy collector reads/writes, authority, trading, and controller producers remain untouched.",
-  "confidence": 0.99,
-  "findings": [],
-  "source_hashes": {
-    "axiom/ui/app.js": "6408b9ff37f542ef8439c9c13eff7b5936ada296f5d9baeaf96e9c0223af931f",
-    "axiom/ui/pages.js": "45d35a60d3b519327bf168e41602a30b61f587229f2cabbc463b660e0bf5f36f",
-    "tests/test_dashboard_ui.py": "7bc72751acd99c318bd4a2b760f060931ca96743d77ba5ef34e2392336f40ab9",
-    "tests/ui_fixture_server.py": "a6751d59bb61e2e2e67cba18adf52dd01d74f9c6c19f4759962f09756ef87350",
-    "docs/polymarket_canary.md": "d0f7839d3bf85723b4b56cee7dce840eb63a386575e708fdfecad18c39dce649",
-    "axiom/operator.py": "f1e4ef2e15cc9c415fdce33cfb73142905c20ca182d5b6281ece385b068d8483",
-    "axiom/dashboard.py": "061f0a1f5838b1bb3c462bcf72c3b1fb3d2b48191e7fd196535c1c0ae499169b",
-    "axiom/storage.py": "8d779dc63260a4eb4e989299b54fe067edc5e999bf6d5322bc13471a0a1edfc8"
-  },
-  "historical_proof": [
-    {
-      "source_root": "C:/Users/User/projects/axiom-ui",
-      "app_hash": "5f6f5fea9f417dc74366fc074db6ad4f10641ffcdb7e20a188617cff33dbd460",
-      "pages_hash": "93136c12a5ff0c3442197a331aff2b05964b58d534b269a48cded2f455956a77",
-      "verdict": "clean prior source-safety review before read-state closure"
-    },
-    {
-      "source_root": "C:/Users/User/projects/axiom",
-      "app_hash": "7e0a2a18b4fbc772293863546eeca606a9a99d705c0b3a3a9bfb7c1474b6bdf0",
-      "pages_hash": "cc9418bc090b98ee156a9448419b9c1a02dd4e6080cecc2b271aa8a43eed0aa9",
-      "verdict": "historical P2 structured-only Live gate finding; this path was not the final UI-root artifact and is superseded"
-    },
-    {
-      "source_root": "C:/Users/User/projects/axiom-ui",
-      "app_hash": "7e0a2a18b4fbc772293863546eeca606a9a99d705c0b3a3a9bfb7c1474b6bdf0",
-      "pages_hash": "0c5c3b699e8a10843d99032ce009db19a5891126d31fd42929339cf5d8125045",
-      "verdict": "current corrected UI-root source review; P2 closed"
-    },
-    {
-      "source_root": "C:/Users/User/projects/axiom-ui",
-      "app_hash": "7e0a2a18b4fbc772293863546eeca606a9a99d705c0b3a3a9bfb7c1474b6bdf0",
-      "pages_hash": "45d35a60d3b519327bf168e41602a30b61f587229f2cabbc463b660e0bf5f36f",
-      "verdict": "final corrected UI-root source review; domain markup and Hermes/Shadow secondary gates closed; no findings"
-    },
-    {
-      "source_root": "C:/Users/User/projects/axiom-ui",
-      "app_hash": "6408b9ff37f542ef8439c9c13eff7b5936ada296f5d9baeaf96e9c0223af931f",
-      "pages_hash": "45d35a60d3b519327bf168e41602a30b61f587229f2cabbc463b660e0bf5f36f",
-      "verdict": "final frontend-only Home closure review; unused overview-summary request/error plumbing removed; canonical Home/Live/Settings/action/abort/pending paths preserved; no findings"
-    },
-    {
-      "source_root": "C:/Users/User/projects/axiom-ui",
-      "dashboard_hash": "061f0a1f5838b1bb3c462bcf72c3b1fb3d2b48191e7fd196535c1c0ae499169b",
-      "storage_hash": "8d779dc63260a4eb4e989299b54fe067edc5e999bf6d5322bc13471a0a1edfc8",
-      "tests_hash": "7bc72751acd99c318bd4a2b760f060931ca96743d77ba5ef34e2392336f40ab9",
-      "docs_hash": "d0f7839d3bf85723b4b56cee7dce840eb63a386575e708fdfecad18c39dce649",
-      "verdict": "final bounded system closure review; storage metadata is READY/UNKNOWN with null-on-error, health is exact-key persisted health-monitor projection with row heartbeat/updated provenance, and unrelated history/lazy writes/authority paths remain untouched; no findings"
-    }
-  ]
+    "reviewer":  "UiSafetyReview",
+    "overall_correctness":  "correct",
+    "explanation":  "Final UI-root and bounded system closure review is clean after superseding the intermediate 22e3c22f risk-reuse edit that accidentally omitted the top-level autonomous_canary projection and the intermediate activation-based freshness proof. Corrected dashboard.py 42d1f783 restores that public schema while reusing one request-local native risk snapshot across ui-state authorization, canary, and rolling projections without cross-request caching, configured display authority, mutation, or changes to canonical status/accounting/action paths; standalone endpoints remain fresh and partial/missing/error snapshots remain preserved. Final direct ui-state proof observes a new draft while active generation/configuration and authorization limits remain unchanged. Frozen app.js 6408b9ff removes only the unused Home overview-summary request/error plumbing, and dashboard.py 061f0a1f plus storage.py 8d779dc6 retain bounded read-only system metadata and exact health-monitor provenance.",
+    "confidence":  0.99,
+    "findings":  [
+
+                 ],
+    "source_hashes":  {
+                          "axiom/ui/app.js":  "6408b9ff37f542ef8439c9c13eff7b5936ada296f5d9baeaf96e9c0223af931f",
+                          "axiom/ui/pages.js":  "45d35a60d3b519327bf168e41602a30b61f587229f2cabbc463b660e0bf5f36f",
+                          "tests/test_dashboard_ui.py":  "7bc72751acd99c318bd4a2b760f060931ca96743d77ba5ef34e2392336f40ab9",
+                          "tests/ui_fixture_server.py":  "1e9cb07c958958a99f47fdbc501a424989ac5cbbcfd55c6f26d89dd3d7f34ba2",
+                          "docs/polymarket_canary.md":  "f27dd27b348dedc71637ab1fd20def2f74516fd0d8f7aecd92cc8929ade9e546",
+                          "axiom/operator.py":  "f1e4ef2e15cc9c415fdce33cfb73142905c20ca182d5b6281ece385b068d8483",
+                          "axiom/dashboard.py":  "42d1f783b34f0e5cb24ce1525032702a0aa693e9a30e0ff88117749ff21f8649",
+                          "axiom/storage.py":  "8d779dc63260a4eb4e989299b54fe067edc5e999bf6d5322bc13471a0a1edfc8",
+                          "tests/test_dashboard_read_latency.py":  "88f3bf4c21212db72bb7f2d47e1fdf2b6801b91c53049ad96cc42e595fe2ef0f",
+                          "axiom/ui/styles.css":  "d17b131ab2e7c96e590e4200fc5ff9e1ef1a7adcd6ce901426a45c84c6a7468e",
+                          "tests/test_dashboard_pagination.py":  "8586cdfc55c00bc6018ee44ad7fe5bd701a08f75da0f586ffd27f6566fff7a1c"
+                      },
+    "historical_proof":  [
+                             {
+                                 "source_root":  "C:/Users/User/projects/axiom-ui",
+                                 "app_hash":  "5f6f5fea9f417dc74366fc074db6ad4f10641ffcdb7e20a188617cff33dbd460",
+                                 "pages_hash":  "93136c12a5ff0c3442197a331aff2b05964b58d534b269a48cded2f455956a77",
+                                 "verdict":  "clean prior source-safety review before read-state closure"
+                             },
+                             {
+                                 "source_root":  "C:/Users/User/projects/axiom",
+                                 "app_hash":  "7e0a2a18b4fbc772293863546eeca606a9a99d705c0b3a3a9bfb7c1474b6bdf0",
+                                 "pages_hash":  "cc9418bc090b98ee156a9448419b9c1a02dd4e6080cecc2b271aa8a43eed0aa9",
+                                 "verdict":  "historical P2 structured-only Live gate finding; this path was not the final UI-root artifact and is superseded"
+                             },
+                             {
+                                 "source_root":  "C:/Users/User/projects/axiom-ui",
+                                 "app_hash":  "7e0a2a18b4fbc772293863546eeca606a9a99d705c0b3a3a9bfb7c1474b6bdf0",
+                                 "pages_hash":  "0c5c3b699e8a10843d99032ce009db19a5891126d31fd42929339cf5d8125045",
+                                 "verdict":  "current corrected UI-root source review; P2 closed"
+                             },
+                             {
+                                 "source_root":  "C:/Users/User/projects/axiom-ui",
+                                 "app_hash":  "7e0a2a18b4fbc772293863546eeca606a9a99d705c0b3a3a9bfb7c1474b6bdf0",
+                                 "pages_hash":  "45d35a60d3b519327bf168e41602a30b61f587229f2cabbc463b660e0bf5f36f",
+                                 "verdict":  "final corrected UI-root source review; domain markup and Hermes/Shadow secondary gates closed; no findings"
+                             },
+                             {
+                                 "source_root":  "C:/Users/User/projects/axiom-ui",
+                                 "app_hash":  "6408b9ff37f542ef8439c9c13eff7b5936ada296f5d9baeaf96e9c0223af931f",
+                                 "pages_hash":  "45d35a60d3b519327bf168e41602a30b61f587229f2cabbc463b660e0bf5f36f",
+                                 "verdict":  "final frontend-only Home closure review; unused overview-summary request/error plumbing removed; canonical Home/Live/Settings/action/abort/pending paths preserved; no findings"
+                             },
+                             {
+                                 "source_root":  "C:/Users/User/projects/axiom-ui",
+                                 "dashboard_hash":  "061f0a1f5838b1bb3c462bcf72c3b1fb3d2b48191e7fd196535c1c0ae499169b",
+                                 "storage_hash":  "8d779dc63260a4eb4e989299b54fe067edc5e999bf6d5322bc13471a0a1edfc8",
+                                 "tests_hash":  "7bc72751acd99c318bd4a2b760f060931ca96743d77ba5ef34e2392336f40ab9",
+                                 "docs_hash":  "d0f7839d3bf85723b4b56cee7dce840eb63a386575e708fdfecad18c39dce649",
+                                 "verdict":  "final bounded system closure review; storage metadata is READY/UNKNOWN with null-on-error, health is exact-key persisted health-monitor projection with row heartbeat/updated provenance, and unrelated history/lazy writes/authority paths remain untouched; no findings"
+                             },
+                             {
+                                 "source_root":  "C:/Users/User/projects/axiom-ui",
+                                 "dashboard_hash":  "22e3c22dfa8d96f68a005a44ea71e2407d238d2bc81fb774750df0fb7cbc2a98",
+                                 "fixture_hash":  "1e9cb07c958958a99f47fdbc501a424989ac5cbbcfd55c6f26d89dd3d7f34ba2",
+                                 "tests_hash":  "8457f94a921ec317502b4b71e4c342fa946973da3e1dbb5d4814f750ceaaf348",
+                                 "docs_hash":  "f27dd27b348dedc71637ab1fd20def2f74516fd0d8f7aecd92cc8929ade9e546",
+                                 "verdict":  "superseded intermediate risk-reuse review; focused native gate caught the patch-introduced omission of the top-level autonomous_canary projection"
+                             },
+                             {
+                                 "source_root":  "C:/Users/User/projects/axiom-ui",
+                                 "dashboard_hash":  "42d1f783b34f0e5cb24ce1525032702a0aa693e9a30e0ff88117749ff21f8649",
+                                 "fixture_hash":  "1e9cb07c958958a99f47fdbc501a424989ac5cbbcfd55c6f26d89dd3d7f34ba2",
+                                 "tests_hash":  "e69b9e4e3e012e414a927a2fc20f636652186831f0271e7e188329c9d5289e3e",
+                                 "docs_hash":  "f27dd27b348dedc71637ab1fd20def2f74516fd0d8f7aecd92cc8929ade9e546",
+                                 "verdict":  "superseded corrected source review with intermediate activation-based freshness proof; native control-config fencing rejected the arrangement, so proof was replaced by a draft-only ui-state freshness case"
+                             },
+                             {
+                                 "source_root":  "C:/Users/User/projects/axiom-ui",
+                                 "dashboard_hash":  "42d1f783b34f0e5cb24ce1525032702a0aa693e9a30e0ff88117749ff21f8649",
+                                 "fixture_hash":  "1e9cb07c958958a99f47fdbc501a424989ac5cbbcfd55c6f26d89dd3d7f34ba2",
+                                 "tests_hash":  "88f3bf4c21212db72bb7f2d47e1fdf2b6801b91c53049ad96cc42e595fe2ef0f",
+                                 "docs_hash":  "f27dd27b348dedc71637ab1fd20def2f74516fd0d8f7aecd92cc8929ade9e546",
+                                 "verdict":  "final corrected request-local native risk snapshot reuse review; top-level autonomous_canary schema restored after the intermediate 22e3c22f omission; final draft-only ui-state freshness proof preserves active settings and authorization while observing draft updates; one native ui-state risk read is reused across authorization, canary, and rolling projections; standalone reads stay fresh; fixture override accepts the new keyword without native rereads; configured display overrides remain non-authoritative; canonical status/accounting/action paths and partial/error handling remain unchanged; no findings"
+                             }
+                         ]
 }

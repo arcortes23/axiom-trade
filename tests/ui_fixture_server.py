@@ -1651,7 +1651,12 @@ class FixtureDashboardData(DashboardData):
             import time
             time.sleep(max(0, min(int(delay), 10_000)) / 1000)
 
-    def canary_data(self) -> dict[str, Any]:
+    def canary_data(
+        self,
+        *,
+        risk_snapshot: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        del risk_snapshot
         self._fixture_delay()
         return deepcopy(self._data.get("canary") or {})
     def risk_settings_data(self) -> dict[str, Any]:

@@ -5,17 +5,19 @@
   "worktree": "C:/Users/User/projects/axiom-ui",
   "base_revision": "18babca0fbff71abfcef8a4e715f212cf70170cd",
   "overall_correctness": "correct",
-  "explanation": "The final frozen source is covered by current native home/system and read-only page closures, current rendered-state/transport/visual/safety evidence, documentation, and gates. Historical action/state/surface captures remain explicitly versioned; current native closures cover changed read paths without silently relabeling old screenshots.",
+  "explanation": "The final frozen source is covered by current risk-reuse native, Home/Settings/System, native read, rendered-state, transport/polling, visual, safety, documentation, and gate evidence. Historical captures retain exact source attribution; current native closures prove the final read/schema paths without silently relabeling prior screenshots.",
   "confidence": 0.98,
   "final_source": {
     "axiom/ui/app.js": "6408b9ff37f542ef8439c9c13eff7b5936ada296f5d9baeaf96e9c0223af931f",
     "axiom/ui/pages.js": "45d35a60d3b519327bf168e41602a30b61f587229f2cabbc463b660e0bf5f36f",
     "axiom/ui/styles.css": "d17b131ab2e7c96e590e4200fc5ff9e1ef1a7adcd6ce901426a45c84c6a7468e",
-    "tests/ui_fixture_server.py": "a6751d59bb61e2e2e67cba18adf52dd01d74f9c6c19f4759962f09756ef87350",
-    "axiom/dashboard.py": "061f0a1f5838b1bb3c462bcf72c3b1fb3d2b48191e7fd196535c1c0ae499169b",
-    "docs/polymarket_canary.md": "d0f7839d3bf85723b4b56cee7dce840eb63a386575e708fdfecad18c39dce649",
+    "tests/ui_fixture_server.py": "1e9cb07c958958a99f47fdbc501a424989ac5cbbcfd55c6f26d89dd3d7f34ba2",
+    "axiom/dashboard.py": "42d1f783b34f0e5cb24ce1525032702a0aa693e9a30e0ff88117749ff21f8649",
+    "docs/polymarket_canary.md": "f27dd27b348dedc71637ab1fd20def2f74516fd0d8f7aecd92cc8929ade9e546",
     "axiom/storage.py": "8d779dc63260a4eb4e989299b54fe067edc5e999bf6d5322bc13471a0a1edfc8",
-    "tests/test_dashboard_ui.py": "7bc72751acd99c318bd4a2b760f060931ca96743d77ba5ef34e2392336f40ab9"
+    "tests/test_dashboard_ui.py": "7bc72751acd99c318bd4a2b760f060931ca96743d77ba5ef34e2392336f40ab9",
+    "tests/test_dashboard_read_latency.py": "88f3bf4c21212db72bb7f2d47e1fdf2b6801b91c53049ad96cc42e595fe2ef0f",
+    "tests/test_dashboard_pagination.py": "8586cdfc55c00bc6018ee44ad7fe5bd701a08f75da0f586ffd27f6566fff7a1c"
   },
   "evidence_modalities": {
     "browser_proof": [
@@ -266,6 +268,12 @@
   },
   "report_mapping": [
     {
+      "report": "reports/ui-release/risk-reuse-native-review.json",
+      "status": "effective_current_risk_reuse",
+      "source": "dashboard 42d / storage 8d / app 6408 / pages 45d / fixture 1e9 / test 7bc / docs f27",
+      "note": "Actual archived17a versus frozen42d native comparison, schema HTTP200, request-local read freshness, genuine UI draft change with active/auth unchanged, and Home/Settings browser reads; no findings."
+    },
+    {
       "report": "reports/ui-release/home-system-read-closure-review.json",
       "status": "effective_current_native_home_system",
       "source": "app 6408 / pages 45d / dashboard 061f / storage 8d / test 7bc / docs d0f7",
@@ -355,7 +363,8 @@
     "Network GET503/deadline/route/settings/live captures retain their dede source capture hash with final 5f6 unchanged-path confirmation; the current-source action-race capture is separately recorded.",
     "Independent walkthrough is an independent agent run, not a human study; earlier synthetic terms in that artifact are not current canonical native terms.",
     "Native read closure is current-source proof for Hermes/Shadow/dataset pages; historical 883a state captures remain explicitly historical and are not relabeled as final45d.",
-    "The state reviewer recorded one incidental synthetic first-stage review POST in a separate action fixture; no global zero-POST claim is made. The scoped delayed-GET Cancel window had zero POST, and no final confirmation or production action occurred."
+    "The state reviewer recorded one incidental synthetic first-stage review POST in a separate action fixture; no global zero-POST claim is made. The scoped delayed-GET Cancel window had zero POST, and no final confirmation or production action occurred.",
+    "The earlier home-system/native-read reports are retained as historical source-version evidence; risk-reuse-native-review.json is the effective current dashboard/docs/fixture freshness closure."
   ],
   "publication_files": {
     "reports": [
@@ -364,6 +373,7 @@
       "reports/ui-release/action-closure-review.json",
       "reports/ui-release/state-closure-review.json",
       "reports/ui-release/network-closure-review.json",
+      "reports/ui-release/risk-reuse-native-review.json",
       "reports/ui-release/home-system-read-closure-review.json",
       "reports/ui-release/native-read-closure-review.json",
       "reports/ui-release/visual-closure-review.json",
@@ -417,7 +427,9 @@
       "reports/ui-release/native-dataset-detail-page3.png",
       "reports/ui-release/state-closure-current-hermes-cold503-shadow.png",
       "reports/ui-release/home-system-native-home.png",
-      "reports/ui-release/home-system-native-settings.png"
+      "reports/ui-release/home-system-native-settings.png",
+      "reports/ui-release/risk-reuse-native-home.png",
+      "reports/ui-release/risk-reuse-native-settings.png"
     ],
     "before_after_responsive_13": {
       "before": [
@@ -567,6 +579,11 @@
       "reports/ui-release/native-automation-page3.png",
       "reports/ui-release/native-dataset-detail-page3.png",
       "reports/ui-release/native-read-closure-review.json",
+      "reports/ui-release/native-shape-home-valid.png",
+      "reports/ui-release/native-shape-live-valid.png",
+      "reports/ui-release/native-shape-review-cancel-delayed.png",
+      "reports/ui-release/native-shape-review-dialog.png",
+      "reports/ui-release/native-shape-settings-valid.png",
       "reports/ui-release/network-closure-action-late.png",
       "reports/ui-release/network-closure-get503.png",
       "reports/ui-release/network-closure-identity-after.png",
@@ -620,6 +637,15 @@
       "reports/ui-release/responsive-768-research-data.png",
       "reports/ui-release/responsive-768-research-strategies.png",
       "reports/ui-release/responsive-768-settings.png",
+      "reports/ui-release/risk-reuse-home-valid.png",
+      "reports/ui-release/risk-reuse-live-valid.png",
+      "reports/ui-release/risk-reuse-native-home.png",
+      "reports/ui-release/risk-reuse-native-review.json",
+      "reports/ui-release/risk-reuse-native-settings.png",
+      "reports/ui-release/risk-reuse-review-cancel-delayed.png",
+      "reports/ui-release/risk-reuse-review-dialog.png",
+      "reports/ui-release/risk-reuse-settings-natural-poll.png",
+      "reports/ui-release/risk-reuse-settings-valid.png",
       "reports/ui-release/safety-final-review-resolved.json",
       "reports/ui-release/safety-final-review.json",
       "reports/ui-release/state-closure-active-no-signal-home.png",
@@ -737,7 +763,7 @@
       "reports/ui-release/visual-closure-settings-200.png",
       "reports/ui-release/visual-final-review.json"
     ],
-    "transitive_reference_count": 239,
+    "transitive_reference_count": 253,
     "transitive_missing_paths": [],
     "manifest_note": "All in-repo JSON/PNG/HTML references reachable from every included report, excluding private deployment-boundary receipt and raw before/session-local paths."
   },
