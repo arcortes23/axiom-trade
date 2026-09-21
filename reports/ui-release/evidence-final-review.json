@@ -5,16 +5,17 @@
   "worktree": "C:/Users/User/projects/axiom-ui",
   "base_revision": "18babca0fbff71abfcef8a4e715f212cf70170cd",
   "overall_correctness": "correct",
-  "explanation": "The final frozen source and read-only native closure are covered by current native-read, rendered-state, transport/polling, visual, surface, safety, documentation, and gate evidence. Historical action/state/surface captures remain explicitly versioned; current final-read receipts cover the changed page/read paths, and the report does not silently relabel old captures as final-source proof.",
+  "explanation": "The final frozen source is covered by current native home/system and read-only page closures, current rendered-state/transport/visual/safety evidence, documentation, and gates. Historical action/state/surface captures remain explicitly versioned; current native closures cover changed read paths without silently relabeling old screenshots.",
   "confidence": 0.98,
   "final_source": {
-    "axiom/ui/app.js": "7e0a2a18b4fbc772293863546eeca606a9a99d705c0b3a3a9bfb7c1474b6bdf0",
+    "axiom/ui/app.js": "6408b9ff37f542ef8439c9c13eff7b5936ada296f5d9baeaf96e9c0223af931f",
     "axiom/ui/pages.js": "45d35a60d3b519327bf168e41602a30b61f587229f2cabbc463b660e0bf5f36f",
     "axiom/ui/styles.css": "d17b131ab2e7c96e590e4200fc5ff9e1ef1a7adcd6ce901426a45c84c6a7468e",
     "tests/ui_fixture_server.py": "a6751d59bb61e2e2e67cba18adf52dd01d74f9c6c19f4759962f09756ef87350",
-    "axiom/dashboard.py": "da70cda306e3904fde891584c5191c9ac97646c2658259caf90c76ae3ac88820",
-    "docs/polymarket_canary.md": "50e2516072a444111eb86d15ae2d274e6d8ef3d6410f02502b3a9849e50cca2a",
-    "axiom/storage.py": "5925b9f178052173e4af2b4caee7c4b97420e2aed38f2d154bba9e2c188b48b8"
+    "axiom/dashboard.py": "061f0a1f5838b1bb3c462bcf72c3b1fb3d2b48191e7fd196535c1c0ae499169b",
+    "docs/polymarket_canary.md": "d0f7839d3bf85723b4b56cee7dce840eb63a386575e708fdfecad18c39dce649",
+    "axiom/storage.py": "8d779dc63260a4eb4e989299b54fe067edc5e999bf6d5322bc13471a0a1edfc8",
+    "tests/test_dashboard_ui.py": "7bc72751acd99c318bd4a2b760f060931ca96743d77ba5ef34e2392336f40ab9"
   },
   "evidence_modalities": {
     "browser_proof": [
@@ -34,7 +35,7 @@
     {
       "destination": "home",
       "route": "?view=home",
-      "endpoint_contract": "/api/operator, /api/v2/overview-summary, /api/v2/canary plus bounded ancillary shell reads",
+      "endpoint_contract": "/api/ui-state and /api/v2/canary for the current Home route; no /api/operator read is claimed in the final Home proof (native home/system closure separately verifies /api/system and scoped system projection).",
       "browser_route_proof": "surface-final-review.json#destinations[0]",
       "state_proof": "state-closure-review.json#empty_missing_destination_checks (missing and empty), state-closure-review.json#matrix (19 rendered states)",
       "before": "reports/ui-release/before-home-1280.png",
@@ -208,7 +209,7 @@
     {
       "destination": "settings",
       "route": "?view=settings",
-      "endpoint_contract": "/api/risk-settings, /api/operator, /api/system, /api/status and bounded advanced projections; writes explicitly controlled",
+      "endpoint_contract": "/api/risk-settings, /api/system, /api/status and bounded advanced projections; current native Home/Settings closure records no /api/operator request; writes explicitly controlled.",
       "browser_route_proof": "surface-final-review.json#destinations[12]",
       "state_proof": "state-closure-review.json#empty_missing_destination_checks",
       "before": "reports/ui-release/before-settings-1280.png (nearest old canary/overview reference; old UI had no Settings tab)",
@@ -224,7 +225,7 @@
   "interaction_state_accessibility": {
     "canonical_action": "action-closure-review.json is current 5f6f evidence for exact REVIEW EXPLORATORY AUTHORIZATION / execution_authorization.review and CONFIRM EXPLORATORY LIVE / exploratory.live.review_confirm, native values shared/lifetime 5.00, duration 86400, FINAL_CONFIRMATION, exact purpose, final payload {}, no client action_id, dropped stage-one response/no replay, COMPLETE-to-Step2/no auto-final, stored RUNNING to COMPLETE/FAILED, material adverse fence, Stop preserving ACTIVE while disarming, and direct Revoke changing permission only while armed remains true. Final current_cancellation_guards also prove real successful /api/ui-state responses released after Cancel/Escape produce zero POSTs, an old Check response cannot clear a newer RUNNING marker, and immediate close after final dispatch retains the recovery marker across reload.",
     "transport_and_polling": "network-closure-review.json is current 5f6 evidence for ancillary GET503 isolation, native 10s client deadline, route abort/late-response ordering, natural Settings >=62s and Live >=17s preservation, selected-record disclosure reset, and late-read protection of newer COMPLETE outcome. No findings.",
-    "rendered_states": "state-closure-review.json has 19 rows, all 13 routes swept under missing and empty, 75 evidence references with 0 missing; final 5f6 targeted rechecks show missing authorization Duration Not available and Home overview unavailable notice. Findings are marked fixed/rechecked. Final current read closure additionally covers Hermes cold primary failure with queue/count/connection/heartbeat Not available and 10 valid Shadow rows page1 of3, plus native dataset gap health/null and v1/v2 pages.",
+    "rendered_states": "state-closure-review.json has 19 rows, all 13 routes swept under missing and empty, 75 evidence references with 0 missing; final 5f6 targeted rechecks show missing authorization Duration Not available and Home overview unavailable notice. Findings are marked fixed/rechecked. Final current read closure additionally covers Hermes cold primary failure with queue/count/connection/heartbeat Not available and 10 valid Shadow rows page1 of3, plus native dataset gap health/null and v1/v2 pages. Final native home/system closure also proves healthy and absent-system projections: /api/system remains 200; absent health is UNKNOWN/null rather than zero; Home uses only ui-state/canary reads and Settings renders native system status; delayed GET plus Cancel remains scoped zero POST.",
     "visual_responsive_zoom": "visual-closure-review.json is current 5f6/d17 evidence for native Chrome 200%, technical detail no page overflow, clipboard full synthetic ID match, review focus/Escape, drawer focus, and offline file:// safety. The prior 13-destination before/after and 390/768/1440 screenshots are retained with explicit historical source attribution because no visual/CSS changes occurred.",
     "accessibility": "visual final/closure report records axe 4.12.1 zero violations on prepared Home, drawer keyboard loop/Escape/focus restoration, no page-level overflow, and local table scrolling; action review records dialog focus and disabled unresolved controls.",
     "offline": "visual-closure-review.json#offline_reference is verified_current: saved offline-reference.html exactly matches current dashboard template (dashboard.py b0dc), file: resources 0/network-like 0, nine links disabled/tabIndex -1, two actions hidden/disabled, click leaves URL unchanged, longHex 0, credentialLiteral 0. Prior offline screenshots remain historical but byte-identical template output is explicitly documented.",
@@ -264,6 +265,12 @@
     }
   },
   "report_mapping": [
+    {
+      "report": "reports/ui-release/home-system-read-closure-review.json",
+      "status": "effective_current_native_home_system",
+      "source": "app 6408 / pages 45d / dashboard 061f / storage 8d / test 7bc / docs d0f7",
+      "note": "Native Home/Settings/System closure: /api/system 200, scoped storage and persisted health, absent health UNKNOWN/null, current Home ui-state+canary reads, no /api/operator, no GUI overflow/console errors."
+    },
     {
       "report": "reports/ui-release/native-read-closure-review.json",
       "status": "effective_current_native_read",
@@ -347,7 +354,8 @@
     "The 13 before/after screenshots and 390/768/1440 images are historical versioned visual evidence from the preceding app freeze; current visual closure rechecked affected technical-detail/copy/review paths at app5f6 and found no CSS/layout changes. This is explicitly attributed, not silently relabeled.",
     "Network GET503/deadline/route/settings/live captures retain their dede source capture hash with final 5f6 unchanged-path confirmation; the current-source action-race capture is separately recorded.",
     "Independent walkthrough is an independent agent run, not a human study; earlier synthetic terms in that artifact are not current canonical native terms.",
-    "Native read closure is current-source proof for Hermes/Shadow/dataset pages; historical 883a state captures remain explicitly historical and are not relabeled as final45d."
+    "Native read closure is current-source proof for Hermes/Shadow/dataset pages; historical 883a state captures remain explicitly historical and are not relabeled as final45d.",
+    "The state reviewer recorded one incidental synthetic first-stage review POST in a separate action fixture; no global zero-POST claim is made. The scoped delayed-GET Cancel window had zero POST, and no final confirmation or production action occurred."
   ],
   "publication_files": {
     "reports": [
@@ -356,6 +364,7 @@
       "reports/ui-release/action-closure-review.json",
       "reports/ui-release/state-closure-review.json",
       "reports/ui-release/network-closure-review.json",
+      "reports/ui-release/home-system-read-closure-review.json",
       "reports/ui-release/native-read-closure-review.json",
       "reports/ui-release/visual-closure-review.json",
       "reports/ui-release/surface-final-review.json",
@@ -406,7 +415,9 @@
       "reports/ui-release/native-automation-page3.png",
       "reports/ui-release/native-automation-hermes-error.png",
       "reports/ui-release/native-dataset-detail-page3.png",
-      "reports/ui-release/state-closure-current-hermes-cold503-shadow.png"
+      "reports/ui-release/state-closure-current-hermes-cold503-shadow.png",
+      "reports/ui-release/home-system-native-home.png",
+      "reports/ui-release/home-system-native-settings.png"
     ],
     "before_after_responsive_13": {
       "before": [
@@ -535,6 +546,18 @@
       "reports/ui-release/detail-browser-evidence.json",
       "reports/ui-release/evidence-final-review.json",
       "reports/ui-release/gates.json",
+      "reports/ui-release/home-system-home-canary-fault.png",
+      "reports/ui-release/home-system-home-ui-state-fault.png",
+      "reports/ui-release/home-system-home-valid.png",
+      "reports/ui-release/home-system-live-canary-fault.png",
+      "reports/ui-release/home-system-live-valid.png",
+      "reports/ui-release/home-system-native-home.png",
+      "reports/ui-release/home-system-native-settings.png",
+      "reports/ui-release/home-system-read-closure-review.json",
+      "reports/ui-release/home-system-review-cancel-delayed.png",
+      "reports/ui-release/home-system-review-dialog.png",
+      "reports/ui-release/home-system-settings-natural-poll-fault.png",
+      "reports/ui-release/home-system-settings-valid.png",
       "reports/ui-release/independent-evidence.json",
       "reports/ui-release/independent-mobile-settings.png",
       "reports/ui-release/independent-postfreeze-home.png",
@@ -714,7 +737,7 @@
       "reports/ui-release/visual-closure-settings-200.png",
       "reports/ui-release/visual-final-review.json"
     ],
-    "transitive_reference_count": 227,
+    "transitive_reference_count": 239,
     "transitive_missing_paths": [],
     "manifest_note": "All in-repo JSON/PNG/HTML references reachable from every included report, excluding private deployment-boundary receipt and raw before/session-local paths."
   },

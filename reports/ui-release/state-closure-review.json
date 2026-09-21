@@ -827,5 +827,181 @@
       "cold": true,
       "honest_limit": "No Hermes primary payload was cached in this browser; the preserved Shadow rows are independent secondary data."
     }
+  },
+  "home_system_closure": {
+    "scope": "Isolated Home/Live/Settings UI state closure against frozen frontend; synthetic loopback fixture only.",
+    "source_hashes": {
+      "axiom/ui/app.js": "6408b9ff37f542ef8439c9c13eff7b5936ada296f5d9baeaf96e9c0223af931f",
+      "axiom/ui/pages.js": "45d35a60d3b519327bf168e41602a30b61f587229f2cabbc463b660e0bf5f36f",
+      "tests/ui_fixture_server.py": "a6751d59bb61e2e2e67cba18adf52dd01d74f9c6c19f4759962f09756ef87350"
+    },
+    "fixture": {
+      "url": "http://127.0.0.1:61374",
+      "admin_url": "http://127.0.0.1:61375",
+      "upstream_url": "http://127.0.0.1:61373",
+      "process": "HomeSystemFixture",
+      "browser_processes": [
+        "HomeSystemChrome",
+        "HomeFaultChrome"
+      ],
+      "cdp_ports": [
+        61376,
+        51083
+      ],
+      "scenario": "prepared"
+    },
+    "home_valid": {
+      "route": "http://127.0.0.1:61374/?view=home",
+      "screenshot": "C:/Users/User/projects/axiom-ui/reports/ui-release/home-system-home-valid.png",
+      "actual_requests": [
+        "GET /api/ui-state 200",
+        "GET /api/v2/canary 200"
+      ],
+      "absent_requests": [
+        "GET /api/v2/overview-summary"
+      ],
+      "observed": [
+        "Home rendered",
+        "Current authority/session rendered",
+        "Session budget $5.00",
+        "Max buy $0.73",
+        "Duration 86,400 seconds (1 days)",
+        "Mode Exploratory Micro Canary",
+        "Members 1",
+        "Review and start rendered",
+        "Stop canary rendered",
+        "What is known now rendered",
+        "No overview-summary request occurred"
+      ]
+    },
+    "review_discovery_cancel": {
+      "screenshot": "C:/Users/User/projects/axiom-ui/reports/ui-release/home-system-review-dialog.png",
+      "observed": [
+        "Exploratory live authorization dialog opened from Home",
+        "Purpose, lifetime budget, scope, exact current proposed members and stop-rule terms rendered",
+        "Review phrase label Type REVIEW EXPLORATORY AUTHORIZATION",
+        "Final phrase label Type CONFIRM EXPLORATORY LIVE present as disabled until Step 2",
+        "Cancel closed the dialog and returned to Home",
+        "No authority or final-confirmation submission in this acceptance run"
+      ],
+      "admin_action_stats_at_end": {
+        "total": 0,
+        "completed": 0,
+        "pending": 0
+      }
+    },
+    "incidental_synthetic_first_stage_review": {
+      "observed": "A later exploratory Step 2 probe submitted one synthetic execution_authorization.review POST; it was excluded from acceptance evidence and no final confirmation, trading, production, venue, credential, or real-money operation occurred.",
+      "fixture_reset": "Scenario reset to prepared; final admin status action_stats total/completed/pending=0, state DISARMED, authorization REVOKED."
+    },
+    "home_ui_state_fault": {
+      "method": "Fresh private browser with actual /api/ui-state GET aborted; /api/v2/canary remained an actual fixture GET.",
+      "screenshot": "C:/Users/User/projects/axiom-ui/reports/ui-release/home-system-home-ui-state-fault.png",
+      "observed": [
+        "Operator unavailable · Failed to fetch",
+        "Current authority unavailable and review actions disabled",
+        "Canary/session projection remained readable",
+        "Canonical session values remained rendered",
+        "No fabricated empty or zero projection used"
+      ]
+    },
+    "home_canary_fault": {
+      "method": "Fresh private browser with actual /api/v2/canary GET aborted; /api/ui-state remained an actual fixture GET.",
+      "screenshot": "C:/Users/User/projects/axiom-ui/reports/ui-release/home-system-home-canary-fault.png",
+      "observed": [
+        "Canary unavailable · Failed to fetch",
+        "Session budget/limits remained readable from operator projection",
+        "Control state, worker, readiness and decision changed to unknown/not available",
+        "Review and start and Stop canary remained visible without a fabricated canary result",
+        "No fabricated empty or zero projection used"
+      ]
+    },
+    "live_valid": {
+      "route": "http://127.0.0.1:61374/?view=live&section=polymarket",
+      "screenshot": "C:/Users/User/projects/axiom-ui/reports/ui-release/home-system-live-valid.png",
+      "actual_requests": [
+        "GET /api/v2/canary?page=1&page_size=25&direction=desc 200",
+        "GET /api/ui-state 200"
+      ],
+      "observed": [
+        "Live trading · Polymarket rendered",
+        "Current authority/session rendered",
+        "Session budget $5.00",
+        "Max buy $0.73",
+        "Duration 86,400 seconds (1 days)",
+        "Review and start rendered",
+        "Stop canary rendered",
+        "Polymarket canary decision boundary rendered"
+      ]
+    },
+    "live_canary_fault": {
+      "method": "Actual /api/v2/canary page GET aborted in a fresh private browser.",
+      "screenshot": "C:/Users/User/projects/axiom-ui/reports/ui-release/home-system-live-canary-fault.png",
+      "observed": [
+        "Page unavailable · Failed to fetch",
+        "Current authority session retained",
+        "Decision/input/signal/readiness became Not available",
+        "Review and start and Stop canary retained",
+        "No Page 1 of 1 or fabricated result claim",
+        "No renderer crash observed"
+      ]
+    },
+    "settings_valid": {
+      "route": "http://127.0.0.1:61374/?view=settings",
+      "screenshot": "C:/Users/User/projects/axiom-ui/reports/ui-release/home-system-settings-valid.png",
+      "actual_requests": [
+        "GET /api/risk-settings 200",
+        "GET /api/ui-state 200",
+        "GET /api/system 200",
+        "GET /api/status 200"
+      ],
+      "observed": [
+        "Settings & system rendered",
+        "Risk limits rendered",
+        "Native system/status reads completed in valid fixture pass"
+      ]
+    },
+    "settings_natural_poll_failure": {
+      "method": "After valid Settings load, Maximum all-in buy was edited to 0.61, submitted-orders selection changed to 10, and focus was placed on Maximum all-in buy. During the natural 60-second Settings poll, the actual /api/system GET was aborted in the private browser.",
+      "screenshot": "C:/Users/User/projects/axiom-ui/reports/ui-release/home-system-settings-natural-poll-fault.png",
+      "observed": [
+        "Draft value 0.61 retained",
+        "Selection 10 retained",
+        "Focus Maximum all-in buy retained",
+        "Risk limits and Settings controls retained",
+        "System unavailable rendered",
+        "Loading false after poll settled",
+        "No fabricated system value"
+      ]
+    },
+    "delayed_review_cancel": {
+      "method": "With valid Home loaded, fixture delay_ms=10000 delayed actual fresh /api/ui-state and /api/v2/canary GETs initiated by Start authorization review. Cancel was clicked while both reads were pending; browser waited beyond response release.",
+      "screenshot": "C:/Users/User/projects/axiom-ui/reports/ui-release/home-system-review-cancel-delayed.png",
+      "observed": [
+        "Delayed fresh review GETs visible as pending actual requests",
+        "Cancel immediately returned to Home",
+        "After delayed responses released, no stale dialog/result resurfaced",
+        "No final confirmation submitted",
+        "No POST present in browser network requests",
+        "Fixture action stats were zero at end of this acceptance run"
+      ]
+    },
+    "honest_limits": [
+      "This current closure supplements, and does not relabel, historical 19-state and prior 13-route evidence; historical source attribution remains unchanged.",
+      "The incidental synthetic first-stage review is recorded separately and excluded from acceptance; only its fixture state was reset.",
+      "No production host, database, Store, venue, credentials, real-money, final confirmation, trading, or retained control operation was used in the acceptance evidence."
+    ],
+    "cleanup": {
+      "processes_stopped": [
+        "HomeSystemChrome",
+        "HomeFaultChrome",
+        "HomeSystemFixture"
+      ],
+      "profiles_removed": [
+        "C:/Users/User/AppData/Local/Temp/axiom-home-system-chrome",
+        "C:/Users/User/AppData/Local/Temp/axiom-home-fault-chrome"
+      ],
+      "fixture_final_status": "prepared, DISARMED, execution authorization REVOKED, action_stats total/completed/pending 0"
+    }
   }
 }

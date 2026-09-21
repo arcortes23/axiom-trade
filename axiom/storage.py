@@ -17272,21 +17272,35 @@ class AxiomStore:
         }
 
 
-    def list_worker_states_dashboard(self, *, limit: int = 32) -> list[dict[str, Any]]:
+    def list_worker_states_dashboard(
+        self,
+        *,
+        limit: int = 32,
+        worker_name: str | None = None,
+    ) -> list[dict[str, Any]]:
         """Return persisted bounded worker summaries without raw payload reads."""
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
             raise ValueError("limit must be a non-negative integer")
+        worker = str(worker_name).strip() if worker_name is not None else ""
         query = (
             "SELECT worker_name,status,started_at,heartbeat_at,updated_at,"
             "payload_summary_json,payload_bytes,payload_truncated,"
             "payload_projection_version "
-            "FROM worker_state "
-            "ORDER BY CASE WHEN worker_name IN "
+            "FROM worker_state"
+        )
+        values: tuple[Any, ...]
+        if worker:
+            query += " WHERE worker_name=?"
+            values = (worker, int(limit))
+        else:
+            values = (int(limit),)
+        query += (
+            " ORDER BY CASE WHEN worker_name IN "
             "('polymarket-collector','paper-engine','research-engine','health-monitor','axiom-node') "
             "THEN 0 ELSE 1 END,updated_at DESC,worker_name ASC LIMIT ?"
         )
         with self._lock:
-            rows = self._conn.execute(query, (int(limit),)).fetchall()
+            rows = self._conn.execute(query, values).fetchall()
         result: list[dict[str, Any]] = []
         for row in rows:
             try:
@@ -17388,6 +17402,50 @@ class AxiomStore:
         with self._lock:
             row = self._conn.execute("SELECT COUNT(*) AS n FROM worker_state").fetchone()
         return int(row["n"] if row is not None else 0)
+
+    def storage_metadata(self) -> dict[str, Any]:
+        """Return bounded SQLite file/page metadata without table scans."""
+        path = str(self.path)
+        memory = path in {":memory:", ""} or path.startswith("file::memory:")
+        try:
+            with self._lock:
+                page_count_row = self._conn.execute("PRAGMA page_count").fetchone()
+                page_size_row = self._conn.execute("PRAGMA page_size").fetchone()
+            page_count = int(page_count_row[0]) if page_count_row is not None else None
+            page_size = int(page_size_row[0]) if page_size_row is not None else None
+            if page_count is None or page_size is None or page_count < 0 or page_size <= 0:
+                raise ValueError("SQLite page metadata is unavailable")
+            if memory or path.startswith("file:"):
+                database_bytes = page_count * page_size
+                bytes_provenance = "sqlite page_count multiplied by page_size"
+            else:
+                database_bytes = int(Path(path).expanduser().stat().st_size)
+                bytes_provenance = "database file filesystem stat"
+            return {
+                "status": "READY",
+                "available": True,
+                "backend": "sqlite",
+                "scope": "database",
+                "mode": "memory" if memory else "file",
+                "database_bytes": database_bytes,
+                "page_count": page_count,
+                "page_size": page_size,
+                "bytes_provenance": bytes_provenance,
+                "read_only": True,
+            }
+        except (OSError, sqlite3.Error, TypeError, ValueError):
+            return {
+                "status": "UNKNOWN",
+                "available": False,
+                "backend": "sqlite",
+                "scope": "database",
+                "mode": "memory" if memory else "file",
+                "database_bytes": None,
+                "page_count": None,
+                "page_size": None,
+                "bytes_provenance": "SQLite metadata unavailable",
+                "read_only": True,
+            }
 
     def candidate_forward_requirements(
         self,

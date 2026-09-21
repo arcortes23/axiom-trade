@@ -236,7 +236,7 @@ function browseControls(route, spec, data = {}, state = {}) {
 }
 function metric(label, value, detail = "") { return `<div class="metric"><div class="metric-label">${esc(label)}</div><div class="metric-value">${value}</div>${detail ? `<small>${esc(detail)}</small>` : ""}</div>`; }
 function valueFrom(data, keys) { return pick([data, data?.summary, data?.totals, data?.metrics, data?.operator_controls], keys); }
-function sessionCard(operator, canary, overview, connected, receivedAt, onReview = "", errors = {}) {
+function sessionCard(operator, canary, connected, receivedAt, onReview = "", errors = {}) {
   const session = sessionPresentation({ operator, canary, connected, receivedAt });
   const p = session.primaryAction;
   const operatorUnavailable = Boolean(errors.operator);
@@ -270,7 +270,6 @@ function activityLabel(item) {
 }
 function renderHome(state) {
   const operator = state.data.operator || {};
-  const overview = state.data.overview || {};
   const canary = state.data.canary || {};
   const risk = operator.risk_settings || canary.risk_settings || {};
   const usage = risk.usage && typeof risk.usage === "object" ? risk.usage : {};
@@ -292,10 +291,7 @@ function renderHome(state) {
   const directReason = [canary.decision, canary.signal, canary.execution].find(value => typeof value === "string");
   const decisionSource = directReason || pick([canary.decision, canary.signal, canary.execution], ["no_trade_reason", "blocker", "reason_code", "last_cycle_blocker", "decision", "signal_status", "status"]) || pick([canary.autonomous, canary.worker, canary], ["no_trade_reason", "blocker", "reason_code", "last_cycle_blocker", "next_decision"]);
   const reason = reasonPresentation(decisionSource);
-  const overviewWarning = overview && typeof overview === "object" && overview.error
-    ? notice("Overview unavailable", `The bounded overview projection reported ${overview.error}. Current overview values may be incomplete.`, "warn")
-    : "";
-  return `<div class="stack">${overviewWarning}${sessionCard(operator, canary, overview, state.connected, state.receivedAt, "", state.errors)}<section class="section"><div class="section-heading"><div><p class="eyebrow">At a glance</p><h2>What is known now</h2></div><span class="muted">Values are copied from bounded server projections.</span></div><div class="metrics">${metrics}</div></section><section class="split"><article class="section"><div class="section-heading"><div><h2>Why no trades</h2><p class="muted">A reason is shown only when the authoritative projection provides one.</p></div>${badge(reason.label, reason.code === "NO_SIGNAL" ? "neutral" : "warn")}</div><p>${esc(reason.explanation)}</p><p class="muted">Next: ${esc(reason.next)}</p></article><article class="section"><div class="section-heading"><div><h2>Recent activity</h2><p class="muted">Persisted actions only; no browser action is inferred from this list.</p></div><a class="button button-quiet" href="${hrefForRoute({ ...currentRoute, view: "activity" })}">Open activity</a></div>${renderActivityPreview(actions)}</article></section></div>`;
+  return `<div class="stack">${sessionCard(operator, canary, state.connected, state.receivedAt, "", state.errors)}<section class="section"><div class="section-heading"><div><p class="eyebrow">At a glance</p><h2>What is known now</h2></div><span class="muted">Values are copied from bounded server projections.</span></div><div class="metrics">${metrics}</div></section><section class="split"><article class="section"><div class="section-heading"><div><h2>Why no trades</h2><p class="muted">A reason is shown only when the authoritative projection provides one.</p></div>${badge(reason.label, reason.code === "NO_SIGNAL" ? "neutral" : "warn")}</div><p>${esc(reason.explanation)}</p><p class="muted">Next: ${esc(reason.next)}</p></article><article class="section"><div class="section-heading"><div><h2>Recent activity</h2><p class="muted">Persisted actions only; no browser action is inferred from this list.</p></div><a class="button button-quiet" href="${hrefForRoute({ ...currentRoute, view: "activity" })}">Open activity</a></div>${renderActivityPreview(actions)}</article></section></div>`;
 }
 function renderActivityPreview(items) { const entries = (Array.isArray(items) ? items : []).map(item => ({ item, time: activityTimestamp(item) })).sort((a, b) => { if (!a.time && !b.time) return 0; if (!a.time) return 1; if (!b.time) return -1; return new Date(b.time).getTime() - new Date(a.time).getTime(); }).slice(0, 5); if (!entries.length) return empty("No recent activity", "No bounded activity entries are available."); return `<ul class="timeline">${entries.map(({ item }) => { const status = item.status ? ` · ${human(item.status)}` : ""; const detail = item.message || (item.reason ? reviewText(item.reason) : item.status ? `Status ${human(item.status)}` : "Not available"); return `<li><time>${esc(formatTime(activityTimestamp(item)))}</time><span>${esc(activityLabel(item))}${esc(status)}</span><p>${esc(detail)}</p></li>`; }).join("")}</ul>`; }
 
@@ -338,7 +334,7 @@ function renderLive(state) {
   const errors = Object.entries(state.errors || {}).map(([key, value]) => notice(`${human(key)} unavailable`, String(value), "warn")).join("");
   const pageContext = { ...state, data: source, detail: state.data.detail || {}, error: state.errors?.page, operator, canary: state.data.canary || source, ledger: operator.ledger || state.data.ledger || {}, ui };
   const execution = renderPage(pageContext);
-  const session = sessionCard(operator, source, state.data.overview || {}, state.connected, state.receivedAt, "", state.errors);
+  const session = sessionCard(operator, source, state.connected, state.receivedAt, "", state.errors);
   return `${errors}<div class="stack">${session}<section class="section"><div class="section-heading"><div><p class="eyebrow">Live decision boundary</p><h2>Polymarket canary</h2><p class="muted">Decision, market input, signal, readiness, and persisted execution evidence remain separate.</p></div>${badge(reviewText(statusValue(source, ["status", "state", "control_state"])), upper(statusValue(source, ["status", "state", "control_state"])) === "READY" ? "good" : "warn")}</div><div class="three-col">${card("Decision", decisionValue, detailValue(decision), upper(String(decisionValue)) === "TRADE" ? "good" : "warn")}${card("Market input", inputValue, detailValue(input), "neutral")}${card("Signal", signalValue, detailValue(signal), "neutral")}${card("Readiness", readinessValue, detailValue(readiness), upper(String(readinessValue)) === "READY" ? "good" : "warn")}${card("Resting records", resting, "Persisted orders or fills currently marked resting/open/pending.", "neutral")}${card("Partial records", partial, "Persisted orders or fills currently marked partial.", "neutral")}</div></section><section class="section"><div class="section-heading"><div><p class="eyebrow">Affordability</p><h2>Per-outcome feasibility</h2></div><span class="muted">Server-provided values only</span></div>${feasibility}</section>${execution}</div>`;
 }
 function controlField(name, label, value = "", options = {}) {
@@ -541,7 +537,6 @@ function renderRoute(state, previousForm = {}) {
     loading: Boolean(state.loading),
     operator: state.data.operator || {},
     canary: state.data.canary || pageData || {},
-    overview: state.data.overview || {},
     ledger: state.data.operator?.ledger || {},
     execution_authorization: state.data.operator?.execution_authorization || {},
     risk_settings: state.data.operator?.risk_settings || {},
@@ -639,12 +634,12 @@ async function loadRoute({ force = false } = {}) {
   const form = sameRoute ? captureFormState(document.querySelector("#content") || document) : {};
   const spec = pageSpec(route) || {};
   const requestedKeys = route.view === "home"
-    ? ["operator", "overview", "canary"]
+    ? ["operator", "canary"]
     : route.view === "settings"
       ? ["operator", "risk", "system", "status"]
       : ["operator", "page", ...(route.view === "portfolio" ? ["canary"] : [])];
   if (!sameRoute) {
-    for (const key of ["overview", "canary", "binance", "page", "risk", "system", "status"]) {
+    for (const key of ["canary", "binance", "page", "risk", "system", "status"]) {
       if (!requestedKeys.includes(key)) delete appState.data[key];
     }
     appState.data.detail = {};
@@ -663,7 +658,6 @@ async function loadRoute({ force = false } = {}) {
   };
   if (route.view === "home") {
     add("operator", "/api/ui-state");
-    add("overview", "/api/v2/overview-summary");
     add("canary", "/api/v2/canary");
   } else if (route.view === "settings") {
     add("risk", "/api/risk-settings");

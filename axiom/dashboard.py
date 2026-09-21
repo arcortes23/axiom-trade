@@ -5681,13 +5681,71 @@ class DashboardData:
         }
 
     def system(self) -> dict[str, Any]:
-
         configured = self._configured("system")
         if configured is not None:
             result = dict(configured) if isinstance(configured, Mapping) else {"value": configured}
         else:
             result = {"service": "axiom-dashboard", "status": "ok", "offline": True, "live_execution": False}
-        result["dataset_health"] = self.dataset_health()
+
+        storage = result.get("storage") if isinstance(result.get("storage"), Mapping) else None
+        storage_loader = getattr(self.store, "storage_metadata", None) if self.store is not None else None
+        if callable(storage_loader):
+            try:
+                projected_storage = storage_loader()
+                if isinstance(projected_storage, Mapping):
+                    storage = dict(projected_storage)
+            except (AttributeError, TypeError, ValueError, sqlite3.Error):
+                storage = None
+        if storage is None:
+            storage = {
+                "status": "UNKNOWN",
+                "available": False,
+                "backend": "sqlite",
+                "scope": "database",
+                "database_bytes": None,
+                "page_count": None,
+                "page_size": None,
+                "bytes_provenance": "SQLite metadata unavailable",
+                "read_only": True,
+            }
+
+        health_rows: list[Mapping[str, Any]] = []
+        worker_loader = getattr(self.store, "list_worker_states_dashboard", None) if self.store is not None else None
+        if callable(worker_loader):
+            try:
+                loaded_workers = worker_loader(worker_name="health-monitor", limit=1)
+                health_rows = [
+                    row for row in loaded_workers
+                    if isinstance(row, Mapping)
+                ] if isinstance(loaded_workers, (list, tuple)) else []
+            except (AttributeError, TypeError, ValueError, sqlite3.Error):
+                health_rows = []
+        health_row = health_rows[0] if health_rows else None
+        health_payload = health_row.get("payload") if isinstance(health_row, Mapping) else None
+        health = self._bounded_operator_health(health_payload)
+        if isinstance(health_row, Mapping):
+            health.update(
+                {
+                    "available": True,
+                    "status": health_row.get("status"),
+                    "worker_name": health_row.get("worker_name"),
+                    "heartbeat_at": health_row.get("heartbeat_at"),
+                    "updated_at": health_row.get("updated_at"),
+                    "provenance": "persisted worker_state health-monitor row",
+                    "payload_projection_pending": health_row.get("payload_projection_pending"),
+                }
+            )
+        else:
+            health = {
+                "available": False,
+                "status": "UNKNOWN",
+                "worker_name": "health-monitor",
+                "heartbeat_at": None,
+                "updated_at": None,
+                "provenance": "persisted worker_state health-monitor row unavailable",
+            }
+        result["storage"] = storage
+        result["dataset_health"] = health
         result["endpoints"] = list(_ENDPOINTS)
         return result
     @staticmethod

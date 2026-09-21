@@ -450,6 +450,13 @@ version, source, coverage, and missing ranges retain the stored provenance;
 not be rendered as zero. The native missing-ranges view spans saved dataset
 versions and keeps each returned row's `dataset_version`; it does not add a
 version-selection feature or change the native query semantics.
+The system read uses bounded native metadata: `system.storage` reports only
+SQLite database-file/page metadata and preserves unavailable values as
+`UNKNOWN`/`null` rather than zero. `system.dataset_health` is the persisted
+projected health-monitor row, including its exact row `heartbeat_at` and
+`updated_at` timestamps; it does not scan historical tables or perform lazy
+writes.
+
 
 For the nine typed canary/financial record kinds `market`, `order`,
 `submission`, `reservation`, `fill`, `risk-fill`, `position`, `mark`, and

@@ -1,23 +1,24 @@
 {
   "base_revision": "18babca0fbff71abfcef8a4e715f212cf70170cd",
   "read_closure_parent_revision": "64697c205e803e580c2a717ca6d8f228c02d79dc",
+  "home_system_closure_parent_revision": "3ce6b0d31edb8ef06a847b6434a64276dcbd8389",
   "worktree": "feature/beginner-friendly-ui",
   "source_hashes": {
-    "axiom/dashboard.py": "da70cda306e3904fde891584c5191c9ac97646c2658259caf90c76ae3ac88820",
-    "axiom/storage.py": "5925b9f178052173e4af2b4caee7c4b97420e2aed38f2d154bba9e2c188b48b8",
-    "axiom/ui/app.js": "7e0a2a18b4fbc772293863546eeca606a9a99d705c0b3a3a9bfb7c1474b6bdf0",
+    "axiom/dashboard.py": "061f0a1f5838b1bb3c462bcf72c3b1fb3d2b48191e7fd196535c1c0ae499169b",
+    "axiom/storage.py": "8d779dc63260a4eb4e989299b54fe067edc5e999bf6d5322bc13471a0a1edfc8",
+    "axiom/ui/app.js": "6408b9ff37f542ef8439c9c13eff7b5936ada296f5d9baeaf96e9c0223af931f",
     "axiom/ui/pages.js": "45d35a60d3b519327bf168e41602a30b61f587229f2cabbc463b660e0bf5f36f",
     "axiom/ui/styles.css": "d17b131ab2e7c96e590e4200fc5ff9e1ef1a7adcd6ce901426a45c84c6a7468e"
   },
   "python_suite": {
     "command": "uv run python -X utf8 -m pytest",
-    "passed": 1881,
+    "passed": 1882,
     "skipped": 3,
     "subtests_passed": 582,
     "warnings": 2,
-    "duration_seconds": 347.97,
+    "duration_seconds": 355.59,
     "warning_detail": "Existing PytestCollectionWarnings for TestCredentials and TestVenue constructors in tests/test_autonomous_canary.py.",
-    "source_scope_note": "Python application, tests and fixture remained frozen throughout the full suite. The final JavaScript-only retained-Shadow-context correction occurred during that run; Bun, ESLint, browser bundle, wheel byte checks and installed-resource smoke were rerun on the exact final browser source hashes above."
+    "source_scope_note": "Application, test, fixture and browser source files remained frozen across the focused and full Python suites, Bun, ESLint, compile checks, browser bundle, wheel byte checks and installed-resource smoke."
   },
   "presentation_tests": {
     "command": "npm exec --offline --yes --package=bun -- bun test tests/ui_presentation.test.mjs",
@@ -48,7 +49,7 @@
   "browser_build": {
     "command": "npm exec --offline --yes --package=bun -- bun build axiom/ui/app.js --target browser",
     "modules": 2,
-    "output_kilobytes": 242.34,
+    "output_kilobytes": 241.88,
     "status": "passed"
   },
   "wheel": {
@@ -72,6 +73,12 @@
     "native_shadow_pagination": "Native 21-job regression covers complete totals, final page, sorting, status/member filters and latest/current metadata.",
     "detail_declaration": "Bun reproduced two failures and ESLint identified undefined domainMarkup before the original domain-specific declaration was restored; final gates pass without global suppressions.",
     "secondary_context": "Independent source review confirmed valid Shadow rows were hidden by a failed Hermes primary source; the final context-aware gate retains that evidence. Browser acceptance is recorded separately."
+  },
+  "home_system_closure_regressions": {
+    "home_read_scope": "The unused Home overview-summary request, its dedicated warning and the unused sessionCard argument were removed; required ui-state/canary reads and action/deadline/pending paths remain unchanged.",
+    "bounded_system_projection": "A real native authorizer regression denies unrelated historical reads and INSERT/UPDATE/DELETE while stored health-monitor values, exact row timestamps and storage metadata remain available.",
+    "metadata_semantics": "Health is explicitly persisted/as-of, not recomputed current health; missing health and unavailable size remain unknown/null. Storage metadata availability is not an integrity verdict or an invented aggregate total.",
+    "native_runtime_proof": "Actual temporary AxiomStore/DashboardServer HTTP and browser acceptance is recorded in home-system-read-closure-review.json."
   },
   "formatter": "No project formatter configuration found; no new formatting convention introduced.",
   "scope": "Gate evidence for the exact source hashes above. Independent runtime and safety acceptance is recorded separately. No production activation or venue order was performed by these gates."

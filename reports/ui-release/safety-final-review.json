@@ -1,18 +1,18 @@
 {
   "reviewer": "UiSafetyReview",
   "overall_correctness": "correct",
-  "explanation": "Final UI-root closure recheck covers app.js 7e0a2a18 and pages.js 45d35a60: structured-only Binance context and Hermes-unavailable Shadow secondary rows now bypass row-only blocking, while explicit loading/error notices and cached status/profile/restrictions remain visible. The domain detail markup regression is restored; canonical action ownership, Home/Live/Settings preservation, and backend read projections remain clean. No unresolved source-safety defect remains.",
+  "explanation": "Final UI-root and bounded system closure review is clean. Frozen app.js 6408b9ff removes only the unused Home overview-summary request/error plumbing while preserving ui-state/canary rendering, canonical status/risk/canary/action ownership, aborts, and pending recovery. Frozen dashboard.py 061f0a1f and storage.py 8d779dc6 replace the system full-health path with read-only SQLite metadata plus an exact health-monitor worker projection carrying row heartbeat_at/updated_at provenance; historical scans, lazy collector reads/writes, authority, trading, and controller producers remain untouched.",
   "confidence": 0.99,
   "findings": [],
   "source_hashes": {
-    "axiom/ui/app.js": "7e0a2a18b4fbc772293863546eeca606a9a99d705c0b3a3a9bfb7c1474b6bdf0",
+    "axiom/ui/app.js": "6408b9ff37f542ef8439c9c13eff7b5936ada296f5d9baeaf96e9c0223af931f",
     "axiom/ui/pages.js": "45d35a60d3b519327bf168e41602a30b61f587229f2cabbc463b660e0bf5f36f",
-    "tests/test_dashboard_ui.py": "67f3ab44259c07bee87b1590a6d24de955021665d68da1174a380a7dc1de4ba7",
+    "tests/test_dashboard_ui.py": "7bc72751acd99c318bd4a2b760f060931ca96743d77ba5ef34e2392336f40ab9",
     "tests/ui_fixture_server.py": "a6751d59bb61e2e2e67cba18adf52dd01d74f9c6c19f4759962f09756ef87350",
-    "docs/polymarket_canary.md": "50e2516072a444111eb86d15ae2d274e6d8ef3d6410f02502b3a9849e50cca2a",
+    "docs/polymarket_canary.md": "d0f7839d3bf85723b4b56cee7dce840eb63a386575e708fdfecad18c39dce649",
     "axiom/operator.py": "f1e4ef2e15cc9c415fdce33cfb73142905c20ca182d5b6281ece385b068d8483",
-    "axiom/dashboard.py": "da70cda306e3904fde891584c5191c9ac97646c2658259caf90c76ae3ac88820",
-    "axiom/storage.py": "5925b9f178052173e4af2b4caee7c4b97420e2aed38f2d154bba9e2c188b48b8"
+    "axiom/dashboard.py": "061f0a1f5838b1bb3c462bcf72c3b1fb3d2b48191e7fd196535c1c0ae499169b",
+    "axiom/storage.py": "8d779dc63260a4eb4e989299b54fe067edc5e999bf6d5322bc13471a0a1edfc8"
   },
   "historical_proof": [
     {
@@ -38,6 +38,20 @@
       "app_hash": "7e0a2a18b4fbc772293863546eeca606a9a99d705c0b3a3a9bfb7c1474b6bdf0",
       "pages_hash": "45d35a60d3b519327bf168e41602a30b61f587229f2cabbc463b660e0bf5f36f",
       "verdict": "final corrected UI-root source review; domain markup and Hermes/Shadow secondary gates closed; no findings"
+    },
+    {
+      "source_root": "C:/Users/User/projects/axiom-ui",
+      "app_hash": "6408b9ff37f542ef8439c9c13eff7b5936ada296f5d9baeaf96e9c0223af931f",
+      "pages_hash": "45d35a60d3b519327bf168e41602a30b61f587229f2cabbc463b660e0bf5f36f",
+      "verdict": "final frontend-only Home closure review; unused overview-summary request/error plumbing removed; canonical Home/Live/Settings/action/abort/pending paths preserved; no findings"
+    },
+    {
+      "source_root": "C:/Users/User/projects/axiom-ui",
+      "dashboard_hash": "061f0a1f5838b1bb3c462bcf72c3b1fb3d2b48191e7fd196535c1c0ae499169b",
+      "storage_hash": "8d779dc63260a4eb4e989299b54fe067edc5e999bf6d5322bc13471a0a1edfc8",
+      "tests_hash": "7bc72751acd99c318bd4a2b760f060931ca96743d77ba5ef34e2392336f40ab9",
+      "docs_hash": "d0f7839d3bf85723b4b56cee7dce840eb63a386575e708fdfecad18c39dce649",
+      "verdict": "final bounded system closure review; storage metadata is READY/UNKNOWN with null-on-error, health is exact-key persisted health-monitor projection with row heartbeat/updated provenance, and unrelated history/lazy writes/authority paths remain untouched; no findings"
     }
   ]
 }

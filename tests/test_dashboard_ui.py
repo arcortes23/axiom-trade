@@ -233,6 +233,68 @@ def test_dataset_reads_stay_available_when_aggregate_health_is_unreadable() -> N
             store.connection.set_authorizer(None)
 
 
+def test_system_reads_bounded_storage_and_persisted_health_when_history_is_denied() -> None:
+    with AxiomStore(":memory:") as store:
+        heartbeat = datetime(2024, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+        store.save_worker_state(
+            "health-monitor",
+            "RUNNING",
+            {
+                "grade": "B",
+                "grade_scope": "collector_health",
+                "reason_code": "CURRENT_COLLECTION_FAILURES",
+                "reasons": [{"code": "CURRENT_COLLECTION_FAILURES", "reason": "fixture"}],
+                "source_type": "FORWARD_COLLECTED",
+            },
+            heartbeat_at=heartbeat,
+        )
+        persisted = store.list_worker_states_dashboard(worker_name="health-monitor", limit=1)[0]
+        dashboard = DashboardData(store=store)
+
+        def deny_history_and_writes(
+            action: int,
+            table: str | None,
+            _column: str | None,
+            _database: str | None,
+            _source: str | None,
+        ) -> int:
+            denied_tables = {
+                "bars",
+                "snapshots",
+                "datasets",
+                "polymarket_snapshots",
+                "polymarket_trades",
+                "collection_errors",
+            }
+            denied_writes = {
+                sqlite3.SQLITE_INSERT,
+                sqlite3.SQLITE_UPDATE,
+                sqlite3.SQLITE_DELETE,
+            }
+            if action == sqlite3.SQLITE_READ and table in denied_tables:
+                return sqlite3.SQLITE_DENY
+            if action in denied_writes:
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        store.connection.set_authorizer(deny_history_and_writes)
+        try:
+            system = dashboard.system()
+        finally:
+            store.connection.set_authorizer(None)
+
+    assert system["storage"]["status"] == "READY"
+    assert system["storage"]["available"] is True
+    assert system["storage"]["scope"] == "database"
+    assert system["storage"]["database_bytes"] > 0
+    assert system["dataset_health"]["available"] is True
+    assert system["dataset_health"]["grade"] == "B"
+    assert system["dataset_health"]["status"] == "RUNNING"
+    assert system["dataset_health"]["heartbeat_at"] == persisted["heartbeat_at"]
+    assert system["dataset_health"]["updated_at"] == persisted["updated_at"]
+    assert system["dataset_health"]["provenance"] == "persisted worker_state health-monitor row"
+
+
 def test_fixture_catalogs_prove_default_page_two_facets_sort_and_deep_identity() -> None:
     with FixtureServer("prepared") as fixture:
         assert fixture.url is not None

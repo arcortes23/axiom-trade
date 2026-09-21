@@ -1,0 +1,139 @@
+{
+  "status": "passed",
+  "scope": "native-home-settings-system-read-closure",
+  "source_hashes": {
+    "axiom/ui/app.js": "6408b9ff37f542ef8439c9c13eff7b5936ada296f5d9baeaf96e9c0223af931f",
+    "axiom/dashboard.py": "061f0a1f5838b1bb3c462bcf72c3b1fb3d2b48191e7fd196535c1c0ae499169b",
+    "axiom/storage.py": "8d779dc63260a4eb4e989299b54fe067edc5e999bf6d5322bc13471a0a1edfc8",
+    "tests/test_dashboard_ui.py": "7bc72751acd99c318bd4a2b760f060931ca96743d77ba5ef34e2392336f40ab9",
+    "docs/polymarket_canary.md": "d0f7839d3bf85723b4b56cee7dce840eb63a386575e708fdfecad18c39dce649",
+    "axiom/ui/pages.js": "45d35a60d3b519327bf168e41602a30b61f587229f2cabbc463b660e0bf5f36f"
+  },
+  "healthy_native": {
+    "base_url": "http://127.0.0.1:61281/",
+    "script": "C:/Users/User/AppData/Local/Temp/axiom-home-system-smoke.py",
+    "temp_db": "C:/Users/User/AppData/Local/Temp/axiom-home-system-smoke.sqlite3",
+    "process_name": "home-system-dashboard",
+    "http": {
+      "system": 200,
+      "ui_state": 200,
+      "canary": 200,
+      "overview_summary": 200
+    },
+    "storage": {
+      "available": true,
+      "backend": "sqlite",
+      "mode": "file",
+      "status": "READY",
+      "read_only": true,
+      "scope": "database",
+      "database_bytes": 4096,
+      "page_count": 241,
+      "page_size": 4096,
+      "bytes_provenance": "database file filesystem stat"
+    },
+    "health": {
+      "available": true,
+      "status": "degraded",
+      "worker_name": "health-monitor",
+      "heartbeat_at": "2035-03-04T05:06:07+00:00",
+      "updated_at": "2026-09-21T19:23:14.770729+00:00",
+      "grade": "C",
+      "reason_code": "NATIVE_HEALTH_SENTINEL",
+      "reasons": [
+        {
+          "code": "NATIVE_HEALTH_SENTINEL",
+          "reason": "Synthetic persisted monitor evidence"
+        }
+      ],
+      "provenance": "persisted worker_state health-monitor row",
+      "payload_projection_pending": false
+    }
+  },
+  "absent_native": {
+    "base_url": "http://127.0.0.1:61532/",
+    "script": "C:/Users/User/AppData/Local/Temp/axiom-home-system-empty-smoke.py",
+    "temp_store": "AxiomStore(:memory:)",
+    "process_name": "home-system-empty",
+    "http": {
+      "system": 200
+    },
+    "storage": {
+      "available": true,
+      "backend": "sqlite",
+      "mode": "memory",
+      "status": "READY",
+      "read_only": true,
+      "scope": "database",
+      "database_bytes": 987136,
+      "page_count": 241,
+      "page_size": 4096,
+      "bytes_provenance": "sqlite page_count multiplied by page_size"
+    },
+    "health": {
+      "available": false,
+      "status": "UNKNOWN",
+      "worker_name": "health-monitor",
+      "heartbeat_at": null,
+      "updated_at": null,
+      "grade": null,
+      "reason_code": null,
+      "reasons": null,
+      "provenance": "persisted worker_state health-monitor row unavailable",
+      "zero_like_fields_present": false
+    }
+  },
+  "gui": {
+    "browser_process": "home-system-chrome",
+    "cdp_port": 52143,
+    "profile": "C:/Users/User/AppData/Local/Temp/axiom-home-system-profile",
+    "fresh_source_hash": "6408b9ff37f542ef8439c9c13eff7b5936ada296f5d9baeaf96e9c0223af931f",
+    "home": {
+      "route": "?view=home",
+      "heading": "Home",
+      "unavailable": false,
+      "session_visible": true,
+      "no_active_authorization": true,
+      "overflow": false,
+      "api_paths": [
+        "/api/ui-state",
+        "/api/v2/canary"
+      ],
+      "overview_summary_request_present": false
+    },
+    "settings_healthy": {
+      "route": "?view=settings",
+      "heading": "Settings & system",
+      "risk_form": true,
+      "advanced_operations": true,
+      "storage_ready_visible": true,
+      "overflow": false,
+      "api_durations_ms": {
+        "/api/risk-settings": 4,
+        "/api/ui-state": 17,
+        "/api/system": 6,
+        "/api/status": 7
+      }
+    },
+    "settings_absent_health": {
+      "route": "?view=settings",
+      "heading": "Settings & system",
+      "risk_form": true,
+      "storage_ready_visible": true,
+      "overflow": false,
+      "api_system_ms": 7
+    },
+    "network": {
+      "api_requests": 10,
+      "non_get": 0,
+      "operator_endpoint_requests": 0
+    },
+    "console_errors": 0,
+    "page_errors": 0
+  },
+  "screenshots": [
+    "reports/ui-release/home-system-native-home.png",
+    "reports/ui-release/home-system-native-settings.png"
+  ],
+  "findings": []
+}
