@@ -211,14 +211,18 @@ class ConnectivityVenueSentinel:
 class ProposedReadinessVenue(ConnectivityVenueSentinel):
     """Read-only venue bound to the proposal's exact market/token identities."""
 
-    def __init__(self) -> None:
+    def __init__(self, market_ids: tuple[str, ...] = ("MARKET-1",)) -> None:
         super().__init__()
+        self.market_ids = frozenset(str(market_id) for market_id in market_ids)
         self.market_context_calls: list[tuple[str, str]] = []
 
     def market_context(self, market_id: str, token_id: str) -> dict[str, object]:
         pair = (str(market_id), str(token_id))
         self.market_context_calls.append(pair)
-        if pair[0] != "MARKET-1" or pair[1] not in {"MARKET-1-YES", "MARKET-1-NO"}:
+        if pair[0] not in self.market_ids or pair[1] not in {
+            f"{pair[0]}-YES",
+            f"{pair[0]}-NO",
+        }:
             raise AssertionError(f"unexpected proposed market/token binding: {pair!r}")
         outcome = "yes" if pair[1].endswith("-YES") else "no"
         return {
@@ -3434,6 +3438,75 @@ class OperatorControlTests(unittest.TestCase):
         encoded = json.dumps({"response": result, "review": review}, default=str)
         for secret in CONNECTIVITY_SECRET_VALUES:
             self.assertNotIn(secret, encoded)
+
+    def test_real_http_connectivity_checks_every_market_binding_for_each_member(self) -> None:
+        self._seed_proposed_selection()
+        selection = self.store.load_current_portfolio_selection()
+        self.assertIsInstance(selection, dict)
+        assert isinstance(selection, dict)
+        original_member = selection["members"][0]
+        self.assertIsInstance(original_member, dict)
+        assert isinstance(original_member, dict)
+        market_two = {
+            "market_id": "MARKET-2",
+            "condition_id": "MARKET-2-CONDITION",
+            "yes_token_id": "MARKET-2-YES",
+            "no_token_id": "MARKET-2-NO",
+        }
+        member_one = dict(original_member)
+        member_one["market_bindings"] = [
+            *list(original_member["market_bindings"]),
+            market_two,
+        ]
+        member_two = {
+            **member_one,
+            "strategy_version_id": "strategy-proposed-two",
+            "research_trial_id": "trial-proposed-two",
+            "candidate_id": "candidate-proposed-two",
+        }
+        selected = {**selection, "members": [member_one, member_two]}
+        now = datetime(2026, 1, 2, 12, tzinfo=timezone.utc)
+        credentials = _configured_credentials()
+        venue = ProposedReadinessVenue(("MARKET-1", "MARKET-2"))
+        assert self.server._server is not None
+        with patch.object(
+            self.store,
+            "load_current_portfolio_selection",
+            return_value=selected,
+        ), patch("axiom.operator.CredentialStore", return_value=credentials), patch(
+            "axiom.operator.PolymarketClobV2Venue",
+            return_value=venue,
+        ), patch("axiom.operator.utc_now", return_value=now):
+            status, result = self._post(
+                {"action": "canary.connectivity_check"},
+                token=self.server._server.control_token,
+            )
+        self.assertEqual(status, 200)
+        self.assertTrue(result["ok"])
+        connectivity = result["result"]["connectivity"]
+        self.assertTrue(connectivity["ready"])
+        legs = connectivity["diagnostics"]["token_readiness"]
+        expected_pairs = {
+            ("MARKET-1", "YES", "MARKET-1-YES"),
+            ("MARKET-1", "NO", "MARKET-1-NO"),
+            ("MARKET-2", "YES", "MARKET-2-YES"),
+            ("MARKET-2", "NO", "MARKET-2-NO"),
+        }
+        self.assertEqual(
+            {
+                (leg["market_id"], leg["outcome"], leg["token_id"])
+                for leg in legs
+            },
+            expected_pairs,
+        )
+        self.assertEqual(len(legs), len(expected_pairs) * 2)
+        self.assertEqual(set(venue.market_context_calls), {
+            (market_id, token_id)
+            for market_id, _outcome, token_id in expected_pairs
+        })
+        self.assertEqual(len(venue.market_context_calls), len(expected_pairs))
+        self.assertEqual(venue.order_calls, 0)
+        self.assertEqual(venue.approval_calls, 0)
 
     def test_real_http_readiness_rejects_immutable_successor_and_stale_proof(self) -> None:
         self._seed_proposed_selection()

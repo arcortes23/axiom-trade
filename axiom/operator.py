@@ -4214,14 +4214,15 @@ class OperatorControlPlane:
             if not bindings:
                 for key in ("market_bindings", "current_market_bindings"):
                     values = member.get(key)
-                    if isinstance(values, (list, tuple)):
-                        first = next(
-                            (item for item in values if isinstance(item, Mapping)),
-                            None,
-                        )
-                        if first is not None:
-                            bindings = [first]
-                            break
+                    if isinstance(values, Mapping):
+                        values = (values,)
+                    if not isinstance(values, (list, tuple)):
+                        continue
+                    bindings = [
+                        item for item in values if isinstance(item, Mapping)
+                    ]
+                    if bindings:
+                        break
             if not bindings:
                 resolution = member.get("scope_resolution")
                 if isinstance(resolution, Mapping):
@@ -9856,26 +9857,34 @@ class OperatorControlPlane:
         )
         leg_records: list[dict[str, Any]] = []
         leg_failures: list[str] = []
+        leg_raw_cache: dict[tuple[str, str], Mapping[str, Any]] = {}
         for request in requests:
-            try:
-                leg_raw = service.connectivity_check(
-                    venue=venue,
-                    market_id=request["market_id"],
-                    token_id=request["token_id"],
-                    allow_environment=False,
+            cache_key = (request["market_id"], request["token_id"])
+            leg_raw = leg_raw_cache.get(cache_key)
+            if leg_raw is None:
+                try:
+                    probe_result = service.connectivity_check(
+                        venue=venue,
+                        market_id=request["market_id"],
+                        token_id=request["token_id"],
+                        allow_environment=False,
+                    )
+                except CanaryBlocked as exc:
+                    probe_result = {
+                        "ready": False,
+                        "failures": [str(exc)],
+                        "diagnostics": {},
+                    }
+                except Exception:
+                    probe_result = {
+                        "ready": False,
+                        "failures": ["MARKET_CONNECTIVITY_FAILED"],
+                        "diagnostics": {},
+                    }
+                leg_raw = (
+                    probe_result if isinstance(probe_result, Mapping) else {}
                 )
-            except CanaryBlocked as exc:
-                leg_raw = {
-                    "ready": False,
-                    "failures": [str(exc)],
-                    "diagnostics": {},
-                }
-            except Exception:
-                leg_raw = {
-                    "ready": False,
-                    "failures": ["MARKET_CONNECTIVITY_FAILED"],
-                    "diagnostics": {},
-                }
+                leg_raw_cache[cache_key] = leg_raw
             leg_mapping = leg_raw if isinstance(leg_raw, Mapping) else {}
             failures = leg_mapping.get("failures", leg_mapping.get("failure_codes", ()))
             failures = (
