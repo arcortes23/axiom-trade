@@ -161,6 +161,12 @@ _SETTINGS_ACTION_ALIASES = {
     "canary.settings.activate_draft": "risk.settings.activate_draft",
     "risk.settings.activate_draft": "risk.settings.activate_draft",
 }
+_ACTION_STATE_AUDIT_RECOVERY = frozenset(
+    {
+        "canary.connectivity_check",
+        "execution_authorization.review",
+    }
+)
 _ACTION_ALIASES = {
     **_ROLLING_ACTION_ALIASES,
     **_SETTINGS_ACTION_ALIASES,
@@ -787,7 +793,9 @@ def _project_connectivity(
         if diagnostic_name == "book" and not isinstance(diagnostic_value, Mapping):
             diagnostic_value = raw.get("order_book")
         diagnostic_projection[diagnostic_name] = (
-            _connectivity_safe_diagnostics(diagnostic_value)
+            _connectivity_safe_book(diagnostic_value)
+            if diagnostic_name == "book" and isinstance(diagnostic_value, Mapping)
+            else _connectivity_safe_diagnostics(diagnostic_value)
             if isinstance(diagnostic_value, Mapping)
             else {}
         )
@@ -906,6 +914,67 @@ def _connectivity_safe_diagnostics(value: Any, *, depth: int = 0) -> Any:
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value if not isinstance(value, str) or len(value) <= 1024 else value[:1021] + "..."
     return str(value)[:1024]
+def _connectivity_level_price(value: Any) -> Decimal | None:
+    if not isinstance(value, Mapping):
+        return None
+    for key in ("price", "px", "rate"):
+        raw = value.get(key)
+        if raw in (None, ""):
+            continue
+        try:
+            price = Decimal(str(raw))
+        except (ArithmeticError, TypeError, ValueError):
+            continue
+        if price.is_finite():
+            return price
+    return None
+
+
+def _connectivity_sorted_book_levels(
+    value: Any,
+    *,
+    reverse: bool,
+) -> list[Mapping[str, Any]]:
+    if not isinstance(value, (list, tuple)):
+        return []
+    valid: list[tuple[Decimal, Mapping[str, Any]]] = []
+    invalid: list[Mapping[str, Any]] = []
+    for raw_level in value:
+        if not isinstance(raw_level, Mapping):
+            continue
+        price = _connectivity_level_price(raw_level)
+        if price is None:
+            invalid.append(raw_level)
+        else:
+            valid.append((price, raw_level))
+    valid.sort(key=lambda item: item[0], reverse=reverse)
+    return [level for _price, level in valid] + invalid
+
+
+def _connectivity_safe_book(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    projected: dict[str, Any] = {}
+    for key, child in list(value.items())[:32]:
+        name = str(key)
+        if (
+            (_SECRET_KEY.search(name) or _CONNECTIVITY_SECRET_KEY.search(name))
+            and name.casefold() not in _CONNECTIVITY_SAFE_ID_KEYS
+        ):
+            continue
+        if key in {"bids", "asks"}:
+            levels = _connectivity_sorted_book_levels(
+                child, reverse=key == "bids"
+            )
+            projected[key] = [
+                _connectivity_safe_diagnostics(level)
+                for level in levels[:32]
+            ]
+        else:
+            projected[name] = _connectivity_safe_diagnostics(child)
+    return projected
+
+
 _CONNECTIVITY_TOKEN_LEG_FIELDS = frozenset(
     {
         "candidate_id",
@@ -942,14 +1011,181 @@ def _connectivity_safe_token_readiness(value: Any) -> list[dict[str, Any]]:
                 for diagnostic_name in ("market", "book"):
                     diagnostic = child.get(diagnostic_name)
                     if isinstance(diagnostic, Mapping):
-                        diagnostics[diagnostic_name] = _connectivity_safe_diagnostics(
-                            diagnostic
+                        diagnostics[diagnostic_name] = (
+                            _connectivity_safe_book(diagnostic)
+                            if diagnostic_name == "book"
+                            else _connectivity_safe_diagnostics(diagnostic)
                         )
                 leg[name] = diagnostics
             else:
                 leg[name] = _connectivity_safe_diagnostics(child)
         projected_legs.append(leg)
     return projected_legs
+_CONNECTIVITY_PERSISTED_MARKET_FIELDS = (
+    "market_id",
+    "market_version",
+    "condition_id",
+    "outcome",
+    "outcome_index",
+    "token_id",
+    "position_id",
+    "asset_id",
+    "accepting_orders",
+    "fee_bps",
+    "status",
+)
+_CONNECTIVITY_PERSISTED_BOOK_FIELDS = (
+    "status",
+    "min_order_size",
+    "tick_size",
+    "fee_bps",
+    "rules",
+    "bids",
+    "asks",
+    "quantity",
+    "max_price",
+    "trade_ready",
+    "trade_blockers",
+    "depth_assessment",
+)
+_CONNECTIVITY_PERSISTED_LEVEL_FIELDS = (
+    "price",
+    "size",
+    "quantity",
+    "amount",
+)
+_CONNECTIVITY_PERSISTED_DEPTH_FIELDS = (
+    "action",
+    "status",
+    "reason",
+    "reason_code",
+    "suitable",
+    "side",
+    "token_id",
+    "requested_quantity",
+    "required_quantity",
+    "filled_quantity",
+    "available_quantity",
+    "depth_quantity",
+    "raw_notional",
+    "adjusted_notional",
+    "slippage_cost",
+    "venue_fee",
+    "fee_reserve",
+    "required_cost",
+    "gross_proceeds",
+    "net_proceeds",
+    "price_bound",
+    "levels_used",
+    "levels",
+    "rules_version",
+)
+_CONNECTIVITY_PERSISTED_RULE_FIELDS = (
+    "min_order_size",
+    "min_order_quantity",
+    "tick_size",
+    "neg_risk",
+    "price_precision",
+    "size_precision",
+    "quantity_precision",
+    "amount_precision",
+    "sdk_version",
+    "docs_version",
+    "rules_version",
+    "exchange",
+    "neg_risk_exchange",
+    "neg_risk_market_id",
+    "exchange_metadata",
+)
+
+
+def _connectivity_persisted_mapping(
+    value: Mapping[str, Any],
+    fields: tuple[str, ...],
+) -> dict[str, Any]:
+    return {
+        field: _connectivity_safe_diagnostics(value[field])
+        for field in fields
+        if field in value
+    }
+
+
+def _connectivity_persisted_book(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    projected: dict[str, Any] = {}
+    for field in _CONNECTIVITY_PERSISTED_BOOK_FIELDS:
+        if field not in value:
+            continue
+        child = value[field]
+        if field in {"bids", "asks"}:
+            levels = _connectivity_sorted_book_levels(
+                child, reverse=field == "bids"
+            )
+            projected[field] = [
+                _connectivity_persisted_mapping(
+                    level, _CONNECTIVITY_PERSISTED_LEVEL_FIELDS
+                )
+                for level in levels[:1]
+                if isinstance(level, Mapping)
+            ]
+        elif field == "rules" and isinstance(child, Mapping):
+            projected[field] = _connectivity_persisted_mapping(
+                child, _CONNECTIVITY_PERSISTED_RULE_FIELDS
+            )
+        elif field == "depth_assessment" and isinstance(child, Mapping):
+            projected[field] = _connectivity_persisted_mapping(
+                child, _CONNECTIVITY_PERSISTED_DEPTH_FIELDS
+            )
+        else:
+            projected[field] = _connectivity_safe_diagnostics(child)
+    return projected
+
+
+def _connectivity_persisted_projection(value: Any) -> dict[str, Any]:
+    """Bound persisted connectivity books without dropping exact leg proof."""
+    if not isinstance(value, Mapping):
+        return {}
+    projected = dict(value)
+    diagnostics = value.get("diagnostics")
+    if not isinstance(diagnostics, Mapping):
+        return projected
+    persisted_diagnostics = dict(diagnostics)
+    token_readiness = diagnostics.get("token_readiness")
+    if isinstance(token_readiness, (list, tuple)):
+        persisted_legs: list[dict[str, Any]] = []
+        for raw_leg in list(token_readiness)[:32]:
+            if not isinstance(raw_leg, Mapping):
+                continue
+            leg = {
+                field: _connectivity_safe_diagnostics(raw_leg[field])
+                for field in _CONNECTIVITY_TOKEN_LEG_FIELDS
+                if field in raw_leg and field != "diagnostics"
+            }
+            raw_diagnostics = raw_leg.get("diagnostics")
+            if isinstance(raw_diagnostics, Mapping):
+                leg_diagnostics: dict[str, Any] = {}
+                market = raw_diagnostics.get("market")
+                book = raw_diagnostics.get("book")
+                if isinstance(market, Mapping):
+                    leg_diagnostics["market"] = _connectivity_persisted_mapping(
+                        market, _CONNECTIVITY_PERSISTED_MARKET_FIELDS
+                    )
+                if isinstance(book, Mapping):
+                    leg_diagnostics["book"] = _connectivity_persisted_book(book)
+                leg["diagnostics"] = leg_diagnostics
+            persisted_legs.append(leg)
+        persisted_diagnostics["token_readiness"] = persisted_legs
+    for name in ("market", "book"):
+        child = diagnostics.get(name)
+        if name == "market" and isinstance(child, Mapping):
+            persisted_diagnostics[name] = _connectivity_persisted_mapping(
+                child, _CONNECTIVITY_PERSISTED_MARKET_FIELDS
+            )
+        elif name == "book" and isinstance(child, Mapping):
+            persisted_diagnostics[name] = _connectivity_persisted_book(child)
+    projected["diagnostics"] = persisted_diagnostics
+    return projected
 
 
 _AUTHORIZATION_PUBLIC_FIELDS = (
@@ -1197,6 +1433,27 @@ def _safe_value(value: Any, *, depth: int = 0) -> Any:
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value if not isinstance(value, str) or len(value) <= 1024 else value[:1021] + "..."
     return str(value)[:1024]
+
+def _action_state_result(value: Any) -> dict[str, Any]:
+    """Keep action-state results small enough for the bounded config row."""
+    safe = _safe_value(value if isinstance(value, Mapping) else {})
+    if not isinstance(safe, Mapping):
+        return {}
+    projection: dict[str, Any] = {}
+    for key in ("ok", "status", "action_status", "reason", "action", "target"):
+        child = safe.get(key)
+        if isinstance(child, (str, int, float, bool)) or child is None:
+            projection[key] = child
+    connectivity = safe.get("connectivity")
+    if isinstance(connectivity, Mapping):
+        projection["connectivity"] = {
+            key: connectivity[key]
+            for key in ("ready", "status", "checked_at", "failure_codes")
+            if key in connectivity
+        }
+    return projection
+
+
 _PUBLIC_SCOPE_NESTED_KEYS = frozenset(
     {
         "scope",
@@ -6731,7 +6988,8 @@ class OperatorControlPlane:
                             "CONNECTIVITY_CHECK_FAILED", type(exc).__name__
                         ) from exc
                     self.store.set_operator_config(
-                        CANARY_CONNECTIVITY_CONFIG_KEY, refreshed
+                        CANARY_CONNECTIVITY_CONFIG_KEY,
+                        _connectivity_persisted_projection(refreshed),
                     )
                 review = self.exploratory_live_review_snapshot(raw)
         if review["blockers"]:
@@ -8292,14 +8550,81 @@ class OperatorControlPlane:
             raw = self.store.get_operator_config("operator_action_state", {})
             body = dict(raw) if isinstance(raw, Mapping) else {}
             entries = body.get("actions")
-            entries = [dict(item) for item in entries if isinstance(item, Mapping)] if isinstance(entries, list) else []
+            entries = (
+                [dict(item) for item in entries if isinstance(item, Mapping)]
+                if isinstance(entries, list)
+                else []
+            )
             for entry in entries:
+                if "result" in entry:
+                    entry["result"] = _action_state_result(entry.get("result"))
+            for index, entry in enumerate(entries):
                 if (
-                    str(entry.get("action")) == action
-                    and str(entry.get("target")) == target
-                    and str(entry.get("status")).upper() == "RUNNING"
+                    str(entry.get("action")) != action
+                    or str(entry.get("target")) != target
+                    or str(entry.get("status")).upper() != "RUNNING"
                 ):
-                    return str(entry.get("action_id") or ""), entry
+                    continue
+                if action in _ACTION_STATE_AUDIT_RECOVERY:
+                    started_at = _connectivity_checked_at(entry.get("started_at"))
+                    started_stamp = (
+                        datetime.fromisoformat(started_at) if started_at else None
+                    )
+                    recovered_audit: Mapping[str, Any] | None = None
+                    list_actions = getattr(self.store, "list_operator_actions", None)
+                    try:
+                        audits = list_actions(limit=128) if callable(list_actions) else ()
+                    except Exception:
+                        audits = ()
+                    for audit in audits if isinstance(audits, (list, tuple)) else ():
+                        if not isinstance(audit, Mapping) or audit.get("success") is not True:
+                            continue
+                        if (
+                            str(audit.get("action") or "").strip() != action
+                            or str(audit.get("target") or "").strip() != target
+                        ):
+                            continue
+                        audit_at = _connectivity_checked_at(audit.get("timestamp"))
+                        audit_stamp = (
+                            datetime.fromisoformat(audit_at) if audit_at else None
+                        )
+                        if (
+                            started_stamp is None
+                            or audit_stamp is None
+                            or audit_stamp < started_stamp
+                        ):
+                            continue
+                        recovered_audit = audit
+                        break
+                    if recovered_audit is not None:
+                        completed = dict(entry)
+                        completed.update(
+                            {
+                                "status": "COMPLETE",
+                                "completed_at": _connectivity_checked_at(
+                                    recovered_audit.get("timestamp")
+                                )
+                                or utc_now().isoformat(),
+                                "reason": "RECOVERED_FROM_SUCCESS_AUDIT",
+                                "result": _action_state_result(
+                                    recovered_audit.get("result")
+                                ),
+                            }
+                        )
+                        entries[index] = completed
+                        body["actions"] = entries[-32:]
+                        try:
+                            self.store.set_operator_config(
+                                "operator_action_state", body
+                            )
+                        except Exception:
+                            return str(entry.get("action_id") or ""), entry
+                        returned = dict(completed)
+                        audit_result = recovered_audit.get("result")
+                        if isinstance(audit_result, Mapping):
+                            returned["result"] = dict(audit_result)
+                        return str(entry.get("action_id") or ""), returned
+                return str(entry.get("action_id") or ""), entry
             action_id = "operator-action:" + uuid.uuid4().hex
             entry = {
                 "action_id": action_id,
@@ -8336,13 +8661,15 @@ class OperatorControlPlane:
                     if not isinstance(raw_entry, Mapping):
                         continue
                     entry = dict(raw_entry)
+                    if "result" in entry:
+                        entry["result"] = _action_state_result(entry.get("result"))
                     if str(entry.get("action_id")) == action_id:
                         entry.update(
                             {
                                 "status": status,
                                 "completed_at": utc_now().isoformat(),
                                 "reason": reason[:160],
-                                "result": _safe_value(result or {}),
+                                "result": _action_state_result(result or {}),
                             }
                         )
                     updated.append(entry)
@@ -10241,6 +10568,22 @@ class OperatorControlPlane:
             if action_value in _ALLOWED_ACTIONS:
                 action_id, duplicate = self._begin_action(action_value, target_value)
                 if duplicate is not None:
+                    if str(duplicate.get("status") or "").upper() == "COMPLETE":
+                        recovered_result = duplicate.get("result")
+                        return {
+                            "ok": True,
+                            "action": requested_action_value,
+                            "target": target_value,
+                            "action_id": action_id,
+                            "action_status": "COMPLETE",
+                            "result": (
+                                recovered_result
+                                if isinstance(recovered_result, Mapping)
+                                else {}
+                            ),
+                            "paper_only": True,
+                            "live_execution": False,
+                        }
                     return {
                         "ok": False,
                         "action": requested_action_value,
@@ -10380,7 +10723,7 @@ class OperatorControlPlane:
                         connectivity = _blocked_connectivity_projection()
                     self.store.set_operator_config(
                         CANARY_CONNECTIVITY_CONFIG_KEY,
-                        connectivity,
+                        _connectivity_persisted_projection(connectivity),
                     )
                     result = {"connectivity": connectivity}
             elif action_value == "canary.eligibility.verify":
