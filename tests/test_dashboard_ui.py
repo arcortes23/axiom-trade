@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -8,6 +9,8 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import pytest
+from axiom.dashboard import DashboardData
+from axiom.storage import AxiomStore
 from ui_fixture_server import FixtureServer, fixture_payload
 
 
@@ -152,6 +155,82 @@ def test_fixture_routes_keep_bounded_pagination_and_exact_detail_surfaces() -> N
         status, missing_record = _json(f"{fixture.url}/api/ui-record?kind=market&id=does-not-exist")
         assert status == 404
         assert missing_record["kind"] == "market"
+
+
+def test_dataset_reads_stay_available_when_aggregate_health_is_unreadable() -> None:
+    with AxiomStore(":memory:") as store:
+        store.save_dataset_catalog(
+            "dataset-aurora",
+            "stored-v1",
+            provider="fixture-provider",
+            instrument="fixture-aurora",
+            market_type="prediction",
+            timeframe="1h",
+            row_count=1000,
+            completeness=0.8,
+            missing_ranges=[{"start": "v1-start", "end": "v1-end"}],
+            quality="HISTORICAL",
+            source_type="HISTORICAL",
+            snapshot_id="snapshot-v1",
+            metadata={"category": "fixture"},
+        )
+        store.save_dataset_catalog(
+            "dataset-aurora",
+            "stored-v2",
+            provider="fixture-provider",
+            instrument="fixture-aurora",
+            market_type="prediction",
+            timeframe="1h",
+            row_count=1842,
+            completeness=0.9,
+            missing_ranges=[{"start": "v2-start", "end": "v2-end"}],
+            quality="PRICE_PROXY",
+            source_type="FORWARD_COLLECTED",
+            snapshot_id="snapshot-v2",
+            metadata={"category": "fixture"},
+        )
+
+        def deny_global_health_tables(
+            action: int,
+            table: str | None,
+            _column: str | None,
+            _database: str | None,
+            _source: str | None,
+        ) -> int:
+            if action == sqlite3.SQLITE_READ and table in {"bars", "snapshots", "datasets"}:
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        dashboard = DashboardData(store=store)
+        store.connection.set_authorizer(deny_global_health_tables)
+        try:
+            detail = dashboard.v2_snapshot("datasets/dataset-aurora")
+            assert detail["available"] is True
+            assert detail["dataset_id"] == "dataset-aurora"
+            assert detail["dataset_version"] == "stored-v2"
+            assert detail["catalog"]["dataset_version"] == "stored-v2"
+            assert detail["catalog"]["row_count"] == 1842
+            assert detail["catalog"]["quality"] == "PRICE_PROXY"
+            assert detail["catalog"]["source_type"] == "FORWARD_COLLECTED"
+            assert detail["catalog"]["missing_range_count"] == 1
+            assert detail["health"] is None
+
+            gaps = dashboard.v2_snapshot(
+                "datasets/dataset-aurora/missing-ranges",
+                {"page": "1", "page_size": "10"},
+            )
+            assert gaps["total"] == 2
+            assert [item["dataset_version"] for item in gaps["items"]] == ["stored-v1", "stored-v2"]
+            assert gaps["range_payload_truncated"] is False
+
+            unknown = dashboard.v2_snapshot(
+                "datasets/does-not-exist/missing-ranges",
+                {"page": "1", "page_size": "10"},
+            )
+            assert unknown["items"] == []
+            assert unknown["total"] == 0
+        finally:
+            store.connection.set_authorizer(None)
 
 
 def test_fixture_catalogs_prove_default_page_two_facets_sort_and_deep_identity() -> None:

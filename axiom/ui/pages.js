@@ -125,6 +125,8 @@ function uiFor(ctx) {
       return `<a href="?${escLocal(params.toString())}">${escLocal(label)}</a>`;
     },
     reason: typeof supplied.reason === "function" ? supplied.reason : humanize,
+    readState: stateFor(ctx?.data, ctx),
+    primaryRows: primaryRows(ctx?.data, ctx?.route, ctx),
   };
 }
 
@@ -209,21 +211,98 @@ function arrayFrom(data, keys = []) {
   if (Array.isArray(data.records)) return data.records;
   return [];
 }
+function primaryRows(data, routeInput = {}, ctx = {}) {
+  const source = envelope(data);
+  const route = normalizeRoute(routeInput);
+  let keys = ["items", "rows", "results", "records"];
+  if (route.view === "markets") keys = ["items", "markets"];
+  else if (route.view === "research" && route.section === "strategies") keys = ["items", "candidates"];
+  else if (route.view === "research" && route.section === "crypto") keys = ["items", "catalog", "catalogs"];
+  else if (route.view === "research" && route.section === "automation") keys = ["items", "queue", "jobs"];
+  else if (route.view === "research" && route.section === "data") keys = ["items", "datasets", "catalog"];
+  else if (route.view === "activity") keys = ["items", "events", "activity"];
+  else if (route.view === "portfolio" && route.section === "practice") keys = ["items", "records", "observations", "paper_records"];
+  else if (route.view === "portfolio" && route.section === "allocations") keys = ["active_rows", "members", "items"];
+  else if (route.view === "live" && route.section === "binance") keys = ["items", "orders", "fills", "positions", "records"];
+  else if ((route.view === "portfolio" && route.section === "real") || (route.view === "live" && route.section === "polymarket")) {
+    keys = ["items", "orders", "fills", "records"];
+  }
+  const rows = arrayFrom(source, keys);
+  if (route.view === "research" && route.section === "automation") {
+    return rows.concat(rowsFromEnvelopes(source, ["shadow"]), arrayFrom(ctx?.detail?.shadow_list, ["items", "jobs", "records"]));
+  }
+  if ((route.view === "portfolio" && route.section === "real") || (route.view === "live" && route.section === "polymarket")) {
+    return rows.concat(rowsFromEnvelopes(source, ["execution", "ledger"]));
+  }
+  return rows;
+}
+function hasStructuredContext(data, routeInput = {}) {
+  const route = normalizeRoute(routeInput);
+  if (route.view !== "live" || route.section !== "binance") return false;
+  const source = envelope(data);
+  return ["status", "state", "environment", "mode", "profile", "identity", "strict_testnet", "credentials", "transport", "title", "available"]
+    .some((key) => Object.prototype.hasOwnProperty.call(source, key) && source[key] !== undefined && source[key] !== null);
+}
 
-function envelope(data) {
-  return isObject(data) ? data : {};
+
+function blockingState(state) {
+  return ["loading", "error", "unavailable", "disconnected"].includes(state);
+}
+
+function nonEmpty(value) {
+  if (Array.isArray(value)) return value.length > 0;
+  if (isObject(value)) return Object.keys(value).length > 0;
+  return value !== undefined && value !== null && String(value).trim() !== "";
+}
+
+function unavailableSource(source) {
+  if (source.available === false) return true;
+  const status = lower(source.status);
+  return ["unavailable", "failed", "error", "timeout", "disconnected"].includes(status);
 }
 
 function stateFor(data, ctx) {
   const source = envelope(data);
   const errors = ctx?.errors;
-  if (ctx?.error || source.error || source.errors) return "error";
-  if (Array.isArray(errors) ? errors.length : isObject(errors) ? Object.keys(errors).length : Boolean(errors)) return "partial";
   if (ctx?.loading || source.loading) return "loading";
+  if (ctx?.error || nonEmpty(source.error) || nonEmpty(source.errors)) return "error";
+  if (Array.isArray(errors) ? errors.length : isObject(errors) ? Object.keys(errors).length : Boolean(errors)) return "partial";
+  if (unavailableSource(source)) return "unavailable";
   if (source.disconnected || source.connection === "DISCONNECTED") return "disconnected";
   if (source.stale || source.partial || source.status === "STALE" || source.status === "PARTIAL") return "partial";
   return "loaded";
 }
+
+function stateLabel(state) {
+  return {
+    loading: ["Loading", "The bounded request is in progress; no empty result is inferred."],
+    error: ["This view is unavailable", "The server returned an error; no empty result is inferred. Try again without changing any controls."],
+    unavailable: ["This view is unavailable", "The bounded source did not provide a readable result; no empty result is inferred."],
+    disconnected: ["Account or venue disconnected", "Current values cannot be verified; no empty result is inferred."],
+  }[state];
+}
+
+
+function stateBody(ui, data, ctx) {
+  const state = stateFor(data, ctx);
+  if (!blockingState(state)) return "";
+  const rows = primaryRows(data, ctx?.route, ctx);
+  if (rows.length) {
+    if (state === "loading") return ui.notice("Refreshing bounded projection", "Showing last-known rows until this read completes; they are not presented as current.", "info");
+    return ui.notice("Current projection unavailable", "Showing last-known rows from the bounded response; they are not presented as current.", "warn");
+  }
+  if (hasStructuredContext(data, ctx?.route)) {
+    return ui.notice("Structured context retained", "Bounded venue, profile, or status context remains available; record totals are not inferred from this read.", "info");
+  }
+  const copy = stateLabel(state) || ["Data unavailable", "No bounded result is available; no empty result is inferred."];
+  return ui.empty(copy[0], copy[1]);
+}
+
+
+function envelope(data) {
+  return isObject(data) ? data : {};
+}
+
 
 function statusTone(status) {
   const value = lower(status);
@@ -332,20 +411,25 @@ function detailLink(ui, route, label, id, recordKind = "") {
 }
 
 function table(ui, columns, rows, caption = "") {
-  if (!rows.length) {
+  const values = list(rows);
+  if (!values.length) {
+    if (blockingState(ui.readState) && !list(ui.primaryRows).length) {
+      const copy = stateLabel(ui.readState) || ["Data unavailable", "No bounded result is available; no empty result is inferred."];
+      return ui.empty(copy[0], copy[1]);
+    }
     const heading = caption || "Nothing to show";
     const explanation = caption ? `No ${caption.toLowerCase()} are present in this bounded projection; no value is inferred.` : "No records are available for this view.";
     return ui.empty(heading, explanation);
   }
   if (ui.table) {
     try {
-      return ui.table(columns, rows, caption ? { caption } : {});
+      return ui.table(columns, values, caption ? { caption } : {});
     } catch (_error) {
       // Keep a safe local table if an integration helper has not landed yet.
     }
   }
   const head = columns.map((column) => `<th scope="col">${ui.esc(column.label)}</th>`).join("");
-  const body = rows.map((row) => `<tr>${columns.map((column) => {
+  const body = values.map((row) => `<tr>${columns.map((column) => {
     let rendered = "";
     try { rendered = column.render(row); } catch (_error) { rendered = `<span class="muted">Not available</span>`; }
     return `<td${column.className ? ` class="${ui.esc(column.className)}"` : ""}>${rendered}</td>`;
@@ -355,12 +439,13 @@ function table(ui, columns, rows, caption = "") {
 
 function pageFrame(ui, title, intro, body, state = "loaded") {
   const stateCopy = {
-    loading: ["Loading", "Reading the bounded server projection."],
-    disconnected: ["Connection unavailable", "The last known values are not being presented as current."],
+    loading: ["Loading", "Reading the bounded server projection; no empty result is inferred."],
+    disconnected: ["Connection unavailable", "The last known values are not being presented as current; no empty result is inferred."],
+    unavailable: ["Data unavailable", "The bounded source did not provide a readable result; no empty result is inferred."],
     partial: ["Partial or stale data", "Some supporting records need a refresh; unknown values remain unknown."],
-    error: ["Could not load this view", "Retry the read-only request. No authority or control action was changed."],
+    error: ["Could not load this view", "Retry the read-only request. No authority or control action was changed; no empty result is inferred."],
   }[state];
-  return `<section class="section" data-page-state="${ui.esc(state)}"><header class="section-heading"><div><h2>${ui.esc(title)}</h2><p class="muted">${ui.esc(intro)}</p></div></header>${stateCopy ? ui.notice(stateCopy[0], stateCopy[1], state === "error" ? "error" : "info") : ""}${body}</section>`;
+  return `<section class="section" data-page-state="${ui.esc(state)}"><header class="section-heading"><div><h2>${ui.esc(title)}</h2><p class="muted">${ui.esc(intro)}</p></div></header>${stateCopy ? ui.notice(stateCopy[0], stateCopy[1], ["error", "unavailable"].includes(state) ? "error" : "info") : ""}${body}</section>`;
 }
 
 function summary(ui, data, labels) {
@@ -371,13 +456,6 @@ function summary(ui, data, labels) {
   }));
 }
 
-function stateBody(ui, data, ctx) {
-  const state = stateFor(data, ctx);
-  if (state === "loading") return ui.empty("Loading", "The bounded request is in progress.");
-  if (state === "error") return ui.empty("This view is unavailable", "The server returned an error. Try again without changing any controls.");
-  if (state === "disconnected") return ui.empty("Account or venue disconnected", "Current values cannot be verified. The last-known timestamp is retained in technical details.");
-  return "";
-}
 function renderOrders(ui, rows, route) {
   return table(ui, [
     { label: "Request / position", render: (row) => { const kind = value(row, "record_kind") || (value(row, "request_id") ? "order" : "submission"); return detailLink(ui, route, first(value(row, "request_id", "position_id", "attempt_id", "id", "question", "name", "market_name", "market"), "Unnamed request"), idOf(row, kind), kind); } },
@@ -655,8 +733,10 @@ function renderDetail(ctx) {
   if (!isObject(detail)) return ui.empty("Details unavailable", "The selected record is no longer in the bounded response; refresh the list before opening it.");
   const embeddedEvents = list(detail.events || detail.evidence || detail.timeline);
   const embeddedRanges = list(detail.missing_ranges || detail.ranges || detail.gaps);
-  const events = map.events !== undefined ? arrayFrom(map.events, ["items", "events", "records"]) : embeddedEvents;
-  const ranges = map.gaps !== undefined ? arrayFrom(map.gaps, ["items", "ranges", "gaps"]) : embeddedRanges;
+  const eventResponseFailed = (isObject(map.events) && (nonEmpty(map.events.error) || nonEmpty(map.events.errors))) || nonEmpty(ctx?.errors?.["detail:events"]);
+  const gapResponseFailed = (isObject(map.gaps) && (nonEmpty(map.gaps.error) || nonEmpty(map.gaps.errors))) || nonEmpty(ctx?.errors?.["detail:gaps"]);
+  const events = map.events !== undefined && !eventResponseFailed ? arrayFrom(map.events, ["items", "events", "records"]) : embeddedEvents;
+  const ranges = map.gaps !== undefined && !gapResponseFailed ? arrayFrom(map.gaps, ["items", "ranges", "gaps"]) : embeddedRanges;
   const records = arrayFrom(detail, ["items", "orders", "fills", "records"]);
   const state = stateFor(detail, ctx);
   const fields = [
@@ -749,6 +829,7 @@ function renderDetail(ctx) {
           ["Start", value(detail, "start_timestamp", "start"), "time"],
           ["End", value(detail, "end_timestamp", "end"), "time"],
           ["Missing ranges", value(detail, "missing_range_count")],
+          ["Aggregate health", detail.health === null ? "Not computed (stored catalog metadata only)" : value(detail, "health")],
         ]
         : detailKey === "hermes"
           ? [
@@ -793,18 +874,29 @@ function renderDetail(ctx) {
   const domainMarkup = visibleDomainFields.length
     ? `<section><h4>${ui.esc(domainTitle)}</h4><dl class="detail-grid">${visibleDomainFields.map(([label, raw, kind]) => ui.kv(label, fieldValue(ui, label, raw, kind))).join("")}</dl></section>`
     : "";
+  const datasetCatalogMarkup = detailKey === "dataset"
+    ? ui.notice("Stored catalog metadata", detail.health === null ? "This bounded dataset detail comes from the stored catalog; aggregate health was not computed." : "This bounded dataset detail comes from the stored catalog and retains its source provenance.", "info")
+    : "";
   const identifierMarkup = identifiers.length ? `<section><h4>Exact identifiers</h4><dl class="detail-grid">${identifiers.map(([label, raw]) => ui.kv(label, `<span>${ui.esc(text(raw))}</span> <button class="button button-quiet copy-button" type="button" data-copy="${ui.esc(text(raw))}" data-copy-label="Copy">Copy</button>`)).join("")}</dl></section>` : "";
   const eventMarkup = detailKey === "candidate"
     ? table(ui, [{ label: "Time", render: (row) => shown(ui, row, ["timestamp", "created_at", "at"], "time") }, { label: "Stage", render: (row) => badge(ui, value(row, "stage", "status", "state")) }, { label: "Event", render: (row) => ui.esc(first(value(row, "title", "message", "name", "kind"), "Unnamed event")) }, { label: "Reason", render: (row) => ui.esc(first(value(row, "reason", "explanation"), "Not available")) }], events, "Evidence and events") + detailPager(ui, route, map.events, "detail", "Evidence and event")
     : "";
-  const rangeMarkup = detailKey === "dataset"
-    ? table(ui, [
+  const gapReadIncomplete = gapResponseFailed || (map.gaps === undefined && Boolean(ctx?.loading));
+  const rangeRowsMarkup = gapReadIncomplete && !ranges.length
+    ? ""
+    : table(ui, [
       { label: "Range #", render: (row) => ui.esc(text(value(row, "range_index", "index"), "Not available")) },
+      { label: "Dataset version", render: (row) => shown(ui, row, ["dataset_version", "range.dataset_version", "missing_range.dataset_version"]) },
       { label: "Start", render: (row) => shown(ui, row, ["range.start", "missing_range.start", "start", "start_timestamp"], "time") },
       { label: "End", render: (row) => shown(ui, row, ["range.end", "missing_range.end", "end", "end_timestamp"], "time") },
       { label: "Kind", render: (row) => ui.esc(text(value(row, "range.kind", "missing_range.kind", "kind"), "Not available")) },
       { label: "Reason", render: (row) => ui.esc(text(value(row, "range.reason", "missing_range.reason", "reason"), "Not available")) },
-    ], ranges, "Missing ranges") + detailPager(ui, route, map.gaps, "detail", "Missing range")
+    ], ranges, "Missing ranges across saved dataset versions") + detailPager(ui, route, map.gaps, "detail", "Missing range");
+  const rangeStatusMarkup = gapReadIncomplete
+    ? ui.notice(ranges.length ? "Missing ranges refresh incomplete" : "Missing ranges unavailable", ranges.length ? "Showing ranges retained in the selected row; the native read did not complete." : "The native missing-ranges read did not complete; no empty result is inferred.", "info")
+    : "";
+  const rangeMarkup = detailKey === "dataset"
+    ? `${datasetCatalogMarkup}${rangeStatusMarkup}${rangeRowsMarkup}`
     : "";
   const shadowMarkup = "";
   const recordMarkup = records.length ? table(ui, [{ label: "Record", render: (row) => ui.esc(first(value(row, "name", "title", "id"), "Unnamed record")) }, { label: "Status", render: (row) => badge(ui, value(row, "status", "state", "stage")) }, { label: "Time", render: (row) => shown(ui, row, ["timestamp", "created_at", "updated_at"], "time") }], records, "Related records") : "";
@@ -828,6 +920,11 @@ function renderPage(ctx = {}) {
   const route = normalizeRoute(ctx.route);
   const ui = uiFor(ctx);
   const data = envelope(ctx.data);
+  const state = stateFor(data, ctx);
+  if (blockingState(state) && !primaryRows(data, route, ctx).length && !hasStructuredContext(data, route)) {
+    const title = ROUTES[route.view]?.title || ROUTES[route.view]?.[route.section]?.title || humanize(route.view);
+    return pageFrame(ui, title, "Read-only bounded server projection.", stateBody(ui, data, { ...ctx, route }), state);
+  }
   if (route.view === "portfolio") return renderPortfolio(ctx, route, ui, data);
   if (route.view === "markets") return renderMarkets(ctx, route, ui, data);
   if (route.view === "research" && route.section === "strategies") return renderStrategyPage(ctx, route, ui, data);
@@ -885,5 +982,5 @@ function pageSpec(routeInput = {}) {
   return spec(title, "Read-only operator destination", endpointFor(route.view, route.section), [], [], detailRequests);
 
 }
-export { pageSpec, renderPage, renderDetail };
+export { pageSpec, renderPage, renderDetail, stateFor, primaryRows };
 export { normalizeRoute as normalizePageRoute };

@@ -1,4 +1,4 @@
-import { pageSpec, renderPage, renderDetail } from "./pages.js";
+import { pageSpec, renderPage, renderDetail, stateFor, primaryRows } from "./pages.js";
 
 const ROUTE_ALIASES = {
   overview: "home", home: "home", live: "live", canary: "live", "polymarket-canary": "live",
@@ -214,9 +214,11 @@ function destinationLinks(route) {
     : [];
   return groups.map(([title, entries]) => `<nav class="subnav" aria-label="${esc(title)} sections"><span>${esc(title)}</span>${entries.map(([section, label]) => `<a class="${route.section === section ? "active" : ""}" href="${hrefForRoute({ ...route, section, page: 1, detail_page: 1, shadow_page: 1, selected: "", expanded: false })}" data-route-link>${esc(label)}</a>`).join("")}</nav>`).join("");
 }
-function browseControls(route, spec, data = {}) {
+function browseControls(route, spec, data = {}, state = {}) {
   const nativePages = Number(data.pages);
-  const hasNativePager = (Number.isInteger(nativePages) && nativePages > 0) || typeof data.has_more === "boolean";
+  const readState = stateFor(data, { loading: state.loading, error: state.errors?.page });
+  const blockedWithoutRows = ["loading", "error", "unavailable", "disconnected"].includes(readState) && !primaryRows(data, route).length;
+  const hasNativePager = !blockedWithoutRows && ((Number.isInteger(nativePages) && nativePages > 0) || typeof data.has_more === "boolean");
   if (!spec || (!spec.facets?.length && !spec.sortOptions?.length && !hasNativePager)) return "";
   const facetFields = (spec.facets || []).map(facet => {
     const options = facet.options || [];
@@ -227,7 +229,7 @@ function browseControls(route, spec, data = {}) {
   const page = Number(route.page) || 1;
   const pages = Number.isInteger(nativePages) && nativePages > 0 ? nativePages : 0;
   const hasMore = typeof data.has_more === "boolean" ? data.has_more : null;
-  const hasPager = pages > 0 || hasMore !== null;
+  const hasPager = hasNativePager && (pages > 0 || hasMore !== null);
   const nextAvailable = hasMore !== null ? hasMore : pages > page;
   const pager = hasPager ? `<nav class="pager" aria-label="Pagination"><button class="button button-quiet" type="button" data-page="${Math.max(1, page - 1)}" ${page <= 1 ? "disabled" : ""}>Previous</button><span>Page ${page}${pages ? ` of ${pages}` : ""}</span><button class="button button-quiet" type="button" data-page="${pages ? Math.min(pages, page + 1) : page + 1}" ${nextAvailable ? "" : "disabled"}>Next</button></nav>` : "";
   return `<form class="browse-controls" id="browse-controls" role="search"><label class="search-field">Search<input name="filter" data-browse-control value="${esc(route.filter || "")}" placeholder="Search this view" autocomplete="off"></label>${facetFields}<label>Sort<select name="sort" data-browse-control><option value="">Default order</option>${sort}</select></label>${direction}<label>Rows<select name="page_size" data-browse-control>${[10, 25, 50, 100].map(size => `<option value="${size}" ${Number(route.page_size) === size ? "selected" : ""}>${size} per page</option>`).join("")}</select></label><button class="button button-secondary" type="submit">Apply filters</button>${pager}</form>`;
@@ -563,9 +565,8 @@ function renderRoute(state, previousForm = {}) {
     const pageContext = { ...shared, data: pageData, detail: state.data.detail || {}, error: shared.errors.page };
     html = renderPage(pageContext);
     if (state.route.selected) html += renderDetail({ ...pageContext, error: detailError });
-    if (!html) html = empty(spec.title || "No page", "This destination did not return a bounded presentation.");
   }
-  const chrome = `${destinationLinks(state.route)}${state.route.view === "home" || state.route.view === "settings" ? "" : browseControls(state.route, spec, pageData)}`;
+  const chrome = `${destinationLinks(state.route)}${state.route.view === "home" || state.route.view === "settings" ? "" : browseControls(state.route, spec, pageData, state)}`;
   const loading = state.loading ? notice("Loading current projection", "Reading the bounded server records. Existing values remain last-known until this refresh completes.", "info") : "";
   const liveStop = "";
   root.innerHTML = `${chrome}${loading}${liveStop}${html}`;

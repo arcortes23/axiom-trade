@@ -234,6 +234,7 @@ def _base_data(now: datetime | None = None) -> dict[str, Any]:
         "coverage": "PARTIAL",
         "quality": "PRICE_PROXY",
         "updated_at": FIXTURE_TIME,
+        "health": None,
     }
     dataset["missing_ranges"] = [
         {

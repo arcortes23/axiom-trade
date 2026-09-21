@@ -1,21 +1,23 @@
 {
   "base_revision": "18babca0fbff71abfcef8a4e715f212cf70170cd",
+  "read_closure_parent_revision": "64697c205e803e580c2a717ca6d8f228c02d79dc",
   "worktree": "feature/beginner-friendly-ui",
   "source_hashes": {
-    "axiom/dashboard.py": "b0dc20898bb748dc4d180e89848b958831b978880e6b206f67ffca6e6bdac469",
-    "axiom/ui/app.js": "5f6f5fea9f417dc74366fc074db6ad4f10641ffcdb7e20a188617cff33dbd460",
-    "axiom/ui/pages.js": "93136c12a5ff0c3442197a331aff2b05964b58d534b269a48cded2f455956a77",
+    "axiom/dashboard.py": "da70cda306e3904fde891584c5191c9ac97646c2658259caf90c76ae3ac88820",
+    "axiom/storage.py": "5925b9f178052173e4af2b4caee7c4b97420e2aed38f2d154bba9e2c188b48b8",
+    "axiom/ui/app.js": "7e0a2a18b4fbc772293863546eeca606a9a99d705c0b3a3a9bfb7c1474b6bdf0",
+    "axiom/ui/pages.js": "45d35a60d3b519327bf168e41602a30b61f587229f2cabbc463b660e0bf5f36f",
     "axiom/ui/styles.css": "d17b131ab2e7c96e590e4200fc5ff9e1ef1a7adcd6ce901426a45c84c6a7468e"
   },
   "python_suite": {
     "command": "uv run python -X utf8 -m pytest",
-    "passed": 1879,
+    "passed": 1881,
     "skipped": 3,
     "subtests_passed": 582,
     "warnings": 2,
-    "duration_seconds": 457.62,
+    "duration_seconds": 347.97,
     "warning_detail": "Existing PytestCollectionWarnings for TestCredentials and TestVenue constructors in tests/test_autonomous_canary.py.",
-    "source_scope_note": "Python application, tests and fixture remained unchanged throughout the subsequent JavaScript-only corrections. Browser tests, identifier checks, bundle, wheel and actual installed-resource smoke were rerun against the final source hashes above."
+    "source_scope_note": "Python application, tests and fixture remained frozen throughout the full suite. The final JavaScript-only retained-Shadow-context correction occurred during that run; Bun, ESLint, browser bundle, wheel byte checks and installed-resource smoke were rerun on the exact final browser source hashes above."
   },
   "presentation_tests": {
     "command": "npm exec --offline --yes --package=bun -- bun test tests/ui_presentation.test.mjs",
@@ -25,13 +27,28 @@
     "expect_calls": 76
   },
   "eslint_no_undef": "Passed for both browser modules with explicit browser globals; no stop/status global suppressions.",
-  "compileall": "passed for axiom",
-  "changed_python_f821": "passed for dashboard.py and all changed Python tests/fixture",
+  "compileall": "passed for axiom and tests",
+  "changed_python_f821": {
+    "status": "passed",
+    "files": [
+      "axiom/dashboard.py",
+      "axiom/storage.py",
+      "tests/test_binance_dashboard.py",
+      "tests/test_canary.py",
+      "tests/test_dashboard_pagination.py",
+      "tests/test_market_scope_dashboard.py",
+      "tests/test_phase3.py",
+      "tests/test_phase4.py",
+      "tests/test_phase42.py",
+      "tests/test_dashboard_ui.py",
+      "tests/ui_fixture_server.py"
+    ]
+  },
   "whole_repository_f821_note": "Earlier diagnostic found one inherited, out-of-scope undefined AxiomStore annotation at axiom/forward.py:682. No whole-repository F821 all-green claim.",
   "browser_build": {
     "command": "npm exec --offline --yes --package=bun -- bun build axiom/ui/app.js --target browser",
     "modules": 2,
-    "output_kilobytes": 235.75,
+    "output_kilobytes": 242.34,
     "status": "passed"
   },
   "wheel": {
@@ -39,6 +56,7 @@
     "status": "passed",
     "byte_identical_source_files": [
       "axiom/dashboard.py",
+      "axiom/storage.py",
       "axiom/ui/app.js",
       "axiom/ui/pages.js",
       "axiom/ui/styles.css"
@@ -47,6 +65,13 @@
     "packaged_ui_assets": 3,
     "dashboard_html_generated": true,
     "embedded_control_token": false
+  },
+  "read_closure_regressions": {
+    "focused_native_ui_tests": "passed for tests/test_dashboard_ui.py and tests/test_dashboard_pagination.py",
+    "bounded_dataset_reads": "Native regression denies unrelated bars/snapshots/datasets reads while stored catalog, version provenance and saved-version gaps remain available.",
+    "native_shadow_pagination": "Native 21-job regression covers complete totals, final page, sorting, status/member filters and latest/current metadata.",
+    "detail_declaration": "Bun reproduced two failures and ESLint identified undefined domainMarkup before the original domain-specific declaration was restored; final gates pass without global suppressions.",
+    "secondary_context": "Independent source review confirmed valid Shadow rows were hidden by a failed Hermes primary source; the final context-aware gate retains that evidence. Browser acceptance is recorded separately."
   },
   "formatter": "No project formatter configuration found; no new formatting convention introduced.",
   "scope": "Gate evidence for the exact source hashes above. Independent runtime and safety acceptance is recorded separately. No production activation or venue order was performed by these gates."

@@ -5,15 +5,16 @@
   "worktree": "C:/Users/User/projects/axiom-ui",
   "base_revision": "18babca0fbff71abfcef8a4e715f212cf70170cd",
   "overall_correctness": "correct",
-  "explanation": "The final frozen source is covered by current action, rendered-state, transport/polling, visual, surface, safety, documentation, and gate evidence. The two rendered-state findings found during the matrix pass (missing authorization duration shown as zero and Home suppressing the shaped overview failure) were fixed and rechecked at the final source; prior reports and screenshots remain explicitly versioned rather than silently presented as current.",
+  "explanation": "The final frozen source and read-only native closure are covered by current native-read, rendered-state, transport/polling, visual, surface, safety, documentation, and gate evidence. Historical action/state/surface captures remain explicitly versioned; current final-read receipts cover the changed page/read paths, and the report does not silently relabel old captures as final-source proof.",
   "confidence": 0.98,
   "final_source": {
-    "axiom/ui/app.js": "5f6f5fea9f417dc74366fc074db6ad4f10641ffcdb7e20a188617cff33dbd460",
-    "axiom/ui/pages.js": "93136c12a5ff0c3442197a331aff2b05964b58d534b269a48cded2f455956a77",
+    "axiom/ui/app.js": "7e0a2a18b4fbc772293863546eeca606a9a99d705c0b3a3a9bfb7c1474b6bdf0",
+    "axiom/ui/pages.js": "45d35a60d3b519327bf168e41602a30b61f587229f2cabbc463b660e0bf5f36f",
     "axiom/ui/styles.css": "d17b131ab2e7c96e590e4200fc5ff9e1ef1a7adcd6ce901426a45c84c6a7468e",
-    "tests/ui_fixture_server.py": "4bcce66f2056fc190f5bc983d32dfc2fe5d45aae6160e07ccd70e0ba5e4173a7",
-    "axiom/dashboard.py": "b0dc20898bb748dc4d180e89848b958831b978880e6b206f67ffca6e6bdac469",
-    "docs/polymarket_canary.md": "d6d72d0dabb1e6514e23ddde639d8bc7e8eca00863f30ac605c2ffe2784b508a"
+    "tests/ui_fixture_server.py": "a6751d59bb61e2e2e67cba18adf52dd01d74f9c6c19f4759962f09756ef87350",
+    "axiom/dashboard.py": "da70cda306e3904fde891584c5191c9ac97646c2658259caf90c76ae3ac88820",
+    "docs/polymarket_canary.md": "50e2516072a444111eb86d15ae2d274e6d8ef3d6410f02502b3a9849e50cca2a",
+    "axiom/storage.py": "5925b9f178052173e4af2b4caee7c4b97420e2aed38f2d154bba9e2c188b48b8"
   },
   "evidence_modalities": {
     "browser_proof": [
@@ -223,7 +224,7 @@
   "interaction_state_accessibility": {
     "canonical_action": "action-closure-review.json is current 5f6f evidence for exact REVIEW EXPLORATORY AUTHORIZATION / execution_authorization.review and CONFIRM EXPLORATORY LIVE / exploratory.live.review_confirm, native values shared/lifetime 5.00, duration 86400, FINAL_CONFIRMATION, exact purpose, final payload {}, no client action_id, dropped stage-one response/no replay, COMPLETE-to-Step2/no auto-final, stored RUNNING to COMPLETE/FAILED, material adverse fence, Stop preserving ACTIVE while disarming, and direct Revoke changing permission only while armed remains true. Final current_cancellation_guards also prove real successful /api/ui-state responses released after Cancel/Escape produce zero POSTs, an old Check response cannot clear a newer RUNNING marker, and immediate close after final dispatch retains the recovery marker across reload.",
     "transport_and_polling": "network-closure-review.json is current 5f6 evidence for ancillary GET503 isolation, native 10s client deadline, route abort/late-response ordering, natural Settings >=62s and Live >=17s preservation, selected-record disclosure reset, and late-read protection of newer COMPLETE outcome. No findings.",
-    "rendered_states": "state-closure-review.json has 19 rows, all 13 routes swept under missing and empty, 75 evidence references with 0 missing; final 5f6 targeted rechecks show missing authorization Duration Not available and Home overview unavailable notice. Findings are marked fixed/rechecked.",
+    "rendered_states": "state-closure-review.json has 19 rows, all 13 routes swept under missing and empty, 75 evidence references with 0 missing; final 5f6 targeted rechecks show missing authorization Duration Not available and Home overview unavailable notice. Findings are marked fixed/rechecked. Final current read closure additionally covers Hermes cold primary failure with queue/count/connection/heartbeat Not available and 10 valid Shadow rows page1 of3, plus native dataset gap health/null and v1/v2 pages.",
     "visual_responsive_zoom": "visual-closure-review.json is current 5f6/d17 evidence for native Chrome 200%, technical detail no page overflow, clipboard full synthetic ID match, review focus/Escape, drawer focus, and offline file:// safety. The prior 13-destination before/after and 390/768/1440 screenshots are retained with explicit historical source attribution because no visual/CSS changes occurred.",
     "accessibility": "visual final/closure report records axe 4.12.1 zero violations on prepared Home, drawer keyboard loop/Escape/focus restoration, no page-level overflow, and local table scrolling; action review records dialog focus and disabled unresolved controls.",
     "offline": "visual-closure-review.json#offline_reference is verified_current: saved offline-reference.html exactly matches current dashboard template (dashboard.py b0dc), file: resources 0/network-like 0, nine links disabled/tabIndex -1, two actions hidden/disabled, click leaves URL unchanged, longHex 0, credentialLiteral 0. Prior offline screenshots remain historical but byte-identical template output is explicitly documented.",
@@ -263,6 +264,12 @@
     }
   },
   "report_mapping": [
+    {
+      "report": "reports/ui-release/native-read-closure-review.json",
+      "status": "effective_current_native_read",
+      "source": "app 7e0 / pages 45d / styles d17 / dashboard da70 / storage 5925",
+      "note": "Native DashboardServer closure: Shadow pagination/status/filter/sort, Hermes primary-abort partial state, dataset health/gaps, GUI no overflow/console errors, 56 GETs, zero /api/operator."
+    },
     {
       "report": "reports/ui-release/action-closure-review.json",
       "status": "effective_current",
@@ -339,7 +346,8 @@
     "No production/native economic backend/venue/account/credential/store/DB proof is claimed; all runtime proof is synthetic loopback browser evidence.",
     "The 13 before/after screenshots and 390/768/1440 images are historical versioned visual evidence from the preceding app freeze; current visual closure rechecked affected technical-detail/copy/review paths at app5f6 and found no CSS/layout changes. This is explicitly attributed, not silently relabeled.",
     "Network GET503/deadline/route/settings/live captures retain their dede source capture hash with final 5f6 unchanged-path confirmation; the current-source action-race capture is separately recorded.",
-    "Independent walkthrough is an independent agent run, not a human study; earlier synthetic terms in that artifact are not current canonical native terms."
+    "Independent walkthrough is an independent agent run, not a human study; earlier synthetic terms in that artifact are not current canonical native terms.",
+    "Native read closure is current-source proof for Hermes/Shadow/dataset pages; historical 883a state captures remain explicitly historical and are not relabeled as final45d."
   ],
   "publication_files": {
     "reports": [
@@ -348,6 +356,7 @@
       "reports/ui-release/action-closure-review.json",
       "reports/ui-release/state-closure-review.json",
       "reports/ui-release/network-closure-review.json",
+      "reports/ui-release/native-read-closure-review.json",
       "reports/ui-release/visual-closure-review.json",
       "reports/ui-release/surface-final-review.json",
       "reports/ui-release/safety-final-review.json",
@@ -393,7 +402,11 @@
       "reports/ui-release/visual-closure-settings-200.png",
       "reports/ui-release/offline-reference.html",
       "reports/ui-release/offline-final-1280.png",
-      "reports/ui-release/offline-final-mobile-390.png"
+      "reports/ui-release/offline-final-mobile-390.png",
+      "reports/ui-release/native-automation-page3.png",
+      "reports/ui-release/native-automation-hermes-error.png",
+      "reports/ui-release/native-dataset-detail-page3.png",
+      "reports/ui-release/state-closure-current-hermes-cold503-shadow.png"
     ],
     "before_after_responsive_13": {
       "before": [
@@ -527,6 +540,10 @@
       "reports/ui-release/independent-postfreeze-home.png",
       "reports/ui-release/lost-response-recovery-evidence.json",
       "reports/ui-release/mobile-drawer-evidence.json",
+      "reports/ui-release/native-automation-hermes-error.png",
+      "reports/ui-release/native-automation-page3.png",
+      "reports/ui-release/native-dataset-detail-page3.png",
+      "reports/ui-release/native-read-closure-review.json",
       "reports/ui-release/network-closure-action-late.png",
       "reports/ui-release/network-closure-get503.png",
       "reports/ui-release/network-closure-identity-after.png",
@@ -593,6 +610,26 @@
       "reports/ui-release/state-closure-armed-no-permission-live.png",
       "reports/ui-release/state-closure-changed-home.png",
       "reports/ui-release/state-closure-changed-live.png",
+      "reports/ui-release/state-closure-current-activity-primary-fault.png",
+      "reports/ui-release/state-closure-current-allocations-primary-fault.png",
+      "reports/ui-release/state-closure-current-automation-primary-fault.png",
+      "reports/ui-release/state-closure-current-binance-primary-fault.png",
+      "reports/ui-release/state-closure-current-binance-refresh-fault.png",
+      "reports/ui-release/state-closure-current-crypto-primary-fault.png",
+      "reports/ui-release/state-closure-current-data-primary-fault.png",
+      "reports/ui-release/state-closure-current-hermes-503-shadow.png",
+      "reports/ui-release/state-closure-current-hermes-cold503-shadow.png",
+      "reports/ui-release/state-closure-current-hermes-unconfigured-shadow.png",
+      "reports/ui-release/state-closure-current-hermes-valid.png",
+      "reports/ui-release/state-closure-current-home-loading-primary.png",
+      "reports/ui-release/state-closure-current-home-primary-fault.png",
+      "reports/ui-release/state-closure-current-live-primary-fault.png",
+      "reports/ui-release/state-closure-current-markets-primary-fault.png",
+      "reports/ui-release/state-closure-current-practice-primary-fault.png",
+      "reports/ui-release/state-closure-current-real-primary-fault.png",
+      "reports/ui-release/state-closure-current-settings-poll-fault.png",
+      "reports/ui-release/state-closure-current-settings-primary-fault.png",
+      "reports/ui-release/state-closure-current-strategies-primary-fault.png",
       "reports/ui-release/state-closure-empty-activity.png",
       "reports/ui-release/state-closure-empty-home.png",
       "reports/ui-release/state-closure-empty-live-binance.png",
@@ -661,16 +698,23 @@
       "reports/ui-release/surface-home.png",
       "reports/ui-release/surface-market-detail.png",
       "reports/ui-release/surface-practice.png",
+      "reports/ui-release/visual-closure-binance-structured-error-390.png",
       "reports/ui-release/visual-closure-copy-control-200.png",
+      "reports/ui-release/visual-closure-data-detail-1280.png",
+      "reports/ui-release/visual-closure-data-detail-390.png",
+      "reports/ui-release/visual-closure-data-detail-768.png",
       "reports/ui-release/visual-closure-dense-table-200.png",
       "reports/ui-release/visual-closure-home-200.png",
       "reports/ui-release/visual-closure-markets-200.png",
+      "reports/ui-release/visual-closure-primary-error-1280.png",
+      "reports/ui-release/visual-closure-primary-error-390.png",
+      "reports/ui-release/visual-closure-primary-error-768.png",
       "reports/ui-release/visual-closure-review-dialog-200.png",
       "reports/ui-release/visual-closure-review.json",
       "reports/ui-release/visual-closure-settings-200.png",
       "reports/ui-release/visual-final-review.json"
     ],
-    "transitive_reference_count": 196,
+    "transitive_reference_count": 227,
     "transitive_missing_paths": [],
     "manifest_note": "All in-repo JSON/PNG/HTML references reachable from every included report, excluding private deployment-boundary receipt and raw before/session-local paths."
   },

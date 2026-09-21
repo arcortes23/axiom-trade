@@ -1,15 +1,43 @@
 {
   "reviewer": "UiSafetyReview",
   "overall_correctness": "correct",
-  "explanation": "Independent recheck of the combined final app freeze confirms fresh-term fencing, cancellation/version ownership, exact pending-action correlation, terminal read-only recovery, and failed-review retry behavior. No unresolved source-safety defect remains in the reviewed UI paths.",
+  "explanation": "Final UI-root closure recheck covers app.js 7e0a2a18 and pages.js 45d35a60: structured-only Binance context and Hermes-unavailable Shadow secondary rows now bypass row-only blocking, while explicit loading/error notices and cached status/profile/restrictions remain visible. The domain detail markup regression is restored; canonical action ownership, Home/Live/Settings preservation, and backend read projections remain clean. No unresolved source-safety defect remains.",
   "confidence": 0.99,
   "findings": [],
   "source_hashes": {
-    "axiom/ui/app.js": "5f6f5fea9f417dc74366fc074db6ad4f10641ffcdb7e20a188617cff33dbd460",
-    "axiom/ui/pages.js": "93136c12a5ff0c3442197a331aff2b05964b58d534b269a48cded2f455956a77",
-    "tests/test_dashboard_ui.py": "5694d546cb4422a4c3652c7a9b8e75cc4d26fa53d7be3f0279be1e9d31421469",
-    "tests/ui_fixture_server.py": "4bcce66f2056fc190f5bc983d32dfc2fe5d45aae6160e07ccd70e0ba5e4173a7",
+    "axiom/ui/app.js": "7e0a2a18b4fbc772293863546eeca606a9a99d705c0b3a3a9bfb7c1474b6bdf0",
+    "axiom/ui/pages.js": "45d35a60d3b519327bf168e41602a30b61f587229f2cabbc463b660e0bf5f36f",
+    "tests/test_dashboard_ui.py": "67f3ab44259c07bee87b1590a6d24de955021665d68da1174a380a7dc1de4ba7",
+    "tests/ui_fixture_server.py": "a6751d59bb61e2e2e67cba18adf52dd01d74f9c6c19f4759962f09756ef87350",
+    "docs/polymarket_canary.md": "50e2516072a444111eb86d15ae2d274e6d8ef3d6410f02502b3a9849e50cca2a",
     "axiom/operator.py": "f1e4ef2e15cc9c415fdce33cfb73142905c20ca182d5b6281ece385b068d8483",
-    "axiom/dashboard.py": "b0dc20898bb748dc4d180e89848b958831b978880e6b206f67ffca6e6bdac469"
-  }
+    "axiom/dashboard.py": "da70cda306e3904fde891584c5191c9ac97646c2658259caf90c76ae3ac88820",
+    "axiom/storage.py": "5925b9f178052173e4af2b4caee7c4b97420e2aed38f2d154bba9e2c188b48b8"
+  },
+  "historical_proof": [
+    {
+      "source_root": "C:/Users/User/projects/axiom-ui",
+      "app_hash": "5f6f5fea9f417dc74366fc074db6ad4f10641ffcdb7e20a188617cff33dbd460",
+      "pages_hash": "93136c12a5ff0c3442197a331aff2b05964b58d534b269a48cded2f455956a77",
+      "verdict": "clean prior source-safety review before read-state closure"
+    },
+    {
+      "source_root": "C:/Users/User/projects/axiom",
+      "app_hash": "7e0a2a18b4fbc772293863546eeca606a9a99d705c0b3a3a9bfb7c1474b6bdf0",
+      "pages_hash": "cc9418bc090b98ee156a9448419b9c1a02dd4e6080cecc2b271aa8a43eed0aa9",
+      "verdict": "historical P2 structured-only Live gate finding; this path was not the final UI-root artifact and is superseded"
+    },
+    {
+      "source_root": "C:/Users/User/projects/axiom-ui",
+      "app_hash": "7e0a2a18b4fbc772293863546eeca606a9a99d705c0b3a3a9bfb7c1474b6bdf0",
+      "pages_hash": "0c5c3b699e8a10843d99032ce009db19a5891126d31fd42929339cf5d8125045",
+      "verdict": "current corrected UI-root source review; P2 closed"
+    },
+    {
+      "source_root": "C:/Users/User/projects/axiom-ui",
+      "app_hash": "7e0a2a18b4fbc772293863546eeca606a9a99d705c0b3a3a9bfb7c1474b6bdf0",
+      "pages_hash": "45d35a60d3b519327bf168e41602a30b61f587229f2cabbc463b660e0bf5f36f",
+      "verdict": "final corrected UI-root source review; domain markup and Hermes/Shadow secondary gates closed; no findings"
+    }
+  ]
 }

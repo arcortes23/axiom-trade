@@ -199,5 +199,127 @@
       "reports/ui-release/visual-closure-review-dialog-200.png"
     ],
     "unaffected_paths": "Home/dense-table/Settings/mobile-drawer prior evidence retained at preceding app hashes because final owner confirmed no visual/CSS changes."
+  },
+  "read_closure": {
+    "status": "complete",
+    "scope": "Final read-layer closure on isolated prepared fixture only; no source edits, gates, repository tests/build/lint/formatters, production access, credentials, venue traffic, database access, or financial/control POSTs.",
+    "source_files_sha256": {
+      "axiom/ui/app.js": "7e0a2a18b4fbc772293863546eeca606a9a99d705c0b3a3a9bfb7c1474b6bdf0",
+      "axiom/ui/pages.js": "45d35a60d3b519327bf168e41602a30b61f587229f2cabbc463b660e0bf5f36f",
+      "axiom/ui/styles.css": "d17b131ab2e7c96e590e4200fc5ff9e1ef1a7adcd6ce901426a45c84c6a7468e",
+      "tests/ui_fixture_server.py": "a6751d59bb61e2e2e67cba18adf52dd01d74f9c6c19f4759962f09756ef87350"
+    },
+    "source_attribution": {
+      "data_detail_screenshots": "pages.js 883a1a6e; app.js 7e0a2a18; styles.css d17b131a; captured before final generic-gate-only pages.js update",
+      "final_error_screenshots": "pages.js 45d35a60; app.js 7e0a2a18; styles.css d17b131a",
+      "final_reload": "Fresh final pages.js 45d35a60 reload confirmed Data detail at real Page zoom 200%, CSS390x422."
+    },
+    "fixture": {
+      "process": "UiVisualClosureFixture",
+      "url": "http://127.0.0.1:61530",
+      "upstream_url": "http://127.0.0.1:61529",
+      "admin_url": "http://127.0.0.1:61531",
+      "scenarios": "prepared for Data and structured Binance; network_failure only for Home notice; browser-local abort for primary Binance GET",
+      "stopped": true,
+      "isolation": "private synthetic read-only fixture only"
+    },
+    "browser": {
+      "process": "UiVisualClosureChrome",
+      "cdp": "ws://127.0.0.1:49500/devtools/browser/5c35b131-51fc-4860-83ce-157732f475d3",
+      "session": "ui-visual-closure-read",
+      "profile": "C:/Users/User/AppData/Local/Temp/axiom-ui-read-closure-profile",
+      "stopped": true,
+      "profile_removed": true,
+      "zoom_method": "Chrome Settings > Appearance > Page zoom 200%; no CSS zoom or emulation",
+      "viewports": {
+        "390": {
+          "physical": "780x844",
+          "css": "390x422",
+          "dpr": 2,
+          "visual_scale": 1
+        },
+        "768": {
+          "physical": "1536x900",
+          "css": "768x450",
+          "dpr": 2,
+          "visual_scale": 1
+        },
+        "1280": {
+          "physical": "2560x900",
+          "css": "1280x450",
+          "dpr": 2,
+          "visual_scale": 1
+        }
+      }
+    },
+    "screenshots": [
+      {
+        "path": "reports/ui-release/visual-closure-data-detail-390.png",
+        "sha256": "deadf9b5bd908d1bbae74b99159935a9839a477bc9744b7cfb5d0b0957211b03",
+        "source": "pages.js 883a1a6e"
+      },
+      {
+        "path": "reports/ui-release/visual-closure-data-detail-768.png",
+        "sha256": "47b30fd1ed6644bf2a890923bd1ee721dda203ad8aea2fecc6febec920ca3a88",
+        "source": "pages.js 883a1a6e"
+      },
+      {
+        "path": "reports/ui-release/visual-closure-data-detail-1280.png",
+        "sha256": "0dcff30f4712aeb7bfe9e9856873b6cbe7175f25d319914ee519a08ed0a3bbda",
+        "source": "pages.js 883a1a6e"
+      },
+      {
+        "path": "reports/ui-release/visual-closure-primary-error-390.png",
+        "sha256": "ca3faf50500b66cd28a2260430f8128bcd3fea9eb3b31d6ee84b8d0c2b9e3705",
+        "source": "pages.js 45d35a60"
+      },
+      {
+        "path": "reports/ui-release/visual-closure-primary-error-768.png",
+        "sha256": "769e36a7f5f92f89e2a28d4089ff06d953e2634adb33b17baf1346624d8c38c6",
+        "source": "pages.js 45d35a60"
+      },
+      {
+        "path": "reports/ui-release/visual-closure-primary-error-1280.png",
+        "sha256": "c5fba66eb973be45390917a48738d01b3dba2cd5258ef3e96c8d8ad4df27c91d",
+        "source": "pages.js 45d35a60"
+      },
+      {
+        "path": "reports/ui-release/visual-closure-binance-structured-error-390.png",
+        "sha256": "bda6de70b3b679704ffc9b4170ca8bd096e13fad20aca75afecdcd917cc17118",
+        "source": "pages.js 45d35a60"
+      }
+    ],
+    "checks": [
+      {
+        "name": "dataset detail responsive",
+        "result": "pass",
+        "evidence": "At CSS390, 768, and 1280 under real Chrome Page zoom 200%, Aurora detail showed Stored catalog metadata, aggregate health was not computed, Missing ranges across saved dataset versions, and Dataset version. No false Total datasets 0, No records, or Page 1 of 1 labels."
+      },
+      {
+        "name": "final pages hash reload",
+        "result": "pass",
+        "evidence": "Fresh reload at final pages.js 45d35a60 confirmed the same Data detail labels at CSS390x422, dpr2, Page zoom200%."
+      },
+      {
+        "name": "local table overflow and keyboard",
+        "result": "pass",
+        "evidence": "At CSS1280 root1272/1272 and body1273/1273 with pageOverflow=false; missing-ranges region client1007/scroll1258. At CSS390 it was role=region, tabIndex=0, client357/scroll1258; focus stayed active and ArrowRight moved local scrollLeft 0 to 40 with page scrollX0 and pageOverflow=false."
+      },
+      {
+        "name": "primary error messages responsive",
+        "result": "pass",
+        "evidence": "Browser-local abort of fixture Binance primary GET at CSS390, 768, and 1280 showed data-page-state=error, Could not load this view, This view is unavailable, and no-authority/no-empty-result language. No No records, Orders observed 0, or Page 1 of 1 appeared."
+      },
+      {
+        "name": "structured Binance error context",
+        "result": "pass",
+        "evidence": "Synthetic fixture-only Binance projection rendered one BTCUSDT row and opened Testnet probe evidence with readable REQUEST_TIMEOUT, timeout message, and request_id JSON."
+      },
+      {
+        "name": "cleanup",
+        "result": "pass",
+        "evidence": "Fixture and Chrome stopped; owned private profile removed; no source or prior reviewer reports edited."
+      }
+    ]
   }
 }

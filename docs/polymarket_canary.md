@@ -444,6 +444,13 @@ query string. Detail requests for candidates/events, crypto reports,
 Hermes/shadow jobs, and datasets/missing-ranges use their existing bounded
 handlers.
 
+Dataset detail is a bounded stored-catalog view. Its catalog identity,
+version, source, coverage, and missing ranges retain the stored provenance;
+`health: null` means aggregate health was not computed for this read and must
+not be rendered as zero. The native missing-ranges view spans saved dataset
+versions and keeps each returned row's `dataset_version`; it does not add a
+version-selection feature or change the native query semantics.
+
 For the nine typed canary/financial record kinds `market`, `order`,
 `submission`, `reservation`, `fill`, `risk-fill`, `position`, `mark`, and
 `cashflow`, read-only details use exactly

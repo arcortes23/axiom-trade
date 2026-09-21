@@ -1,0 +1,159 @@
+{
+  "status": "passed",
+  "scope": "native-read-layer-closure",
+  "base_url": "http://127.0.0.1:63437/",
+  "server": {
+    "type": "DashboardServer",
+    "script": "C:/Users/User/AppData/Local/Temp/axiom-native-read-smoke.py",
+    "temp_db": "C:/Users/User/AppData/Local/Temp/axiom-native-read-smoke.sqlite3",
+    "process_name": "native-read-dashboard",
+    "profile": "C:/Users/User/AppData/Local/Temp/axiom-native-read-profile",
+    "browser_process": "native-read-chrome",
+    "cdp_port": 55140
+  },
+  "source_hashes": {
+    "axiom/dashboard.py": "da70cda306e3904fde891584c5191c9ac97646c2658259caf90c76ae3ac88820",
+    "axiom/storage.py": "5925b9f178052173e4af2b4caee7c4b97420e2aed38f2d154bba9e2c188b48b8",
+    "axiom/ui/app.js": "7e0a2a18b4fbc772293863546eeca606a9a99d705c0b3a3a9bfb7c1474b6bdf0",
+    "axiom/ui/pages.js": "45d35a60d3b519327bf168e41602a30b61f587229f2cabbc463b660e0bf5f36f",
+    "axiom/ui/styles.css": "d17b131ab2e7c96e590e4200fc5ff9e1ef1a7adcd6ce901426a45c84c6a7468e"
+  },
+  "http": {
+    "shadow": {
+      "page1": {
+        "request": "GET /api/v2/shadow?page=1&page_size=10",
+        "http": 200,
+        "items": 10,
+        "total": 21,
+        "pages": 3,
+        "first": "native-shadow-21",
+        "last": "native-shadow-12"
+      },
+      "page3": {
+        "request": "GET /api/v2/shadow?page=3&page_size=10",
+        "http": 200,
+        "items": 1,
+        "total": 21,
+        "pages": 3,
+        "last": "native-shadow-01"
+      },
+      "status_filter": {
+        "request": "GET /api/v2/shadow?page=1&page_size=10&status=RUNNING",
+        "http": 200,
+        "total": 7,
+        "all_items_running": true
+      },
+      "text_filter": {
+        "request": "GET /api/v2/shadow?page=1&page_size=10&filter=native-shadow-21",
+        "http": 200,
+        "total": 1,
+        "ids": [
+          "native-shadow-21"
+        ]
+      },
+      "sort_asc": {
+        "request": "GET /api/v2/shadow?page=1&page_size=10&sort=job_id&direction=asc",
+        "http": 200,
+        "first": "native-shadow-01",
+        "last": "native-shadow-10"
+      },
+      "sort_desc": {
+        "request": "GET /api/v2/shadow?page=1&page_size=10&sort=job_id&direction=desc",
+        "http": 200,
+        "first": "native-shadow-21",
+        "last": "native-shadow-12"
+      }
+    },
+    "dataset": {
+      "detail": {
+        "request": "GET /api/v2/datasets/native-dataset",
+        "http": 200,
+        "available": true,
+        "latest_version": "v2",
+        "health_is_null": true,
+        "aggregate_health_present": false
+      },
+      "ranges_page1": {
+        "request": "GET /api/v2/datasets/native-dataset/missing-ranges?page=1&page_size=10",
+        "http": 200,
+        "items": 10,
+        "total": 24,
+        "pages": 3,
+        "versions": [
+          "v1",
+          "v2"
+        ]
+      },
+      "ranges_page3": {
+        "request": "GET /api/v2/datasets/native-dataset/missing-ranges?page=3&page_size=10",
+        "http": 200,
+        "items": 4,
+        "total": 24,
+        "pages": 3,
+        "versions": [
+          "v1",
+          "v2"
+        ],
+        "last_range_index": 0
+      }
+    }
+  },
+  "gui": {
+    "browser_fresh_reload_after_pages_hash": "45d35a60d3b519327bf168e41602a30b61f587229f2cabbc463b660e0bf5f36f",
+    "automation_normal": {
+      "route": "?view=research&section=automation&page=1&page_size=10&shadow_page=1",
+      "shadow_rows": 10,
+      "shadow_first": "native-shadow-21",
+      "shadow_pager": "Page 1 of 3 \u00b7 21 bounded records",
+      "valid_shadow_detail": true,
+      "shadow_detail_id": "native-shadow-21",
+      "hermes_empty_or_unconfigured": true,
+      "overflow": false
+    },
+    "automation_page3": {
+      "route": "?view=research&section=automation&page=1&page_size=10&shadow_page=3",
+      "shadow_rows": 1,
+      "last_shadow": "native-shadow-01",
+      "pager": "Page 3 of 3 \u00b7 21 bounded records",
+      "overflow": false
+    },
+    "hermes_error": {
+      "hermes_request_aborted_in_browser": true,
+      "page_state": "error",
+      "shadow_rows_retained": 10,
+      "shadow_first": "native-shadow-21",
+      "shadow_pager": "Page 1 of 3 \u00b7 21 bounded records",
+      "no_empty_inference": true,
+      "overflow": false
+    },
+    "dataset_detail": {
+      "route": "?view=research&section=data&page=1&page_size=10&detail_page=1&selected=native-dataset",
+      "detail_id": "native-dataset",
+      "aggregate_health_label": "Not computed (stored catalog metadata only)",
+      "range_rows": 10,
+      "pager": "Page 1 of 3 \u00b7 24 bounded records",
+      "overflow": false
+    },
+    "dataset_page3": {
+      "route": "?view=research&section=data&page=1&page_size=10&detail_page=3&selected=native-dataset",
+      "detail_id": "native-dataset",
+      "range_rows": 4,
+      "last_row": "0\\tv2",
+      "pager": "Page 3 of 3 \u00b7 24 bounded records",
+      "overflow": false
+    },
+    "network": {
+      "api_requests": 56,
+      "non_get": 0,
+      "operator_endpoint": 0
+    },
+    "console_errors": 0,
+    "page_errors": 0
+  },
+  "screenshots": [
+    "reports/ui-release/native-automation-page3.png",
+    "reports/ui-release/native-automation-hermes-error.png",
+    "reports/ui-release/native-dataset-detail-page3.png"
+  ],
+  "findings": []
+}

@@ -550,5 +550,282 @@
       ],
       "status": "fixed and rechecked in combined final freeze"
     }
-  ]
+  ],
+  "current_read_closure": {
+    "scope": "Current frozen read-state closure; actual browser GET faults and fixture/admin behavior only; no source edits or control actions.",
+    "fixture": {
+      "url": "http://127.0.0.1:61400",
+      "admin_url": "http://127.0.0.1:61401",
+      "upstream_url": "http://127.0.0.1:61399",
+      "process": "ReadClosureFixture",
+      "browser_process": "ReadClosureChrome",
+      "cdp_port": 61405
+    },
+    "source_hashes": {
+      "axiom/ui/app.js": "7e0a2a18b4fbc772293863546eeca606a9a99d705c0b3a3a9bfb7c1474b6bdf0",
+      "axiom/ui/pages.js": "45d35a60d3b519327bf168e41602a30b61f587229f2cabbc463b660e0bf5f36f",
+      "tests/ui_fixture_server.py": "a6751d59bb61e2e2e67cba18adf52dd01d74f9c6c19f4759962f09756ef87350"
+    },
+    "method": "agent-browser network route --abort intercepted the actual primary GET; each route was opened and rendered in the private browser. Existing 19-state/missing-empty evidence remains attributed to its recorded historical source hashes.",
+    "primary_get_failure_sweep": [
+      {
+        "route": "?view=home",
+        "primary": "/api/v2/overview-summary",
+        "screenshot": "reports/ui-release/state-closure-current-home-primary-fault.png",
+        "observed": [
+          "Overview unavailable · Failed to fetch",
+          "Current authority session retained",
+          "Review and start retained",
+          "Stop canary retained",
+          "Loading false",
+          "No empty/no-record claim",
+          "No page1of1 claim"
+        ]
+      },
+      {
+        "route": "?view=live&section=polymarket",
+        "primary": "/api/v2/canary",
+        "screenshot": "reports/ui-release/state-closure-current-live-primary-fault.png",
+        "observed": [
+          "Current authority session retained",
+          "Review and start retained",
+          "Stop canary retained",
+          "This view is unavailable",
+          "Loading false",
+          "No empty/no-record claim"
+        ]
+      },
+      {
+        "route": "?view=live&section=binance",
+        "primary": "/api/v2/binance-canary",
+        "screenshot": "reports/ui-release/state-closure-current-binance-primary-fault.png",
+        "observed": [
+          "This view is unavailable",
+          "Loading false",
+          "No empty/no-record claim",
+          "No structured records claimed from failed initial GET"
+        ]
+      },
+      {
+        "route": "?view=portfolio&section=real",
+        "primary": "/api/v2/canary",
+        "screenshot": "reports/ui-release/state-closure-current-real-primary-fault.png",
+        "observed": [
+          "This view is unavailable",
+          "Loading false",
+          "No empty/no-record claim"
+        ]
+      },
+      {
+        "route": "?view=portfolio&section=practice",
+        "primary": "/api/v2/paper",
+        "screenshot": "reports/ui-release/state-closure-current-practice-primary-fault.png",
+        "observed": [
+          "This view is unavailable",
+          "Loading false",
+          "No empty/no-record claim"
+        ]
+      },
+      {
+        "route": "?view=portfolio&section=allocations",
+        "primary": "/api/v2/rolling-portfolio",
+        "screenshot": "reports/ui-release/state-closure-current-allocations-primary-fault.png",
+        "observed": [
+          "This view is unavailable",
+          "Loading false",
+          "No empty/no-record claim"
+        ]
+      },
+      {
+        "route": "?view=markets&section=polymarket",
+        "primary": "/api/v2/polymarket",
+        "screenshot": "reports/ui-release/state-closure-current-markets-primary-fault.png",
+        "observed": [
+          "This view is unavailable",
+          "Loading false",
+          "No empty/no-record claim",
+          "No page1of1 claim"
+        ]
+      },
+      {
+        "route": "?view=research&section=strategies",
+        "primary": "/api/v2/candidates",
+        "screenshot": "reports/ui-release/state-closure-current-strategies-primary-fault.png",
+        "observed": [
+          "This view is unavailable",
+          "Loading false",
+          "No empty/no-record claim",
+          "No page1of1 claim"
+        ]
+      },
+      {
+        "route": "?view=research&section=crypto",
+        "primary": "/api/v2/crypto-research",
+        "screenshot": "reports/ui-release/state-closure-current-crypto-primary-fault.png",
+        "observed": [
+          "This view is unavailable",
+          "Loading false",
+          "No empty/no-record claim"
+        ]
+      },
+      {
+        "route": "?view=research&section=automation",
+        "primary": "/api/v2/hermes",
+        "screenshot": "reports/ui-release/state-closure-current-automation-primary-fault.png",
+        "observed": [
+          "This view is unavailable",
+          "Loading false",
+          "No empty/no-record claim",
+          "No page1of1 claim"
+        ]
+      },
+      {
+        "route": "?view=research&section=data",
+        "primary": "/api/v2/datasets",
+        "screenshot": "reports/ui-release/state-closure-current-data-primary-fault.png",
+        "observed": [
+          "This view is unavailable",
+          "Loading false",
+          "No empty/no-record claim",
+          "No page1of1 claim"
+        ]
+      },
+      {
+        "route": "?view=activity",
+        "primary": "/api/v2/activity",
+        "screenshot": "reports/ui-release/state-closure-current-activity-primary-fault.png",
+        "observed": [
+          "This view is unavailable",
+          "Loading false",
+          "No empty/no-record claim",
+          "No page1of1 claim"
+        ]
+      },
+      {
+        "route": "?view=settings",
+        "primary": "/api/risk-settings",
+        "screenshot": "reports/ui-release/state-closure-current-settings-primary-fault.png",
+        "observed": [
+          "Settings controls remain rendered",
+          "Risk limits remain present",
+          "Unavailable status is visible",
+          "Loading false",
+          "No draft values fabricated"
+        ]
+      }
+    ],
+    "structured_binance_refresh_503": {
+      "baseline_route": "?view=live&section=binance",
+      "baseline_observed": "Valid load showed Observed Binance records and STRICT TESTNET structured context.",
+      "fault": "After valid load, actual /api/v2/binance-canary GET was aborted during the natural poll interval.",
+      "screenshot": "reports/ui-release/state-closure-current-binance-refresh-fault.png",
+      "observed": [
+        "Structured context retained",
+        "Venue state Parked",
+        "Mode STRICT_TESTNET",
+        "Environment BINANCE_SPOT_TESTNET",
+        "Transport DISABLED",
+        "Execution Parked",
+        "Orders observed Not available",
+        "This view is unavailable",
+        "No zero/empty/page1of1 totals inferred"
+      ],
+      "honest_limit": "Record rows/totals were not retained; the structured venue/profile context and safety controls remained available. No claim is made that record totals survive the failed refresh."
+    },
+    "settings_natural_poll_failure": {
+      "route": "?view=settings",
+      "fault": "After valid load, draft Maximum all-in buy was filled with 0.61, submitted-orders selection changed to 10, and focus was placed on Maximum all-in buy. Actual /api/status GET was aborted while the natural poll ran.",
+      "screenshot": "reports/ui-release/state-closure-current-settings-poll-fault.png",
+      "observed": [
+        "draft value 0.61 retained",
+        "selection 10 retained",
+        "active focus Maximum all-in buy retained",
+        "Risk limits and Settings controls retained",
+        "Unavailable notice visible",
+        "Loading false",
+        "No mutation POST performed"
+      ]
+    },
+    "loading_probe": {
+      "method": "Fresh private browser with fixture admin delay_ms=10000; an actual SPA route transition was observed with MutationObserver on rendered body text while primary GETs remained pending.",
+      "observed": {
+        "loading_seen": true,
+        "loading_current_during_500ms_sample": true,
+        "session_not_fabricated": true,
+        "zero_not_fabricated": true,
+        "empty_not_fabricated": true
+      },
+      "screenshot": "reports/ui-release/state-closure-current-home-loading-primary.png",
+      "screenshot_note": "CLI screenshot completed after the short loading window and therefore shows the subsequent fault-preserving surface; loading_seen is the actual transition proof, not a claim that the PNG is a frozen loading frame."
+    },
+    "known_empty_and_missing": {
+      "status": "Retain prior 19-state report and all13 missing/empty destination sweep with its honest historical source attribution; current fault sweep adds actual GET-failure proof without relabeling failures as empty."
+    },
+    "console_errors": "Fresh browser page-error check was not separately recorded for every fault route; no DOM crash was observed in the rendered fault sweep. No action/control calls were made; fixture action stats remained zero.",
+    "uncovered": [
+      "A stable loading-state screenshot was not captured because fixture delay completed before the browser sampling window; no pass is claimed.",
+      "The current fault sweep does not replace the historical missing/empty matrix; those rows retain their prior source hashes.",
+      "No actual control, authorization, trading, credentials, production, database or venue operation was performed."
+    ],
+    "hermes_secondary_proof": {
+      "source_hash": "45d35a60d3b519327bf168e41602a30b61f587229f2cabbc463b660e0bf5f36f",
+      "route": "?view=research&section=automation",
+      "valid_baseline": {
+        "screenshot": "reports/ui-release/state-closure-current-hermes-valid.png",
+        "observed": [
+          "Hermes research queue rendered",
+          "Shadow jobs rendered",
+          "10 fixture Shadow rows visible",
+          "no unavailable state"
+        ]
+      },
+      "hermes_503": {
+        "method": "Actual browser GET abort for /api/v2/hermes after valid fixture load",
+        "screenshot": "reports/ui-release/state-closure-current-hermes-503-shadow.png",
+        "observed": [
+          "Could not load this view",
+          "Current projection unavailable",
+          "Hermes queue explicitly says no records rather than inventing zero",
+          "10 valid fixture Shadow rows remain visible",
+          "Shadow pager says Page 1 of 3 · 25 bounded records",
+          "No Page 1 of 1 claim",
+          "No renderer crash"
+        ]
+      },
+      "hermes_unconfigured": {
+        "method": "Actual browser response override for /api/v2/hermes with native-shaped UNCONFIGURED/NOT_CONFIGURED payload; /api/v2/shadow remained the live fixture GET",
+        "screenshot": "reports/ui-release/state-closure-current-hermes-unconfigured-shadow.png",
+        "observed": [
+          "Hermes connection NOT_CONFIGURED",
+          "Queue items 0 from the explicit unconfigured payload",
+          "Hermes research queue explicitly says no records",
+          "10 valid fixture Shadow rows remain visible",
+          "Shadow pager says Page 1 of 3 · 25 bounded records",
+          "No Page 1 of 1 claim",
+          "No renderer crash"
+        ]
+      },
+      "honest_limit": "The unconfigured Hermes payload was browser-network response shaping, not a DOM mock; no controls or writes were performed."
+    },
+    "hermes_cold_primary_failure": {
+      "source_hash": "45d35a60d3b519327bf168e41602a30b61f587229f2cabbc463b660e0bf5f36f",
+      "fixture_url": "http://127.0.0.1:58113",
+      "route": "?view=research&section=automation&hermesproof=cold503",
+      "method": "Fresh isolated browser/profile; /api/v2/hermes was aborted before the first page load, while /api/v2/shadow remained an actual fixture GET.",
+      "screenshot": "reports/ui-release/state-closure-current-hermes-cold503-shadow.png",
+      "observed": [
+        "Could not load this view",
+        "Current projection unavailable",
+        "Queue items Not available (not authoritative zero)",
+        "Pending/next schedule/Hermes connection/heartbeat Not available",
+        "Hermes research queue says no records are present in this bounded projection and no value is inferred",
+        "10 valid fixture Shadow rows remain visible",
+        "Shadow pager says Page 1 of 3 · 25 bounded records",
+        "No Page 1 of 1 claim",
+        "No renderer crash"
+      ],
+      "cold": true,
+      "honest_limit": "No Hermes primary payload was cached in this browser; the preserved Shadow rows are independent secondary data."
+    }
+  }
 }

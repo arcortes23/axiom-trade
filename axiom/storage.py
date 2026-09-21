@@ -16027,6 +16027,115 @@ class AxiomStore:
                 rows = self._conn.execute(query, values).fetchall()
         return [_shadow_job_record(row) for row in rows]
 
+    def paginate_shadow_jobs(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = _DEFAULT_PAGE_SIZE,
+        status: str | None = None,
+        sort: str = "updated_at",
+        direction: str = "desc",
+        filter: str | None = None,
+    ) -> dict[str, Any]:
+        """Page shadow jobs with SQL-side counts, filtering, and ordering."""
+        requested_page, size = _pagination_args(page, page_size)
+        status_value = None if status is None else _shadow_job_status(status)
+        sort_columns = {
+            "updated_at": "updated_at",
+            "created_at": "created_at",
+            "job_id": "job_id",
+            "status": "status",
+            "next_evaluation_at": "next_evaluation_at",
+            "version": "version",
+        }
+        order_column = sort_columns.get(str(sort or "updated_at").strip().lower())
+        if order_column is None:
+            raise ValueError(f"unsupported shadow job sort: {sort}")
+        order_direction = str(direction or "desc").strip().lower()
+        if order_direction not in {"asc", "desc"}:
+            raise ValueError("direction must be 'asc' or 'desc'")
+        clauses: list[str] = []
+        values: list[Any] = []
+        if status_value is not None:
+            clauses.append("status=?")
+            values.append(status_value)
+        needle = str(filter or "").strip().lower()
+        if needle:
+            pattern = f"%{needle}%"
+            clauses.append(
+                "(lower(CAST(job_id AS TEXT)) LIKE ? OR EXISTS ("
+                "SELECT 1 FROM json_each(shadow_jobs.manifest_json,'$.members') AS member "
+                "WHERE CAST(member.key AS INTEGER) < 2 AND "
+                "lower(CAST(json_extract(member.value,'$.shadow_member_id') AS TEXT)) LIKE ?"
+                "))"
+            )
+            values.extend([pattern, pattern])
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        selected_columns = (
+            "job_id,manifest_json,state_json,status,next_evaluation_at,"
+            "created_at,updated_at,version"
+        )
+        active_statuses = ("REGISTERED", "RUNNING", "WAITING_FOR_DATA")
+
+        def read_page(connection: sqlite3.Connection) -> tuple[Any, ...]:
+            total = int(
+                connection.execute(
+                    f"SELECT COUNT(*) AS n FROM shadow_jobs{where}",
+                    values,
+                ).fetchone()["n"]
+            )
+            actual_page, pages = _pagination_shape(requested_page, size, total)
+            rows = connection.execute(
+                f"SELECT {selected_columns} FROM shadow_jobs{where} "
+                f"ORDER BY {order_column} {order_direction.upper()},job_id {order_direction.upper()} "
+                "LIMIT ? OFFSET ?",
+                [*values, size, (actual_page - 1) * size],
+            ).fetchall()
+            status_rows = connection.execute(
+                f"SELECT status,COUNT(*) AS n FROM shadow_jobs{where} GROUP BY status",
+                values,
+            ).fetchall()
+            latest = connection.execute(
+                f"SELECT {selected_columns} FROM shadow_jobs{where} "
+                "ORDER BY updated_at DESC,job_id DESC LIMIT 1",
+                values,
+            ).fetchone()
+            active_where = (
+                f"{where} AND status IN (?,?,?)"
+                if where
+                else " WHERE status IN (?,?,?)"
+            )
+            current = connection.execute(
+                f"SELECT {selected_columns} FROM shadow_jobs{active_where} "
+                "ORDER BY updated_at DESC,job_id DESC LIMIT 1",
+                [*values, *active_statuses],
+            ).fetchone()
+            return total, actual_page, pages, rows, status_rows, latest, current
+
+        if self.path not in {":memory:", ""} and not self.path.startswith("file:"):
+            snapshot = self._snapshot_read_connection()
+            try:
+                total, actual_page, pages, rows, status_rows, latest, current = read_page(snapshot)
+            finally:
+                snapshot.close()
+        else:
+            with self._lock:
+                total, actual_page, pages, rows, status_rows, latest, current = read_page(self._conn)
+        status_counts = {name: 0 for name in sorted(_SHADOW_JOB_STATUSES)}
+        for row in status_rows:
+            if row["status"] in status_counts:
+                status_counts[row["status"]] = int(row["n"] or 0)
+        return {
+            "items": [_shadow_job_record(row) for row in rows],
+            "page": actual_page,
+            "page_size": size,
+            "total": total,
+            "pages": pages,
+            "latest": _shadow_job_record(latest),
+            "current_job": _shadow_job_record(current),
+            "status_counts": status_counts,
+        }
+
     def update_shadow_job(
         self,
         job_id: str,

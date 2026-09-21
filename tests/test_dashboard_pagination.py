@@ -1531,6 +1531,102 @@ class DashboardPaginationEndpointTests(DashboardPaginationFixture):
         )
         self.assertEqual([item["range_index"] for item in out_of_range["items"]], [20, 21, 22])
 
+    def test_shadow_jobs_use_native_pagination_and_preserve_query_projection(self) -> None:
+        for index in range(21):
+            member_id = f"shadow-member-{index:02d}"
+            status = "RUNNING" if index % 2 else "COMPLETED"
+            observed_at = T0 + timedelta(minutes=index)
+            self.store.register_shadow_job(
+                f"shadow-page-{index:02d}",
+                {
+                    "schema": "axiom-shadow-composite-model-v1",
+                    "members": [{"shadow_member_id": member_id}],
+                },
+                {
+                    "cycles": index,
+                    "members": {member_id: {"signals": index}},
+                },
+                status,
+                observed_at,
+                observed_at,
+            )
+
+        first = self._page(
+            "api/v2/shadow",
+            page=1,
+            page_size=10,
+            expected_page=1,
+            expected_size=10,
+            expected_total=21,
+        )
+        self.assertEqual(
+            [item["job_id"] for item in first["items"]],
+            [f"shadow-page-{index:02d}" for index in range(20, 10, -1)],
+        )
+        self.assertEqual(first["latest"]["job_id"], "shadow-page-20")
+        self.assertEqual(first["current_job"]["job_id"], "shadow-page-19")
+        self.assertEqual(sum(first["status_counts"].values()), 21)
+
+        final = self._page(
+            "api/v2/shadow",
+            page=3,
+            page_size=10,
+            expected_page=3,
+            expected_size=10,
+            expected_total=21,
+        )
+        self.assertEqual([item["job_id"] for item in final["items"]], ["shadow-page-00"])
+
+        ascending = self._page(
+            "api/v2/shadow",
+            page=1,
+            page_size=10,
+            sort="job_id",
+            direction="asc",
+            expected_page=1,
+            expected_size=10,
+            expected_total=21,
+        )
+        self.assertEqual(
+            [item["job_id"] for item in ascending["items"]],
+            [f"shadow-page-{index:02d}" for index in range(10)],
+        )
+        descending = self._page(
+            "api/v2/shadow",
+            page=1,
+            page_size=10,
+            sort="job_id",
+            direction="desc",
+            expected_page=1,
+            expected_size=10,
+            expected_total=21,
+        )
+        self.assertEqual(
+            [item["job_id"] for item in descending["items"]],
+            [f"shadow-page-{index:02d}" for index in range(20, 10, -1)],
+        )
+
+        member_match = self._page(
+            "api/v2/shadow",
+            page=1,
+            page_size=10,
+            filter="shadow-member-10",
+            expected_page=1,
+            expected_size=10,
+            expected_total=1,
+        )
+        self.assertEqual(member_match["items"][0]["job_id"], "shadow-page-10")
+        running = self._page(
+            "api/v2/shadow",
+            page=1,
+            page_size=10,
+            status="RUNNING",
+            expected_page=1,
+            expected_size=10,
+            expected_total=10,
+        )
+        self.assertTrue(all(item["status"] == "RUNNING" for item in running["items"]))
+
     def test_candidate_lifecycle_events_are_paginated(self) -> None:
         path = f"api/v2/candidates/{quote('candidate-00', safe='')}/events"
         first = self._page(

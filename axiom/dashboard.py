@@ -3171,13 +3171,14 @@ class DashboardData:
                         break
         if record is None:
             return {"available": False, "dataset_id": identifier, "error": "dataset not found", "live_execution": False}
-        result: dict[str, Any] = {"available": True, "dataset_id": identifier, "dataset_version": record.get("dataset_version"), "catalog": record, "live_execution": False}
-        if self.store is not None and callable(getattr(self.store, "data_health", None)):
-            try:
-                result["health"] = self.store.data_health(identifier)
-            except (AttributeError, TypeError, ValueError):
-                pass
-        return result
+        return {
+            "available": True,
+            "dataset_id": identifier,
+            "dataset_version": record.get("dataset_version"),
+            "catalog": record,
+            "health": None,
+            "live_execution": False,
+        }
 
     @staticmethod
     def _binance_testnet_status(status: Mapping[str, Any] | None, result: Mapping[str, Any] | None = None) -> bool:
@@ -5308,7 +5309,6 @@ class DashboardData:
         if name.lower().startswith("datasets/"):
             parts = name.split("/")
             identifier = unquote(parts[1])
-            detail = self.dataset_detail(identifier)
             if len(parts) > 2 and parts[2].lower() == "missing-ranges":
                 values = _pagination_params(params)
                 method = getattr(self.store, "paginate_dataset_missing_ranges", None) if self.store is not None else None
@@ -5317,11 +5317,12 @@ class DashboardData:
                         return method(identifier, dataset_version=values.get("dataset_version"), page=values["page"], page_size=values["page_size"], sort=values["sort"] or "range_index", direction=values["direction"], filter=values["filter"])
                     except (AttributeError, TypeError, ValueError):
                         pass
+                detail = self.dataset_detail(identifier)
                 catalog = detail.get("catalog", {}) if isinstance(detail, Mapping) else {}
                 ranges = catalog.get("missing_ranges", []) if isinstance(catalog, Mapping) else []
                 start = (values["page"] - 1) * values["page_size"]
                 return _page_result(ranges[start : start + values["page_size"]], page=values["page"], page_size=values["page_size"], total=len(ranges))
-            return detail
+            return self.dataset_detail(identifier)
         if name.lower().startswith("candidates/") and name.lower().endswith("/events"):
             parts = name.split("/")
             identifier = unquote(parts[1])
@@ -5410,27 +5411,6 @@ class DashboardData:
             else []
         )
         return {"available": bool(states), "states": states, "live_execution": False}
-    def _shadow_storage_rows(
-        self,
-        *,
-        status: str | None = None,
-        limit: int = 1000,
-    ) -> list[Mapping[str, Any]]:
-        if self.store is None:
-            return []
-        loader = getattr(self.store, "list_shadow_jobs", None)
-        if not callable(loader):
-            return []
-        try:
-            rows = loader(status=status, limit=limit)
-        except TypeError:
-            try:
-                rows = loader(status, limit)
-            except (AttributeError, TypeError, ValueError, sqlite3.Error):
-                rows = []
-        except (AttributeError, TypeError, ValueError, sqlite3.Error):
-            rows = []
-        return [row for row in rows if isinstance(row, Mapping)] if isinstance(rows, (list, tuple)) else []
 
     def shadow_detail(self, job_id: str) -> dict[str, Any]:
         identifier = unquote(str(job_id).strip())
@@ -5459,36 +5439,59 @@ class DashboardData:
         status = str(raw_status).strip().upper() if raw_status else None
         if status and status not in _SHADOW_STATUSES:
             raise ValueError("invalid shadow status")
-        requested = min(1000, max(values["page"] * values["page_size"], values["page_size"]))
-        rows = [
-            projected
-            for row in self._shadow_storage_rows(status=status, limit=requested)
-            if (projected := _shadow_public_job(row)) is not None
-        ]
-        needle = str(values.get("filter") or "").strip().lower()
-        if needle:
+        page = values["page"]
+        page_size = values["page_size"]
+        native_result: Mapping[str, Any] | None = None
+        paginator = getattr(self.store, "paginate_shadow_jobs", None) if self.store is not None else None
+        if callable(paginator):
+            try:
+                result = paginator(
+                    page=page,
+                    page_size=page_size,
+                    status=status,
+                    sort=values["sort"] or "updated_at",
+                    direction=values["direction"],
+                    filter=values["filter"],
+                )
+                native_result = result if isinstance(result, Mapping) else None
+            except (AttributeError, TypeError, ValueError, sqlite3.Error):
+                native_result = None
+        if native_result is None:
+            rows: list[dict[str, Any]] = []
+            total = 0
+            latest = None
+            current = None
+            status_counts = {status_name: 0 for status_name in sorted(_SHADOW_STATUSES)}
+        else:
+            raw_items = native_result.get("items", [])
             rows = [
-                row
-                for row in rows
-                if needle in str(row.get("job_id") or "").lower()
-                or any(needle in str(member.get("shadow_member_id") or "").lower() for member in row.get("members", []))
-            ]
-        total = len(rows)
-        start = (values["page"] - 1) * values["page_size"]
-        items = rows[start : start + values["page_size"]]
-        latest = rows[0] if rows else None
-        active = next(
-            (row for row in rows if str(row.get("status") or "").upper() in _SHADOW_ACTIVE_STATUSES),
-            None,
-        )
-        current = active or latest
-        status_counts = {
-            status_name: sum(1 for row in rows if row.get("status") == status_name)
-            for status_name in sorted(_SHADOW_STATUSES)
-        }
+                projected
+                for row in raw_items if isinstance(row, Mapping)
+                if (projected := _shadow_public_job(row)) is not None
+            ] if isinstance(raw_items, (list, tuple)) else []
+            page = int(native_result.get("page", page) or page)
+            page_size = int(native_result.get("page_size", page_size) or page_size)
+            total = max(0, int(native_result.get("total", 0) or 0))
+            latest = _shadow_public_job(native_result.get("latest"))
+            current = _shadow_public_job(native_result.get("current_job"))
+            raw_counts = native_result.get("status_counts")
+            status_counts = {
+                status_name: int(raw_counts.get(status_name, 0) or 0)
+                for status_name in sorted(_SHADOW_STATUSES)
+            } if isinstance(raw_counts, Mapping) else {
+                status_name: sum(1 for row in rows if row.get("status") == status_name)
+                for status_name in sorted(_SHADOW_STATUSES)
+            }
+            if latest is None and rows:
+                latest = rows[0]
+            if current is None:
+                current = next(
+                    (row for row in rows if str(row.get("status") or "").upper() in _SHADOW_ACTIVE_STATUSES),
+                    None,
+                ) or latest
         return {
-            **_page_result(items, page=values["page"], page_size=values["page_size"], total=total),
-            "available": bool(rows),
+            **_page_result(rows, page=page, page_size=page_size, total=total),
+            "available": bool(total),
             "latest": latest,
             "current_job": current,
             "current_job_id": current.get("job_id") if isinstance(current, Mapping) else None,
