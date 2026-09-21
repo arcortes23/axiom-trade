@@ -150,11 +150,41 @@ class RollingLifecycleVenue(FakeVenue):
         statuses: tuple[str, ...] = (),
         *,
         market_id: str = "rolling-market",
+        min_order_size: str = "0.01",
+        size_increment: str = "0.01",
+        tick_size: str = "0.01",
+        fee_rate: str = "0",
+        fee_exponent: str = "0",
+        best_bid: str = "0.49",
+        best_ask: str = "0.50",
     ) -> None:
         super().__init__(statuses)
         self.market_id = market_id
+        self.min_order_size = min_order_size
+        self.size_increment = size_increment
+        self.tick_size = tick_size
+        self.fee_rate = fee_rate
+        self.fee_exponent = fee_exponent
+        self.best_bid = best_bid
+        self.best_ask = best_ask
         self._orders: dict[str, dict[str, object]] = {}
         self.trade_timestamp = NOW
+    def market_context(self, market_id: str, token_id: str) -> dict[str, object]:
+        context = super().market_context(market_id, token_id)
+        context.update(
+            {
+                "min_order_size": self.min_order_size,
+                "size_increment": self.size_increment,
+                "tick_size": self.tick_size,
+                "fee_rate": self.fee_rate,
+                "fee_exponent": self.fee_exponent,
+                "bids": [{"price": self.best_bid, "size": "100"}],
+                "asks": [{"price": self.best_ask, "size": "100"}],
+            }
+        )
+        if self.fee_rate != "0" or self.fee_exponent != "0":
+            context.pop("fee_bps", None)
+        return context
 
     def submit_limit_order(self, **kwargs: object) -> dict[str, object]:
         response = super().submit_limit_order(**kwargs)
@@ -174,6 +204,8 @@ class RollingLifecycleVenue(FakeVenue):
             "side": kwargs.get("side", "BUY"),
             "price": kwargs.get("price", "0.50"),
             "size": kwargs.get("size", "1"),
+            "fee_rate": self.fee_rate,
+            "fee_exponent": self.fee_exponent,
             "timestamp": self.trade_timestamp,
         }
         return response
@@ -186,6 +218,17 @@ class RollingLifecycleVenue(FakeVenue):
 
     def list_account_trades(self, *, order_id: str, **_: object) -> list[dict[str, object]]:
         order = self._orders[order_id]
+        price = Decimal(str(order["price"]))
+        quantity = Decimal(str(order["size"]))
+        fee_rate = Decimal(str(order["fee_rate"]))
+        fee_exponent = Decimal(str(order["fee_exponent"]))
+        curve = (
+            Decimal("1")
+            if fee_exponent == 0
+            else (price * (Decimal("1") - price)) ** fee_exponent
+        )
+        fee = (quantity * fee_rate * curve).quantize(Decimal("0.00001"))
+        fee_text = "0" if fee == 0 else format(fee, "f")
         return [
             {
                 "trade_id": f"trade:{order_id}",
@@ -196,7 +239,7 @@ class RollingLifecycleVenue(FakeVenue):
                 "side": order["side"],
                 "quantity": order["size"],
                 "price": order["price"],
-                "fee": "0",
+                "fee": fee_text,
                 "status": "CONFIRMED",
                 "timestamp": order["timestamp"].isoformat(),
             }
@@ -257,6 +300,11 @@ class CommissionReadOnlyVenue:
         if pair[0] != "rolling-market" or pair[1] not in {"yes", "no"}:
             raise AssertionError(f"unexpected readiness binding: {pair!r}")
         outcome = "yes" if pair[1] == "yes" else "no"
+        bid, ask = (
+            ("0.021", "0.022")
+            if outcome == "yes"
+            else ("0.978", "0.979")
+        )
         return {
             "market_id": pair[0],
             "token_id": pair[1],
@@ -265,14 +313,15 @@ class CommissionReadOnlyVenue:
             "market_version": "v1",
             "outcome": outcome,
             "accepting_orders": True,
-            "min_order_size": "0.01",
+            "min_order_size": "5",
             "size_increment": "0.01",
             "min_notional": "0.001",
-            "tick_size": "0.01",
+            "tick_size": "0.001",
             "neg_risk": False,
-            "bids": [{"price": "0.49", "size": "100"}],
-            "asks": [{"price": "0.50", "size": "100"}],
-            "fee_bps": "0",
+            "bids": [{"price": bid, "size": "100"}],
+            "asks": [{"price": ask, "size": "100"}],
+            "fee_rate": "0.04",
+            "fee_exponent": "1",
             "allowance": self.allowance(),
         }
 
@@ -3810,7 +3859,7 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
         """Traverse the isolated commissioning boundary without pre-activating authority."""
         seed_candidate_id = "candidate-sv-commission-joined"
         seed_strategy_version_id = "sv-commission-joined"
-        initial_quote = "0.40"
+        initial_quote = "0.072"
         first_collection_at = NOW + timedelta(seconds=1)
         commissioning_at = NOW + timedelta(seconds=61)
         policy = _policy(
@@ -3820,6 +3869,13 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
         venue = RollingLifecycleVenue(
             ("FILLED", "SETTLED"),
             market_id="rolling-market",
+            min_order_size="5",
+            size_increment="0.01",
+            tick_size="0.001",
+            fee_rate="0.04",
+            fee_exponent="1",
+            best_bid="0.021",
+            best_ask="0.022",
         )
         with self._store("rolling-http-commission.sqlite3") as store:
             self._seed_artifacts(
@@ -3864,19 +3920,19 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
             control._research_processor.clock = controlled_clock
             discovery_book = OrderBookSnapshot(
                 first_collection_at,
-                (OrderBookLevel(0.39, 100.0),),
-                (OrderBookLevel(float(initial_quote), 100.0),),
+                (OrderBookLevel(0.071, 1000.0),),
+                (OrderBookLevel(float(initial_quote), 1000.0),),
             )
             discovery_market = PredictionMarketSnapshot(
                 timestamp=first_collection_at,
                 market_id=venue.market_id,
                 question="Commission fixture market",
-                yes_bid=0.39,
+                yes_bid=0.071,
                 yes_ask=float(initial_quote),
-                yes_mid=0.395,
-                no_bid=0.39,
-                no_ask=float(initial_quote),
-                no_mid=0.395,
+                yes_mid=0.0715,
+                no_bid=0.928,
+                no_ask=0.929,
+                no_mid=0.9285,
                 volume=100.0,
                 liquidity=100.0,
                 expiry=first_collection_at + timedelta(days=2),
@@ -3909,8 +3965,8 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
                 closed=False,
                 accepting_orders=True,
                 enable_order_book=True,
-                min_order_size=0.01,
-                neg_risk=False,
+                min_order_size=5,
+                tick_size=0.001,
                 order_book_available=True,
             )
             class CommissionDiscoveryProvider(InMemoryPredictionProvider):
@@ -3947,11 +4003,26 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
                         if ask is not None
                         else self._book_template.asks
                     )
+                    yes_bid = float(bids[0].price)
+                    yes_ask = float(asks[0].price)
+                    no_bid = round(1.0 - yes_ask, 3)
+                    no_ask = round(1.0 - yes_bid, 3)
                     self._books[market_id] = replace(
                         self._book_template,
                         timestamp=observed_at,
                         bids=bids,
                         asks=asks,
+                        provider_timestamp=observed_at,
+                    )
+                    self._markets[market_id] = replace(
+                        self._markets[market_id],
+                        timestamp=observed_at,
+                        yes_bid=yes_bid,
+                        yes_ask=yes_ask,
+                        yes_mid=(yes_bid + yes_ask) / 2.0,
+                        no_bid=no_bid,
+                        no_ask=no_ask,
+                        no_mid=(no_bid + no_ask) / 2.0,
                         provider_timestamp=observed_at,
                     )
                 def order_books(
@@ -3963,6 +4034,14 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
                     base = self.order_book(market_id, depth=depth)
                     if snapshot is None or base is None:
                         return {}
+                    no_bids = tuple(
+                        OrderBookLevel(round(1.0 - float(level.price), 3), level.size)
+                        for level in base.asks
+                    )
+                    no_asks = tuple(
+                        OrderBookLevel(round(1.0 - float(level.price), 3), level.size)
+                        for level in base.bids
+                    )
                     return {
                         "yes": OrderBookSnapshot(
                             base.timestamp,
@@ -3970,19 +4049,19 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
                             base.asks,
                             token_id=str(snapshot.yes_token_id),
                             condition_id=str(snapshot.condition_id),
-                            min_order_size=0.01,
-                            tick_size=0.01,
+                            min_order_size=5,
+                            tick_size=0.001,
                             neg_risk=False,
                             source="polymarket",
                         ),
                         "no": OrderBookSnapshot(
                             base.timestamp,
-                            base.bids,
-                            base.asks,
+                            no_bids,
+                            no_asks,
                             token_id=str(snapshot.no_token_id),
                             condition_id=str(snapshot.condition_id),
-                            min_order_size=0.01,
-                            tick_size=0.01,
+                            min_order_size=5,
+                            tick_size=0.001,
                             neg_risk=False,
                             source="polymarket",
                         ),
@@ -4303,16 +4382,16 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
                         member["direct_evidence"]["signal_outcome"],
                         "NO_SIGNAL",
                     )
-                momentum_members = [
+                mean_reversion_members = [
                     member
                     for member in proposal_members
                     if str(
                         member.get("strategy_document", {}).get("family", "")
                     ).strip().lower()
-                    == "momentum"
+                    == "mean_reversion"
                 ]
-                self.assertEqual(len(momentum_members), 1)
-                proposed_member = momentum_members[0]
+                self.assertEqual(len(mean_reversion_members), 1)
+                proposed_member = mean_reversion_members[0]
                 proposed_amounts = [
                     Decimal(
                         str(
@@ -4606,7 +4685,7 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
                 )
                 # Confirmation does not forward an order; the real rolling worker
                 # first observes a genuine NO_SIGNAL, then evaluates a positive
-                # momentum delta from a fresh same-market snapshot.
+                # mean-reversion delta from a fresh same-market snapshot.
                 self.assertEqual(venue.submissions, [])
                 worker_time = [commissioning_at]
                 worker = AutonomousCanaryWorker(
@@ -4657,8 +4736,8 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
                 # one-minute spacing preserves normal polling cadence.
                 discovery_provider.set_observed_at(
                     dynamic_now,
-                    bid=0.49,
-                    ask=0.50,
+                    bid=0.021,
+                    ask=0.022,
                 )
                 dynamic_cycle = discovery_node.collector.collect_once(
                     [venue.market_id],
@@ -4677,9 +4756,14 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
                     ["BUY"],
                 )
                 entry_request = venue.submissions[0]
-                external_cost = Decimal(str(entry_request["price"])) * Decimal(
-                    str(entry_request["size"])
-                )
+                entry_price = Decimal(str(entry_request["price"]))
+                entry_quantity = Decimal(str(entry_request["size"]))
+                external_cost = entry_price * entry_quantity
+                external_fee = (
+                    entry_quantity
+                    * Decimal("0.04")
+                    * (entry_price * (Decimal("1") - entry_price))
+                ).quantize(Decimal("0.00001"))
                 reservation = store.connection.execute(
                     """
                     SELECT reservation_id, requested_cost, fee_reserve,
@@ -4711,7 +4795,7 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     Decimal(str(reservation["filled_cost"])),
-                    external_cost,
+                    external_cost + external_fee,
                 )
                 self.assertEqual(
                     reservation["portfolio_selection_id"],
@@ -4732,10 +4816,11 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
                 assert fill is not None
                 fill_cost = Decimal(str(fill["cost"]))
                 fill_fee = Decimal(str(fill["fee"]))
-                all_in = fill_cost + fill_fee
-                self.assertEqual(fill_cost, external_cost)
-                self.assertEqual(fill_fee, Decimal("0"))
-                self.assertGreater(all_in, Decimal("0"))
+                all_in = fill_cost
+                self.assertEqual(fill_cost, external_cost + external_fee)
+                self.assertEqual(fill_fee, external_fee)
+                self.assertGreater(fill_fee, Decimal("0"))
+                self.assertGreater(fill_cost, external_cost)
                 self.assertLessEqual(all_in, Decimal("1.00"))
                 self.assertEqual(
                     fill["execution_authorization_id"],
@@ -4785,8 +4870,8 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
                 # exercising the expiry-bound exit path.
                 discovery_provider.set_observed_at(
                     expires_at,
-                    bid=0.49,
-                    ask=0.50,
+                    bid=0.021,
+                    ask=0.022,
                 )
                 expiry_cycle = discovery_node.collector.collect_once(
                     [venue.market_id],

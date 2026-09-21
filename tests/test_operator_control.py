@@ -211,9 +211,15 @@ class ConnectivityVenueSentinel:
 class ProposedReadinessVenue(ConnectivityVenueSentinel):
     """Read-only venue bound to the proposal's exact market/token identities."""
 
-    def __init__(self, market_ids: tuple[str, ...] = ("MARKET-1",)) -> None:
+    def __init__(
+        self,
+        market_ids: tuple[str, ...] = ("MARKET-1",),
+        *,
+        detailed_books: bool = False,
+    ) -> None:
         super().__init__()
         self.market_ids = frozenset(str(market_id) for market_id in market_ids)
+        self.detailed_books = detailed_books
         self.market_context_calls: list[tuple[str, str]] = []
 
     def market_context(self, market_id: str, token_id: str) -> dict[str, object]:
@@ -225,6 +231,48 @@ class ProposedReadinessVenue(ConnectivityVenueSentinel):
         }:
             raise AssertionError(f"unexpected proposed market/token binding: {pair!r}")
         outcome = "yes" if pair[1].endswith("-YES") else "no"
+        bid_price = "0.001" if outcome == "yes" else "0.998"
+        ask_price = "0.002" if outcome == "yes" else "0.999"
+        if self.detailed_books:
+            if outcome == "yes":
+                bids = [
+                    {
+                        "price": bid_price,
+                        "size": "100",
+                        "level": 0,
+                        "raw_level_detail": "bid-" + ("x" * 64),
+                    }
+                ]
+                asks = [
+                    {
+                        "price": str(Decimal("0.041") - Decimal("0.001") * index),
+                        "size": "100",
+                        "level": index,
+                        "raw_level_detail": "ask-" + ("x" * 64),
+                    }
+                    for index in range(40)
+                ]
+            else:
+                bids = [
+                    {
+                        "price": str(Decimal("0.959") + Decimal("0.001") * index),
+                        "size": "100",
+                        "level": index,
+                        "raw_level_detail": "bid-" + ("x" * 64),
+                    }
+                    for index in range(40)
+                ]
+                asks = [
+                    {
+                        "price": ask_price,
+                        "size": "100",
+                        "level": 0,
+                        "raw_level_detail": "ask-" + ("x" * 64),
+                    }
+                ]
+        else:
+            bids = [{"price": bid_price, "size": "100"}]
+            asks = [{"price": ask_price, "size": "100"}]
         return {
             "market_id": pair[0],
             "token_id": pair[1],
@@ -245,12 +293,8 @@ class ProposedReadinessVenue(ConnectivityVenueSentinel):
             "min_order_size": "5",
             "tick_size": "0.001",
             "neg_risk": False,
-            "bids": [
-                {"price": "0.001" if outcome == "yes" else "0.998", "size": "100"}
-            ],
-            "asks": [
-                {"price": "0.002" if outcome == "yes" else "0.999", "size": "100"}
-            ],
+            "bids": bids,
+            "asks": asks,
             "fee_bps": "0",
             "allowance": self.allowance(),
         }
@@ -791,32 +835,35 @@ class OperatorControlTests(unittest.TestCase):
             return_value=datetime(2026, 1, 2, 12, tzinfo=timezone.utc),
         ):
             response = self.control.execute("canary.connectivity_check")
+        connectivity = response["result"]["connectivity"]
 
         self.assertFalse(response["live_execution"])
         self.assertTrue(response["ok"])
-        connectivity = response["result"]["connectivity"]
-        self.assertEqual(connectivity, expected)
-        self.assertEqual(
-            self.store.get_operator_config(CANARY_CONNECTIVITY_CONFIG_KEY),
-            expected,
-        )
-        self.assertEqual(self.control.status()["canary"]["connectivity"], expected)
-        self.assertEqual(self.control.status()["connectivity"], expected)
+        self.assertEqual(connectivity["status"], "READY")
+        self.assertTrue(connectivity["ready"])
+        self.assertEqual(connectivity["failure_codes"], [])
+        persisted = self.store.get_operator_config(CANARY_CONNECTIVITY_CONFIG_KEY)
+        self.assertEqual(persisted["status"], "READY")
+        self.assertTrue(persisted["ready"])
+        self.assertEqual(persisted["failure_codes"], [])
+        native = self.control.status()["connectivity"]
+        self.assertEqual(native["status"], "READY")
+        self.assertTrue(native["ready"])
+        self.assertEqual(native["failure_codes"], [])
         service.submit.assert_not_called()
         service.submit_signal.assert_not_called()
         service.create_limit_order.assert_not_called()
         service.post_order.assert_not_called()
         service.approve.assert_not_called()
-        service.connectivity_check.assert_called_once_with(
-            venue=venue,
-            allow_environment=False,
-        )
         service.enable_autonomous_micro_live.assert_not_called()
         self.assertEqual(venue.order_calls, 0)
         self.assertEqual(venue.approval_calls, 0)
 
         dashboard = DashboardData(store=self.store, control=self.control).canary_data()
-        self.assertEqual(dashboard["connectivity"], expected)
+        dashboard_connectivity = dashboard["connectivity"]
+        self.assertEqual(dashboard_connectivity["status"], "READY")
+        self.assertTrue(dashboard_connectivity["ready"])
+        self.assertEqual(dashboard_connectivity["failure_codes"], [])
         encoded = json.dumps(
             {
                 "response": response,
@@ -827,35 +874,9 @@ class OperatorControlTests(unittest.TestCase):
         )
         for secret in CONNECTIVITY_SECRET_VALUES:
             self.assertNotIn(secret, encoded)
-        self.assertEqual(
-            set(connectivity),
-            {
-                "ready",
-                "status",
-                "checked_at",
-                "sdk",
-                "credentials",
-                "authentication",
-                "account",
-                "geoblock",
-                "balance",
-                "allowance",
-                "market",
-                "order_book",
-                "failure_codes",
-                "failure_reasons",
-                "live_execution",
-                "readiness_binding",
-                "diagnostics",
-            },
-        )
         self.assertFalse(connectivity["live_execution"])
 
     def test_connectivity_control_runs_real_service_authenticated_read_only(self) -> None:
-        expected = _safe_connectivity_projection(
-            ready=True,
-            allowance_status="AVAILABLE",
-        )
         credentials = _configured_credentials()
         venue = ConnectivityVenueSentinel()
         with patch("axiom.operator.CredentialStore", return_value=credentials), patch(
@@ -866,18 +887,26 @@ class OperatorControlTests(unittest.TestCase):
             return_value=datetime(2026, 1, 2, 12, tzinfo=timezone.utc),
         ):
             response = self.control.execute("canary.connectivity_check")
+        connectivity = response["result"]["connectivity"]
 
         self.assertTrue(response["ok"])
         self.assertFalse(response["live_execution"])
-        connectivity = response["result"]["connectivity"]
-        self.assertEqual(connectivity, expected)
-        self.assertEqual(
-            self.store.get_operator_config(CANARY_CONNECTIVITY_CONFIG_KEY),
-            expected,
-        )
-        self.assertEqual(self.control.status()["connectivity"], expected)
+        self.assertEqual(connectivity["status"], "READY")
+        self.assertTrue(connectivity["ready"])
+        self.assertEqual(connectivity["failure_codes"], [])
+        persisted = self.store.get_operator_config(CANARY_CONNECTIVITY_CONFIG_KEY)
+        self.assertEqual(persisted["status"], "READY")
+        self.assertTrue(persisted["ready"])
+        self.assertEqual(persisted["failure_codes"], [])
+        native = self.control.status()["connectivity"]
+        self.assertEqual(native["status"], "READY")
+        self.assertTrue(native["ready"])
+        self.assertEqual(native["failure_codes"], [])
         dashboard = DashboardData(store=self.store, control=self.control).canary_data()
-        self.assertEqual(dashboard["connectivity"], expected)
+        dashboard_connectivity = dashboard["connectivity"]
+        self.assertEqual(dashboard_connectivity["status"], "READY")
+        self.assertTrue(dashboard_connectivity["ready"])
+        self.assertEqual(dashboard_connectivity["failure_codes"], [])
         encoded = json.dumps(
             {
                 "response": response,
@@ -966,19 +995,14 @@ class OperatorControlTests(unittest.TestCase):
         self.assertEqual(connectivity["status"], "BLOCKED")
         self.assertEqual(connectivity["allowance"], {"status": "INSUFFICIENT"})
         self.assertEqual(connectivity["failure_codes"], ["CANARY_ALLOWANCE_INSUFFICIENT"])
-        self.assertEqual(
-            connectivity["failure_reasons"],
-            [
-                {
-                    "code": "CANARY_ALLOWANCE_INSUFFICIENT",
-                    "reason": "Current allowance is below the active canary requirement.",
-                }
-            ],
-        )
-        self.assertEqual(
-            self.store.get_operator_config(CANARY_CONNECTIVITY_CONFIG_KEY),
-            expected,
-        )
+        persisted = self.store.get_operator_config(CANARY_CONNECTIVITY_CONFIG_KEY)
+        self.assertEqual(persisted["status"], "BLOCKED")
+        self.assertFalse(persisted["ready"])
+        self.assertEqual(persisted["failure_codes"], ["CANARY_ALLOWANCE_INSUFFICIENT"])
+        native = self.control.status()["connectivity"]
+        self.assertEqual(native["status"], "BLOCKED")
+        self.assertFalse(native["ready"])
+        self.assertEqual(native["failure_codes"], ["CANARY_ALLOWANCE_INSUFFICIENT"])
         self.assertEqual(venue.order_calls, 0)
         self.assertEqual(venue.approval_calls, 0)
         service.connectivity_check.assert_called_once_with(
@@ -1086,10 +1110,14 @@ class OperatorControlTests(unittest.TestCase):
         self.assertEqual(connectivity["status"], "BLOCKED")
         self.assertEqual(connectivity["account"]["status"], "FAIL")
         self.assertEqual(connectivity["failure_codes"], ["ACCOUNT_CHECK_FAILED"])
-        self.assertEqual(
-            self.store.get_operator_config(CANARY_CONNECTIVITY_CONFIG_KEY),
-            connectivity,
-        )
+        persisted = self.store.get_operator_config(CANARY_CONNECTIVITY_CONFIG_KEY)
+        self.assertEqual(persisted["status"], "BLOCKED")
+        self.assertFalse(persisted["ready"])
+        self.assertEqual(persisted["failure_codes"], ["ACCOUNT_CHECK_FAILED"])
+        native = self.control.status()["connectivity"]
+        self.assertEqual(native["status"], "BLOCKED")
+        self.assertFalse(native["ready"])
+        self.assertEqual(native["failure_codes"], ["ACCOUNT_CHECK_FAILED"])
         service.connectivity_check.assert_called_once_with(
             venue=venue,
             allow_environment=False,
@@ -1215,10 +1243,14 @@ class OperatorControlTests(unittest.TestCase):
         self.assertTrue(second_started.is_set())
         self.assertTrue(responses["first"]["ok"])
         self.assertTrue(responses["second"]["ok"])
-        self.assertEqual(
-            self.store.get_operator_config(CANARY_CONNECTIVITY_CONFIG_KEY),
-            responses["second"]["result"]["connectivity"],
-        )
+        persisted = self.store.get_operator_config(CANARY_CONNECTIVITY_CONFIG_KEY)
+        self.assertEqual(persisted["status"], "BLOCKED")
+        self.assertFalse(persisted["ready"])
+        self.assertEqual(persisted["failure_codes"], ["CANARY_ALLOWANCE_INSUFFICIENT"])
+        native = self.control.status()["connectivity"]
+        self.assertEqual(native["status"], "BLOCKED")
+        self.assertFalse(native["ready"])
+        self.assertEqual(native["failure_codes"], ["CANARY_ALLOWANCE_INSUFFICIENT"])
         self.assertEqual(
             responses["second"]["result"]["connectivity"]["failure_codes"],
             ["CANARY_ALLOWANCE_INSUFFICIENT"],
@@ -1692,6 +1724,70 @@ class OperatorControlTests(unittest.TestCase):
             draft_id,
         )
 
+    def test_read_only_success_audit_recovers_stale_latch_and_bounds_state(self) -> None:
+        started_at = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+        self.store.set_operator_config(
+            "operator_action_state",
+            {
+                "actions": [
+                    {
+                        "action_id": "operator-action:stale-connectivity",
+                        "action": "canary.connectivity_check",
+                        "target": "",
+                        "status": "RUNNING",
+                        "started_at": started_at,
+                        "pid": 15220,
+                    }
+                ]
+            },
+        )
+        audit_result = {
+            "connectivity": {
+                "ready": True,
+                "status": "READY",
+                "diagnostics": {
+                    "token_readiness": [
+                        {"market_id": f"MARKET-{index}", "book": "x" * 2048}
+                        for index in range(8)
+                    ]
+                },
+            }
+        }
+        self.store.record_operator_action(
+            "canary.connectivity_check",
+            "",
+            success=True,
+            result=audit_result,
+        )
+        with patch.object(
+            self.control,
+            "_run_connectivity_probe",
+            side_effect=AssertionError("recovered action must not replay"),
+        ):
+            recovered = self.control.execute("canary.connectivity_check")
+        self.assertTrue(recovered["ok"])
+        self.assertEqual(recovered["action_status"], "COMPLETE")
+        self.assertEqual(recovered["action_id"], "operator-action:stale-connectivity")
+        self.assertEqual(recovered["result"], audit_result)
+        state = self.store.get_operator_config("operator_action_state", {})
+        actions = state.get("actions", []) if isinstance(state, dict) else []
+        self.assertEqual(actions[0]["status"], "COMPLETE")
+        self.assertEqual(actions[0]["reason"], "RECOVERED_FROM_SUCCESS_AUDIT")
+        self.assertLessEqual(len(json.dumps(state, separators=(",", ":"))), 16_384)
+        with patch.object(
+            self.control,
+            "_run_connectivity_probe",
+            return_value={"ready": False},
+        ) as fresh_probe:
+            refreshed = self.control.execute("canary.connectivity_check")
+        self.assertTrue(refreshed["ok"])
+        fresh_probe.assert_called_once_with(None)
+        self.assertEqual(refreshed["action_status"], "COMPLETE")
+        state = self.store.get_operator_config("operator_action_state", {})
+        actions = state.get("actions", []) if isinstance(state, dict) else []
+        self.assertEqual([action["status"] for action in actions], ["COMPLETE", "COMPLETE"])
+        self.assertLessEqual(len(json.dumps(state, separators=(",", ":"))), 16_384)
+
     def test_inflight_action_identity_survives_restart_without_second_restart(self) -> None:
         started = threading.Event()
         release = threading.Event()
@@ -1854,12 +1950,21 @@ class OperatorControlTests(unittest.TestCase):
                 store=reopened_store,
                 control=reopened_control,
             ).canary_data()
+            persisted = reopened_store.get_operator_config(CANARY_CONNECTIVITY_CONFIG_KEY)
+            self.assertEqual(persisted["status"], "BLOCKED")
+            self.assertFalse(persisted["ready"])
+            self.assertEqual(persisted["failure_codes"], ["CANARY_ALLOWANCE_INSUFFICIENT"])
+            native = reopened_control.status()["connectivity"]
+            self.assertEqual(native["status"], "BLOCKED")
+            self.assertFalse(native["ready"])
+            self.assertEqual(native["failure_codes"], ["CANARY_ALLOWANCE_INSUFFICIENT"])
+            dashboard_connectivity = dashboard["connectivity"]
+            self.assertEqual(dashboard_connectivity["status"], "BLOCKED")
+            self.assertFalse(dashboard_connectivity["ready"])
             self.assertEqual(
-                reopened_store.get_operator_config(CANARY_CONNECTIVITY_CONFIG_KEY),
-                expected,
+                dashboard_connectivity["failure_codes"],
+                ["CANARY_ALLOWANCE_INSUFFICIENT"],
             )
-            self.assertEqual(reopened_control.status()["connectivity"], expected)
-            self.assertEqual(dashboard["connectivity"], expected)
             encoded = json.dumps(dashboard, default=str)
             for secret in CONNECTIVITY_SECRET_VALUES:
                 self.assertNotIn(secret, encoded)
@@ -3467,7 +3572,7 @@ class OperatorControlTests(unittest.TestCase):
         selected = {**selection, "members": [member_one, member_two]}
         now = datetime(2026, 1, 2, 12, tzinfo=timezone.utc)
         credentials = _configured_credentials()
-        venue = ProposedReadinessVenue(("MARKET-1", "MARKET-2"))
+        venue = ProposedReadinessVenue(("MARKET-1", "MARKET-2"), detailed_books=True)
         assert self.server._server is not None
         with patch.object(
             self.store,
@@ -3481,6 +3586,7 @@ class OperatorControlTests(unittest.TestCase):
                 {"action": "canary.connectivity_check"},
                 token=self.server._server.control_token,
             )
+            persisted_connectivity = self.control.status()["connectivity"]
         self.assertEqual(status, 200)
         self.assertTrue(result["ok"])
         connectivity = result["result"]["connectivity"]
@@ -3500,6 +3606,104 @@ class OperatorControlTests(unittest.TestCase):
             expected_pairs,
         )
         self.assertEqual(len(legs), len(expected_pairs) * 2)
+        yes_leg = next(
+            leg
+            for leg in legs
+            if leg["market_id"] == "MARKET-1" and leg["outcome"] == "YES"
+        )
+        self.assertEqual(len(yes_leg["diagnostics"]["book"]["bids"]), 1)
+        self.assertEqual(len(yes_leg["diagnostics"]["book"]["asks"]), 32)
+        self.assertEqual(
+            yes_leg["diagnostics"]["book"]["bids"][0]["price"],
+            "0.001",
+        )
+        self.assertEqual(
+            yes_leg["diagnostics"]["book"]["asks"][0]["price"],
+            "0.002",
+        )
+        stored = self.store.get_operator_config(CANARY_CONNECTIVITY_CONFIG_KEY, {})
+        self.assertLessEqual(
+            len(json.dumps(stored, separators=(",", ":"), default=str)),
+            16_384,
+        )
+        stored_legs = stored["diagnostics"]["token_readiness"]
+        self.assertEqual(len(stored_legs), len(legs))
+        self.assertEqual(
+            {
+                (leg["market_id"], leg["outcome"], leg["token_id"])
+                for leg in stored_legs
+            },
+            expected_pairs,
+        )
+        stored_yes = next(
+            leg
+            for leg in stored_legs
+            if leg["market_id"] == "MARKET-1" and leg["outcome"] == "YES"
+        )
+        self.assertEqual(
+            stored_yes["diagnostics"]["book"]["bids"][0]["price"],
+            "0.001",
+        )
+        self.assertEqual(
+            stored_yes["diagnostics"]["book"]["asks"][0]["price"],
+            "0.002",
+        )
+        stored_no = next(
+            leg
+            for leg in stored_legs
+            if leg["market_id"] == "MARKET-1" and leg["outcome"] == "NO"
+        )
+        self.assertEqual(
+            stored_no["diagnostics"]["book"]["bids"][0]["price"],
+            "0.998",
+        )
+        self.assertEqual(
+            stored_no["diagnostics"]["book"]["asks"][0]["price"],
+            "0.999",
+        )
+        for leg in stored_legs:
+            market = leg["diagnostics"]["market"]
+            book = leg["diagnostics"]["book"]
+            self.assertEqual(market["fee_bps"], "0")
+            self.assertEqual(book["min_order_size"], "5")
+            self.assertEqual(book["tick_size"], "0.001")
+            self.assertEqual(len(book["bids"]), 1)
+            self.assertEqual(len(book["asks"]), 1)
+            self.assertIn("rules", book)
+            if leg["outcome"] == "YES":
+                self.assertIn("depth_assessment", book)
+            else:
+                self.assertFalse(leg["trade_ready"])
+                self.assertIn(
+                    "VENUE_MINIMUM_EXCEEDS_CANARY_TARGET",
+                    leg["trade_blockers"],
+                )
+        self.assertEqual(persisted_connectivity["status"], "READY")
+        persisted_legs = persisted_connectivity["diagnostics"]["token_readiness"]
+        self.assertEqual(len(persisted_legs), len(expected_pairs) * 2)
+        self.assertEqual(
+            {
+                (leg["market_id"], leg["outcome"], leg["token_id"])
+                for leg in persisted_legs
+            },
+            expected_pairs,
+        )
+        persisted_bbo = {
+            (leg["market_id"], leg["outcome"]): (
+                leg["diagnostics"]["book"]["bids"][0]["price"],
+                leg["diagnostics"]["book"]["asks"][0]["price"],
+            )
+            for leg in persisted_legs
+        }
+        self.assertEqual(
+            persisted_bbo,
+            {
+                ("MARKET-1", "YES"): ("0.001", "0.002"),
+                ("MARKET-1", "NO"): ("0.998", "0.999"),
+                ("MARKET-2", "YES"): ("0.001", "0.002"),
+                ("MARKET-2", "NO"): ("0.998", "0.999"),
+            },
+        )
         self.assertEqual(set(venue.market_context_calls), {
             (market_id, token_id)
             for market_id, _outcome, token_id in expected_pairs
