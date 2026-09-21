@@ -130,6 +130,14 @@ canonical status-report accounting, authority bindings, or freshness gates.
 Missing or failed native settings remain unavailable/blocked; the projection
 does not fabricate zero-valued risk or authority data.
 
+The Settings status read uses `GET /api/ui-status`, schema `ui-status.v1`.
+It is a bounded persisted-worker projection: it reports native worker status
+and health precedence, compact worker details, explicit scan/detail scope, and
+provenance that process identity and lock ownership were not verified. It
+does not replace the full diagnostics read. `GET /api/status` remains the
+full status endpoint for summary, cycle, queue, and complete diagnostic
+payloads used by other consumers.
+
 ## Budget units and accounting
 
 Configured monetary values are exact decimal strings in Polymarket collateral

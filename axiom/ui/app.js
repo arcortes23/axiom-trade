@@ -663,7 +663,7 @@ async function loadRoute({ force = false } = {}) {
     add("risk", "/api/risk-settings");
     add("operator", "/api/ui-state");
     add("system", "/api/system");
-    add("status", "/api/status");
+    add("status", "/api/ui-status");
   } else {
     add("page", endpointUrl(spec, route));
     add("operator", "/api/ui-state");

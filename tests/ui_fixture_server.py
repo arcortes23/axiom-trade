@@ -1342,7 +1342,7 @@ class _LegacyHandler(BaseHTTPRequestHandler):
             self._send(200, record)
             return
         dynamic_strategy = endpoint.lower().startswith("strategy/") and len(endpoint.split("/", 1)[1]) > 0
-        if endpoint.lower() != "ui-state" and endpoint not in _ENDPOINTS and not dynamic_strategy:
+        if endpoint.lower() not in {"ui-state", "ui-status"} and endpoint not in _ENDPOINTS and not dynamic_strategy:
             self._send(404, {"error": "not found"})
             return
         try:
@@ -1756,6 +1756,109 @@ class FixtureDashboardData(DashboardData):
                 return {"kind": normalized_kind, "id": normalized_id, "record": deepcopy(row), "provenance": {"fixture": True, "source": normalized_kind}}
         return None
 
+    def ui_status_data(self) -> dict[str, Any]:
+        """Return the bounded synthetic worker-status projection used by Settings."""
+        now = self.clock().astimezone(timezone.utc)
+        scenario = str(self._data.get("operator", {}).get("fixture_scenario") or "")
+        health_grade = "C" if scenario in {"network_failure", "stale"} else "A"
+        health_reason_code = (
+            "FIXTURE_STALE_WORKER" if scenario == "stale"
+            else "FIXTURE_NETWORK_FAILURE" if scenario == "network_failure"
+            else None
+        )
+        health_reasons = (
+            [{"code": health_reason_code, "reason": "Fixture persisted worker evidence is degraded."}]
+            if health_reason_code
+            else []
+        )
+        worker_specs = [
+            ("health-monitor", "RUNNING", health_grade, health_reason_code),
+            ("polymarket-collector", "DEGRADED" if scenario == "network_failure" else "RUNNING", None, None),
+            ("axiom-node", "RUNNING", None, None),
+        ]
+        workers: list[dict[str, Any]] = []
+        for worker_name, raw_status, grade, reason_code in worker_specs:
+            stale_after = 60.0 if scenario == "stale" and worker_name == "polymarket-collector" else 300.0
+            age = 120.0 if scenario == "stale" and worker_name == "polymarket-collector" else 0.0
+            heartbeat = (now - timedelta(seconds=age)).isoformat()
+            status = str(raw_status).lower()
+            if status in {"running", "degraded"} and age > stale_after:
+                status = "stale"
+            reason = (
+                "Fixture persisted worker heartbeat exceeded its stale threshold."
+                if status == "stale"
+                else "Fixture synthetic network failure."
+                if status == "degraded"
+                else None
+            )
+            workers.append(
+                {
+                    "worker_name": worker_name,
+                    "status": status,
+                    "started_at": (now - timedelta(minutes=5)).isoformat(),
+                    "heartbeat_at": heartbeat,
+                    "updated_at": now.isoformat(),
+                    "heartbeat_age_seconds": age,
+                    "stale_after_seconds": stale_after,
+                    "worker_alive": None,
+                    "worker_identity_valid": None,
+                    "worker_lock_owner_valid": None,
+                    "liveness": "PERSISTED_ONLY",
+                    "degrading_reason": reason,
+                    "reason_code": reason_code,
+                    "last_error": "FIXTURE_NETWORK_FAILURE" if status == "degraded" else None,
+                    "grade": grade,
+                    "reasons": deepcopy(health_reasons if worker_name == "health-monitor" else []),
+                    "crypto_paper": None,
+                    "payload_bytes": 256,
+                    "payload_truncated": False,
+                    "payload_projection_pending": False,
+                    "projection_truncated": False,
+                    "projection_truncated_fields": [],
+                }
+            )
+        degrading_worker = "health-monitor" if health_grade not in {"A", "OK", "HEALTHY"} else (
+            next((row["worker_name"] for row in workers if row["status"] in {"degraded", "stale"}), None)
+        )
+        return {
+            "schema": "ui-status.v1",
+            "status": "stale" if any(row["status"] == "stale" for row in workers) else (
+                "degraded" if health_grade not in {"A", "OK", "HEALTHY"} or any(row["status"] == "degraded" for row in workers)
+                else "running"
+            ),
+            "live_execution": False,
+            "workers": workers,
+            "workers_total": len(workers),
+            "workers_returned": len(workers),
+            "workers_considered": len(workers),
+            "workers_truncated": False,
+            "status_scope": {
+                "kind": "persisted_worker_state",
+                "scan_limit": 128,
+                "details_limit": 64,
+                "scan_truncated": False,
+                "details_complete": True,
+            },
+            "provenance": {
+                "source": "persisted worker_state dashboard projection",
+                "full_status_endpoint": "/api/status",
+                "process_identity_verified": False,
+                "lock_owner_verified": False,
+            },
+            "health_grade": health_grade,
+            "health_reason_code": health_reason_code,
+            "health_reasons": health_reasons,
+            "degrading_worker": degrading_worker,
+            "degrading_reason": (
+                "Fixture persisted worker evidence is degraded."
+                if health_reason_code
+                else next((row["degrading_reason"] for row in workers if row["degrading_reason"]), None)
+            ),
+            "historical_maturity_grade": None,
+            "historical_error_count": 0,
+            "health_window": {"start": None, "end": None, "seconds": None},
+        }
+
     def ui_state_data(self) -> dict[str, Any]:
         canary = self.canary_data()
         execution = canary.get("execution") if isinstance(canary.get("execution"), Mapping) else {}
@@ -1828,6 +1931,9 @@ class FixtureDashboardData(DashboardData):
         }
 
     def snapshot(self, endpoint: str, params: Mapping[str, Any] | None = None) -> Any:
+        if endpoint.strip("/").lower() == "ui-status":
+            self._fixture_delay()
+            return self.ui_status_data()
         if endpoint.strip("/").lower() == "ui-state":
             self._fixture_delay()
             return self.ui_state_data()

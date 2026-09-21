@@ -1,0 +1,194 @@
+{
+  "review": "bounded-status-native-review",
+  "status": "passed",
+  "scope": "isolated temporary AxiomStore and native DashboardServer only; no LIVE, production, venue, database-copy, operator, control, or POST access",
+  "source": {
+    "parent_revision": "854c79f91c5975fac2ac5ecd6e06d519df9cc638",
+    "ui_root": "C:/Users/User/projects/axiom-ui",
+    "source_hashes": {
+      "axiom/dashboard.py": "215b024248d9b88b057ecd79387884db496c368689cdf743eaf7f22c6aea2db9",
+      "axiom/storage.py": "8d779dc63260a4eb4e989299b54fe067edc5e999bf6d5322bc13471a0a1edfc8",
+      "axiom/ui/app.js": "1ad5c9a207bd3626ab36b548378e9f9fe7f6af6f05f2742cfab9dcfeedd30054",
+      "axiom/ui/pages.js": "45d35a60d3b519327bf168e41602a30b61f587229f2cabbc463b660e0bf5f36f",
+      "axiom/ui/styles.css": "d17b131ab2e7c96e590e4200fc5ff9e1ef1a7adcd6ce901426a45c84c6a7468e",
+      "tests/test_dashboard_ui.py": "5458d4c6b0f9c5dd5979815449f5df5603aaffceb7d161c9ead427cee0360c89",
+      "tests/test_dashboard_pagination.py": "8586cdfc55c00bc6018ee44ad7fe5bd701a08f75da0f586ffd27f6566fff7a1c",
+      "tests/ui_fixture_server.py": "4282d1d43e34db51c2d0a79514241dba07c501540bb650aa3e5ab29bcbdee52d",
+      "docs/polymarket_canary.md": "a0f7287223e5ce2543b30feafae2c2c1b582183334aded44670aaba9c4f5a6b5",
+      "tests/test_dashboard_read_latency.py": "88f3bf4c21212db72bb7f2d47e1fdf2b6801b91c53049ad96cc42e595fe2ef0f"
+    }
+  },
+  "native": {
+    "base_url": "http://127.0.0.1:55135",
+    "seeded_workers": 128,
+    "fixture": "worker-outside-degraded was persisted before 126 newer RUNNING workers; health-monitor grade A was also persisted; native classifier source scope was 128 and compact UI detail limit 64",
+    "full_status": {
+      "status": 200,
+      "bytes": 81515,
+      "duration_ms": 38,
+      "keys": [
+        "_response_projection",
+        "autonomous",
+        "cycles",
+        "degrading_reason",
+        "degrading_worker",
+        "health_grade",
+        "health_reason_code",
+        "health_reasons",
+        "health_window",
+        "hermes",
+        "historical_error_count",
+        "historical_maturity_grade",
+        "live_execution",
+        "normalized_workers",
+        "queue",
+        "status",
+        "summary",
+        "workers",
+        "workers_returned",
+        "workers_total",
+        "workers_truncated"
+      ],
+      "unchanged_contract": {
+        "summary": true,
+        "cycles": true,
+        "queue": true,
+        "normalized_workers": true
+      }
+    },
+    "ui_status": {
+      "status": 200,
+      "bytes": 49315,
+      "duration_ms": 7,
+      "schema": "ui-status.v1",
+      "status_value": "degraded",
+      "live_execution": false,
+      "workers_total": 128,
+      "workers_considered": 128,
+      "workers_returned": 64,
+      "workers_truncated": true,
+      "degrading_worker": "worker-outside-degraded",
+      "degrading_reason": "fixture degraded worker",
+      "health_grade": "A",
+      "health_reason_code": "OUTSIDE_DETAIL",
+      "status_scope": {
+        "kind": "persisted_worker_state",
+        "source": "list_worker_states_dashboard",
+        "scan_limit": 128,
+        "scan_truncated": false,
+        "details_limit": 64,
+        "details_complete": false,
+        "persisted_only": true
+      },
+      "provenance": {
+        "source": "persisted worker_state dashboard projection",
+        "full_status_endpoint": "/api/status",
+        "process_identity_verified": false,
+        "lock_owner_verified": false
+      },
+      "unknown_fields_preserved": {
+        "health_window": {
+          "start": null,
+          "end": null,
+          "seconds": null
+        },
+        "historical_error_count": null,
+        "historical_maturity_grade": null
+      }
+    },
+    "authorizer": {
+      "read_tables": [
+        "worker_state"
+      ],
+      "denied_history_reads": [],
+      "writes": []
+    }
+  },
+  "browser": {
+    "profile": "C:/Users/User/AppData/Local/Temp/axiom-bounded-status-profile",
+    "har": "temporary HAR, removed after review",
+    "operator_route": "**/api/operator aborted before navigation; no wire request observed; no controls clicked",
+    "console_messages": [],
+    "home": {
+      "route": "?view=home",
+      "heading": "Home",
+      "current_authority_visible": true,
+      "no_active_authorization_visible": true,
+      "overflow": false,
+      "overview_request": false,
+      "requests": [
+        {
+          "method": "GET",
+          "path": "/api/ui-state",
+          "status": 200,
+          "duration_ms": 42.34,
+          "bytes": 45298
+        },
+        {
+          "method": "GET",
+          "path": "/api/v2/canary",
+          "status": 200,
+          "duration_ms": 30.42,
+          "bytes": 73149
+        }
+      ]
+    },
+    "settings": {
+      "route": "?view=settings",
+      "heading": "Settings & system",
+      "risk_form": true,
+      "advanced_visible": true,
+      "storage_visible": true,
+      "overflow": false,
+      "role_alerts": [],
+      "full_status_requested": false,
+      "settings_status_overwrite": false,
+      "requests": [
+        {
+          "method": "GET",
+          "path": "/api/risk-settings",
+          "status": 200,
+          "duration_ms": 4.88,
+          "bytes": 5280
+        },
+        {
+          "method": "GET",
+          "path": "/api/ui-state",
+          "status": 200,
+          "duration_ms": 38.7,
+          "bytes": 45298
+        },
+        {
+          "method": "GET",
+          "path": "/api/system",
+          "status": 200,
+          "duration_ms": 16.68,
+          "bytes": 1494
+        },
+        {
+          "method": "GET",
+          "path": "/api/ui-status",
+          "status": 200,
+          "duration_ms": 15.32,
+          "bytes": 49536
+        }
+      ]
+    }
+  },
+  "cleanup": {
+    "server_stopped": "bounded-status-native",
+    "browser_stopped": "bounded-status-chrome",
+    "temp_script_removed": true,
+    "temp_database_removed": true,
+    "temp_profile_removed": true,
+    "temp_har_removed": true,
+    "production_access": false,
+    "source_edits": false
+  },
+  "findings": [],
+  "artifacts": [
+    "bounded-status-native-review.json",
+    "bounded-status-home.png",
+    "bounded-status-settings.png"
+  ]
+}

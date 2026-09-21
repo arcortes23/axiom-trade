@@ -81,6 +81,7 @@ _ENDPOINTS = (
     "hermes",
     "system",
     "status",
+    "ui-status",
     "dataset-health",
     "evidence-maturity",
     "strategy",
@@ -5523,25 +5524,46 @@ class DashboardData:
             return {"total": 0, "live_execution": False}
         return {"stats": self.store.research_queue_stats(), "items": self.store.list_research_items(limit=50), "live_execution": False}
 
-    def status_data(self) -> Any:
+    def _native_worker_status(
+        self,
+        *,
+        worker_limit: int = 128,
+        dashboard_only: bool = False,
+        historical_error_count_default: int | None = 0,
+    ) -> dict[str, Any]:
+        """Normalize persisted workers and apply the native status precedence."""
         if self.store is None:
-            return {"status": "offline", "live_execution": False}
-        # This endpoint is a storage projection.  Process identity and lock
-        # ownership are verified by the supervisor/action paths, never by a
-        # dashboard refresh.
+            return {
+                "status": "offline",
+                "normalized_workers": [],
+                "worker_total": None,
+                "workers_considered": 0,
+                "health_grade": None,
+                "health_fields": self._health_status_fields(
+                    [],
+                    {},
+                    historical_error_count_default=historical_error_count_default,
+                ),
+                "loader_available": False,
+            }
         worker_count_method = getattr(self.store, "worker_state_count", None)
         worker_total = (
             int(worker_count_method())
             if callable(worker_count_method)
             else None
         )
-        worker_limit = 128
         worker_dashboard_loader = getattr(self.store, "list_worker_states_dashboard", None)
-        workers = (
-            worker_dashboard_loader(limit=worker_limit)
-            if callable(worker_dashboard_loader)
-            else self.store.list_worker_states(limit=worker_limit)
-        )
+        if callable(worker_dashboard_loader):
+            workers = worker_dashboard_loader(limit=worker_limit)
+            loader_available = True
+        elif dashboard_only:
+            # The bounded endpoint must never fall back to the raw payload
+            # loader.  A missing dashboard projection is an unknown read.
+            workers = []
+            loader_available = False
+        else:
+            workers = self.store.list_worker_states(limit=worker_limit)
+            loader_available = True
         now = ensure_utc(self.clock())
         statuses: list[str] = []
         normalized_workers: list[dict[str, Any]] = []
@@ -5616,13 +5638,39 @@ class DashboardData:
             status = "idle"
         else:
             status = "not_started"
+        if dashboard_only and not loader_available and worker_total != 0:
+            status = "unknown"
+        current_health = dict(health_payload) if isinstance(health_payload, Mapping) else {}
+        health_fields = self._health_status_fields(
+            normalized_workers,
+            current_health,
+            historical_error_count_default=historical_error_count_default,
+        )
+        return {
+            "status": status,
+            "normalized_workers": normalized_workers,
+            "worker_total": worker_total,
+            "workers_considered": len(normalized_workers),
+            "health_grade": health_grade or health_fields["health_grade"],
+            "health_fields": health_fields,
+            "loader_available": loader_available,
+        }
+
+    def status_data(self) -> Any:
+        if self.store is None:
+            return {"status": "offline", "live_execution": False}
+        # This endpoint is a storage projection.  Process identity and lock
+        # ownership are verified by the supervisor/action paths, never by a
+        # dashboard refresh.
+        native = self._native_worker_status(worker_limit=128)
+        normalized_workers = native["normalized_workers"]
+        worker_total = native["worker_total"]
+        health_fields = native["health_fields"]
         # Do not rebuild collector health or research accounting from large
         # history tables during a status refresh.  Persisted worker health is
         # the truthful local read projection; detailed health remains on its
         # dedicated endpoint.
         summary = {"autonomous": {}, "hermes": {}}
-        current_health = dict(health_payload) if isinstance(health_payload, Mapping) else {}
-        health_fields = self._health_status_fields(normalized_workers, current_health)
         cycles_loader = getattr(self.store, "list_collection_cycles_dashboard", None)
         cycles = (
             cycles_loader(limit=20)
@@ -5631,7 +5679,7 @@ class DashboardData:
         )
         queue = self.store.research_queue_stats()
         return {
-            "status": status,
+            "status": native["status"],
             "summary": self.store.dashboard_summary(),
             "cycles": cycles,
             "queue": queue,
@@ -5644,11 +5692,170 @@ class DashboardData:
             ),
             "autonomous": summary.get("autonomous", {}),
             "hermes": summary.get("hermes", {}),
-            "health_grade": health_grade or health_fields["health_grade"],
+            "health_grade": native["health_grade"],
             **health_fields,
             "live_execution": False,
         }
-    def _health_status_fields(self, workers: Sequence[Mapping[str, Any]], health: Mapping[str, Any]) -> dict[str, Any]:
+
+    @staticmethod
+    def _ui_status_text(value: Any, *, limit: int = 512) -> str | None:
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        return text[:limit] if len(text) > limit else text
+
+    @classmethod
+    def _ui_status_reasons(cls, value: Any) -> list[Any]:
+        if not isinstance(value, (list, tuple)):
+            return []
+        reasons: list[Any] = []
+        for reason in list(value)[:8]:
+            if isinstance(reason, Mapping):
+                projected: dict[str, Any] = {}
+                for key in ("code", "reason", "message", "detail"):
+                    if key not in reason:
+                        continue
+                    child = reason.get(key)
+                    if child is None:
+                        continue
+                    if isinstance(child, (bool, int, float)):
+                        projected[key] = child
+                    else:
+                        text = cls._ui_status_text(child, limit=256)
+                        if text is not None:
+                            projected[key] = text
+                if projected:
+                    reasons.append(projected)
+            elif isinstance(reason, (str, int, float, bool)):
+                reasons.append(
+                    reason
+                    if isinstance(reason, (int, float, bool))
+                    else cls._ui_status_text(reason, limit=256)
+                )
+        return reasons
+
+    @classmethod
+    def _compact_ui_worker(cls, item: Mapping[str, Any]) -> dict[str, Any]:
+        payload = item.get("payload")
+        payload = payload if isinstance(payload, Mapping) else {}
+        crypto_value = payload.get("crypto_paper")
+        crypto = None
+        if isinstance(crypto_value, Mapping):
+            enabled = crypto_value.get("enabled")
+            crypto = {
+                "enabled": enabled if isinstance(enabled, bool) else None,
+                "last_error": cls._ui_status_text(crypto_value.get("last_error")),
+            }
+        payload_bytes = item.get("payload_bytes")
+        if isinstance(payload_bytes, bool) or not isinstance(payload_bytes, int):
+            payload_bytes = None
+        payload_truncated = item.get("payload_truncated")
+        if not isinstance(payload_truncated, bool):
+            payload_truncated = None
+        projection_pending = item.get("payload_projection_pending")
+        if not isinstance(projection_pending, bool):
+            projection_pending = None
+        projection_truncated = payload.get("projection_truncated")
+        if not isinstance(projection_truncated, bool):
+            projection_truncated = None
+        truncated_fields = payload.get("projection_truncated_fields")
+        if isinstance(truncated_fields, (list, tuple)):
+            truncated_fields = [
+                text
+                for value in list(truncated_fields)[:16]
+                if (text := cls._ui_status_text(value, limit=128)) is not None
+            ]
+        else:
+            truncated_fields = []
+        return {
+            "worker_name": cls._ui_status_text(item.get("worker_name"), limit=256),
+            "status": cls._ui_status_text(item.get("status"), limit=64),
+            "started_at": item.get("started_at"),
+            "heartbeat_at": item.get("heartbeat_at"),
+            "updated_at": item.get("updated_at"),
+            "heartbeat_age_seconds": item.get("heartbeat_age_seconds"),
+            "stale_after_seconds": item.get("stale_after_seconds"),
+            "worker_alive": None,
+            "worker_identity_valid": item.get("worker_identity_valid"),
+            "worker_lock_owner_valid": None,
+            "liveness": "PERSISTED_ONLY",
+            "degrading_reason": cls._ui_status_text(payload.get("degrading_reason")),
+            "reason_code": cls._ui_status_text(payload.get("reason_code"), limit=128),
+            "last_error": cls._ui_status_text(payload.get("last_error")),
+            "grade": cls._ui_status_text(payload.get("grade"), limit=64),
+            "reasons": cls._ui_status_reasons(payload.get("reasons")),
+            "crypto_paper": crypto,
+            "payload_bytes": payload_bytes,
+            "payload_truncated": payload_truncated,
+            "payload_projection_pending": projection_pending,
+            "projection_truncated": projection_truncated,
+            "projection_truncated_fields": truncated_fields,
+        }
+
+    def ui_status_data(self) -> dict[str, Any]:
+        """Return the bounded persisted worker status used by Settings."""
+        native = self._native_worker_status(
+            worker_limit=128,
+            dashboard_only=True,
+            historical_error_count_default=None,
+        )
+        normalized_workers = native["normalized_workers"]
+        worker_total = native["worker_total"]
+        workers = [
+            self._compact_ui_worker(item)
+            for item in normalized_workers[:64]
+        ]
+        workers_returned = len(workers)
+        workers_considered = int(native["workers_considered"])
+        workers_truncated = (
+            worker_total > workers_returned
+            if worker_total is not None
+            else None
+        )
+        scan_truncated = (
+            worker_total > workers_considered
+            if worker_total is not None
+            else None
+        )
+        health_fields = dict(native["health_fields"])
+        health_reasons = health_fields.get("health_reasons")
+        health_fields["health_reasons"] = self._ui_status_reasons(health_reasons)
+        return {
+            "schema": "ui-status.v1",
+            "status": native["status"],
+            "live_execution": False,
+            "workers": workers,
+            "workers_total": worker_total,
+            "workers_returned": workers_returned,
+            "workers_considered": workers_considered,
+            "workers_truncated": workers_truncated,
+            "status_scope": {
+                "kind": "persisted_worker_state",
+                "source": "list_worker_states_dashboard",
+                "persisted_only": True,
+                "scan_limit": 128,
+                "details_limit": 64,
+                "scan_truncated": scan_truncated,
+                "details_complete": workers_truncated is False,
+            },
+            "provenance": {
+                "source": "persisted worker_state dashboard projection",
+                "full_status_endpoint": "/api/status",
+                "process_identity_verified": False,
+                "lock_owner_verified": False,
+            },
+            "health_grade": native["health_grade"],
+            **health_fields,
+        }
+    def _health_status_fields(
+        self,
+        workers: Sequence[Mapping[str, Any]],
+        health: Mapping[str, Any],
+        *,
+        historical_error_count_default: int | None = 0,
+    ) -> dict[str, Any]:
         grade = str(health.get("grade", "")).upper() or None
         reasons = health.get("reasons", [])
         first_reason = reasons[0] if isinstance(reasons, (list, tuple)) and reasons else {}
@@ -5680,7 +5887,7 @@ class DashboardData:
             "degrading_worker": worker_name,
             "degrading_reason": str(reason) if reason else None,
             "historical_maturity_grade": health.get("historical_maturity_grade"),
-            "historical_error_count": health.get("historical_error_count", 0),
+            "historical_error_count": health.get("historical_error_count", historical_error_count_default),
             "health_window": {
                 "start": health.get("window_start"),
                 "end": health.get("window_end"),
@@ -11361,6 +11568,8 @@ class DashboardData:
             return self.system()
         if endpoint == "status":
             return self.status_data()
+        if endpoint == "ui-status":
+            return self.ui_status_data()
         if endpoint == "dataset-health":
             return self.dataset_health()
         if endpoint == "evidence-maturity":

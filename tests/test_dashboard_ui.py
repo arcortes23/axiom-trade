@@ -9,7 +9,7 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import pytest
-from axiom.dashboard import DashboardData
+from axiom.dashboard import DashboardData, DashboardServer
 from axiom.storage import AxiomStore
 from ui_fixture_server import FixtureServer, fixture_payload
 
@@ -78,9 +78,23 @@ def test_fixture_uses_dashboard_server_routes_and_explicit_fixture_label() -> No
         status, ui_state = _json(f"{fixture.url}/api/ui-state")
         assert status == 200
         assert ui_state["execution_authorization"]["status"] == "ACTIVE"
-        assert canary["execution_authorization"]["status"] == "ACTIVE"
-        assert canary["decision"]["reason_code"] == "NO_SIGNAL"
+        status, ui_status = _json(f"{fixture.url}/api/ui-status")
+        assert status == 200
+        assert ui_status["schema"] == "ui-status.v1"
+        assert ui_status["live_execution"] is False
+        assert ui_status["status_scope"]["kind"] == "persisted_worker_state"
+        assert ui_status["status_scope"]["details_complete"] is True
+        assert ui_status["provenance"]["full_status_endpoint"] == "/api/status"
+        assert ui_status["status_scope"]["scan_truncated"] is False
+        assert ui_status["workers_returned"] == len(ui_status["workers"])
+        assert ui_status["workers_returned"] <= 64
+        assert ui_status["workers_considered"] == ui_status["workers_total"]
+        assert "summary" not in ui_status
+        assert "cycles" not in ui_status
+        assert "queue" not in ui_status
+        assert "normalized_workers" not in ui_status
         assert fixture.control.calls == []
+        assert canary["execution_authorization"]["status"] == "ACTIVE"
 
 
 def test_fixture_can_serve_token_free_legacy_baseline_for_before_captures() -> None:
@@ -293,6 +307,163 @@ def test_system_reads_bounded_storage_and_persisted_health_when_history_is_denie
     assert system["dataset_health"]["heartbeat_at"] == persisted["heartbeat_at"]
     assert system["dataset_health"]["updated_at"] == persisted["updated_at"]
     assert system["dataset_health"]["provenance"] == "persisted worker_state health-monitor row"
+
+
+def test_ui_status_http_keeps_worker_health_when_history_reads_and_writes_are_denied() -> None:
+    with TemporaryDirectory() as directory:
+        store = AxiomStore(str(Path(directory) / "ui-status.sqlite"))
+        now = datetime(2024, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+        store.save_worker_state(
+            "health-monitor",
+            "RUNNING",
+            {
+                "grade": "B",
+                "grade_scope": "collector_health",
+                "reason_code": "CURRENT_COLLECTION_FAILURES",
+                "reasons": [{"code": "CURRENT_COLLECTION_FAILURES", "reason": "fixture"}],
+                "source_type": "FORWARD_COLLECTED",
+            },
+            heartbeat_at=now,
+        )
+        store.save_worker_state("polymarket-collector", "RUNNING", {"stale_after_seconds": 300}, heartbeat_at=now)
+        server = DashboardServer(
+            port=0,
+            data=DashboardData(store=store, clock=lambda: now),
+        ).start()
+        try:
+            def deny_history_and_writes(
+                action: int,
+                table: str | None,
+                _column: str | None,
+                _database: str | None,
+                _source: str | None,
+            ) -> int:
+                denied_tables = {
+                    "bars",
+                    "snapshots",
+                    "datasets",
+                    "dataset_catalog",
+                    "polymarket_markets",
+                    "polymarket_snapshots",
+                    "polymarket_trades",
+                    "collection_errors",
+                    "collection_cycles",
+                    "research_queue",
+                    "research_queue_events",
+                }
+                if action == sqlite3.SQLITE_READ and table in denied_tables:
+                    return sqlite3.SQLITE_DENY
+                if action in {sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_DELETE}:
+                    return sqlite3.SQLITE_DENY
+                return sqlite3.SQLITE_OK
+
+            store.connection.set_authorizer(deny_history_and_writes)
+            assert server.url is not None
+            status, payload = _json(server.url + "/api/ui-status")
+        finally:
+            store.connection.set_authorizer(None)
+            server.stop()
+            store.close()
+
+    assert status == 200
+    assert payload["schema"] == "ui-status.v1"
+    assert payload["status"] == "degraded"
+    assert payload["health_grade"] == "B"
+    assert payload["degrading_worker"] == "health-monitor"
+    assert payload["workers_total"] == 2
+    assert payload["workers_returned"] == 2
+
+
+def test_ui_status_http_keeps_native_stale_then_degraded_precedence() -> None:
+    with TemporaryDirectory() as directory:
+        store = AxiomStore(str(Path(directory) / "ui-status-precedence.sqlite"))
+        now = datetime(2024, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+        store.save_worker_state(
+            "health-monitor",
+            "RUNNING",
+            {
+                "grade": "C",
+                "reason_code": "CURRENT_COLLECTION_FAILURES",
+                "reasons": [{"code": "CURRENT_COLLECTION_FAILURES", "reason": "fixture"}],
+            },
+            heartbeat_at=now,
+        )
+        store.save_worker_state(
+            "polymarket-collector",
+            "RUNNING",
+            {"stale_after_seconds": 60},
+            heartbeat_at=now.replace(minute=2),
+        )
+        server = DashboardServer(port=0, data=DashboardData(store=store, clock=lambda: now)).start()
+        try:
+            assert server.url is not None
+            status, stale = _json(server.url + "/api/ui-status")
+            assert status == 200
+            assert stale["status"] == "stale"
+            assert any(row["status"] == "stale" for row in stale["workers"])
+
+            store.save_worker_state(
+                "polymarket-collector",
+                "RUNNING",
+                {"stale_after_seconds": 60},
+                heartbeat_at=now,
+            )
+            status, degraded = _json(server.url + "/api/ui-status")
+            assert status == 200
+            assert degraded["status"] == "degraded"
+            assert degraded["health_grade"] == "C"
+
+            store.save_worker_state(
+                "health-monitor",
+                "RUNNING",
+                {"grade": "A", "reasons": []},
+                heartbeat_at=now,
+            )
+            status, running = _json(server.url + "/api/ui-status")
+            assert status == 200
+            assert running["status"] == "running"
+        finally:
+            server.stop()
+            store.close()
+
+
+def test_ui_status_http_reports_truthful_worker_scope_when_degraded_row_is_omitted() -> None:
+    with TemporaryDirectory() as directory:
+        store = AxiomStore(str(Path(directory) / "ui-status-scope.sqlite"))
+        now = datetime(2024, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+        store.save_worker_state(
+            "worker-zzz-degraded",
+            "DEGRADED",
+            {"reason_code": "OUTSIDE_DETAIL", "degrading_reason": "fixture degraded worker"},
+            heartbeat_at=now,
+        )
+        for index in range(64):
+            store.save_worker_state(
+                f"worker-{index:03d}",
+                "RUNNING",
+                {"stale_after_seconds": 300},
+                heartbeat_at=now,
+            )
+        server = DashboardServer(port=0, data=DashboardData(store=store, clock=lambda: now)).start()
+        try:
+            assert server.url is not None
+            status, payload = _json(server.url + "/api/ui-status")
+        finally:
+            server.stop()
+            store.close()
+
+    assert status == 200
+    assert payload["status"] == "degraded"
+    assert payload["workers_total"] == 65
+    assert payload["workers_considered"] == 65
+    assert payload["workers_returned"] == 64
+    assert payload["workers_truncated"] is True
+    assert payload["status_scope"]["details_complete"] is False
+    assert payload["status_scope"]["scan_limit"] == 128
+    assert payload["status_scope"]["scan_truncated"] is False
+    assert payload["status_scope"]["details_limit"] == 64
+    assert payload["degrading_worker"] == "worker-zzz-degraded"
+    assert "worker-zzz-degraded" not in {row["worker_name"] for row in payload["workers"]}
 
 
 def test_fixture_catalogs_prove_default_page_two_facets_sort_and_deep_identity() -> None:
@@ -546,6 +717,11 @@ def test_fixture_authority_absent_armed_without_permission_and_stale_are_distinc
         checked_at = datetime.fromisoformat(payload["readiness"]["checked_at"])
         age = (datetime.now(timezone.utc) - checked_at).total_seconds()
         assert 90 <= age <= 180
+        status, ui_status = _json(f"{fixture.url}/api/ui-status")
+        assert status == 200
+        assert ui_status["schema"] == "ui-status.v1"
+        assert ui_status["status"] == "stale"
+        assert any(row["status"] == "stale" for row in ui_status["workers"])
 
 def test_binance_fixture_is_parked_without_forbidden_probe_or_activation_controls() -> None:
     with FixtureServer("prepared") as fixture:

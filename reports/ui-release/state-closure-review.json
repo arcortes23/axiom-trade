@@ -1272,5 +1272,228 @@
         "C:/Users/User/AppData/Local/Temp/axiom-native-review-chrome"
       ]
     }
+  },
+  "bounded_status_closure": {
+    "scope": "Focused current Home/Live/Settings state closure for bounded /api/ui-status; fixture only; no production or action operations.",
+    "source_hashes": {
+      "axiom/dashboard.py": "215b024248d9b88b057ecd79387884db496c368689cdf743eaf7f22c6aea2db9",
+      "axiom/storage.py": "8d779dc63260a4eb4e989299b54fe067edc5e999bf6d5322bc13471a0a1edfc8",
+      "axiom/ui/app.js": "1ad5c9a207bd3626ab36b548378e9f9fe7f6af6f05f2742cfab9dcfeedd30054",
+      "axiom/ui/pages.js": "45d35a60d3b519327bf168e41602a30b61f587229f2cabbc463b660e0bf5f36f",
+      "axiom/ui/styles.css": "d17b131ab2e7c96e590e4200fc5ff9e1ef1a7adcd6ce901426a45c84c6a7468e",
+      "tests/test_dashboard_ui.py": "5458d4c6b0f9c5dd5979815449f5df5603aaffceb7d161c9ead427cee0360c89",
+      "tests/test_dashboard_pagination.py": "8586cdfc55c00bc6018ee44ad7fe5bd701a08f75da0f586ffd27f6566fff7a1c",
+      "tests/ui_fixture_server.py": "4282d1d43e34db51c2d0a79514241dba07c501540bb650aa3e5ab29bcbdee52d",
+      "docs/polymarket_canary.md": "a0f7287223e5ce2543b30feafae2c2c1b582183334aded44670aaba9c4f5a6b5",
+      "tests/test_dashboard_read_latency.py": "88f3bf4c21212db72bb7f2d47e1fdf2b6801b91c53049ad96cc42e595fe2ef0f"
+    },
+    "fixture": {
+      "url": "http://127.0.0.1:49255",
+      "admin_url": "http://127.0.0.1:49256",
+      "upstream_url": "http://127.0.0.1:49254",
+      "processes": [
+        "BoundedStatusFixture",
+        "BoundedStatusChrome",
+        "BoundedStatusReview"
+      ],
+      "cdp_ports": [
+        49291,
+        54388
+      ],
+      "scenario": "prepared"
+    },
+    "settings_valid": {
+      "screenshot": "C:/Users/User/projects/axiom-ui/reports/ui-release/bounded-status-settings-valid.png",
+      "actual_requests": [
+        "GET /api/risk-settings 200",
+        "GET /api/ui-state 200",
+        "GET /api/system 200",
+        "GET /api/ui-status 200"
+      ],
+      "context_error": false,
+      "native_status": {
+        "schema": "ui-status.v1",
+        "status": "running",
+        "health_grade": "A",
+        "status_scope": {
+          "kind": "persisted_worker_state",
+          "details_complete": true,
+          "scan_truncated": false
+        },
+        "workers_returned": 3,
+        "workers_truncated": false
+      },
+      "observed": [
+        "Settings & system rendered",
+        "Risk limits rendered",
+        "No TypeError/undefined context error",
+        "Native bounded /api/ui-status request completed"
+      ]
+    },
+    "settings_ui_status_fault": {
+      "screenshot": "C:/Users/User/projects/axiom-ui/reports/ui-release/bounded-status-settings-ui-status-fault.png",
+      "method": "After valid Settings load, actual /api/ui-status GET was aborted during the natural 60-second Settings poll.",
+      "observed": [
+        "Status unavailable · Failed to fetch",
+        "Storage UNKNOWN rather than false healthy",
+        "Canary connection Not Available",
+        "Node Not Available",
+        "Persisted health-monitor provenance showed available false/status UNKNOWN, not fabricated zero",
+        "Draft Maximum all-in buy 0.61 retained",
+        "Selection max_submitted_orders_per_day 10 retained",
+        "Focus Maximum all-in buy retained",
+        "Disclosure Connection and storage provenance remained open",
+        "Window scroll 420 retained",
+        "Loading false after poll settled",
+        "No TypeError/undefined context error"
+      ]
+    },
+    "home_valid": {
+      "screenshot": "C:/Users/User/projects/axiom-ui/reports/ui-release/bounded-status-home-valid.png",
+      "observed": [
+        "Home rendered without TypeError/undefined context error",
+        "Session budget and canonical session context rendered",
+        "Review and start and Stop canary rendered"
+      ]
+    },
+    "live_valid": {
+      "screenshot": "C:/Users/User/projects/axiom-ui/reports/ui-release/bounded-status-live-valid.png",
+      "observed": [
+        "Live trading · Polymarket rendered without TypeError/undefined context error",
+        "Session budget and 86,400-second duration rendered",
+        "Review and start and Stop canary rendered",
+        "Polymarket canary decision boundary rendered"
+      ]
+    },
+    "review_discovery_cancel": {
+      "screenshot": "C:/Users/User/projects/axiom-ui/reports/ui-release/bounded-status-review-dialog.png",
+      "observed": [
+        "Review dialog opened without TypeError/undefined context error",
+        "Purpose, lifetime budget, scope, exact current proposed members, and stop rules rendered",
+        "Type REVIEW EXPLORATORY AUTHORIZATION label rendered",
+        "Type CONFIRM EXPLORATORY LIVE label present disabled before Step 2",
+        "Cancel closed the dialog",
+        "No stage-one submit or final confirmation performed"
+      ]
+    },
+    "delayed_review_cancel": {
+      "screenshot": "C:/Users/User/projects/axiom-ui/reports/ui-release/bounded-status-review-cancel-delayed.png",
+      "method": "Fixture delay_ms=10000 delayed actual fresh /api/ui-state and /api/v2/canary GETs after entering the review phrase; Cancel was clicked while reads were pending.",
+      "observed": [
+        "Both fresh GETs were visibly pending",
+        "Cancel returned to Home",
+        "After delayed responses released, dialog did not reopen and no stale result appeared",
+        "No POST in browser network view",
+        "No final confirmation or authority transition"
+      ]
+    },
+    "final_admin_status": {
+      "action_stats": {
+        "total": 0,
+        "completed": 0,
+        "pending": 0
+      },
+      "armed_state": "DISARMED",
+      "execution_authorization": "REVOKED",
+      "scenario": "prepared"
+    },
+    "honest_limits": [
+      "This focused result does not relabel historical all-13/zoom evidence; prior source attributions remain unchanged.",
+      "No production host, credentials, database, Store, venue, trading, authorization, or real-money operation was used."
+    ],
+    "cleanup": {
+      "processes_stopped": [
+        "BoundedStatusChrome",
+        "BoundedStatusReview",
+        "BoundedStatusFixture",
+        "UiStatusOnlyChrome",
+        "UiStatusOnlyFixture",
+        "UiStatusCompareChrome",
+        "UiStatusCompareFixture"
+      ],
+      "profiles_removed": [
+        "C:/Users/User/AppData/Local/Temp/axiom-bounded-status-chrome",
+        "C:/Users/User/AppData/Local/Temp/axiom-bounded-review-chrome",
+        "C:/Users/User/AppData/Local/Temp/axiom-ui-status-only-chrome",
+        "C:/Users/User/AppData/Local/Temp/axiom-ui-status-compare-chrome"
+      ]
+    },
+    "ui_status_only_fault": {
+      "screenshot": "C:/Users/User/projects/axiom-ui/reports/ui-release/bounded-status-ui-status-only-fault.png",
+      "method": "Fresh isolated Settings browser with only the actual /api/ui-status GET aborted before navigation completed; no route interception applied to risk-settings, ui-state, or system.",
+      "network_requests": [
+        "GET /api/risk-settings 200",
+        "GET /api/ui-state 200",
+        "GET /api/system 200",
+        "GET /api/ui-status (aborted)",
+        "GET /favicon.ico 404"
+      ],
+      "observed": [
+        "Settings & system rendered without TypeError/undefined context error",
+        "Status unavailable · Failed to fetch",
+        "Risk limits and draft controls remained rendered from independent reads",
+        "Canary connection Not Available",
+        "Node Not Available",
+        "Storage UNKNOWN",
+        "Service status Not available",
+        "Persisted health-monitor provenance reported available false/status UNKNOWN",
+        "No false HEALTHY status",
+        "No fabricated zero/false healthy value"
+      ]
+    },
+    "baseline_to_status_only_fault": {
+      "baseline_screenshot": "C:/Users/User/projects/axiom-ui/reports/ui-release/bounded-status-baseline-compare.png",
+      "fault_screenshot": "C:/Users/User/projects/axiom-ui/reports/ui-release/bounded-status-baseline-to-fault.png",
+      "baseline_network": [
+        "GET /api/risk-settings 200",
+        "GET /api/ui-state 200",
+        "GET /api/system 200",
+        "GET /api/ui-status 200"
+      ],
+      "fault_network": [
+        "GET /api/risk-settings 200",
+        "GET /api/ui-state 200",
+        "GET /api/system 200",
+        "GET /api/ui-status aborted"
+      ],
+      "baseline_fixture_gaps": {
+        "canary_connection": "Not Available",
+        "node": "Not Available",
+        "storage": "UNKNOWN",
+        "system_dataset_health": {
+          "available": false,
+          "status": "UNKNOWN",
+          "provenance": "persisted worker_state health-monitor row unavailable"
+        }
+      },
+      "fault_values": {
+        "canary_connection": "Not Available",
+        "node": "Not Available",
+        "storage": "UNKNOWN",
+        "system_dataset_health": {
+          "available": false,
+          "status": "UNKNOWN",
+          "provenance": "persisted worker_state health-monitor row unavailable"
+        }
+      },
+      "independent_context": {
+        "risk_limits": "Rendered in both baseline and fault",
+        "default_maximum_all_in_buy": "0.73 in fault comparison; prior draft/focus/selection/scroll proof remains separately recorded",
+        "system_provenance": "Same persisted health-monitor provenance in baseline and fault"
+      },
+      "status_owned_change": {
+        "baseline": "Service status running; no status-unavailable notice",
+        "fault": "Status unavailable · Failed to fetch; Service status Not available",
+        "interpretation": "This is the ui-status-owned value becoming unavailable when its sole source is aborted; independent system fields above remained the same. No claim is made that these baseline fixture gaps were caused by the ui-status fault."
+      },
+      "context_error": false,
+      "honest_limit": "The separately measured natural-poll proof covers draft 0.61, selection 10, focus Maximum all-in buy, disclosure and scroll; this baseline/fault comparison intentionally did not mutate controls."
+    },
+    "independent_disposition": {
+      "reviewer": "UiSafetyReview",
+      "classification": "CLEAN",
+      "finding": "none",
+      "reason": "Status-only failure renders source-owned unknown/unavailable state; no false healthy or zero; independent risk/system/connection fields remain unchanged."
+    }
   }
 }

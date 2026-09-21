@@ -1,19 +1,19 @@
 {
     "reviewer":  "UiSafetyReview",
     "overall_correctness":  "correct",
-    "explanation":  "Final UI-root and bounded system closure review is clean after superseding the intermediate 22e3c22f risk-reuse edit that accidentally omitted the top-level autonomous_canary projection and the intermediate activation-based freshness proof. Corrected dashboard.py 42d1f783 restores that public schema while reusing one request-local native risk snapshot across ui-state authorization, canary, and rolling projections without cross-request caching, configured display authority, mutation, or changes to canonical status/accounting/action paths; standalone endpoints remain fresh and partial/missing/error snapshots remain preserved. Final direct ui-state proof observes a new draft while active generation/configuration and authorization limits remain unchanged. Frozen app.js 6408b9ff removes only the unused Home overview-summary request/error plumbing, and dashboard.py 061f0a1f plus storage.py 8d779dc6 retain bounded read-only system metadata and exact health-monitor provenance.",
+    "explanation":  "Final UI-root and bounded system closure review is clean. Corrected dashboard.py 42d1f783 preserved complete canary schema and request-local native risk reuse; final direct ui-state proof observed a new draft with active settings and authorization unchanged. Bounded status dashboard.py 215b0242, app.js 1ad5c9a2, fixture 4282d1d4, tests 5458d4c6, and docs a0f72872 add only GET /api/ui-status for persisted-worker normalization with native stale/degraded precedence, 128-row scan, 64-row detail cap, truthful omission/provenance, and no broad history/canary/risk/control/ledger reads or actions; full /api/status semantics remain unchanged. Same-browser status-only abort acceptance is clean: independent risk/ui-state/system reads remain 200 and unchanged, while the failed ui-status source renders unknown/unavailable rather than false healthy or zero. The LIVE source incident remains separately contained and historically recorded; no source judgment is inferred from that operational event.",
     "confidence":  0.99,
     "findings":  [
 
                  ],
     "source_hashes":  {
-                          "axiom/ui/app.js":  "6408b9ff37f542ef8439c9c13eff7b5936ada296f5d9baeaf96e9c0223af931f",
+                          "axiom/ui/app.js":  "1ad5c9a207bd3626ab36b548378e9f9fe7f6af6f05f2742cfab9dcfeedd30054",
                           "axiom/ui/pages.js":  "45d35a60d3b519327bf168e41602a30b61f587229f2cabbc463b660e0bf5f36f",
-                          "tests/test_dashboard_ui.py":  "7bc72751acd99c318bd4a2b760f060931ca96743d77ba5ef34e2392336f40ab9",
-                          "tests/ui_fixture_server.py":  "1e9cb07c958958a99f47fdbc501a424989ac5cbbcfd55c6f26d89dd3d7f34ba2",
-                          "docs/polymarket_canary.md":  "f27dd27b348dedc71637ab1fd20def2f74516fd0d8f7aecd92cc8929ade9e546",
+                          "tests/test_dashboard_ui.py":  "5458d4c6b0f9c5dd5979815449f5df5603aaffceb7d161c9ead427cee0360c89",
+                          "tests/ui_fixture_server.py":  "4282d1d43e34db51c2d0a79514241dba07c501540bb650aa3e5ab29bcbdee52d",
+                          "docs/polymarket_canary.md":  "a0f7287223e5ce2543b30feafae2c2c1b582183334aded44670aaba9c4f5a6b5",
                           "axiom/operator.py":  "f1e4ef2e15cc9c415fdce33cfb73142905c20ca182d5b6281ece385b068d8483",
-                          "axiom/dashboard.py":  "42d1f783b34f0e5cb24ce1525032702a0aa693e9a30e0ff88117749ff21f8649",
+                          "axiom/dashboard.py":  "215b024248d9b88b057ecd79387884db496c368689cdf743eaf7f22c6aea2db9",
                           "axiom/storage.py":  "8d779dc63260a4eb4e989299b54fe067edc5e999bf6d5322bc13471a0a1edfc8",
                           "tests/test_dashboard_read_latency.py":  "88f3bf4c21212db72bb7f2d47e1fdf2b6801b91c53049ad96cc42e595fe2ef0f",
                           "axiom/ui/styles.css":  "d17b131ab2e7c96e590e4200fc5ff9e1ef1a7adcd6ce901426a45c84c6a7468e",
@@ -81,6 +81,15 @@
                                  "tests_hash":  "88f3bf4c21212db72bb7f2d47e1fdf2b6801b91c53049ad96cc42e595fe2ef0f",
                                  "docs_hash":  "f27dd27b348dedc71637ab1fd20def2f74516fd0d8f7aecd92cc8929ade9e546",
                                  "verdict":  "final corrected request-local native risk snapshot reuse review; top-level autonomous_canary schema restored after the intermediate 22e3c22f omission; final draft-only ui-state freshness proof preserves active settings and authorization while observing draft updates; one native ui-state risk read is reused across authorization, canary, and rolling projections; standalone reads stay fresh; fixture override accepts the new keyword without native rereads; configured display overrides remain non-authoritative; canonical status/accounting/action paths and partial/error handling remain unchanged; no findings"
+                             },
+                             {
+                                 "source_root":  "C:/Users/User/projects/axiom-ui",
+                                 "dashboard_hash":  "215b024248d9b88b057ecd79387884db496c368689cdf743eaf7f22c6aea2db9",
+                                 "app_hash":  "1ad5c9a207bd3626ab36b548378e9f9fe7f6af6f05f2742cfab9dcfeedd30054",
+                                 "fixture_hash":  "4282d1d43e34db51c2d0a79514241dba07c501540bb650aa3e5ab29bcbdee52d",
+                                 "tests_hash":  "5458d4c6b0f9c5dd5979815449f5df5603aaffceb7d161c9ead427cee0360c89",
+                                 "docs_hash":  "a0f7287223e5ce2543b30feafae2c2c1b582183334aded44670aaba9c4f5a6b5",
+                                 "verdict":  "final bounded ui-status source and state-matrix review; GET /api/ui-status is a persisted-worker-only Settings projection with shared native status precedence, 128-row aggregate scan, 64-row detail cap, explicit truncation/provenance, no broad historical/canary/risk/control/ledger reads or actions, unchanged full /api/status semantics, fixture route/schema compatibility, and same-browser status-only abort fails closed to unknown/unavailable while independent reads remain unchanged; no findings"
                              }
                          ]
 }
