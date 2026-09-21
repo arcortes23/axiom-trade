@@ -2583,6 +2583,75 @@ class MarketScopeCollectorTests(unittest.TestCase):
             ["requested-rule-market"],
         )
 
+    def test_requested_rule_markets_use_direct_subset_for_partial_inventory(self) -> None:
+        requested = (
+            market("partial-requested-rule-market-a", category="politics"),
+            market("partial-requested-rule-market-b", category="economics"),
+        )
+        unrelated = market("partial-unrelated-inventory-market", category="sports")
+
+        class DirectClone(_PagedProvider):
+            def __init__(self, snapshot: PredictionMarketSnapshot) -> None:
+                super().__init__((snapshot,), ())
+                self._snapshot = snapshot
+
+            def scope_market(self, market_id: str):
+                return (
+                    self._snapshot
+                    if str(market_id) == self._snapshot.market_id
+                    else None
+                )
+
+        class PartialForkedProvider(_PagedProvider):
+            def __init__(self) -> None:
+                super().__init__(
+                    (unrelated,),
+                    (
+                        {
+                            "snapshots": (unrelated,),
+                            "next_cursor": "opaque-next",
+                        },
+                    ),
+                )
+                self._clones = iter(
+                    DirectClone(snapshot) for snapshot in requested
+                )
+
+            def isolated_worker_factory(self):
+                return next(self._clones)
+
+        provider = PartialForkedProvider()
+        store = _ScopeStore(
+            {
+                "partial-rule-candidate": {
+                    "experiment_plan": {
+                        "market_scope": scope("RULE_BASED_MARKETS"),
+                    }
+                }
+            }
+        )
+
+        cycle = self._collector(
+            provider,
+            store,
+            ("partial-rule-candidate",),
+            max_markets=2,
+            market_ids=tuple(snapshot.market_id for snapshot in requested),
+        ).collect_once(now=T0)
+
+        requested_ids = [snapshot.market_id for snapshot in requested]
+        self.assertEqual(
+            list(cycle.candidate_bound_scheduled),
+            requested_ids,
+        )
+        matched = store.resolutions[-1].matched_markets
+        self.assertEqual([item.market_id for item in matched], requested_ids)
+        self.assertNotIn(
+            unrelated.market_id,
+            [item.market_id for item in matched],
+        )
+
+
     def test_requested_exact_market_precedes_large_legacy_exact_rotation(self) -> None:
         legacy_ids = tuple(f"legacy-exact-{index:03d}" for index in range(256))
         requested = market("requested-exact-target")
