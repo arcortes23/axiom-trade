@@ -2583,6 +2583,47 @@ class MarketScopeCollectorTests(unittest.TestCase):
             ["requested-rule-market"],
         )
 
+    def test_requested_exact_market_precedes_large_legacy_exact_rotation(self) -> None:
+        legacy_ids = tuple(f"legacy-exact-{index:03d}" for index in range(256))
+        requested = market("requested-exact-target")
+        provider = _PagedProvider(
+            (requested,),
+            ({"snapshots": (), "next_cursor": None},),
+        )
+        store = _ScopeStore(
+            {
+                "legacy-exact-candidate": {
+                    "experiment_plan": {
+                        "market_scope": scope("EXACT_MARKETS", market_ids=legacy_ids),
+                    }
+                },
+                "requested-exact-candidate": {
+                    "experiment_plan": {
+                        "market_scope": scope(
+                            "EXACT_MARKETS",
+                            market_ids=("requested-exact-target",),
+                        ),
+                    }
+                },
+            }
+        )
+        cycle = self._collector(
+            provider,
+            store,
+            ("legacy-exact-candidate", "requested-exact-candidate"),
+            max_markets=1,
+            market_ids=("requested-exact-target",),
+        ).collect_once(now=T0)
+
+        self.assertEqual(list(cycle.candidate_bound_scheduled), ["requested-exact-target"])
+        self.assertGreaterEqual(cycle.markets_attempted, 1)
+        self.assertGreaterEqual(cycle.snapshots_inserted, 1)
+        self.assertEqual(provider.market_calls[0], "requested-exact-target")
+        self.assertEqual(
+            [item.market_id for item in store.resolutions[-1].matched_markets],
+            ["requested-exact-target"],
+        )
+
     def test_full_cycle_reserves_collection_after_scope_authorization(self) -> None:
         base = market("collect-after-scope")
         selected_book = base.order_book
