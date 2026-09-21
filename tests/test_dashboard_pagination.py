@@ -2910,6 +2910,66 @@ class DashboardPaginationSurfaceTests(DashboardPaginationFixture):
         self.assertLessEqual(len(body.encode("utf-8")), 1_048_576)
         oversized = _http_json_bytes({"sentinel": "x" * 20_000_000})
         self.assertLessEqual(len(oversized), 1_048_576)
+    def test_operator_controls_survive_oversized_rolling_history(self) -> None:
+        oversized_history = [
+            {
+                f"history_field_{field_index}": "x" * 4096
+                for field_index in range(32)
+            }
+            for _ in range(64)
+        ]
+        self.server.data._data["operator"] = {
+            "operator_controls": {
+                "execution_authorization": {
+                    "status": "UNREVIEWED",
+                    "selection_id": "rolling-exploratory-proposal-direct",
+                },
+                "exploratory_live_review": {
+                    "proposal_status": "BLOCKED",
+                    "proposal": {
+                        "status": "BLOCKED",
+                        "selection_id": "rolling-exploratory-proposal-direct",
+                        "selection_hash": "direct-selection-hash",
+                        "policy_id": "polymarket-exploratory-live",
+                        "policy_version": "exploratory-live-v1",
+                        "members": [],
+                    },
+                    "no_member_reason": {
+                        "code": "EXPLORATORY_LIVE_NO_ELIGIBLE_PROPOSED_MEMBERS",
+                        "selection_id": "rolling-exploratory-proposal-direct",
+                    },
+                    "blockers": ["DIRECT_INPUT_MISSING", "INSUFFICIENT_LOOKBACK"],
+                },
+            },
+            "rolling_portfolio": {
+                "event_history": oversized_history,
+                "reason_history": oversized_history,
+                "replacement_reason_history": oversized_history,
+            },
+            "paper_only": True,
+            "live_execution": False,
+        }
+        status, payload, body = self._request("api/operator")
+        self.assertEqual(status, 200, body)
+        self.assertIsInstance(payload, dict)
+        assert isinstance(payload, dict)
+        self.assertLessEqual(len(body.encode("utf-8")), 1_048_576)
+        projection = payload.get("_response_projection")
+        self.assertIsInstance(projection, dict)
+        assert isinstance(projection, dict)
+        self.assertTrue(projection.get("byte_cap_applied"))
+        controls = payload.get("operator_controls")
+        self.assertIsInstance(controls, dict)
+        assert isinstance(controls, dict)
+        review = controls.get("exploratory_live_review")
+        self.assertIsInstance(review, dict)
+        assert isinstance(review, dict)
+        proposal = review.get("proposal")
+        self.assertIsInstance(proposal, dict)
+        assert isinstance(proposal, dict)
+        self.assertEqual(proposal["selection_id"], "rolling-exploratory-proposal-direct")
+        self.assertEqual(proposal["members"], [])
+        self.assertIn("DIRECT_INPUT_MISSING", review["blockers"])
 
     def test_overview_and_list_responses_do_not_embed_unbounded_records(self) -> None:
         status, overview, overview_body = self._request("api/overview")
