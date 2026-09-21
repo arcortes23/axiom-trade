@@ -1,0 +1,231 @@
+{
+  "completed_checks": {
+    "active_vs_legacy": {
+      "control_state": "ARMED",
+      "live_execution": true,
+      "observed_endpoint": "/api/v2/canary",
+      "paper_only": false,
+      "production_live_trading": false
+    },
+    "adverse_consent": {
+      "checked_review_payload": {
+        "adverse_evidence_ack": true,
+        "post_count": 1
+      },
+      "evidence": "reports/ui-release/action-frozen-blocked-1280.png",
+      "optional_prepared_payload_omitted_ack": true,
+      "required_unchecked": {
+        "observed": true,
+        "post_count": 0
+      }
+    },
+    "canonical_open_cancel": {
+      "evidence": "reports/ui-release/action-frozen-open-1280.png",
+      "observed": true,
+      "opening_and_cancel_calls": 0
+    },
+    "doubleclick_and_dropped_response": {
+      "final_payload": {},
+      "final_posts": 1,
+      "no_replay": true,
+      "response_dropped": true,
+      "review_posts": 1,
+      "terminal_status": "COMPLETE"
+    },
+    "exact_phrases": {
+      "final": "CONFIRM EXPLORATORY LIVE",
+      "observed": true,
+      "review": "REVIEW EXPLORATORY AUTHORIZATION"
+    },
+    "frozen_native_terms": {
+      "adverse_required": false,
+      "duration_seconds": 86400,
+      "evidence": "reports/ui-release/action-frozen-open-1280.png",
+      "expiry_anchor": "FINAL_CONFIRMATION",
+      "lifetime_budget": "5.00",
+      "purpose": "commission exploratory automation and measure actual net results; profitability unproven",
+      "risk_displayed": [
+        "cumulative_buy_cap_usd=null",
+        "equity_loss_entry_stop_usd=0.25",
+        "max_aggregate_open_cost_usd=0.73",
+        "max_all_in_buy_usd=0.73",
+        "max_fee_reserve_usd=0.01",
+        "max_gross_daily_buy_usd=0.73",
+        "max_positions=1",
+        "max_slippage_bps=100",
+        "max_submitted_orders_per_day=2",
+        "per_event_buy_cap_usd=null",
+        "per_market_buy_cap_usd=null",
+        "realized_loss_entry_stop_usd=0.25"
+      ],
+      "scope_market_id": "fixture-market-aurora",
+      "shared_allocation": "5.00"
+    },
+    "normal_final": {
+      "evidence": [
+        "reports/ui-release/action-frozen-reviewed-1280.png",
+        "reports/ui-release/action-frozen-complete-1280.png"
+      ],
+      "final_ok": true,
+      "final_payload": {},
+      "final_posts": 1,
+      "final_status": "COMPLETE",
+      "no_order_claim": true,
+      "review_posts": 1
+    },
+    "polling": {
+      "live": {
+        "expanded_technical_after": false,
+        "expanded_technical_before": true,
+        "scroll_y": 700
+      },
+      "live_interval_seconds": 15,
+      "route_abort": {
+        "endpoint": "/api/ui-state",
+        "no_crash": true,
+        "visible": "Operator unavailable / Failed to fetch"
+      },
+      "settings": {
+        "expanded_technical_after": false,
+        "expanded_technical_before": true,
+        "focus": "max_all_in_buy_usd",
+        "scroll_y": 900,
+        "selection": [
+          1,
+          3
+        ],
+        "value": "0.66"
+      },
+      "settings_interval_seconds": 60
+    },
+    "reload_uncertain": {
+      "after_reload": "A prior final confirmation has no terminal outcome yet. Check its read-only status before starting another review.",
+      "no_new_post": true,
+      "observed": true
+    },
+    "risk_settings": {
+      "activation": {
+        "active_max_all_in_buy_usd": "0.61",
+        "active_per_event_buy_cap_usd": "0.70",
+        "config_id": "fixture-risk-draft",
+        "draft": null,
+        "expected_generation": 2,
+        "status": "COMPLETE"
+      },
+      "evidence": "browser and admin counters from pre-freeze corrected fixture 53264/53265; source behavior rechecked",
+      "invalid_money": {
+        "action": "risk.settings.save_draft",
+        "active_unchanged": true,
+        "durable_visible_error_after_62s_poll": true,
+        "input": "abc",
+        "reason": "CANARYSETTINGSVALIDATIONERROR",
+        "status": "FAILED",
+        "typed_value_preserved": "abc"
+      },
+      "nullable_clear": {
+        "observed": true,
+        "per_event_buy_cap_usd": null
+      },
+      "unknown_fields": "native-normalized target_notional/max_daily_loss and other persisted fields remained in draft/active projection",
+      "valid_draft": {
+        "active_unchanged": true,
+        "draft_generation": 3,
+        "max_all_in_buy_usd": "0.61",
+        "max_submitted_orders_per_day": 2,
+        "per_event_buy_cap_usd": "0.70",
+        "status": "COMPLETE"
+      }
+    },
+    "running_ok_false": {
+      "evidence": "reports/ui-release/action-frozen-running-1280.png",
+      "final_posts": 1,
+      "no_replay": true,
+      "response": {
+        "ok": false,
+        "payload": {},
+        "reason": "OUTCOME_UNCERTAIN",
+        "status": "RUNNING"
+      },
+      "review_posts": 1,
+      "terminal_complete": true,
+      "terminal_failed": true,
+      "visible": "The confirmation outcome is still unresolved. Do not submit again. Check read-only outcome"
+    },
+    "stop_revoke": {
+      "production": false,
+      "stop_action": "canary.disarm",
+      "stop_payload": {},
+      "stop_result": {
+        "armed": false,
+        "orders_cancelled": false,
+        "orders_closed": false
+      },
+      "visible_distinction": "Stop prevents new canary submissions and does not close/cancel every position; Revoke remains specialist advanced exact-identity control"
+    }
+  },
+  "findings": [
+    {
+      "evidence": [
+        "Settings wait 62s eval: open true to false",
+        "Live wait 17s eval: open true to false"
+      ],
+      "file": "axiom/ui/app.js",
+      "id": "ACTION-001",
+      "impact": "Settings 60-second and Live 15-second natural refreshes close an expanded details.technical panel while preserving value, selection, focus, and scroll. Operators lose expanded provenance context on every refresh.",
+      "lines": "501-526",
+      "priority": 2,
+      "status": "open",
+      "title": "Preserve expanded technical details during polling"
+    },
+    {
+      "evidence": [
+        "reports/ui-release/action-stage1-running-1280.png",
+        "post-fix recheck: buttonDisabled=true, text=Outcome uncertain, stats total=1"
+      ],
+      "file": "axiom/ui/app.js",
+      "id": "ACTION-002",
+      "impact": "Before UiShell correction, execution_authorization.review RUNNING/ok:false displayed no-retry text but re-enabled Start authorization review, allowing duplicate review POSTs. Frozen fixture reproduced one RUNNING action with enabled Start button; patch changed it to disabled Outcome uncertain and recheck passed.",
+      "lines": "1191-1194",
+      "priority": 1,
+      "status": "corrected_and_rechecked",
+      "title": "Lock stage-one review after an uncertain outcome"
+    }
+  ],
+  "limitations": [
+    "Synthetic fixture only; no production, credentials, venue APIs, DB, Binance enable/resume, or native economic backend gate simulation.",
+    "Fixture admin network behavior supports delays, dropped responses, uncertainty, and ancillary failure; direct HTTP 503 status injection was not claimed. Browser route-abort for GET /api/ui-state was observed.",
+    "No catalog/navigation/detail coverage; those surfaces belong to UiSurfaceReview.",
+    "Final frozen positive action evidence uses fixture 59389/admin 59390; risk draft/activation evidence was run on the corrected pre-freeze fixture 53264/admin 53265 and is labeled accordingly."
+  ],
+  "owned_processes": {
+    "browser": "action-chrome",
+    "browser_cdp": "ws://127.0.0.1:54166",
+    "browser_profile": "C:/Users/User/AppData/Local/Temp/axiom-ui-action-review",
+    "fixture": "action-fixture",
+    "fixture_admin_url": "http://127.0.0.1:59390",
+    "fixture_only": true,
+    "fixture_upstream_url": "http://127.0.0.1:59388",
+    "fixture_url": "http://127.0.0.1:59389",
+    "production_touched": false
+  },
+  "review": "action/settings/lifecycle",
+  "reviewed_source": {
+    "app_sha256": "9e09626fe3abc52779bdbf6504fb8eb6bc7ddc54a74db2aa77919638b986dbe1",
+    "fixture_sha256": "4bcce66f2056fc190f5bc983d32dfc2fe5d45aae6160e07ccd70e0ba5e4173a7",
+    "source_state": "fresh frozen source after UiPages native-schema fixture freeze and UiShell action/risk corrections",
+    "worktree": "C:/Users/User/projects/axiom-ui"
+  },
+  "scope": "axiom/ui/app.js, tests/ui_fixture_server.py, isolated synthetic UI action/settings surfaces; catalog/navigation and visual ownership excluded",
+  "screenshots": [
+    "reports/ui-release/action-frozen-open-1280.png",
+    "reports/ui-release/action-frozen-reviewed-1280.png",
+    "reports/ui-release/action-frozen-complete-1280.png",
+    "reports/ui-release/action-frozen-running-1280.png",
+    "reports/ui-release/action-frozen-blocked-1280.png",
+    "reports/ui-release/action-stage1-running-1280.png",
+    "reports/ui-release/action-open-1280.png",
+    "reports/ui-release/action-running-1280.png",
+    "reports/ui-release/action-complete-1280.png"
+  ],
+  "verdict": "incorrect_until_expansion_state_fix"
+}

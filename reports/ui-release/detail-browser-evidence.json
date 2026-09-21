@@ -1,0 +1,629 @@
+[
+  {
+    "key": "portfolio-real",
+    "opened": {
+      "name": "fixture-submission-aurora",
+      "href": "http://127.0.0.1:56630/?view=portfolio&section=real&page=1&page_size=25&detail_page=1&detail_page_size=10&shadow_page=1&direction=desc&selected=fixture-submission-aurora&record_kind=submission&expanded=1"
+    },
+    "linkExamples": [
+      {
+        "name": "fixture-submission-aurora",
+        "href": "http://127.0.0.1:56630/?view=portfolio&section=real&page=1&page_size=25&detail_page=1&detail_page_size=10&shadow_page=1&direction=desc&selected=fixture-submission-aurora&record_kind=submission&expanded=1"
+      },
+      {
+        "name": "fixture-position-request-aurora",
+        "href": "http://127.0.0.1:56630/?view=portfolio&section=real&page=1&page_size=25&detail_page=1&detail_page_size=10&shadow_page=1&direction=desc&selected=fixture-position-request-aurora&record_kind=order&expanded=1"
+      },
+      {
+        "name": "fixture-position-fill-aurora",
+        "href": "http://127.0.0.1:56630/?view=portfolio&section=real&page=1&page_size=25&detail_page=1&detail_page_size=10&shadow_page=1&direction=desc&selected=fixture-position-fill-aurora&record_kind=fill&expanded=1"
+      }
+    ],
+    "runtimeErrors": [],
+    "url": "http://127.0.0.1:56630/?view=portfolio&section=real&page=1&page_size=25&detail_page=1&detail_page_size=10&shadow_page=1&direction=desc&selected=fixture-submission-aurora&record_kind=submission&expanded=true",
+    "text": "Portfolio\nReal canary\nPractice\nAllocations\nSearch\nSort\nDefault order\nRows\n10 per page\n25 per page\n50 per page\n100 per page\nApply filters\nPrevious\nPage 1\nNext\nReal canary portfolio\n\nExecution records and accounting evidence from the canary only; practice results stay separate.\n\nExecution authority\nAuthorization\nREVOKED\nMode\nEXPLORATORY_MICRO_CANARY\nWorker decision\nNO_SIGNAL\nWorker tick\n09/21/2026, 20:35:32 PHT (UTC 2026-09-21T12:35:32.819Z)\nReadiness\nCURRENT\nAccount\nNot available\nControl state\nDISARMED\nDecision\nNO_SIGNAL\n\nReview is readable and non-activating. This page never grants permission or infers readiness.\n\nCanary status\nDISARMED\nRemaining daily capacity\n$0.625\nRealized result\n$0.00\nExecution events\n1\nToday orders\n1\nTotal exposure\n$0.105\nOpen positions\n0\nLast request\nNO_SIGNAL\nOrders and position requests\nRequest / position\tPhase\tSelected outcome\tFeasibility\tSide\tQuantity\tSubmitted price\tFees\tTime\nfixture-submission-aurora\tATTEMPTED\tNot available\tNot available\tBUY\t1\t0.42\tNot available\t09/21/2026, 20:35:32 PHT (UTC 2026-09-21T12:35:32.819Z)\nfixture-position-request-aurora\tPARTIAL\tNot available\tNot available\tBUY\t1\t0.42\t$0.0001\t09/21/2026, 20:35:32 PHT (UTC 2026-09-21T12:35:32.819Z)\nPosition fills\nFill / position\tPhase\tSelected outcome\tFeasibility\tSide\tFilled quantity\tSubmitted price\tFees\tTime\nfixture-position-fill-aurora\tSETTLED\tNot available\tNot available\tNot available\t0.25\t0.42\t$0.0001\t09/21/2026, 20:35:32 PHT (UTC 2026-09-21T12:35:32.819Z)\nClosed positions and settled round trips\n\nNo closed positions and settled round trips are present in this bounded projection; no value is inferred.\n\nResolution payouts\n\nNo resolution payouts are present in this bounded projection; no value is inferred.\n\nPosition inventory\n\nNo position inventory are present in this bounded projection; no value is inferred.\n\nPosition marks\n\nNo position marks are present in this bounded projection; no value is inferred.\n\nUnknown obligations\n\nNo unknown obligations are present in this bounded projection; no value is inferred.\n\nTechnical details\nWill the Aurora index close above 61 by the fixture cutoff?\n\nExact detail for the selected bounded record.\n\nRESTING\nStatus\nRESTING\nReason\nNot available\nUpdated\n09/21/2026, 20:35:32 PHT (UTC 2026-09-21T12:35:32.819Z)\nSource\nNot available\nSide\nBUY\nRequested quantity\n1\nFill price\n0.42\nPhase\nATTEMPTED\nExact identifiers\nRecord ID\nfixture-order-aurora Copy\nAttempt ID\nfixture-submission-aurora Copy\nTechnical details",
+    "headings": [
+      "Real canary portfolio",
+      "Execution authority",
+      "Closed positions and settled round trips",
+      "Resolution payouts",
+      "Position inventory",
+      "Position marks",
+      "Unknown obligations",
+      "Will the Aurora index close above 61 by the fixture cutoff?"
+    ],
+    "pagers": [
+      {
+        "tag": "DIV",
+        "role": null,
+        "label": "Pagination",
+        "text": "Previous\nPage 1\nNext",
+        "buttons": [
+          {
+            "text": "Previous",
+            "disabled": true,
+            "attributes": [
+              [
+                "class",
+                "button button-quiet"
+              ],
+              [
+                "type",
+                "button"
+              ],
+              [
+                "data-page",
+                "1"
+              ],
+              [
+                "disabled",
+                ""
+              ]
+            ]
+          },
+          {
+            "text": "Next",
+            "disabled": false,
+            "attributes": [
+              [
+                "class",
+                "button button-quiet"
+              ],
+              [
+                "type",
+                "button"
+              ],
+              [
+                "data-page",
+                "2"
+              ],
+              [
+                "true",
+                ""
+              ]
+            ]
+          }
+        ]
+      }
+    ],
+    "overflow": false,
+    "nativeFunctionLeak": false,
+    "failedRequests": []
+  },
+  {
+    "key": "markets-polymarket",
+    "opened": {
+      "name": "Will the Aurora index close above 61 by the fixture cutoff?",
+      "href": "http://127.0.0.1:56630/?view=markets&section=polymarket&page=1&page_size=25&detail_page=1&detail_page_size=10&shadow_page=1&direction=desc&selected=fixture-market-aurora&record_kind=market&expanded=1"
+    },
+    "linkExamples": [
+      {
+        "name": "Will the Aurora index close above 61 by the fixture cutoff?",
+        "href": "http://127.0.0.1:56630/?view=markets&section=polymarket&page=1&page_size=25&detail_page=1&detail_page_size=10&shadow_page=1&direction=desc&selected=fixture-market-aurora&record_kind=market&expanded=1"
+      },
+      {
+        "name": "Fixture market question 02",
+        "href": "http://127.0.0.1:56630/?view=markets&section=polymarket&page=1&page_size=25&detail_page=1&detail_page_size=10&shadow_page=1&direction=desc&selected=fixture-market-02&record_kind=market&expanded=1"
+      },
+      {
+        "name": "Fixture market question 03",
+        "href": "http://127.0.0.1:56630/?view=markets&section=polymarket&page=1&page_size=25&detail_page=1&detail_page_size=10&shadow_page=1&direction=desc&selected=fixture-market-03&record_kind=market&expanded=1"
+      },
+      {
+        "name": "Fixture market question 04",
+        "href": "http://127.0.0.1:56630/?view=markets&section=polymarket&page=1&page_size=25&detail_page=1&detail_page_size=10&shadow_page=1&direction=desc&selected=fixture-market-04&record_kind=market&expanded=1"
+      }
+    ],
+    "runtimeErrors": [],
+    "url": "http://127.0.0.1:56630/?view=markets&section=polymarket&page=1&page_size=25&detail_page=1&detail_page_size=10&shadow_page=1&direction=desc&selected=fixture-market-aurora&record_kind=market&expanded=true",
+    "text": "Search\nCategory\nAll categories\nPolitics\nSports\nWeather\nCrypto\nOther\nMarket\nAll market types\ncrypto_spot\nprediction\nQuality\nAll quality states\nPRICE_PROXY\nORDER_BOOK_SIMULATED\nTimeframe\nAll timeframes\n1m\n1h\n1d\nlive\nSettlement\nAll settlement states\nopen\nresolved_yes\nresolved_no\nvoid\nSort\nDefault order\nObserved\nSource time\nMarket ID\nQuality\nCategory\nTimeframe\nSettlement\nRows\n10 per page\n25 per page\n50 per page\n100 per page\nApply filters\nPrevious\nPage 1 of 2\nNext\nMarkets\n\nQuestions and order-book labels are reported as observed; no predicted chance is inferred.\n\nMarkets in bounded page\n25\nTotal available\n31\nPage\n1\nUpdated\nNot available\nBounded Polymarket market list\nQuestion / name\tYES mid\tYES ask\tYES bid\tNO mid\tNO ask\tNO bid\tCategory\tSettlement\nWill the Aurora index close above 61 by the fixture cutoff?\t0.41\t0.42\t0.4\t0.59\t0.6\t0.58\tPolitics\topen\nFixture market question 02\t0.41\t0.42\t0.4\t0.59\t0.6\t0.58\tWeather\tresolved_no\nFixture market question 03\t0.41\t0.42\t0.4\t0.59\t0.6\t0.58\tPolitics\tvoid\nFixture market question 04\t0.41\t0.42\t0.4\t0.59\t0.6\t0.58\tSports\topen\nFixture market question 05\t0.41\t0.42\t0.4\t0.59\t0.6\t0.58\tWeather\tresolved_yes\nFixture market question 06\t0.41\t0.42\t0.4\t0.59\t0.6\t0.58\tPolitics\tresolved_no\nFixture market question 07\t0.41\t0.42\t0.4\t0.59\t0.6\t0.58\tSports\tvoid\nFixture market question 08\t0.41\t0.42\t0.4\t0.59\t0.6\t0.58\tWeather\topen\nFixture market question 09\t0.41\t0.42\t0.4\t0.59\t0.6\t0.58\tPolitics\tresolved_yes\nFixture market question 10\t0.41\t0.42\t0.4\t0.59\t0.6\t0.58\tSports\tresolved_no\nFixture market question 11\t0.41\t0.42\t0.4\t0.59\t0.6\t0.58\tWeather\tvoid\nFixture market question 12\t0.41\t0.42\t0.4\t0.59\t0.6\t0.58\tPolitics\topen\nFixture market question 13\t0.41\t0.42\t0.4\t0.59\t0.6\t0.58\tSports\tresolved_yes\nFixture market question 14\t0.41\t0.42\t0.4\t0.59\t0.6\t0.58\tWeather\tresolved_no\nFixture market question 15\t0.41\t0.42\t0.4\t0.59\t0.6\t0.58\tPolitics\tvoid\nFixture market question 16\t0.41\t0.42\t0.4\t0.59\t0.6\t0.58\tSports\topen\nFixture market question 17\t0.41\t0.42\t0.4\t0.59\t0.6\t0.58\tWeather\tresolved_yes\nFixture market question 18\t0.41\t0.42\t0.4\t0.59\t0.6\t0.58\tPolitics\tresolved_no\nFixture market question 19\t0.41\t0.42\t0.4\t0.59\t0.6\t0.58\tSports\tvoid\nFixture market question 20\t0.41\t0.42\t0.4\t0.59\t0.6\t0.58\tWeather\topen\nFixture market question 21\t0.41\t0.42\t0.4\t0.59\t0.6\t0.58\tPolitics\tresolved_yes\nFixture market question 22\t0.41\t0.42\t0.4\t0.59\t0.6\t0.58\tSports\tresolved_no\nFixture market question 23\t0.41\t0.42\t0.4\t0.59\t0.6\t0.58\tWeather\tvoid\nFixture market question 24\t0.41\t0.42\t0.4\t0.59\t0.6\t0.58\tPolitics\topen\nFixture market question 25\t0.41\t0.42\t0.4\t0.59\t0.6\t0.58\tSports\tresolved_yes\nWill the Aurora index close above 61 by the fixture cutoff?\n\nExact detail for the selected bounded record.\n\nopen\nStatus\nopen\nReason\nNot available\nUpdated\nNot available\nSource\nFORWARD_COLLECTED\nMarket\nfixture-market-aurora\nSettlement\nopen\nObserved market details\nQuestion\nWill the Aurora index close above 61 by the fixture cutoff?\nMarket ID\nfixture-market-aurora\nMarket type\nprediction\nCategory\nPolitics\nSource type\nFORWARD_COLLECTED\nTimeframe\nlive\nSettlement\nopen\nAvailable outcomes\nYES / NO\nQuality\nPRICE_PROXY\nFreshness\nFRESH\nObserved at\n2026-09-21T12:35:32.819089+00:00\nYES mid\n0.4100\nYES bid\n0.4000\nYES ask\n0.4200\nNO mid\n0.5900\nNO bid\n0.5800\nNO ask\n0.6000\nBook depth\n12.40\nMinimum affordable\n0.43\nExact identifiers\nRecord ID\nfixture-market-aurora Copy\nTechnical details",
+    "headings": [
+      "Markets",
+      "Will the Aurora index close above 61 by the fixture cutoff?"
+    ],
+    "pagers": [
+      {
+        "tag": "DIV",
+        "role": null,
+        "label": "Pagination",
+        "text": "Previous\nPage 1 of 2\nNext",
+        "buttons": [
+          {
+            "text": "Previous",
+            "disabled": true,
+            "attributes": [
+              [
+                "class",
+                "button button-quiet"
+              ],
+              [
+                "type",
+                "button"
+              ],
+              [
+                "data-page",
+                "1"
+              ],
+              [
+                "disabled",
+                ""
+              ]
+            ]
+          },
+          {
+            "text": "Next",
+            "disabled": false,
+            "attributes": [
+              [
+                "class",
+                "button button-quiet"
+              ],
+              [
+                "type",
+                "button"
+              ],
+              [
+                "data-page",
+                "2"
+              ],
+              [
+                "false",
+                ""
+              ]
+            ]
+          }
+        ]
+      }
+    ],
+    "overflow": false,
+    "nativeFunctionLeak": false,
+    "failedRequests": []
+  },
+  {
+    "key": "research-strategies",
+    "opened": {
+      "name": "Aurora threshold study",
+      "href": "http://127.0.0.1:56630/?view=research&section=strategies&page=1&page_size=25&detail_page=1&detail_page_size=10&shadow_page=1&direction=desc&selected=fixture-candidate-aurora&expanded=1"
+    },
+    "linkExamples": [
+      {
+        "name": "Aurora threshold study",
+        "href": "http://127.0.0.1:56630/?view=research&section=strategies&page=1&page_size=25&detail_page=1&detail_page_size=10&shadow_page=1&direction=desc&selected=fixture-candidate-aurora&expanded=1"
+      },
+      {
+        "name": "Aurora threshold study 02",
+        "href": "http://127.0.0.1:56630/?view=research&section=strategies&page=1&page_size=25&detail_page=1&detail_page_size=10&shadow_page=1&direction=desc&selected=fixture-candidate-02&expanded=1"
+      },
+      {
+        "name": "Aurora threshold study 03",
+        "href": "http://127.0.0.1:56630/?view=research&section=strategies&page=1&page_size=25&detail_page=1&detail_page_size=10&shadow_page=1&direction=desc&selected=fixture-candidate-03&expanded=1"
+      },
+      {
+        "name": "Aurora threshold study 04",
+        "href": "http://127.0.0.1:56630/?view=research&section=strategies&page=1&page_size=25&detail_page=1&detail_page_size=10&shadow_page=1&direction=desc&selected=fixture-candidate-04&expanded=1"
+      }
+    ],
+    "runtimeErrors": [],
+    "url": "http://127.0.0.1:56630/?view=research&section=strategies&page=1&page_size=25&detail_page=1&detail_page_size=10&shadow_page=1&direction=desc&selected=fixture-candidate-aurora&expanded=true",
+    "text": "h observation above the reviewed threshold\tClose on settlement or invalidated observation\tFIXTURE_MOMENTUM_V1\tSettlement or invalidation\t\nCandidate provenance\n\nAurora threshold study 07\tfixture family 07\tPAPER_PROMOTABLE\tOne fresh observation above the reviewed threshold\tClose on settlement or invalidated observation\tFIXTURE_MOMENTUM_V1\tSettlement or invalidation\t\nCandidate provenance\n\nAurora threshold study 08\tfixture family 08\tREJECTED\tOne fresh observation above the reviewed threshold\tClose on settlement or invalidated observation\tFIXTURE_MOMENTUM_V1\tSettlement or invalidation\t\nCandidate provenance\n\nAurora threshold study 09\tfixture family 09\tIDEA\tOne fresh observation above the reviewed threshold\tClose on settlement or invalidated observation\tFIXTURE_MOMENTUM_V1\tSettlement or invalidation\t\nCandidate provenance\n\nAurora threshold study 10\tfixture family 10\tSCHEMA_VALIDATED\tOne fresh observation above the reviewed threshold\tClose on settlement or invalidated observation\tFIXTURE_MOMENTUM_V1\tSettlement or invalidation\t\nCandidate provenance\n\nAurora threshold study 11\tfixture family 11\tBACKTESTED\tOne fresh observation above the reviewed threshold\tClose on settlement or invalidated observation\tFIXTURE_MOMENTUM_V1\tSettlement or invalidation\t\nCandidate provenance\n\nAurora threshold study 12\tfixture family 12\tVALIDATED\tOne fresh observation above the reviewed threshold\tClose on settlement or invalidated observation\tFIXTURE_MOMENTUM_V1\tSettlement or invalidation\t\nCandidate provenance\n\nAurora threshold study 13\tfixture family 13\tROBUSTNESS_CHECKED\tOne fresh observation above the reviewed threshold\tClose on settlement or invalidated observation\tFIXTURE_MOMENTUM_V1\tSettlement or invalidation\t\nCandidate provenance\n\nAurora threshold study 14\tfixture family 14\tFROZEN\tOne fresh observation above the reviewed threshold\tClose on settlement or invalidated observation\tFIXTURE_MOMENTUM_V1\tSettlement or invalidation\t\nCandidate provenance\n\nAurora threshold study 15\tfixture family 15\tPAPER_FORWARD\tOne fresh observation above the reviewed threshold\tClose on settlement or invalidated observation\tFIXTURE_MOMENTUM_V1\tSettlement or invalidation\t\nCandidate provenance\n\nAurora threshold study 16\tfixture family 16\tPAPER_PROMOTABLE\tOne fresh observation above the reviewed threshold\tClose on settlement or invalidated observation\tFIXTURE_MOMENTUM_V1\tSettlement or invalidation\t\nCandidate provenance\n\nAurora threshold study 17\tfixture family 17\tREJECTED\tOne fresh observation above the reviewed threshold\tClose on settlement or invalidated observation\tFIXTURE_MOMENTUM_V1\tSettlement or invalidation\t\nCandidate provenance\n\nAurora threshold study 18\tfixture family 18\tIDEA\tOne fresh observation above the reviewed threshold\tClose on settlement or invalidated observation\tFIXTURE_MOMENTUM_V1\tSettlement or invalidation\t\nCandidate provenance\n\nAurora threshold study 19\tfixture family 19\tSCHEMA_VALIDATED\tOne fresh observation above the reviewed threshold\tClose on settlement or invalidated observation\tFIXTURE_MOMENTUM_V1\tSettlement or invalidation\t\nCandidate provenance\n\nAurora threshold study 20\tfixture family 20\tBACKTESTED\tOne fresh observation above the reviewed threshold\tClose on settlement or invalidated observation\tFIXTURE_MOMENTUM_V1\tSettlement or invalidation\t\nCandidate provenance\n\nAurora threshold study 21\tfixture family 21\tVALIDATED\tOne fresh observation above the reviewed threshold\tClose on settlement or invalidated observation\tFIXTURE_MOMENTUM_V1\tSettlement or invalidation\t\nCandidate provenance\n\nAurora threshold study 22\tfixture family 22\tROBUSTNESS_CHECKED\tOne fresh observation above the reviewed threshold\tClose on settlement or invalidated observation\tFIXTURE_MOMENTUM_V1\tSettlement or invalidation\t\nCandidate provenance\n\nAurora threshold study 23\tfixture family 23\tFROZEN\tOne fresh observation above the reviewed threshold\tClose on settlement or invalidated observation\tFIXTURE_MOMENTUM_V1\tSettlement or invalidation\t\nCandidate provenance\n\nAurora threshold study 24\tfixture family 24\tPAPER_FORWARD\tOne fresh observation above the reviewed threshold\tClose on settlement or invalidated observation\tFIXTURE_MOMENTUM_V1\tSettlement or invalidation\t\nCandidate provenance\n\nAurora threshold study 25\tfixture family 25\tPAPER_PROMOTABLE\tOne fresh observation above the reviewed threshold\tClose on settlement or invalidated observation\tFIXTURE_MOMENTUM_V1\tSettlement or invalidation\t\nCandidate provenance\nAurora threshold study\n\nExact detail for the selected bounded record.\n\nPAPER_FORWARD\nStatus\nPAPER_FORWARD\nReason\nNot available\nUpdated\n09/21/2026, 20:35:32 PHT (UTC 2026-09-21T12:35:32.819Z)\nSource\nFIXTURE_CATALOG\nPhase\nPAPER_FORWARD\nExact identifiers\nRecord ID\nfixture-candidate-aurora Copy\nCanonical setup and strategy document\nOperational setup\nOne fresh observation above the reviewed threshold\nStrategy document\nClose on settlement or invalidated observation\nEntry setup\nOne fresh observation above the reviewed threshold\nExit setup\nSettlement or invalidation\nEvidence and events\nTime\tStage\tEvent\tReason\n09/21/2026, 19:35:32 PHT (UTC 2026-09-21T11:35:32.819Z)\tSCHEMA_VALIDATED\tFixture evidence observation 1\tBounded fixture evidence remains visible\n09/21/2026, 18:35:32 PHT (UTC 2026-09-21T10:35:32.819Z)\tBACKTESTED\tFixture evidence observation 2\tBounded fixture evidence remains visible\n09/21/2026, 17:35:32 PHT (UTC 2026-09-21T09:35:32.819Z)\tVALIDATED\tFixture evidence observation 3\tBounded fixture evidence remains visible\n09/21/2026, 16:35:32 PHT (UTC 2026-09-21T08:35:32.819Z)\tROBUSTNESS_CHECKED\tFixture evidence observation 4\tBounded fixture evidence remains visible\n09/21/2026, 15:35:32 PHT (UTC 2026-09-21T07:35:32.819Z)\tFROZEN\tFixture evidence observation 5\tBounded fixture evidence remains visible\n09/21/2026, 14:35:32 PHT (UTC 2026-09-21T06:35:32.819Z)\tPAPER_FORWARD\tFixture evidence observation 6\tBounded fixture evidence remains visible\n09/21/2026, 13:35:32 PHT (UTC 2026-09-21T05:35:32.819Z)\tPAPER_PROMOTABLE\tFixture evidence observation 7\tBounded fixture evidence remains visible\n09/21/2026, 12:35:32 PHT (UTC 2026-09-21T04:35:32.819Z)\tREJECTED\tFixture evidence observation 8\tBounded fixture evidence remains visible\n09/21/2026, 11:35:32 PHT (UTC 2026-09-21T03:35:32.819Z)\tIDEA\tFixture evidence observation 9\tBounded fixture evidence remains visible\n09/21/2026, 10:35:32 PHT (UTC 2026-09-21T02:35:32.819Z)\tSCHEMA_VALIDATED\tFixture evidence observation 10\tBounded fixture evidence remains visible\nPage 1 of 2 · 18 bounded recordsPreviousNext\nTechnical details",
+    "headings": [
+      "Research strategies",
+      "Aurora threshold study"
+    ],
+    "pagers": [
+      {
+        "tag": "DIV",
+        "role": null,
+        "label": "Pagination",
+        "text": "Previous\nPage 1 of 2\nNext",
+        "buttons": [
+          {
+            "text": "Previous",
+            "disabled": true,
+            "attributes": [
+              [
+                "class",
+                "button button-quiet"
+              ],
+              [
+                "type",
+                "button"
+              ],
+              [
+                "data-page",
+                "1"
+              ],
+              [
+                "disabled",
+                ""
+              ]
+            ]
+          },
+          {
+            "text": "Next",
+            "disabled": false,
+            "attributes": [
+              [
+                "class",
+                "button button-quiet"
+              ],
+              [
+                "type",
+                "button"
+              ],
+              [
+                "data-page",
+                "2"
+              ],
+              [
+                "false",
+                ""
+              ]
+            ]
+          }
+        ]
+      }
+    ],
+    "overflow": false,
+    "nativeFunctionLeak": false,
+    "failedRequests": []
+  },
+  {
+    "key": "research-crypto",
+    "opened": {
+      "name": "AURX",
+      "href": "http://127.0.0.1:56630/?view=research&section=crypto&page=1&page_size=25&detail_page=1&detail_page_size=10&shadow_page=1&direction=desc&selected=AURX&expanded=1"
+    },
+    "linkExamples": [
+      {
+        "name": "AURX",
+        "href": "http://127.0.0.1:56630/?view=research&section=crypto&page=1&page_size=25&detail_page=1&detail_page_size=10&shadow_page=1&direction=desc&selected=AURX&expanded=1"
+      },
+      {
+        "name": "AUR02X",
+        "href": "http://127.0.0.1:56630/?view=research&section=crypto&page=1&page_size=25&detail_page=1&detail_page_size=10&shadow_page=1&direction=desc&selected=AUR02X&expanded=1"
+      },
+      {
+        "name": "AUR03X",
+        "href": "http://127.0.0.1:56630/?view=research&section=crypto&page=1&page_size=25&detail_page=1&detail_page_size=10&shadow_page=1&direction=desc&selected=AUR03X&expanded=1"
+      },
+      {
+        "name": "AUR04X",
+        "href": "http://127.0.0.1:56630/?view=research&section=crypto&page=1&page_size=25&detail_page=1&detail_page_size=10&shadow_page=1&direction=desc&selected=AUR04X&expanded=1"
+      }
+    ],
+    "runtimeErrors": [],
+    "url": "http://127.0.0.1:56630/?view=research&section=crypto&page=1&page_size=25&detail_page=1&detail_page_size=10&shadow_page=1&direction=desc&selected=AURX&expanded=true",
+    "text": "Research\nStrategies\nCrypto research\nAutomation\nData\nSearch\nSymbol\nAll symbols\nSource\nAll sources\nHISTORICAL\nFORWARD_COLLECTED\nSort\nDefault order\nNewest\nDataset\nRows\n10 per page\n25 per page\n50 per page\n100 per page\nApply filters\nPrevious\nPage 1 of 2\nNext\nCrypto research\n\nCatalog, coverage, source, report, and bootstrap provenance without a trading implication.\n\nCatalogs in bounded page\n25\nUniverse versions\n1\nSymbols\n31\nReports\n3\nBootstrap reports\n3\nResearch only\n\nCrypto catalogs, reports, and bootstrap evidence are parked research records. This view has no activation or trading control.\n\nCrypto research datasets and catalogs\nDataset / symbol\tVersion\tCoverage\tSource\tValidation\tUpdated\nAURX\tfixture-universe-v2\tCATALOG_ONLY\tFORWARD_COLLECTED\tREVIEW\t09/21/2026, 20:35:32 PHT (UTC 2026-09-21T12:35:32.819Z)\nAUR02X\tfixture-universe-v2\tPARTIAL\tHISTORICAL\tREVIEW\t09/21/2026, 20:33:32 PHT (UTC 2026-09-21T12:33:32.819Z)\nAUR03X\tfixture-universe-v2\tCATALOG_ONLY\tFORWARD_COLLECTED\tFRESH\t09/21/2026, 20:32:32 PHT (UTC 2026-09-21T12:32:32.819Z)\nAUR04X\tfixture-universe-v2\tPARTIAL\tHISTORICAL\tREVIEW\t09/21/2026, 20:31:32 PHT (UTC 2026-09-21T12:31:32.819Z)\nAUR05X\tfixture-universe-v2\tCATALOG_ONLY\tFORWARD_COLLECTED\tREVIEW\t09/21/2026, 20:30:32 PHT (UTC 2026-09-21T12:30:32.819Z)\nAUR06X\tfixture-universe-v2\tPARTIAL\tHISTORICAL\tFRESH\t09/21/2026, 20:29:32 PHT (UTC 2026-09-21T12:29:32.819Z)\nAUR07X\tfixture-universe-v2\tCATALOG_ONLY\tFORWARD_COLLECTED\tREVIEW\t09/21/2026, 20:28:32 PHT (UTC 2026-09-21T12:28:32.819Z)\nAUR08X\tfixture-universe-v2\tPARTIAL\tHISTORICAL\tREVIEW\t09/21/2026, 20:27:32 PHT (UTC 2026-09-21T12:27:32.819Z)\nAUR09X\tfixture-universe-v2\tCATALOG_ONLY\tFORWARD_COLLECTED\tFRESH\t09/21/2026, 20:26:32 PHT (UTC 2026-09-21T12:26:32.819Z)\nAUR10X\tfixture-universe-v2\tPARTIAL\tHISTORICAL\tREVIEW\t09/21/2026, 20:25:32 PHT (UTC 2026-09-21T12:25:32.819Z)\nAUR11X\tfixture-universe-v2\tCATALOG_ONLY\tFORWARD_COLLECTED\tREVIEW\t09/21/2026, 20:24:32 PHT (UTC 2026-09-21T12:24:32.819Z)\nAUR12X\tfixture-universe-v2\tPARTIAL\tHISTORICAL\tFRESH\t09/21/2026, 20:23:32 PHT (UTC 2026-09-21T12:23:32.819Z)\nAUR13X\tfixture-universe-v2\tCATALOG_ONLY\tFORWARD_COLLECTED\tREVIEW\t09/21/2026, 20:22:32 PHT (UTC 2026-09-21T12:22:32.819Z)\nAUR14X\tfixture-universe-v2\tPARTIAL\tHISTORICAL\tREVIEW\t09/21/2026, 20:21:32 PHT (UTC 2026-09-21T12:21:32.819Z)\nAUR15X\tfixture-universe-v2\tCATALOG_ONLY\tFORWARD_COLLECTED\tFRESH\t09/21/2026, 20:20:32 PHT (UTC 2026-09-21T12:20:32.819Z)\nAUR16X\tfixture-universe-v2\tPARTIAL\tHISTORICAL\tREVIEW\t09/21/2026, 20:19:32 PHT (UTC 2026-09-21T12:19:32.819Z)\nAUR17X\tfixture-universe-v2\tCATALOG_ONLY\tFORWARD_COLLECTED\tREVIEW\t09/21/2026, 20:18:32 PHT (UTC 2026-09-21T12:18:32.819Z)\nAUR18X\tfixture-universe-v2\tPARTIAL\tHISTORICAL\tFRESH\t09/21/2026, 20:17:32 PHT (UTC 2026-09-21T12:17:32.819Z)\nAUR19X\tfixture-universe-v2\tCATALOG_ONLY\tFORWARD_COLLECTED\tREVIEW\t09/21/2026, 20:16:32 PHT (UTC 2026-09-21T12:16:32.819Z)\nAUR20X\tfixture-universe-v2\tPARTIAL\tHISTORICAL\tREVIEW\t09/21/2026, 20:15:32 PHT (UTC 2026-09-21T12:15:32.819Z)\nAUR21X\tfixture-universe-v2\tCATALOG_ONLY\tFORWARD_COLLECTED\tFRESH\t09/21/2026, 20:14:32 PHT (UTC 2026-09-21T12:14:32.819Z)\nAUR22X\tfixture-universe-v2\tPARTIAL\tHISTORICAL\tREVIEW\t09/21/2026, 20:13:32 PHT (UTC 2026-09-21T12:13:32.819Z)\nAUR23X\tfixture-universe-v2\tCATALOG_ONLY\tFORWARD_COLLECTED\tREVIEW\t09/21/2026, 20:12:32 PHT (UTC 2026-09-21T12:12:32.819Z)\nAUR24X\tfixture-universe-v2\tPARTIAL\tHISTORICAL\tFRESH\t09/21/2026, 20:11:32 PHT (UTC 2026-09-21T12:11:32.819Z)\nAUR25X\tfixture-universe-v2\tCATALOG_ONLY\tFORWARD_COLLECTED\tREVIEW\t09/21/2026, 20:10:32 PHT (UTC 2026-09-21T12:10:32.819Z)\nReports\nIdentity\tStatus\tSource\tDetails\nAURX\tREVIEW\tFORWARD_COLLECTED\tNot available\nAUR02X\tREVIEW\tHISTORICAL\tNot available\nAUR03X\tFRESH\tFORWARD_COLLECTED\tNot available\nStrategy reports\nIdentity\tStatus\tSource\tDetails\nAUR04X\tREVIEW\tHISTORICAL\tNot available\nAUR05X\tREVIEW\tFORWARD_COLLECTED\tNot available\nAUR06X\tFRESH\tHISTORICAL\tNot available\nBootstrap reports\nIdentity\tStatus\tSource\tDetails\nAUR07X\tREVIEW\tFORWARD_COLLECTED\tNot available\nAUR08X\tREVIEW\tHISTORICAL\tNot available\nAUR09X\tFRESH\tFORWARD_COLLECTED\tNot available\nCatalogs\nIdentity\tStatus\tSource\tDetails\nAURX\tREVIEW\tFORWARD_COLLECTED\tNot available\nAUR02X\tREVIEW\tHISTORICAL\tNot available\nAUR03X\tFRESH\tFORWARD_COLLECTED\tNot available\nAUR04X\tREVIEW\tHISTORICAL\tNot available\nAUR05X\tREVIEW\tFORWARD_COLLECTED\tNot available\nAUR06X\tFRESH\tHISTORICAL\tNot available\nAUR07X\tREVIEW\tFORWARD_COLLECTED\tNot available\nAUR08X\tREVIEW\tHISTORICAL\tNot available\nAUR09X\tFRESH\tFORWARD_COLLECTED\tNot available\nUniverse versions\nIdentity\tStatus\tSource\tDetails\nfixture-universe-v2\tCURRENT\tFIXTURE_SOURCE\tNot available\nAURX\n\nExact detail for the selected bounded record.\n\nNot available\nStatus\nNot available\nReason\nNot available\nUpdated\n09/21/2026, 20:35:32 PHT (UTC 2026-09-21T12:35:32.819Z)\nSource\nFORWARD_COLLECTED\nNative crypto catalog details\nSymbol\nAURX\nMarket type\ncrypto_spot\nInstrument\nAURX\nUniverse version\nfixture-universe-v2\nSource type\nFORWARD_COLLECTED\nQuality\nREVIEW\nCoverage\nCATALOG_ONLY\nReport status\nPARKED\nExact identifiers\nRecord ID\nfixture-crypto-aurora Copy\nTechnical details",
+    "headings": [
+      "Crypto research",
+      "AURX"
+    ],
+    "pagers": [
+      {
+        "tag": "DIV",
+        "role": null,
+        "label": "Pagination",
+        "text": "Previous\nPage 1 of 2\nNext",
+        "buttons": [
+          {
+            "text": "Previous",
+            "disabled": true,
+            "attributes": [
+              [
+                "class",
+                "button button-quiet"
+              ],
+              [
+                "type",
+                "button"
+              ],
+              [
+                "data-page",
+                "1"
+              ],
+              [
+                "disabled",
+                ""
+              ]
+            ]
+          },
+          {
+            "text": "Next",
+            "disabled": false,
+            "attributes": [
+              [
+                "class",
+                "button button-quiet"
+              ],
+              [
+                "type",
+                "button"
+              ],
+              [
+                "data-page",
+                "2"
+              ],
+              [
+                "false",
+                ""
+              ]
+            ]
+          }
+        ]
+      }
+    ],
+    "overflow": false,
+    "nativeFunctionLeak": false,
+    "failedRequests": []
+  },
+  {
+    "key": "research-automation",
+    "opened": {
+      "name": "fixture-hermes-aurora",
+      "href": "http://127.0.0.1:56630/?view=research&section=automation&page=1&page_size=25&detail_page=1&detail_page_size=10&shadow_page=1&direction=desc&selected=fixture-hermes-aurora&record_kind=hermes&expanded=1"
+    },
+    "linkExamples": [
+      {
+        "name": "fixture-hermes-aurora",
+        "href": "http://127.0.0.1:56630/?view=research&section=automation&page=1&page_size=25&detail_page=1&detail_page_size=10&shadow_page=1&direction=desc&selected=fixture-hermes-aurora&record_kind=hermes&expanded=1"
+      },
+      {
+        "name": "fixture-hermes-02",
+        "href": "http://127.0.0.1:56630/?view=research&section=automation&page=1&page_size=25&detail_page=1&detail_page_size=10&shadow_page=1&direction=desc&selected=fixture-hermes-02&record_kind=hermes&expanded=1"
+      },
+      {
+        "name": "fixture-hermes-03",
+        "href": "http://127.0.0.1:56630/?view=research&section=automation&page=1&page_size=25&detail_page=1&detail_page_size=10&shadow_page=1&direction=desc&selected=fixture-hermes-03&record_kind=hermes&expanded=1"
+      },
+      {
+        "name": "fixture-hermes-04",
+        "href": "http://127.0.0.1:56630/?view=research&section=automation&page=1&page_size=25&detail_page=1&detail_page_size=10&shadow_page=1&direction=desc&selected=fixture-hermes-04&record_kind=hermes&expanded=1"
+      }
+    ],
+    "runtimeErrors": [],
+    "url": "http://127.0.0.1:56630/?view=research&section=automation&page=1&page_size=25&detail_page=1&detail_page_size=10&shadow_page=1&direction=desc&selected=fixture-hermes-aurora&record_kind=hermes&expanded=true",
+    "text": "Research\nStrategies\nCrypto research\nAutomation\nData\nSearch\nStatus\nAll statuses\nPENDING\nRUNNING\nSUCCEEDED\nCOMPLETED\nREVIEW_REQUIRED\nREJECTED\nFAILED\nUNKNOWN\nINFO\nNOTICE\nWARNING\nERROR\nSort\nDefault order\nNext schedule\nStatus\nRows\n10 per page\n25 per page\n50 per page\n100 per page\nApply filters\nPrevious\nPage 1 of 2\nNext\nResearch automation\n\nSeparate queue outcomes, external connection state, schedule, and heartbeat.\n\nQueue items\n31\nPending\nNot available\nNext schedule\nNot available\nHermes connection\nNot available\nHeartbeat\nNot available\nResearch queue\nHermes research queue\nItem\tStatus\tHuman reason\tAvailable at\tSource\nfixture-hermes-aurora\tPENDING\tRefresh the bounded fixture evidence before review\t09/21/2026, 20:45:32 PHT (UTC 2026-09-21T12:45:32.819Z)\tNot available\nfixture-hermes-02\tFAILED\tFixture queue reason 02\t09/21/2026, 20:33:32 PHT (UTC 2026-09-21T12:33:32.819Z)\tNot available\nfixture-hermes-03\tPENDING\tFixture queue reason 03\t09/21/2026, 20:32:32 PHT (UTC 2026-09-21T12:32:32.819Z)\tNot available\nfixture-hermes-04\tCOMPLETE\tFixture queue reason 04\t09/21/2026, 20:31:32 PHT (UTC 2026-09-21T12:31:32.819Z)\tNot available\nfixture-hermes-05\tFAILED\tFixture queue reason 05\t09/21/2026, 20:30:32 PHT (UTC 2026-09-21T12:30:32.819Z)\tNot available\nfixture-hermes-06\tPENDING\tFixture queue reason 06\t09/21/2026, 20:29:32 PHT (UTC 2026-09-21T12:29:32.819Z)\tNot available\nfixture-hermes-07\tCOMPLETE\tFixture queue reason 07\t09/21/2026, 20:28:32 PHT (UTC 2026-09-21T12:28:32.819Z)\tNot available\nfixture-hermes-08\tFAILED\tFixture queue reason 08\t09/21/2026, 20:27:32 PHT (UTC 2026-09-21T12:27:32.819Z)\tNot available\nfixture-hermes-09\tPENDING\tFixture queue reason 09\t09/21/2026, 20:26:32 PHT (UTC 2026-09-21T12:26:32.819Z)\tNot available\nfixture-hermes-10\tCOMPLETE\tFixture queue reason 10\t09/21/2026, 20:25:32 PHT (UTC 2026-09-21T12:25:32.819Z)\tNot available\nfixture-hermes-11\tFAILED\tFixture queue reason 11\t09/21/2026, 20:24:32 PHT (UTC 2026-09-21T12:24:32.819Z)\tNot available\nfixture-hermes-12\tPENDING\tFixture queue reason 12\t09/21/2026, 20:23:32 PHT (UTC 2026-09-21T12:23:32.819Z)\tNot available\nfixture-hermes-13\tCOMPLETE\tFixture queue reason 13\t09/21/2026, 20:22:32 PHT (UTC 2026-09-21T12:22:32.819Z)\tNot available\nfixture-hermes-14\tFAILED\tFixture queue reason 14\t09/21/2026, 20:21:32 PHT (UTC 2026-09-21T12:21:32.819Z)\tNot available\nfixture-hermes-15\tPENDING\tFixture queue reason 15\t09/21/2026, 20:20:32 PHT (UTC 2026-09-21T12:20:32.819Z)\tNot available\nfixture-hermes-16\tCOMPLETE\tFixture queue reason 16\t09/21/2026, 20:19:32 PHT (UTC 2026-09-21T12:19:32.819Z)\tNot available\nfixture-hermes-17\tFAILED\tFixture queue reason 17\t09/21/2026, 20:18:32 PHT (UTC 2026-09-21T12:18:32.819Z)\tNot available\nfixture-hermes-18\tPENDING\tFixture queue reason 18\t09/21/2026, 20:17:32 PHT (UTC 2026-09-21T12:17:32.819Z)\tNot available\nfixture-hermes-19\tCOMPLETE\tFixture queue reason 19\t09/21/2026, 20:16:32 PHT (UTC 2026-09-21T12:16:32.819Z)\tNot available\nfixture-hermes-20\tFAILED\tFixture queue reason 20\t09/21/2026, 20:15:32 PHT (UTC 2026-09-21T12:15:32.819Z)\tNot available\nfixture-hermes-21\tPENDING\tFixture queue reason 21\t09/21/2026, 20:14:32 PHT (UTC 2026-09-21T12:14:32.819Z)\tNot available\nfixture-hermes-22\tCOMPLETE\tFixture queue reason 22\t09/21/2026, 20:13:32 PHT (UTC 2026-09-21T12:13:32.819Z)\tNot available\nfixture-hermes-23\tFAILED\tFixture queue reason 23\t09/21/2026, 20:12:32 PHT (UTC 2026-09-21T12:12:32.819Z)\tNot available\nfixture-hermes-24\tPENDING\tFixture queue reason 24\t09/21/2026, 20:11:32 PHT (UTC 2026-09-21T12:11:32.819Z)\tNot available\nfixture-hermes-25\tCOMPLETE\tFixture queue reason 25\t09/21/2026, 20:10:32 PHT (UTC 2026-09-21T12:10:32.819Z)\tNot available\nShadow jobs\nShadow jobs\nJob\tStatus\tNext evaluation\tBlockers\nfixture-shadow-aurora\tPARKED\t09/21/2026, 20:35:32 PHT (UTC 2026-09-21T12:35:32.819Z)\tNot available\nfixture-shadow-02\tBLOCKED\t09/21/2026, 20:37:32 PHT (UTC 2026-09-21T12:37:32.819Z)\tNot available\nfixture-shadow-03\tPARKED\t09/21/2026, 20:38:32 PHT (UTC 2026-09-21T12:38:32.819Z)\tNot available\nfixture-shadow-04\tCOMPLETE\t09/21/2026, 20:39:32 PHT (UTC 2026-09-21T12:39:32.819Z)\tNot available\nfixture-shadow-05\tBLOCKED\t09/21/2026, 20:40:32 PHT (UTC 2026-09-21T12:40:32.819Z)\tNot available\nfixture-shadow-06\tPARKED\t09/21/2026, 20:41:32 PHT (UTC 2026-09-21T12:41:32.819Z)\tNot available\nfixture-shadow-07\tCOMPLETE\t09/21/2026, 20:42:32 PHT (UTC 2026-09-21T12:42:32.819Z)\tNot available\nfixture-shadow-08\tBLOCKED\t09/21/2026, 20:43:32 PHT (UTC 2026-09-21T12:43:32.819Z)\tNot available\nfixture-shadow-09\tPARKED\t09/21/2026, 20:44:32 PHT (UTC 2026-09-21T12:44:32.819Z)\tNot available\nfixture-shadow-10\tCOMPLETE\t09/21/2026, 20:45:32 PHT (UTC 2026-09-21T12:45:32.819Z)\tNot available\nConnection is not authority\n\nHermes connection and worker heartbeat describe research automation only. Testing or completed jobs do not authorize live execution.\n\nfixture-hermes-aurora\n\nExact detail for the selected bounded record.\n\nPENDING\nStatus\nPENDING\nReason\nNot available\nUpdated\n09/21/2026, 20:35:32 PHT (UTC 2026-09-21T12:35:32.819Z)\nSource\nNot available\nHermes item details\nItem ID\nfixture-hermes-aurora\nTitle\nAurora evidence refresh\nHuman reason\nRefresh the bounded fixture evidence before review\nAvailable at\n2026-09-21T12:45:32.819089+00:00\nNext schedule\n2026-09-21T12:45:32.819089+00:00\nExact identifiers\nRecord ID\nfixture-hermes-aurora Copy\nTechnical details",
+    "headings": [
+      "Research automation",
+      "Research queue",
+      "Shadow jobs",
+      "fixture-hermes-aurora"
+    ],
+    "pagers": [
+      {
+        "tag": "DIV",
+        "role": null,
+        "label": "Pagination",
+        "text": "Previous\nPage 1 of 2\nNext",
+        "buttons": [
+          {
+            "text": "Previous",
+            "disabled": true,
+            "attributes": [
+              [
+                "class",
+                "button button-quiet"
+              ],
+              [
+                "type",
+                "button"
+              ],
+              [
+                "data-page",
+                "1"
+              ],
+              [
+                "disabled",
+                ""
+              ]
+            ]
+          },
+          {
+            "text": "Next",
+            "disabled": false,
+            "attributes": [
+              [
+                "class",
+                "button button-quiet"
+              ],
+              [
+                "type",
+                "button"
+              ],
+              [
+                "data-page",
+                "2"
+              ],
+              [
+                "false",
+                ""
+              ]
+            ]
+          }
+        ]
+      }
+    ],
+    "overflow": false,
+    "nativeFunctionLeak": false,
+    "failedRequests": []
+  },
+  {
+    "key": "research-data",
+    "opened": {
+      "name": "Aurora observations",
+      "href": "http://127.0.0.1:56630/?view=research&section=data&page=1&page_size=25&detail_page=1&detail_page_size=10&shadow_page=1&direction=desc&selected=fixture-dataset-aurora&expanded=1"
+    },
+    "linkExamples": [
+      {
+        "name": "Aurora observations",
+        "href": "http://127.0.0.1:56630/?view=research&section=data&page=1&page_size=25&detail_page=1&detail_page_size=10&shadow_page=1&direction=desc&selected=fixture-dataset-aurora&expanded=1"
+      },
+      {
+        "name": "Aurora observations 02",
+        "href": "http://127.0.0.1:56630/?view=research&section=data&page=1&page_size=25&detail_page=1&detail_page_size=10&shadow_page=1&direction=desc&selected=fixture-dataset-02&expanded=1"
+      },
+      {
+        "name": "Aurora observations 03",
+        "href": "http://127.0.0.1:56630/?view=research&section=data&page=1&page_size=25&detail_page=1&detail_page_size=10&shadow_page=1&direction=desc&selected=fixture-dataset-03&expanded=1"
+      },
+      {
+        "name": "Aurora observations 04",
+        "href": "http://127.0.0.1:56630/?view=research&section=data&page=1&page_size=25&detail_page=1&detail_page_size=10&shadow_page=1&direction=desc&selected=fixture-dataset-04&expanded=1"
+      }
+    ],
+    "runtimeErrors": [],
+    "url": "http://127.0.0.1:56630/?view=research&section=data&page=1&page_size=25&detail_page=1&detail_page_size=10&shadow_page=1&direction=desc&selected=fixture-dataset-aurora&expanded=true",
+    "text": "Research\nStrategies\nCrypto research\nAutomation\nData\nSearch\nSource\nAll sources\nHISTORICAL\nFORWARD_COLLECTED\nMarket\nAll market types\ncrypto_spot\nprediction\nTimeframe\nAll timeframes\n1m\n1h\n1d\nlive\nQuality\nAll quality states\nOHLCV\nPRICE_PROXY\nORDER_BOOK_SIMULATED\nSort\nDefault order\nNewest\nDataset\nVersion\nProvider\nInstrument\nMarket type\nTimeframe\nRows\nCompleteness\nQuality\nSource\nRows\n10 per page\n25 per page\n50 per page\n100 per page\nApply filters\nPrevious\nPage 1 of 2\nNext\nData catalog\n\nManifests, versions, coverage, and bounded missing ranges retain their source distinction.\n\nDatasets in bounded page\n25\nTotal datasets\n31\nPage\n1\nUpdated\nNot available\nBounded dataset catalog\nDataset\tVersion\tCoverage\tSource\tInstrument\tUpdated\nAurora observations\tfixture-v3\tPARTIAL\tFORWARD_COLLECTED\tfixture-aurora\t09/21/2026, 20:35:32 PHT (UTC 2026-09-21T12:35:32.819Z)\nAurora observations 02\tfixture-v2\tPARTIAL\tHISTORICAL\tfixture-aurora\t09/21/2026, 20:33:32 PHT (UTC 2026-09-21T12:33:32.819Z)\nAurora observations 03\tfixture-v3\tPARTIAL\tFORWARD_COLLECTED\tfixture-aurora\t09/21/2026, 20:32:32 PHT (UTC 2026-09-21T12:32:32.819Z)\nAurora observations 04\tfixture-v4\tPARTIAL\tHISTORICAL\tfixture-aurora\t09/21/2026, 20:31:32 PHT (UTC 2026-09-21T12:31:32.819Z)\nAurora observations 05\tfixture-v5\tPARTIAL\tFORWARD_COLLECTED\tfixture-aurora\t09/21/2026, 20:30:32 PHT (UTC 2026-09-21T12:30:32.819Z)\nAurora observations 06\tfixture-v6\tPARTIAL\tHISTORICAL\tfixture-aurora\t09/21/2026, 20:29:32 PHT (UTC 2026-09-21T12:29:32.819Z)\nAurora observations 07\tfixture-v7\tPARTIAL\tFORWARD_COLLECTED\tfixture-aurora\t09/21/2026, 20:28:32 PHT (UTC 2026-09-21T12:28:32.819Z)\nAurora observations 08\tfixture-v8\tPARTIAL\tHISTORICAL\tfixture-aurora\t09/21/2026, 20:27:32 PHT (UTC 2026-09-21T12:27:32.819Z)\nAurora observations 09\tfixture-v9\tPARTIAL\tFORWARD_COLLECTED\tfixture-aurora\t09/21/2026, 20:26:32 PHT (UTC 2026-09-21T12:26:32.819Z)\nAurora observations 10\tfixture-v10\tPARTIAL\tHISTORICAL\tfixture-aurora\t09/21/2026, 20:25:32 PHT (UTC 2026-09-21T12:25:32.819Z)\nAurora observations 11\tfixture-v11\tPARTIAL\tFORWARD_COLLECTED\tfixture-aurora\t09/21/2026, 20:24:32 PHT (UTC 2026-09-21T12:24:32.819Z)\nAurora observations 12\tfixture-v12\tPARTIAL\tHISTORICAL\tfixture-aurora\t09/21/2026, 20:23:32 PHT (UTC 2026-09-21T12:23:32.819Z)\nAurora observations 13\tfixture-v13\tPARTIAL\tFORWARD_COLLECTED\tfixture-aurora\t09/21/2026, 20:22:32 PHT (UTC 2026-09-21T12:22:32.819Z)\nAurora observations 14\tfixture-v14\tPARTIAL\tHISTORICAL\tfixture-aurora\t09/21/2026, 20:21:32 PHT (UTC 2026-09-21T12:21:32.819Z)\nAurora observations 15\tfixture-v15\tPARTIAL\tFORWARD_COLLECTED\tfixture-aurora\t09/21/2026, 20:20:32 PHT (UTC 2026-09-21T12:20:32.819Z)\nAurora observations 16\tfixture-v16\tPARTIAL\tHISTORICAL\tfixture-aurora\t09/21/2026, 20:19:32 PHT (UTC 2026-09-21T12:19:32.819Z)\nAurora observations 17\tfixture-v17\tPARTIAL\tFORWARD_COLLECTED\tfixture-aurora\t09/21/2026, 20:18:32 PHT (UTC 2026-09-21T12:18:32.819Z)\nAurora observations 18\tfixture-v18\tPARTIAL\tHISTORICAL\tfixture-aurora\t09/21/2026, 20:17:32 PHT (UTC 2026-09-21T12:17:32.819Z)\nAurora observations 19\tfixture-v19\tPARTIAL\tFORWARD_COLLECTED\tfixture-aurora\t09/21/2026, 20:16:32 PHT (UTC 2026-09-21T12:16:32.819Z)\nAurora observations 20\tfixture-v20\tPARTIAL\tHISTORICAL\tfixture-aurora\t09/21/2026, 20:15:32 PHT (UTC 2026-09-21T12:15:32.819Z)\nAurora observations 21\tfixture-v21\tPARTIAL\tFORWARD_COLLECTED\tfixture-aurora\t09/21/2026, 20:14:32 PHT (UTC 2026-09-21T12:14:32.819Z)\nAurora observations 22\tfixture-v22\tPARTIAL\tHISTORICAL\tfixture-aurora\t09/21/2026, 20:13:32 PHT (UTC 2026-09-21T12:13:32.819Z)\nAurora observations 23\tfixture-v23\tPARTIAL\tFORWARD_COLLECTED\tfixture-aurora\t09/21/2026, 20:12:32 PHT (UTC 2026-09-21T12:12:32.819Z)\nAurora observations 24\tfixture-v24\tPARTIAL\tHISTORICAL\tfixture-aurora\t09/21/2026, 20:11:32 PHT (UTC 2026-09-21T12:11:32.819Z)\nAurora observations 25\tfixture-v25\tPARTIAL\tFORWARD_COLLECTED\tfixture-aurora\t09/21/2026, 20:10:32 PHT (UTC 2026-09-21T12:10:32.819Z)\nAurora observations\n\nExact detail for the selected bounded record.\n\nNot available\nStatus\nNot available\nReason\nNot available\nUpdated\n09/21/2026, 20:35:32 PHT (UTC 2026-09-21T12:35:32.819Z)\nSource\nFORWARD_COLLECTED\nNative dataset catalog details\nDataset ID\nfixture-dataset-aurora\nDataset version\nfixture-v3\nInstrument\nfixture-aurora\nMarket type\nprediction\nTimeframe\n1h\nQuality\nPRICE_PROXY\nSource type\nFORWARD_COLLECTED\nCompleteness\nPARTIAL\nExact identifiers\nRecord ID\nfixture-dataset-aurora Copy\nMissing ranges\nRange #\tStart\tEnd\tKind\tReason\n0\t2026-09-21T00:35:32.819089+00:00\t2026-09-21T01:35:32.819089+00:00\tmissing\tNo fixture observation\n1\t2026-09-20T23:35:32.819089+00:00\t2026-09-21T00:35:32.819089+00:00\tmissing\tNo fixture observation\n2\t2026-09-20T22:35:32.819089+00:00\t2026-09-20T23:35:32.819089+00:00\tmissing\tNo fixture observation\n3\t2026-09-20T21:35:32.819089+00:00\t2026-09-20T22:35:32.819089+00:00\tmissing\tNo fixture observation\n4\t2026-09-20T20:35:32.819089+00:00\t2026-09-20T21:35:32.819089+00:00\tmissing\tNo fixture observation\n5\t2026-09-20T19:35:32.819089+00:00\t2026-09-20T20:35:32.819089+00:00\tmissing\tNo fixture observation\n6\t2026-09-20T18:35:32.819089+00:00\t2026-09-20T19:35:32.819089+00:00\tmissing\tNo fixture observation\n7\t2026-09-20T17:35:32.819089+00:00\t2026-09-20T18:35:32.819089+00:00\tmissing\tNo fixture observation\n8\t2026-09-20T16:35:32.819089+00:00\t2026-09-20T17:35:32.819089+00:00\tmissing\tNo fixture observation\n9\t2026-09-20T15:35:32.819089+00:00\t2026-09-20T16:35:32.819089+00:00\tmissing\tNo fixture observation\nPage 1 of 2 · 18 bounded recordsPreviousNext\nTechnical details",
+    "headings": [
+      "Data catalog",
+      "Aurora observations"
+    ],
+    "pagers": [
+      {
+        "tag": "DIV",
+        "role": null,
+        "label": "Pagination",
+        "text": "Previous\nPage 1 of 2\nNext",
+        "buttons": [
+          {
+            "text": "Previous",
+            "disabled": true,
+            "attributes": [
+              [
+                "class",
+                "button button-quiet"
+              ],
+              [
+                "type",
+                "button"
+              ],
+              [
+                "data-page",
+                "1"
+              ],
+              [
+                "disabled",
+                ""
+              ]
+            ]
+          },
+          {
+            "text": "Next",
+            "disabled": false,
+            "attributes": [
+              [
+                "class",
+                "button button-quiet"
+              ],
+              [
+                "type",
+                "button"
+              ],
+              [
+                "data-page",
+                "2"
+              ],
+              [
+                "false",
+                ""
+              ]
+            ]
+          }
+        ]
+      }
+    ],
+    "overflow": false,
+    "nativeFunctionLeak": false,
+    "failedRequests": []
+  },
+  {
+    "key": "activity",
+    "opened": {
+      "name": "Fixture evidence retained",
+      "href": "http://127.0.0.1:56630/?view=activity&page=1&page_size=25&detail_page=1&detail_page_size=10&shadow_page=1&direction=desc&selected=fixture-activity-1&record_kind=activity&expanded=1"
+    },
+    "linkExamples": [
+      {
+        "name": "Fixture evidence retained",
+        "href": "http://127.0.0.1:56630/?view=activity&page=1&page_size=25&detail_page=1&detail_page_size=10&shadow_page=1&direction=desc&selected=fixture-activity-1&record_kind=activity&expanded=1"
+      },
+      {
+        "name": "Fixture order observed",
+        "href": "http://127.0.0.1:56630/?view=activity&page=1&page_size=25&detail_page=1&detail_page_size=10&shadow_page=1&direction=desc&selected=fixture-activity-3&record_kind=activity&expanded=1"
+      },
+      {
+        "name": "Fixture activity event 04",
+        "href": "http://127.0.0.1:56630/?view=activity&page=1&page_size=25&detail_page=1&detail_page_size=10&shadow_page=1&direction=desc&selected=fixture-activity-04&record_kind=activity&expanded=1"
+      },
+      {
+        "name": "Fixture activity event 05",
+        "href": "http://127.0.0.1:56630/?view=activity&page=1&page_size=25&detail_page=1&detail_page_size=10&shadow_page=1&direction=desc&selected=fixture-activity-05&record_kind=activity&expanded=1"
+      }
+    ],
+    "runtimeErrors": [],
+    "url": "http://127.0.0.1:56630/?view=activity&page=1&page_size=25&detail_page=1&detail_page_size=10&shadow_page=1&direction=desc&selected=fixture-activity-1&record_kind=activity&expanded=true",
+    "text": "Search\nKind\nAll kinds\ntrading\nresearch\ndata\nsystem\ndataset\nbootstrap\ncollection\nlifecycle\nreport\ncollection_error\noperator\nStatus\nAll statuses\nPENDING\nRUNNING\nSUCCEEDED\nCOMPLETED\nREVIEW_REQUIRED\nREJECTED\nFAILED\nUNKNOWN\nINFO\nNOTICE\nWARNING\nERROR\nSort\nDefault order\nNewest\nStatus\nRows\n10 per page\n25 per page\n50 per page\n100 per page\nApply filters\nPrevious\nPage 1 of 2\nNext\nActivity\n\nA chronological, bounded audit view with truthful kind, source, status, and grouped time span.\n\nEvents in loaded page\n25\nTotal events\n31\nKinds\nNot available\nLatest\nNot available\nPage-local grouping\n\nIdentical nonfinancial messages are grouped only within this bounded page. Trading and accounting events remain individual audit evidence.\n\nActivity evidence\nActivity\tFirst time\tLast time\tKind\tSource\tStatus\tCount\nFixture evidence retained\t09/21/2026, 20:35:32 PHT (UTC 2026-09-21T12:35:32.819Z)\t09/21/2026, 20:35:32 PHT (UTC 2026-09-21T12:35:32.819Z)\tresearch\tfixture\tINFO\t2 repeated\nFixture order observed\t09/21/2026, 20:35:32 PHT (UTC 2026-09-21T12:35:32.819Z)\t09/21/2026, 20:35:32 PHT (UTC 2026-09-21T12:35:32.819Z)\ttrading\tfixture\tNOTICE\t1\nFixture activity event 04\t09/21/2026, 20:31:32 PHT (UTC 2026-09-21T12:31:32.819Z)\t09/21/2026, 20:31:32 PHT (UTC 2026-09-21T12:31:32.819Z)\ttrading\tfixture\tNOTICE\t1\nFixture activity event 05\t09/21/2026, 20:30:32 PHT (UTC 2026-09-21T12:30:32.819Z)\t09/21/2026, 20:30:32 PHT (UTC 2026-09-21T12:30:32.819Z)\tsystem\tfixture\tWARNING\t1\nFixture activity event 06\t09/21/2026, 20:29:32 PHT (UTC 2026-09-21T12:29:32.819Z)\t09/21/2026, 20:29:32 PHT (UTC 2026-09-21T12:29:32.819Z)\tresearch\tfixture\tINFO\t1\nFixture activity event 07\t09/21/2026, 20:28:32 PHT (UTC 2026-09-21T12:28:32.819Z)\t09/21/2026, 20:28:32 PHT (UTC 2026-09-21T12:28:32.819Z)\ttrading\tfixture\tNOTICE\t1\nFixture activity event 08\t09/21/2026, 20:27:32 PHT (UTC 2026-09-21T12:27:32.819Z)\t09/21/2026, 20:27:32 PHT (UTC 2026-09-21T12:27:32.819Z)\tsystem\tfixture\tWARNING\t1\nFixture activity event 09\t09/21/2026, 20:26:32 PHT (UTC 2026-09-21T12:26:32.819Z)\t09/21/2026, 20:26:32 PHT (UTC 2026-09-21T12:26:32.819Z)\tresearch\tfixture\tINFO\t1\nFixture activity event 10\t09/21/2026, 20:25:32 PHT (UTC 2026-09-21T12:25:32.819Z)\t09/21/2026, 20:25:32 PHT (UTC 2026-09-21T12:25:32.819Z)\ttrading\tfixture\tNOTICE\t1\nFixture activity event 11\t09/21/2026, 20:24:32 PHT (UTC 2026-09-21T12:24:32.819Z)\t09/21/2026, 20:24:32 PHT (UTC 2026-09-21T12:24:32.819Z)\tsystem\tfixture\tWARNING\t1\nFixture activity event 12\t09/21/2026, 20:23:32 PHT (UTC 2026-09-21T12:23:32.819Z)\t09/21/2026, 20:23:32 PHT (UTC 2026-09-21T12:23:32.819Z)\tresearch\tfixture\tINFO\t1\nFixture activity event 13\t09/21/2026, 20:22:32 PHT (UTC 2026-09-21T12:22:32.819Z)\t09/21/2026, 20:22:32 PHT (UTC 2026-09-21T12:22:32.819Z)\ttrading\tfixture\tNOTICE\t1\nFixture activity event 14\t09/21/2026, 20:21:32 PHT (UTC 2026-09-21T12:21:32.819Z)\t09/21/2026, 20:21:32 PHT (UTC 2026-09-21T12:21:32.819Z)\tsystem\tfixture\tWARNING\t1\nFixture activity event 15\t09/21/2026, 20:20:32 PHT (UTC 2026-09-21T12:20:32.819Z)\t09/21/2026, 20:20:32 PHT (UTC 2026-09-21T12:20:32.819Z)\tresearch\tfixture\tINFO\t1\nFixture activity event 16\t09/21/2026, 20:19:32 PHT (UTC 2026-09-21T12:19:32.819Z)\t09/21/2026, 20:19:32 PHT (UTC 2026-09-21T12:19:32.819Z)\ttrading\tfixture\tNOTICE\t1\nFixture activity event 17\t09/21/2026, 20:18:32 PHT (UTC 2026-09-21T12:18:32.819Z)\t09/21/2026, 20:18:32 PHT (UTC 2026-09-21T12:18:32.819Z)\tsystem\tfixture\tWARNING\t1\nFixture activity event 18\t09/21/2026, 20:17:32 PHT (UTC 2026-09-21T12:17:32.819Z)\t09/21/2026, 20:17:32 PHT (UTC 2026-09-21T12:17:32.819Z)\tresearch\tfixture\tINFO\t1\nFixture activity event 19\t09/21/2026, 20:16:32 PHT (UTC 2026-09-21T12:16:32.819Z)\t09/21/2026, 20:16:32 PHT (UTC 2026-09-21T12:16:32.819Z)\ttrading\tfixture\tNOTICE\t1\nFixture activity event 20\t09/21/2026, 20:15:32 PHT (UTC 2026-09-21T12:15:32.819Z)\t09/21/2026, 20:15:32 PHT (UTC 2026-09-21T12:15:32.819Z)\tsystem\tfixture\tWARNING\t1\nFixture activity event 21\t09/21/2026, 20:14:32 PHT (UTC 2026-09-21T12:14:32.819Z)\t09/21/2026, 20:14:32 PHT (UTC 2026-09-21T12:14:32.819Z)\tresearch\tfixture\tINFO\t1\nFixture activity event 22\t09/21/2026, 20:13:32 PHT (UTC 2026-09-21T12:13:32.819Z)\t09/21/2026, 20:13:32 PHT (UTC 2026-09-21T12:13:32.819Z)\ttrading\tfixture\tNOTICE\t1\nFixture activity event 23\t09/21/2026, 20:12:32 PHT (UTC 2026-09-21T12:12:32.819Z)\t09/21/2026, 20:12:32 PHT (UTC 2026-09-21T12:12:32.819Z)\tsystem\tfixture\tWARNING\t1\nFixture activity event 24\t09/21/2026, 20:11:32 PHT (UTC 2026-09-21T12:11:32.819Z)\t09/21/2026, 20:11:32 PHT (UTC 2026-09-21T12:11:32.819Z)\tresearch\tfixture\tINFO\t1\nFixture activity event 25\t09/21/2026, 20:10:32 PHT (UTC 2026-09-21T12:10:32.819Z)\t09/21/2026, 20:10:32 PHT (UTC 2026-09-21T12:10:32.819Z)\ttrading\tfixture\tNOTICE\t1\nFixture evidence retained\n\nExact detail for the selected bounded record.\n\nINFO\nStatus\nINFO\nReason\nNot available\nUpdated\n09/21/2026, 20:35:32 PHT (UTC 2026-09-21T12:35:32.819Z)\nSource\nfixture\nExact identifiers\nRecord ID\nfixture-activity-1 Copy\nEvent ID\nfixture-activity-1 Copy\nTechnical details",
+    "headings": [
+      "Activity",
+      "Fixture evidence retained"
+    ],
+    "pagers": [
+      {
+        "tag": "DIV",
+        "role": null,
+        "label": "Pagination",
+        "text": "Previous\nPage 1 of 2\nNext",
+        "buttons": [
+          {
+            "text": "Previous",
+            "disabled": true,
+            "attributes": [
+              [
+                "class",
+                "button button-quiet"
+              ],
+              [
+                "type",
+                "button"
+              ],
+              [
+                "data-page",
+                "1"
+              ],
+              [
+                "disabled",
+                ""
+              ]
+            ]
+          },
+          {
+            "text": "Next",
+            "disabled": false,
+            "attributes": [
+              [
+                "class",
+                "button button-quiet"
+              ],
+              [
+                "type",
+                "button"
+              ],
+              [
+                "data-page",
+                "2"
+              ],
+              [
+                "false",
+                ""
+              ]
+            ]
+          }
+        ]
+      }
+    ],
+    "overflow": false,
+    "nativeFunctionLeak": false,
+    "failedRequests": []
+  }
+]

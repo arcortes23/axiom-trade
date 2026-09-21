@@ -1,0 +1,95 @@
+{
+  "text": "A Axiom\nResearch and canary workspace\n\nOPERATE\n\nHome\nLive trading\nPortfolio\nMarkets\n\nEXPLORE\n\nResearch\nActivity\n\nMANAGE\n\nSettings & system\nLocal operator UI · guarded actions\n\nAxiom workspace\n\nHome\nBinance\n\nOffline reference\n\nRead-only workspace copy\n\nThis saved page is a safe reference only. It does not load live data, request an operator token, or send controls.\n\nStart the local Axiom dashboard to inspect current bounded projections. Navigation and control actions are intentionally disabled in this file copy.",
+  "interactive": [
+    {
+      "tag": "A",
+      "text": "A Axiom\nResearch and canary workspace"
+    },
+    {
+      "tag": "A",
+      "text": "Home"
+    },
+    {
+      "tag": "A",
+      "text": "Live trading"
+    },
+    {
+      "tag": "A",
+      "text": "Portfolio"
+    },
+    {
+      "tag": "A",
+      "text": "Markets"
+    },
+    {
+      "tag": "A",
+      "text": "Research"
+    },
+    {
+      "tag": "A",
+      "text": "Activity"
+    },
+    {
+      "tag": "A",
+      "text": "Settings & system"
+    },
+    {
+      "tag": "A",
+      "text": "Binance"
+    }
+  ],
+  "externalScripts": [],
+  "resources": [],
+  "loading": false,
+  "anchorClickProof": {
+    "anchors": [
+      {
+        "name": "A Axiom\nResearch and canary workspace",
+        "disabled": "true",
+        "tabIndex": -1
+      },
+      {
+        "name": "Home",
+        "disabled": "true",
+        "tabIndex": -1
+      },
+      {
+        "name": "Live trading",
+        "disabled": "true",
+        "tabIndex": -1
+      },
+      {
+        "name": "Portfolio",
+        "disabled": "true",
+        "tabIndex": -1
+      },
+      {
+        "name": "Markets",
+        "disabled": "true",
+        "tabIndex": -1
+      },
+      {
+        "name": "Research",
+        "disabled": "true",
+        "tabIndex": -1
+      },
+      {
+        "name": "Activity",
+        "disabled": "true",
+        "tabIndex": -1
+      },
+      {
+        "name": "Settings & system",
+        "disabled": "true",
+        "tabIndex": -1
+      },
+      {
+        "name": "Binance",
+        "disabled": "true",
+        "tabIndex": -1
+      }
+    ],
+    "urlUnchanged": true,
+    "resources": 0
+  }
+}

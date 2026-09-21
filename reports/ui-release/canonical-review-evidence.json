@@ -1,0 +1,32 @@
+{
+  "validity": {
+    "valid": true,
+    "inactiveDisabled": true,
+    "finalRequired": true
+  },
+  "pending": {
+    "disabled": true,
+    "button": "Checking current terms…",
+    "message": "Pending. Current terms are being checked; do not submit again."
+  },
+  "result": {
+    "message": "Final authorization completed with status Complete at 09/21/2026, 20:13:30 PHT (UTC 2026-09-21T12:13:30.286Z). Current authority is refreshing; this confirmation submitted no order.",
+    "button": "Completed",
+    "disabled": true
+  },
+  "calls": 2,
+  "latest": {
+    "action": "exploratory.live.review_confirm",
+    "payload": {},
+    "status": "COMPLETE"
+  },
+  "authorization": "ACTIVE",
+  "activeLive": false,
+  "paperOnly": true,
+  "armed": true,
+  "legacyProduction": false,
+  "decision": {
+    "reason_code": "NO_SIGNAL",
+    "status": "NO_SIGNAL"
+  }
+}

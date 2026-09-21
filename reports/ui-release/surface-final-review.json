@@ -1,0 +1,254 @@
+{
+  "review": "surface-final-review",
+  "status": "passed",
+  "scope": "Read-only isolated browser review of axiom/ui/app.js, axiom/ui/pages.js, tests/ui_fixture_server.py; no production access, financial/control actions, source edits, builds, tests, linters, or formatters.",
+  "fixture": {
+    "process": "surface-fixture7",
+    "url": "http://127.0.0.1:49874",
+    "upstream": "http://127.0.0.1:49873",
+    "admin": "http://127.0.0.1:49875",
+    "scenario": "prepared with all nine synthetic exact financial kinds and native-schema link fields",
+    "banner": "FIXTURE ONLY - sanitized read-only fixture; no production authority"
+  },
+  "browser": {
+    "process": "surface-chrome3",
+    "cdp": "ws://127.0.0.1:62526",
+    "session": "surface-review-pager",
+    "profile": "C:/Users/User/AppData/Local/Temp/axiom-surface-review-pager"
+  },
+  "source": {
+    "app.js_sha256": "001b4f16e64596b26920c04e3e235664f70b59e5d644cd238ef80683b1d488bf",
+    "pages.js_sha256": "93136c12a5ff0c3442197a331aff2b05964b58d534b269a48cded2f455956a77",
+    "fixture_sha256": "4bcce66f2056fc190f5bc983d32dfc2fe5d45aae6160e07ccd70e0ba5e4173a7"
+  },
+  "destinations": [
+    {
+      "route": "?view=home",
+      "title": "Home",
+      "result": "passed",
+      "checks": "Loaded current authority/session, known metrics, why-no-trades, recent activity; no detail.",
+      "evidence": [
+        "reports/ui-release/surface-home-final.png"
+      ]
+    },
+    {
+      "route": "?view=live&section=polymarket",
+      "title": "Live trading · Polymarket",
+      "result": "passed_with_limitations",
+      "checks": "Decision/readiness/per-outcome and real execution sections loaded; submission/order/position-fill links used exact kind/id paths; no control action clicked.",
+      "evidence": []
+    },
+    {
+      "route": "?view=live&section=binance",
+      "title": "Live trading · Binance",
+      "result": "passed",
+      "checks": "Parked STRICT TESTNET projection, credential-not-read notice, separate controls and no Polymarket mixing; no control action clicked.",
+      "evidence": []
+    },
+    {
+      "route": "?view=portfolio&section=real",
+      "title": "Portfolio · Real canary",
+      "result": "passed_with_limitations",
+      "checks": "Execution/accounting tables, open inventory and marks loaded; exact request_id order and position_id detail paths exercised.",
+      "evidence": []
+    },
+    {
+      "route": "?view=portfolio&section=practice",
+      "title": "Portfolio · Practice",
+      "result": "passed",
+      "checks": "After fixture correction, one synthetic paper observation loaded separately from real records; Practice only notice visible.",
+      "evidence": [
+        "reports/ui-release/surface-practice.png"
+      ]
+    },
+    {
+      "route": "?view=portfolio&section=allocations",
+      "title": "Portfolio · Allocations",
+      "result": "passed",
+      "checks": "Prepared rolling projection loaded after fixture correction; active member count 0 is distinct from proposed member count 2 and proposed $0.73 allocation.",
+      "evidence": []
+    },
+    {
+      "route": "?view=markets",
+      "title": "Markets",
+      "result": "passed",
+      "checks": "31-row catalog; question/outcome, YES/NO mid/bid/ask, category, settlement, depth, minimum affordable, freshness and source rendered; exact market detail via /api/ui-record; category/search/filtered-empty/sort asc+desc/page-size 10/25/50/100 exercised.",
+      "evidence": [
+        "reports/ui-release/surface-market-detail.png"
+      ]
+    },
+    {
+      "route": "?view=research&section=strategies",
+      "title": "Research · Strategies",
+      "result": "passed",
+      "checks": "Stage/search/sort asc+desc filters; candidate detail and exact 18-event paging (10+8), page2 selection retained, deep link/reload checked.",
+      "evidence": []
+    },
+    {
+      "route": "?view=research&section=crypto",
+      "title": "Research · Crypto",
+      "result": "passed",
+      "checks": "Catalog/reports/strategy/bootstrap/catalog/universe sections; source/search/sort exercised; AURX deep detail exposes source, quality, coverage, universe and parked report state.",
+      "evidence": []
+    },
+    {
+      "route": "?view=research&section=automation",
+      "title": "Research · Automation",
+      "result": "passed",
+      "checks": "Hermes queue filters/sorts and Shadow independent pager both loaded; Shadow page2 gives fixture-shadow-11 while queue remains independently page2; Hermes and Shadow details exercised.",
+      "evidence": [
+        "reports/ui-release/surface-automation.png"
+      ]
+    },
+    {
+      "route": "?view=research&section=data",
+      "title": "Research · Data",
+      "result": "passed",
+      "checks": "Source/market/timeframe/quality filters and catalog paging; exact 18 missing ranges page1 10/page2 8, IDs/indexes 0-17; back/forward/reload retained selected dataset and detail_page=2.",
+      "evidence": [
+        "reports/ui-release/surface-dataset-detail.png"
+      ]
+    },
+    {
+      "route": "?view=activity",
+      "title": "Activity",
+      "result": "passed",
+      "checks": "Kind/category + status/severity-like filter combinations, grouping notice, chronological bounded rows and retained financial Fixture order observed event; filtered trading+NOTICE returned 11 rows.",
+      "evidence": [
+        "reports/ui-release/surface-activity.png"
+      ]
+    },
+    {
+      "route": "?view=settings",
+      "title": "Settings & system",
+      "result": "passed_with_limitations",
+      "checks": "Risk values, supported stop rules, connection/system provenance and advanced specialist sections loaded; no financial/control writes performed.",
+      "evidence": []
+    }
+  ],
+  "aliases": {
+    "passed": [
+      "overview",
+      "canary",
+      "binance-canary",
+      "portfolio",
+      "rolling-portfolio",
+      "polymarket",
+      "candidates",
+      "crypto",
+      "hermes",
+      "shadow",
+      "datasets",
+      "activity"
+    ],
+    "observed": "Legacy aliases were tested with ?tab=; app fixes for hermes and shadow were reloaded and rechecked to Research · Automation with queue/shadow visible.",
+    "limitations": "?tab=portfolio intentionally resolves to Practice in parseRoute; canonical ?view=portfolio defaults Real. ?tab=polymarket resolves Markets, while canonical Live uses view=live&section=polymarket.",
+    "deep_link_recheck": "?tab=shadow&selected=fixture-shadow-aurora&record_kind=shadow -> Research · Automation, detailId fixture-shadow-aurora; ?tab=hermes&selected=fixture-hermes-aurora&record_kind=hermes -> Research · Automation, detailId fixture-hermes-aurora."
+  },
+  "pagination": {
+    "list_sizes": [
+      10,
+      25,
+      50,
+      100
+    ],
+    "evidence": "Markets and Strategies exercised all native list sizes; pages are bounded by native pages/has_more and no synthetic pages were inferred.",
+    "detail": {
+      "candidate_events": "18 total, pages 10+8",
+      "dataset_missing_ranges": "18 total, pages 10+8",
+      "shadow": "25 total, independent page_size=10, 10 rows/page, page2 begins fixture-shadow-11"
+    }
+  },
+  "exact_record_probe": {
+    "fixture_open_position_ids": {
+      "market": "fixture-market-aurora",
+      "order_request": "fixture-position-request-aurora",
+      "submission_attempt": "fixture-submission-aurora",
+      "fill": "fixture-position-fill-aurora",
+      "position": "fixture-position-aurora",
+      "mark": "fixture-mark-aurora",
+      "reservation": "fixture-reservation-aurora",
+      "risk-fill": "fixture-risk-fill-aurora",
+      "cashflow": "fixture-cashflow-aurora"
+    },
+    "statuses": {
+      "market": 200,
+      "order": 200,
+      "submission": 200,
+      "reservation": 200,
+      "fill": 200,
+      "risk-fill": 200,
+      "position": 200,
+      "mark": 200,
+      "cashflow": 200
+    },
+    "identity_checks": "order request_id fixture-position-request-aurora was not substituted with position_id fixture-position-aurora; submission attempt_id fixture-submission-aurora remained distinct; nonexistent market detail returned unavailable rather than unrelated fallback.",
+    "limitation": "All nine exact kinds returned HTTP 200 from the consolidated fixture and were deep-linked with selected IDs; no exact-kind coverage limitation remains."
+  },
+  "network_console": {
+    "api_success": "All exercised supported reads returned 200, including /api/ui-state, /api/v2/canary, /api/v2/paper, /api/v2/rolling-portfolio, candidate events, dataset missing-ranges, Hermes, Shadow, and exact records. Out-of-range correction made one bounded page=1 read and no retry loop.",
+    "expected_404": "Unsupported/nonexistent exact records returned 404; no unrelated single-row fallback accepted.",
+    "console_errors": [],
+    "page_errors": []
+  },
+  "findings": [],
+  "rechecked_fixes": [
+    {
+      "item": "Legacy shadow alias",
+      "result": "?tab=shadow reload now Research · Automation with Shadow jobs visible."
+    },
+    {
+      "item": "Legacy Hermes alias",
+      "result": "?tab=hermes reload now Research · Automation with Research queue and Shadow jobs visible."
+    },
+    {
+      "item": "Activity kind filter fixture",
+      "result": "kind=trading&status=NOTICE now returns 11 trading Notice rows including financial Fixture order observed."
+    },
+    {
+      "item": "Practice fixture endpoint",
+      "result": "/api/v2/paper now returns one synthetic record and UI shows one Paper record."
+    },
+    {
+      "item": "Rolling portfolio fixture endpoint",
+      "result": "/api/v2/rolling-portfolio now shows Review, active 0, proposed 2 and $1.37 shared allocation."
+    },
+    {
+      "item": "Independent Shadow pagination",
+      "result": "Shadow page2 pager visible; page2 begins fixture-shadow-11 while queue page remains independent."
+    },
+    {
+      "item": "Dataset gap count handoff",
+      "result": "Native prepared fixture truthfully reports 18 gaps, page1 10 + page2 8; back/forward/reload preserved detail state."
+    },
+    {
+      "item": "All nine exact financial kinds",
+      "result": "Consolidated prepared fixture returned HTTP 200 for market/order/submission/reservation/fill/risk-fill/position/mark/cashflow; reservation, risk-fill, cashflow deep links rendered exact selected IDs."
+    },
+    {
+      "item": "Legacy Shadow/Hermes deep links",
+      "result": "Both aliases route to Research · Automation and retain selected native entity IDs in detail panels."
+    },
+    {
+      "item": "Exact mark detail",
+      "result": "Mark detail now exposes mark price, observed/marked time, position ID and mark ID."
+    },
+    {
+      "item": "Exact cashflow detail",
+      "result": "Cashflow detail now exposes amount, native flow kind EXTERNAL, occurred time, position ID and flow ID."
+    },
+    {
+      "item": "Filtered deep-link out-of-range page recovery",
+      "result": "Initial page=2 request was corrected with one native page=1 read; replaceState preserved filter=Fixture, category=Sports, sort=category, direction=asc, selected fixture-market-25 and detail state. UI now shows 10 rows and Page 1 of 1."
+    }
+  ],
+  "screenshots": [
+    "reports/ui-release/surface-home.png",
+    "reports/ui-release/surface-home-final.png",
+    "reports/ui-release/surface-practice.png",
+    "reports/ui-release/surface-market-detail.png",
+    "reports/ui-release/surface-automation.png",
+    "reports/ui-release/surface-dataset-detail.png",
+    "reports/ui-release/surface-activity.png"
+  ]
+}

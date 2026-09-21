@@ -321,18 +321,22 @@ the raw fee term is `q*r*(p*(1-p))**e = 0.00039920`, the bounded fee is
 [place-order documentation](https://docs.polymarket.com/trading/place-orders.md),
 and [builder-fee documentation](https://docs.polymarket.com/programs/builders/fees.md).
 
-`execution_authorization.review` requires the exact purpose
-`commission exploratory automation and measure actual net results; profitability
-unproven`, a proposed shared allocation of `5.00`, a cumulative all-in BUY
-budget of `{"max_notional_usd":"5.00"}`, `FINAL_CONFIRMATION` expiry anchoring,
-and a duration of `86400` seconds. It persists the exact proposal, policy/setup
-binding, allocation, and selected market/token bindings as an unactivated
-`DRAFT`; a confirmation-time anchored draft has no effective expiry until final
-confirmation assigns its UTC expiry atomically. Legacy absolute UTC expiry
-remains valid. Review is paper-only: it does not require an active authorization
-and does not approve or submit an order. The existing
-`exploratory.live.review_confirm` action remains the only continuation after
-genuine readiness and explicit confirmation.
+The first stage is the read-only `execution_authorization.review` action. The
+UI sends the exact phrase `REVIEW EXPLORATORY AUTHORIZATION` and the native
+`values` document: the exact purpose, proposed shared allocation, lifetime
+budget, `FINAL_CONFIRMATION` expiry anchor, duration, selected setup/scope,
+and the other backend-disclosed terms. An adverse-evidence acknowledgement is
+only required and checked when the backend marks it required; the UI does not
+invent an acknowledgement requirement. This stage persists a reviewed
+unactivated `DRAFT`, does not arm authority, and does not submit an order.
+
+The final stage is the single `exploratory.live.review_confirm` action. It
+requires the exact phrase `CONFIRM EXPLORATORY LIVE` and an empty final
+payload `{}`; the client must not send a client-generated `action_id`. Opening
+or cancelling the dialog changes no authority. If the request is pending or
+uncertain, the UI performs only read-only status checks and never auto-replays
+the final action. The final action remains subject to fresh readiness and all
+native fences; it does not itself submit an order.
 
 The lifetime entry BUY budget and expiry are separate from the daily BUY
 budget; neither is reset implicitly at midnight. A SELL, filled or terminal
@@ -387,24 +391,99 @@ The single final action is `exploratory.live.review_confirm`. It must present
 complete disclosure of the strategy/setup and direction, capture/evaluator
 binding, 1–3 selected members, exact market and token, current readiness,
 account/geoblock/depth checks, active settings, lifetime budget and expiry,
-stop rules, positions, UNKNOWN usage, and exit capacity. It coordinates the
-existing reviewed fences; it does not submit an order.
+stop rules, positions, UNKNOWN usage, and exit capacity. It requires the
+exact phrase `CONFIRM EXPLORATORY LIVE` and the empty payload `{}`; it does
+not accept a client-generated action ID. It coordinates the existing reviewed
+fences and does not submit an order itself.
 
-`exploratory.live.review_confirm` remains **unclicked**. Live submission is
-disabled until explicit user confirmation through the control-wired operator
-surface. This release makes no live-order or live-fill claim; paper,
-historical, simulated, and fake-transport evidence are not execution
-evidence. Any isolated HTTP proof or test authorization is limited to its
-fake-transport fixture and is not a production venue or account
-authorization. Production remains **DISARMED** and unconfirmed.
+Opening the confirmation dialog or cancelling it changes no authority. If the
+request is pending or uncertain, the UI shows the read-only status and checks
+the existing action; it never replays the final request. This release makes
+no live-order or live-fill claim; paper, historical, simulated, and
+fake-transport evidence are not execution evidence. Any isolated HTTP proof
+or test authorization is limited to its fake-transport fixture and is not a
+production venue or account authorization. Production remains **DISARMED** and
+unconfirmed.
+
+**Stop versus Revoke:** Stop/Disable/Disarm prevents new `ENTRY` and `EXIT`
+submissions, retains the reviewed `ACTIVE` permission, and does not close,
+cancel, or liquidate existing positions. Specialist Revoke changes the
+authorization permission only; it is not a substitute for Disarm and does not
+perform position liquidation.
 
 ## Emergency rollback
 
-On a stop or emergency, pause new entries first, reconcile each UNKNOWN intent
-using its exact client order ID, then use the control-wired operator dashboard
-**Disable/Disarm** and verify the persisted state is `DISARMED`. If a setting
-must be reverted, create and review a DRAFT from the prior ACTIVE values and
-activate it with the fresh generation/hash fence; this persists settings only
-and does not activate the isolated canary. Never delete history or manually
-release a reservation to make the dashboard appear clear; failed cleanup is an
-incident.
+On a stop or emergency, pause new `ENTRY` and `EXIT` submissions first,
+reconcile each UNKNOWN intent using its exact client order ID, then use the
+control-wired operator dashboard **Disable/Disarm** and verify the persisted
+control state is `DISARMED`. Disarm retains the reviewed permission record but
+prevents new submissions; it does not close, cancel, or liquidate positions.
+If authorization permission itself must change, use the specialist Revoke
+action separately; Revoke is not Disarm. If a setting must be reverted,
+create and review a DRAFT from the prior ACTIVE values and activate it with the
+fresh generation/hash fence; this persists settings only and does not activate
+the isolated canary. Never delete history or manually release a reservation to
+make the dashboard appear clear; failed cleanup is an incident.
+
+## Beginner-friendly UI and fixture provenance
+
+The hosted operator UI now keeps the following destinations separate:
+real canary accounting, practice observations, allocation review, observed
+markets, research strategies and crypto reports, Hermes/shadow automation, data
+catalogs and bounded gaps, chronological activity, and Binance parked/Testnet
+status. A question or name is the primary label; IDs remain available in
+collapsed technical details. The UI never reconstructs totals: server-provided
+orders, fills, closed round trips, resolution payouts, open inventory, and
+UNKNOWN obligations are displayed as separate evidence. Missing values remain
+“Not available”; an actual zero remains zero.
+
+Display provenance is the bounded `/api/v2/*` projection (plus the existing
+`/api/operator`, risk, system, and status reads used by the shell). The shell
+keeps filters, sorting, pagination, selected details, and URL aliases in the
+query string. Detail requests for candidates/events, crypto reports,
+Hermes/shadow jobs, and datasets/missing-ranges use their existing bounded
+handlers.
+
+For the nine typed canary/financial record kinds `market`, `order`,
+`submission`, `reservation`, `fill`, `risk-fill`, `position`, `mark`, and
+`cashflow`, read-only details use exactly
+`/api/ui-record?kind=<kind>&id=<id>`. The kind and ID must be a supported
+identity pair: a missing/blank ID or unsupported kind returns `400`, while a
+supported kind with an unknown ID returns `404`. The handler reads only the
+bounded projected record; it does not fall back to an unrelated page-record
+endpoint or enumerate the database. Binance-specific pages retain their own
+bounded Binance projections and control/action handlers; this typed
+`/api/ui-record` contract is not a generic Binance detail endpoint.
+
+Browser captures and pure adapter tests use `tests/ui_fixture_server.py`.
+Fixtures are loopback-only, carry a visible `FIXTURE` label, use synthetic
+identifiers and values, and route through the existing DashboardServer host and
+CSRF checks. They include prepared, stale, changed, missing-account, missing-auth,
+armed-without-permission, no-members, unaffordable, network-failure, no-signal,
+open-position, partial-fill, UNKNOWN, expired, revoked, missing, and empty scenarios.
+Fixture actions are recorded only as synthetic IDs/status/history; they never authenticate a venue,
+submit an order, read credentials, or alter a production database. The loopback-only
+fixture admin URL (printed as `FIXTURE_ADMIN`) can switch scenarios, delay or drop
+responses, fail ancillary reads, and resolve an uncertain synthetic outcome. Binance
+strict Testnet remains parked with transport disabled and no generic execution
+or reconciliation probe.
+
+The admin contract is `GET /admin/status` or `/admin/action-stats`,
+`POST /admin/scenario` with `{"scenario":"stale"}`, and
+`POST /admin/behavior` with any of `{"delay_ms":250}`,
+`{"drop_next_response":true}`, `{"fail_ancillary":true}`,
+`{"uncertain_next":true}`, or `{"resolve_uncertain":true}`.
+
+For a capture, run the fixture service with
+`python -m tests.ui_fixture_server --scenario active_no_signal --legacy-html
+<token-free-baseline.html>`. It prints separate loopback URLs for the current
+hosted UI, fixture admin controls, and the legacy BEFORE baseline; the legacy
+server has no control transport.
+
+The fixture examples do not describe the live runtime. At this release boundary
+the production projection remains `armed=false`, `paper_only=true`, with no
+active authorization and a latest `REVOKED` result. The UI must display those
+backend values rather than revive an old draft or infer readiness from a worker
+lease or research status. Review is readable and non-activating until the
+existing explicit final action is deliberately used on the control-wired
+surface.

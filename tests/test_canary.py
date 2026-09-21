@@ -41,7 +41,7 @@ from axiom.canary import (
     _require_execution_authorization,
 )
 from axiom.cli import main
-from axiom.dashboard import DashboardData, _dashboard_html
+from axiom.dashboard import DashboardData
 from axiom.storage import AxiomStore, SQLiteBusyTimeout, _rolling_hash
 DIRECT_POLICY_HASH = hashlib.sha256(b"policy-direct-binding").hexdigest()
 
@@ -4736,8 +4736,8 @@ class CanaryTests(unittest.TestCase):
         self.assertIn("CANARY_NOT_ARMED", result["failures"])
         self.assertFalse(result["connectivity_only"])
 
-    def test_credentials_never_persist_or_render(self):
-        self.arm(); self.submit(); dump="\n".join(str(tuple(r)) for r in self.store.connection.iterdump()); dashboard=json.dumps(DashboardData(store=self.store).operator_data(),default=str)+_dashboard_html(); self.assertNotIn("test-only",dump+dashboard)
+    def test_credentials_never_persist_in_projection(self):
+        self.arm(); self.submit(); dump="\n".join(str(tuple(r)) for r in self.store.connection.iterdump()); dashboard=json.dumps(DashboardData(store=self.store).operator_data(),default=str); self.assertNotIn("test-only",dump+dashboard)
     def test_dashboard_preserves_killed_state_and_last_request_status(self):
         self.arm()
         self.submit("dashboard-request")
@@ -4745,14 +4745,10 @@ class CanaryTests(unittest.TestCase):
         canary = DashboardData(store=self.store).operator_data()["canary"]
         self.assertEqual(canary["micro_live_canary"], "KILLED")
         self.assertEqual(canary["last_request_status"], "MATCHED")
-        html = _dashboard_html()
         self.assertEqual(
             canary["expiry"],
             (T0 + timedelta(hours=24)).isoformat(),
         )
-        self.assertIn("SUBMITTING", html)
-        self.assertIn("last_request_status", json.dumps(canary))
-        self.assertIn("in-flight not retracted", html)
 
     def test_paper_and_real_ledgers_are_separate(self):
         self.arm()
@@ -4772,7 +4768,7 @@ class CanaryTests(unittest.TestCase):
     def test_canary_check_without_credentials_rejects_without_order(self):
         service=CanaryService(self.store,credentials=FakeCredentials(False),clock=lambda:T0); result=service.check(candidate_id="C123",venue=None); self.assertFalse(result["ready"]); self.assertIn("CREDENTIALS_NOT_CONFIGURED",result["failures"]); self.assertFalse(self.venue.submissions)
     def test_dashboard_labels_real_canary_and_production_disabled(self):
-        data=DashboardData(store=self.store).operator_data(); self.assertFalse(data["live_execution"]); self.assertFalse(PRODUCTION_LIVE_EXECUTION); self.assertIn("REAL CANARY MONEY",_dashboard_html()); self.assertEqual(data["canary"]["production_live_trading"],"DISABLED")
+        data=DashboardData(store=self.store).operator_data(); self.assertFalse(data["live_execution"]); self.assertFalse(PRODUCTION_LIVE_EXECUTION); self.assertEqual(data["canary"]["production_live_trading"],"DISABLED")
     def test_autonomous_scan_reaches_persisted_rank_after_1000_without_exceeding_tick_cap(self):
         self.service.enable_autonomous_micro_live("polymarket", self.service._settings_binding()[0], self.service._settings_binding()[1])
         ranking_run_id = "persisted-run-after-1000"
@@ -8464,14 +8460,10 @@ class CanarySignalTests(unittest.TestCase):
             0,
         )
 
-    def test_dashboard_displays_signal_readiness_separately(self):
+    def test_signal_projection_keeps_readiness_distinct_from_exchange_mutations(self):
         signal = self._signal()
         data = DashboardData(store=self.store).operator_data()
         self.assertEqual(data["canary_signal"]["signal_id"], signal["signal_id"])
-        html = _dashboard_html()
-        self.assertIn("Signal readiness", html)
-        self.assertIn("Order result", html)
-        self.assertNotIn("do_POST", html)
 
     def test_signal_submission_timeout_is_unknown(self):
         signal = self._signal()

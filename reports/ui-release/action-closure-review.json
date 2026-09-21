@@ -1,0 +1,335 @@
+{
+  "review": "action/settings/lifecycle canonical closure",
+  "scope": "Current frozen app.js canonical two-stage authorization, pending/reload/no-replay, material-term fencing, adverse acknowledgement, Stop and Revoke on isolated synthetic fixture. Catalog/state-matrix and transport/polling ownership are explicitly delegated to UiStateMatrixReview and UiNetworkReview.",
+  "reviewed_source": {
+    "worktree": "C:/Users/User/projects/axiom-ui",
+    "app_sha256": "5f6f5fea9f417dc74366fc074db6ad4f10641ffcdb7e20a188617cff33dbd460",
+    "fixture_sha256": "4bcce66f2056fc190f5bc983d32dfc2fe5d45aae6160e07ccd70e0ba5e4173a7",
+    "source_state": "fresh final freeze after pending ownership, cancellation, retry, status-recovery, and presentation corrections"
+  },
+  "completed_checks": {
+    "native_stage_one_complete": {
+      "observed": true,
+      "action": "execution_authorization.review",
+      "confirm": "REVIEW EXPLORATORY AUTHORIZATION",
+      "payload_values": {
+        "duration_seconds": 86400,
+        "expiry_anchor": "FINAL_CONFIRMATION",
+        "lifetime_budget": {
+          "max_notional_usd": "5.00"
+        },
+        "purpose": "commission exploratory automation and measure actual net results; profitability unproven",
+        "shared_allocation": "5.00",
+        "active_settings_generation": 2,
+        "active_settings_hash": "sha256:fixture-risk-active",
+        "scope_hash": "sha256:fixture-scope",
+        "scope_version": "fixture-scope-v1",
+        "selection_hash": "sha256:fixture-selection",
+        "selection_id": "fixture-selection-aurora"
+      },
+      "post_count_delta": 1,
+      "permission": "REVIEWED_ONLY",
+      "armed": false,
+      "next_stage": "Final confirmation \u00b7 Step 2",
+      "final_post_count_at_stage_transition": 0,
+      "evidence": "Current final freeze browser run: stage-one COMPLETE opened fresh Final confirmation Step 2 with zero final POST.",
+      "source_hash": "5f6f5fea9f417dc74366fc074db6ad4f10641ffcdb7e20a188617cff33dbd460"
+    },
+    "native_final_complete": {
+      "observed": true,
+      "action": "exploratory.live.review_confirm",
+      "confirm": "CONFIRM EXPLORATORY LIVE",
+      "payload": {},
+      "post_count_delta": 1,
+      "total_stage_posts": 2,
+      "status": "COMPLETE",
+      "permission": "ACTIVE",
+      "armed": true,
+      "backend_invocation": false,
+      "no_order_claim": true,
+      "source_hash": "5f6f5fea9f417dc74366fc074db6ad4f10641ffcdb7e20a188617cff33dbd460",
+      "evidence": "Current final freeze browser run: exact final review completed with payload {}, ACTIVE permission, and armed fixture state."
+    },
+    "stage_one_running_reload_read_only": {
+      "observed": true,
+      "status": "RUNNING",
+      "ok": false,
+      "reason": "OUTCOME_UNCERTAIN",
+      "post_count_before_reload": 1,
+      "post_count_after_reload_and_reopen": 1,
+      "controls": "phrase disabled; Check read-only outcome available; Outcome unresolved disabled",
+      "no_replay": true,
+      "native_resolution": "FAILED via fixture resolve_uncertain; phrase became empty/enabled and Start authorization review became an explicit retry",
+      "evidence": "Private fixture action stats and browser snapshots; reports/ui-release/action-closure-stage1-failed.png"
+    },
+    "final_running_reload_no_replay": {
+      "observed": true,
+      "status": "RUNNING",
+      "ok": false,
+      "reason": "OUTCOME_UNCERTAIN",
+      "confirm": "CONFIRM EXPLORATORY LIVE",
+      "payload": {},
+      "post_count_before_reload": 2,
+      "post_count_after_reload_and_reopen": 2,
+      "controls": "final phrase disabled; Check read-only outcome available; Outcome unresolved disabled",
+      "permission_after_reload": "REVIEWED_ONLY",
+      "armed_after_reload": false,
+      "no_replay": true,
+      "source_hash": "5f6f5fea9f417dc74366fc074db6ad4f10641ffcdb7e20a188617cff33dbd460"
+    },
+    "material_terms_fence": {
+      "observed": true,
+      "baseline_scenario": "prepared",
+      "material_change": "adverse_required (required adverse evidence acknowledgement and item added)",
+      "trigger": "fresh pre-submit GET /api/ui-state + /api/v2/canary after dialog opened",
+      "visible_result": "Terms changed while this review was open. Current terms were refreshed; review them again before re-entering the phrase.",
+      "adverse_checkbox": "dynamically present, unchecked and required after refresh",
+      "phrase_cleared": true,
+      "step_reset": "authorization review Step 1",
+      "post_count_delta": 0,
+      "evidence": "reports/ui-release/action-closure-material-fence-final.png; admin action stats total 0 after attempted stale submit"
+    },
+    "volatile_only_fence": {
+      "observed": true,
+      "change": "natural fixture timestamps advanced between dialog open and fresh pre-submit read; terms remained prepared",
+      "result": "stage-one review POST proceeded",
+      "post_count_delta": 1,
+      "no_false_stale_block": true
+    },
+    "stop_preserves_active": {
+      "observed": true,
+      "action": "canary.disarm",
+      "confirm": "DISARM",
+      "payload": {},
+      "post_count": 3,
+      "result": {
+        "armed": false,
+        "orders_cancelled": false,
+        "orders_closed": false
+      },
+      "permission_after_stop": "ACTIVE",
+      "visible": "Authorization active; control disarmed; Execution is stopped; no new entry or exit submissions will be sent."
+    },
+    "revoke_permission_only": {
+      "observed": true,
+      "action": "execution_authorization.revoke",
+      "confirm": "REVOKE EXPLORATORY AUTHORIZATION",
+      "payload": {
+        "authorization_id": "fixture-execution-authorization",
+        "expected_generation": "3",
+        "reason": "fixture review"
+      },
+      "post_count": 4,
+      "result": {
+        "active": null,
+        "status": "REVOKED",
+        "live_execution": false,
+        "paper_only": true
+      },
+      "orders_closed_or_cancelled": false,
+      "control_state": "DISARMED"
+    },
+    "exact_phrases_and_payloads": {
+      "stage_one": "REVIEW EXPLORATORY AUTHORIZATION",
+      "final": "CONFIRM EXPLORATORY LIVE",
+      "final_payload": {},
+      "no_client_action_id": true,
+      "synthetic_only": true
+    },
+    "final_pending_recovery": {
+      "observed": true,
+      "source_hash": "5f6f5fea9f417dc74366fc074db6ad4f10641ffcdb7e20a188617cff33dbd460",
+      "fixture": "http://127.0.0.1:51135",
+      "running_marker": {
+        "action": "exploratory.live.review_confirm",
+        "confirm": "CONFIRM EXPLORATORY LIVE",
+        "payload": {},
+        "post_count": 2,
+        "status": "RUNNING",
+        "ok": false,
+        "reason": "OUTCOME_UNCERTAIN"
+      },
+      "reload_reopen": {
+        "check_read_only_visible": true,
+        "outcome_unresolved_visible": true,
+        "post_count_unchanged": 2
+      },
+      "complete_resolution": {
+        "resolve": "COMPLETE",
+        "button_after_check": "Completed",
+        "permission": "ACTIVE",
+        "armed": true,
+        "post_count_unchanged": 2
+      },
+      "failed_resolution": {
+        "resolve": "FAILED",
+        "phrase_after_check": "",
+        "confirm_button_enabled": true,
+        "post_count_unchanged": 2
+      },
+      "no_repost": true,
+      "evidence": "reports/ui-release/action-closure-final-failed-recovery.png"
+    },
+    "stage_one_dropped_response": {
+      "observed": true,
+      "source_hash": "5f6f5fea9f417dc74366fc074db6ad4f10641ffcdb7e20a188617cff33dbd460",
+      "fixture_behavior": "drop_next_response=true on real stage-one review request",
+      "action": "execution_authorization.review",
+      "post_count": 1,
+      "status": "COMPLETE",
+      "ok": true,
+      "next_stage": "Final confirmation \u00b7 Step 2",
+      "final_post_count_at_transition": 0,
+      "reload_reopen": {
+        "stage_one_review_visible": true,
+        "post_count_unchanged": 1
+      },
+      "no_replay": true,
+      "evidence": "Current final freeze browser snapshot and loopback fixture action stats"
+    },
+    "stage_one_pending_complete_to_step_two": {
+      "observed": true,
+      "source_hash": "5f6f5fea9f417dc74366fc074db6ad4f10641ffcdb7e20a188617cff33dbd460",
+      "status": "COMPLETE",
+      "action": "execution_authorization.review",
+      "post_count": 1,
+      "final_post_count": 0,
+      "step_two_opened": true,
+      "auto_final": false,
+      "permission": "REVIEWED_ONLY",
+      "armed": false,
+      "evidence": "Same current final freeze dropped-response run; Step 2 appeared only after stage-one completion and no final request was issued"
+    },
+    "revoke_from_active_armed": {
+      "observed": true,
+      "source_hash": "5f6f5fea9f417dc74366fc074db6ad4f10641ffcdb7e20a188617cff33dbd460",
+      "before": {
+        "action_stats_total": 3,
+        "permission": "ACTIVE",
+        "armed": true,
+        "execution_authorization_status": "ACTIVE"
+      },
+      "action": "execution_authorization.revoke",
+      "confirm": "REVOKE EXPLORATORY AUTHORIZATION",
+      "payload": {
+        "authorization_id": "fixture-execution-authorization",
+        "expected_generation": "3",
+        "reason": "fixture direct revoke review"
+      },
+      "after": {
+        "action_stats_total": 4,
+        "permission": "REVIEWED_ONLY",
+        "execution_authorization_status": "REVOKED",
+        "armed": true,
+        "live_execution": false,
+        "paper_only": true,
+        "orders_closed_or_cancelled": false
+      },
+      "permission_only": true,
+      "evidence": "Current final freeze loopback fixture action stats artifact 22519"
+    },
+    "current_cancellation_guards": {
+      "observed": true,
+      "source_hash": "5f6f5fea9f417dc74366fc074db6ad4f10641ffcdb7e20a188617cff33dbd460",
+      "fixture": "http://127.0.0.1:60257",
+      "fresh_get_response_hold": {
+        "endpoint": "/api/ui-state",
+        "intercept": "real GET was issued and successful response held in-page; no mocked response",
+        "cancel": {
+          "held_response_released_after": "Cancel",
+          "action_stats_total": 0,
+          "new_post": false
+        },
+        "escape": {
+          "held_response_released_after": "Escape",
+          "action_stats_total": 0,
+          "new_post": false
+        },
+        "no_post_after_release": true
+      },
+      "old_check_new_attempt_interleave": {
+        "old_action": {
+          "action_id": "fixture-action-1",
+          "status": "RUNNING",
+          "count": 1
+        },
+        "old_check_response": "real /api/ui-state GET response held after issuance",
+        "old_action_resolution": "FAILED",
+        "new_action": {
+          "action_id": "fixture-action-2",
+          "status": "RUNNING",
+          "count": 2
+        },
+        "old_response_released_after_new_attempt": true,
+        "after_release": {
+          "latest_action_id": "fixture-action-2",
+          "status": "RUNNING",
+          "count": 2,
+          "outcome_unresolved_visible": true,
+          "phrase_disabled": true,
+          "check_read_only_visible": true
+        },
+        "new_marker_preserved": true
+      },
+      "close_after_dispatch": {
+        "stage_one_count": 1,
+        "final_action": "exploratory.live.review_confirm",
+        "final_status": "RUNNING",
+        "total_count": 2,
+        "confirm_payload": {},
+        "close_immediately_after_confirm": true,
+        "reload_reopen": {
+          "check_read_only_visible": true,
+          "outcome_unresolved_visible": true,
+          "phrase_disabled": true,
+          "total_count_unchanged": 2
+        },
+        "recovery_retained": true
+      }
+    }
+  },
+  "screenshots": [
+    "reports/ui-release/action-closure-prepared-home.png",
+    "reports/ui-release/action-closure-adverse-required.png",
+    "reports/ui-release/action-closure-stage1-failed.png",
+    "reports/ui-release/action-closure-material-fence-final.png",
+    "reports/ui-release/action-closure-final-failed-recovery.png"
+  ],
+  "owned_processes": {
+    "browser": "action-status-chrome",
+    "browser_cdp": "ws://127.0.0.1:62370",
+    "browser_profile": "C:/Users/User/AppData/Local/Temp/axiom-ui-action-status-profile",
+    "fixture": "action-status-fixture",
+    "fixture_url": "http://127.0.0.1:60257",
+    "fixture_upstream_url": "http://127.0.0.1:60256",
+    "fixture_admin_url": "http://127.0.0.1:60258",
+    "fixture_only": true,
+    "production_touched": false
+  },
+  "limitations": [
+    "Synthetic loopback fixture only; no production, credentials, venue APIs, DB, Binance enable/resume, or native economic backend fence was accessed.",
+    "UiStateMatrixReview owns all 19 rendered fixture-state catalog observations; UiNetworkReview owns GET503, route abort, late responses, ancillary isolation, Live natural 17s and Settings natural 62s disclosure preservation. Their reports are required for those acceptance slices and are not duplicated here.",
+    "Screenshots and report contain synthetic fixture values only; no token, request auth header, or private production value was recorded.",
+    "Cancellation/interleave guards were rechecked on final SHA 5f6f5fea with real loopback GET responses held/released in-page; the probes did not mock response bodies or contact production."
+  ],
+  "findings": [],
+  "corrected_rechecks": [
+    "Earlier expansion-state finding remains owned by the prior action report; current report does not reclassify it.",
+    "Earlier stale material-term behavior was rechecked after app SHA 060124c8: adverse material change dynamically appeared, stale POST was blocked with zero action count, and phrase/ack were cleared.",
+    "Final freeze SHA 5f6f5fea rechecked persisted final RUNNING marker through reload/read-only Check to both COMPLETE and FAILED; exact payload remained {}, no repost, and FAILED cleared the phrase for explicit retry.",
+    "Final freeze SHA 5f6f5fea reconciled dropped first-stage response/no replay, ordinary first-stage COMPLETE to fresh Step 2 without auto-final, final stored RUNNING recovery, and direct Revoke from ACTIVE+armed.",
+    "Final SHA 5f6f5fea cancellation/interleave probes held successful fresh /api/ui-state responses through Cancel and Escape with zero POSTs, released an old Check response after a newer RUNNING attempt without clearing its marker/count, and retained final RUNNING recovery after immediate close and reload."
+  ],
+  "verdict": "correct",
+  "reviewed_at": "Final freeze source SHA 5f6f5fea; isolated synthetic browser run on fixture 60257/admin60258",
+  "cleanup": {
+    "completed": true,
+    "stopped_processes": [
+      "action-status-fixture",
+      "action-status-chrome"
+    ],
+    "removed_temporary_browser_profile": "C:/Users/User/AppData/Local/Temp/axiom-ui-action-status-profile",
+    "remaining_owned_private_processes": [],
+    "production_or_shared_services_untouched": true
+  }
+}

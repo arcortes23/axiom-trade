@@ -1,0 +1,32 @@
+{
+  "uncheckedPosted": false,
+  "firstReview": {
+    "values": {
+      "active_settings_generation": 2,
+      "active_settings_hash": "sha256:fixture-risk-active",
+      "adverse_evidence_ack": true,
+      "duration_seconds": 321,
+      "expiry_anchor": "FINAL_CONFIRMATION",
+      "lifetime_budget": {
+        "max_notional_usd": "0.73"
+      },
+      "purpose": "Fixture exploratory authorization review",
+      "scope_hash": "sha256:fixture-scope",
+      "scope_version": "fixture-scope-v1",
+      "selection_hash": "sha256:fixture-selection",
+      "selection_id": "fixture-selection-aurora",
+      "shared_allocation": "1.37",
+      "stop_rules": {
+        "halt_on_unknown_execution": true,
+        "on_any_blocker": "STOP_AND_REVIEW"
+      }
+    }
+  },
+  "final": {
+    "message": "Final authorization completed with status Complete at 09/21/2026, 20:45:13 PHT (UTC 2026-09-21T12:45:13.248Z). Current authority is refreshing; this confirmation submitted no order.",
+    "calls": 2,
+    "action": "exploratory.live.review_confirm",
+    "status": "COMPLETE",
+    "payload": {}
+  }
+}

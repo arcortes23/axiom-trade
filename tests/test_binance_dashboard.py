@@ -224,12 +224,6 @@ class BinanceDashboardTests(unittest.TestCase):
         self.addCleanup(server.stop)
         assert server.url is not None
 
-        with urlopen(server.url + "/", timeout=3) as response:
-            html = response.read().decode("utf-8")
-        self.assertIn("Polymarket Canary", html)
-        self.assertIn("BINANCE SPOT CANARY", html)
-        self.assertIn("POLYMARKET TRANSPORT: DISABLED", html)
-        self.assertIn("/api/v2/binance-canary", html)
 
         with urlopen(server.url + "/api/v2/canary", timeout=3) as response:
             polymarket = json.load(response)
@@ -302,12 +296,6 @@ class BinanceDashboardTests(unittest.TestCase):
         self.addCleanup(server.stop)
         assert server.url is not None
 
-        with urlopen(server.url + "/", timeout=3) as response:
-            html = response.read().decode("utf-8")
-        self.assertIn("BINANCE SPOT TESTNET", html)
-        self.assertIn("TESTNET CONNECTIVITY", html)
-        self.assertIn("TESTNET EXECUTION PROBE", html)
-        self.assertIn("No browser action can place an order.", html)
 
         with urlopen(server.url + "/api/v2/binance-canary", timeout=3) as response:
             projected = json.load(response)
@@ -389,34 +377,6 @@ class BinanceDashboardTests(unittest.TestCase):
         self.assertNotIn("probe_confirmation", projected["status"])
 
 
-    def test_initial_binance_nav_label_uses_only_strict_facade_marker(self) -> None:
-        cases = (
-            (FakeTestnetFacade(), "BINANCE SPOT TESTNET"),
-            (FakeForeignTestnetFacade(), "BINANCE SPOT CANARY"),
-            (FakePaperFacade(), "BINANCE SPOT CANARY"),
-        )
-        for facade, expected in cases:
-            with self.subTest(facade=type(facade).__name__):
-                server = DashboardServer(
-                    port=0, data=DashboardData(binance_canary=facade)
-                ).start()
-                try:
-                    assert server.url is not None
-                    with urlopen(server.url + "/", timeout=3) as response:
-                        html = response.read().decode("utf-8")
-                finally:
-                    server.stop()
-                nav_label = f'data-view="binance-canary">{expected}</button>'
-                self.assertIn(nav_label, html)
-                other = (
-                    "BINANCE SPOT CANARY"
-                    if expected == "BINANCE SPOT TESTNET"
-                    else "BINANCE SPOT TESTNET"
-                )
-                self.assertNotIn(
-                    f'data-view="binance-canary">{other}</button>',
-                    html,
-                )
 
     def test_paper_projection_keeps_legacy_environment_shape(self) -> None:
         projected = DashboardData(

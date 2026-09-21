@@ -1,0 +1,257 @@
+{
+  "sourceRevision": "18babca0fbff71abfcef8a4e715f212cf70170cd",
+  "data": "Isolated sanitized fixtures, not production account values",
+  "captures": [
+    {
+      "destination": "home",
+      "file": "before-home-1280.png",
+      "url": "http://127.0.0.1:55212/?tab=overview&page=1&page_size=25",
+      "width": 1280,
+      "height": 900,
+      "headings": [
+        "AXIOM / OPERATOR CONSOLE",
+        "AUTOMATIC RESEARCH",
+        "RESEARCH FEED",
+        "EXTERNAL HERMES FEED",
+        "INTERNAL RESEARCH QUEUE PROCESSING",
+        "PROPOSALS",
+        "CANDIDATES",
+        "BUDGETS",
+        "CANDIDATE ADMISSION",
+        "SYSTEM CONTROL",
+        "AXIOM NODE",
+        "CRYPTO BOOTSTRAP",
+        "INTERNAL RESEARCH QUEUE",
+        "PAPER ENGINE",
+        "COLLECTOR",
+        "CREDENTIALS",
+        "HISTORICAL / FORWARD COVERAGE",
+        "CANDIDATE-BOUND FORWARD EVIDENCE",
+        "CANDIDATE LIFECYCLE FUNNEL",
+        "RESEARCH → ORDER FUNNEL",
+        "LATEST CANDIDATES",
+        "LATEST ACTIVITY",
+        "SELECTED DETAIL",
+        "EXPLORATORY LIVE FINAL REVIEW"
+      ],
+      "fixtureLabel": true,
+      "failed": []
+    },
+    {
+      "destination": "live-polymarket",
+      "file": "before-live-polymarket-1280.png",
+      "url": "http://127.0.0.1:55212/?tab=canary&page=1&page_size=25",
+      "width": 1280,
+      "height": 900,
+      "headings": [
+        "AXIOM / OPERATOR CONSOLE",
+        "REAL CANARY MONEY",
+        "AUTONOMOUS CANARY CONTROL",
+        "CUMULATIVE BUY CAP",
+        "POLYMARKET RISK SETTINGS",
+        "ACTIONABLE SIGNAL SCAN",
+        "AUTONOMOUS READINESS",
+        "RISK ENVELOPE",
+        "LATEST SIGNAL",
+        "FORWARD EVIDENCE",
+        "EXPLORATORY MICRO-CANARY AUTHORIZATION",
+        "EXPLORATORY LIVE FINAL REVIEW"
+      ],
+      "fixtureLabel": true,
+      "failed": []
+    },
+    {
+      "destination": "live-binance",
+      "file": "before-live-binance-1280.png",
+      "url": "http://127.0.0.1:55212/?tab=binance-canary&page=1&page_size=25",
+      "width": 1280,
+      "height": 900,
+      "headings": [
+        "AXIOM / OPERATOR CONSOLE",
+        "EXPLORATORY LIVE FINAL REVIEW",
+        "BINANCE SPOT CANARY",
+        "DEVELOPMENT / PAPER|TESTNET IDENTITY",
+        "READ-ONLY CONNECTIVITY / READINESS",
+        "QUALIFICATION / RANKING",
+        "RISK ENVELOPE / BUDGETS",
+        "BINANCE CONTROL",
+        "LATEST SIGNAL / NO-TRADE"
+      ],
+      "fixtureLabel": true,
+      "failed": []
+    },
+    {
+      "destination": "portfolio-real",
+      "file": "before-portfolio-real-1280.png",
+      "url": "http://127.0.0.1:55212/?tab=canary&page=1&page_size=25",
+      "width": 1280,
+      "height": 900,
+      "headings": [
+        "AXIOM / OPERATOR CONSOLE",
+        "REAL CANARY MONEY",
+        "AUTONOMOUS CANARY CONTROL",
+        "CUMULATIVE BUY CAP",
+        "POLYMARKET RISK SETTINGS",
+        "ACTIONABLE SIGNAL SCAN",
+        "AUTONOMOUS READINESS",
+        "RISK ENVELOPE",
+        "LATEST SIGNAL",
+        "FORWARD EVIDENCE",
+        "EXPLORATORY MICRO-CANARY AUTHORIZATION",
+        "EXPLORATORY LIVE FINAL REVIEW"
+      ],
+      "fixtureLabel": true,
+      "failed": []
+    },
+    {
+      "destination": "portfolio-practice",
+      "file": "before-portfolio-practice-1280.png",
+      "url": "http://127.0.0.1:55212/?tab=portfolio&page=1&page_size=25",
+      "width": 1280,
+      "height": 900,
+      "headings": [
+        "AXIOM / OPERATOR CONSOLE",
+        "PAPER PORTFOLIO",
+        "EXPLORATORY LIVE FINAL REVIEW"
+      ],
+      "fixtureLabel": true,
+      "failed": []
+    },
+    {
+      "destination": "portfolio-allocations",
+      "file": "before-portfolio-allocations-1280.png",
+      "url": "http://127.0.0.1:55212/?tab=rolling-portfolio&page=1&page_size=25",
+      "width": 1280,
+      "height": 900,
+      "headings": [
+        "AXIOM / OPERATOR CONSOLE",
+        "ROLLING PORTFOLIO",
+        "POLICY / ALLOCATION REVIEW",
+        "ADMISSION / REPLACEMENT HISTORY",
+        "EXPLORATORY LIVE FINAL REVIEW"
+      ],
+      "fixtureLabel": true,
+      "failed": []
+    },
+    {
+      "destination": "markets-polymarket",
+      "file": "before-markets-polymarket-1280.png",
+      "url": "http://127.0.0.1:55212/?tab=polymarket&page=1&page_size=25",
+      "width": 1280,
+      "height": 900,
+      "headings": [
+        "AXIOM / OPERATOR CONSOLE",
+        "POLYMARKET OPPORTUNITIES",
+        "EXPLORATORY LIVE FINAL REVIEW"
+      ],
+      "fixtureLabel": true,
+      "failed": []
+    },
+    {
+      "destination": "research-strategies",
+      "file": "before-research-strategies-1280.png",
+      "url": "http://127.0.0.1:55212/?tab=candidates&page=1&page_size=25",
+      "width": 1280,
+      "height": 900,
+      "headings": [
+        "AXIOM / OPERATOR CONSOLE",
+        "CANDIDATES",
+        "CANDIDATE DETAIL",
+        "EXPLORATORY LIVE FINAL REVIEW"
+      ],
+      "fixtureLabel": true,
+      "failed": []
+    },
+    {
+      "destination": "research-crypto",
+      "file": "before-research-crypto-1280.png",
+      "url": "http://127.0.0.1:55212/?tab=crypto&page=1&page_size=25",
+      "width": 1280,
+      "height": 900,
+      "headings": [
+        "AXIOM / OPERATOR CONSOLE",
+        "CRYPTO RESEARCH",
+        "EXPLORATORY LIVE FINAL REVIEW"
+      ],
+      "fixtureLabel": true,
+      "failed": []
+    },
+    {
+      "destination": "research-automation",
+      "file": "before-research-automation-1280.png",
+      "url": "http://127.0.0.1:55212/?tab=hermes&page=1&page_size=25",
+      "width": 1280,
+      "height": 900,
+      "headings": [
+        "AXIOM / OPERATOR CONSOLE",
+        "HERMES / RESEARCH LOOP",
+        "EXPLORATORY LIVE FINAL REVIEW"
+      ],
+      "fixtureLabel": true,
+      "failed": []
+    },
+    {
+      "destination": "research-data",
+      "file": "before-research-data-1280.png",
+      "url": "http://127.0.0.1:55212/?tab=datasets&page=1&page_size=25",
+      "width": 1280,
+      "height": 900,
+      "headings": [
+        "AXIOM / OPERATOR CONSOLE",
+        "DATASETS",
+        "EXPLORATORY LIVE FINAL REVIEW"
+      ],
+      "fixtureLabel": true,
+      "failed": []
+    },
+    {
+      "destination": "activity",
+      "file": "before-activity-1280.png",
+      "url": "http://127.0.0.1:55212/?tab=activity&page=1&page_size=25",
+      "width": 1280,
+      "height": 900,
+      "headings": [
+        "AXIOM / OPERATOR CONSOLE",
+        "ACTIVITY",
+        "EXPLORATORY LIVE FINAL REVIEW"
+      ],
+      "fixtureLabel": true,
+      "failed": []
+    },
+    {
+      "destination": "settings",
+      "file": "before-settings-1280.png",
+      "url": "http://127.0.0.1:55212/?tab=overview&page=1&page_size=25",
+      "width": 1280,
+      "height": 900,
+      "headings": [
+        "AXIOM / OPERATOR CONSOLE",
+        "AUTOMATIC RESEARCH",
+        "RESEARCH FEED",
+        "EXTERNAL HERMES FEED",
+        "INTERNAL RESEARCH QUEUE PROCESSING",
+        "PROPOSALS",
+        "CANDIDATES",
+        "BUDGETS",
+        "CANDIDATE ADMISSION",
+        "SYSTEM CONTROL",
+        "AXIOM NODE",
+        "CRYPTO BOOTSTRAP",
+        "INTERNAL RESEARCH QUEUE",
+        "PAPER ENGINE",
+        "COLLECTOR",
+        "CREDENTIALS",
+        "HISTORICAL / FORWARD COVERAGE",
+        "CANDIDATE-BOUND FORWARD EVIDENCE",
+        "CANDIDATE LIFECYCLE FUNNEL",
+        "RESEARCH → ORDER FUNNEL",
+        "LATEST CANDIDATES",
+        "LATEST ACTIVITY",
+        "SELECTED DETAIL",
+        "EXPLORATORY LIVE FINAL REVIEW"
+      ],
+      "fixtureLabel": true,
+      "failed": []
+    }
+  ]
+}

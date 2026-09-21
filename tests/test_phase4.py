@@ -10,7 +10,7 @@ from unittest.mock import patch
 from axiom.autonomous import AutonomousResearchConfig, AutonomousResearchProcessor
 from axiom.cli import _CliProbabilityModel
 from axiom.canary import CanaryService
-from axiom.dashboard import DashboardData, _dashboard_html
+from axiom.dashboard import DashboardData
 from axiom.director import research_summary, validate_hermes_proposal
 from axiom.experiment_plan import ExperimentPlan, ExperimentPlanError
 from axiom.forward import ForwardTestRegistry
@@ -2020,7 +2020,6 @@ class Phase4AutonomousLoopTests(unittest.TestCase):
             self.assertIn("autonomous", summary)
             self.assertIn("accounting", summary["autonomous"])
             self.assertIsNotNone(DashboardData(store=store).snapshot("autonomous-research"))
-            self.assertIn("autonomous-research", _dashboard_html())
             json.dumps(summary)
 
         report = ResearchReport(T0, {"bars": 0}, {"markets": 0}, ("public data only",))

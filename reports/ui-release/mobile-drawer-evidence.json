@@ -1,0 +1,112 @@
+{
+  "data": "Isolated sanitized fixture",
+  "keyboardAndResize": {
+    "opened": {
+      "drawerId": "site-navigation",
+      "drawerInert": false,
+      "mainInert": false,
+      "expanded": "true",
+      "overflow": false
+    },
+    "focus": [
+      {
+        "name": "Home",
+        "inside": true
+      },
+      {
+        "name": "Live trading",
+        "inside": true
+      },
+      {
+        "name": "Portfolio",
+        "inside": true
+      },
+      {
+        "name": "Markets",
+        "inside": true
+      },
+      {
+        "name": "Research",
+        "inside": true
+      },
+      {
+        "name": "Activity",
+        "inside": true
+      },
+      {
+        "name": "Settings & system",
+        "inside": true
+      },
+      {
+        "name": "A\nAxiom\nResearch and canary workspace",
+        "inside": true
+      },
+      {
+        "name": "Home",
+        "inside": true
+      },
+      {
+        "name": "Live trading",
+        "inside": true
+      },
+      {
+        "name": "Portfolio",
+        "inside": true
+      },
+      {
+        "name": "Markets",
+        "inside": true
+      },
+      {
+        "name": "Research",
+        "inside": true
+      },
+      {
+        "name": "Activity",
+        "inside": true
+      },
+      {
+        "name": "Settings & system",
+        "inside": true
+      },
+      {
+        "name": "A\nAxiom\nResearch and canary workspace",
+        "inside": true
+      },
+      {
+        "name": "Home",
+        "inside": true
+      },
+      {
+        "name": "Live trading",
+        "inside": true
+      },
+      {
+        "name": "Portfolio",
+        "inside": true
+      },
+      {
+        "name": "Markets",
+        "inside": true
+      }
+    ],
+    "closed": {
+      "drawerInert": true,
+      "mainInert": false,
+      "focus": "Menu"
+    },
+    "desktop": {
+      "drawerInert": false
+    },
+    "mobileAgain": {
+      "drawerInert": true,
+      "mainInert": false
+    }
+  },
+  "backgroundInertness": {
+    "mainOwnInert": false,
+    "ancestorWrapperInert": true,
+    "programmaticBackgroundFocusBlocked": true
+  },
+  "notes": "Twenty Tab presses stayed in the drawer. Escape restored Menu focus. Desktop/mobile resize updated inertness."
+}

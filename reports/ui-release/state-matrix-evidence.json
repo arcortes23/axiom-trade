@@ -1,0 +1,2566 @@
+[
+  {
+    "scenario": "prepared",
+    "url": "http://127.0.0.1:53456/?view=home",
+    "title": "AXIOM / operator console",
+    "width": 1280,
+    "height": 900,
+    "scrollWidth": 1265,
+    "bodyWidth": 1265,
+    "overflowX": false,
+    "duplicateIds": [],
+    "objectLeaks": false,
+    "headings": [
+      "Home",
+      "No active authorization",
+      "What is known now",
+      "Why no trades",
+      "Recent activity",
+      "No recent activity"
+    ],
+    "controls": [
+      {
+        "tag": "A",
+        "name": "A\nAxiom\nResearch and canary workspace",
+        "id": "",
+        "disabled": false,
+        "height": 94
+      },
+      {
+        "tag": "A",
+        "name": "Home",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Live trading",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Portfolio",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Markets",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Research",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Activity",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Settings & system",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Binance",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "BUTTON",
+        "name": "Review and start",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "BUTTON",
+        "name": "Stop canary",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Open settings",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      }
+    ],
+    "text": "A\nAxiom\nResearch and canary workspace\n\nOPERATE\n\nHome\nLive trading\nPortfolio\nMarkets\n\nEXPLORE\n\nResearch\nActivity\n\nMANAGE\n\nSettings & system\nLocal operator UI · guarded actions\n\nAxiom workspace\n\nHome\nBinance\n\nCurrent authority\n\nNo active authorization\n\nAuthorization no active authorization; control disarmed; worker last heartbeat 09/21/2026, 20:22:55 pht (utc 2026-09-21t12:22:55.634z); next no signal; readiness current; connection connected.\n\nReview needed\nSession budget\n$0.73\nMax buy\n$0.73\nDuration\n321 seconds\nMode\nExploratory Micro Canary\nMembers\n1\nAuthorization status\nNo active authorization\nControl state\nDisarmed\nWorker observation\nLast heartbeat 09/21/2026, 20:22:55 PHT (UTC 2026-09-21T12:22:55.634Z); next No Signal\nReadiness\nCurrent\nCurrent decision\nNo signal\nResearch\nResearch only\nData freshness\nCurrent\nNext supported action\n\nThe latest authorization is revoked.\n\nReview and start\nStop canary\nOpen settings\n\nAt a glance\n\nWhat is known now\nValues are copied from bounded server projections.\nRemaining session budget\n$0.73\nAuthoritative lifetime allowance only\nOpen-position cost\n$0.105\nPersisted open-cost mark\nOpen-position value\nNot available\nServer-reported marked value\nKnown net result\nNot available\nNo totals reconstructed here\nSubmissions today\n1\nLatest action\nNot available\nWhy no trades\n\nA reason is shown only when the authoritative projection provides one.\n\nNo signal\n\nThe current strategy scan did not produce an actionable signal.\n\nNext: Wait for the next supported scan.\n\nRecent activity\n\nDurable action outcomes are never inferred from a button click.\n\nNo recent activity\n\nNo bounded activity entries are available.\n\nFIXTURE ONLY - sanitized read-only fixture; no production authority",
+    "errors": [],
+    "failedRequests": [],
+    "statusFields": {
+      "authorization": "No active authorization",
+      "control": "Disarmed",
+      "worker": "Last heartbeat 09/21/2026, 20:22:55 PHT (UTC 2026-09-21T12:22:55.634Z); next No Signal",
+      "readiness": "Current",
+      "decision": "No signal",
+      "freshness": "Current",
+      "remaining": "$0.73"
+    },
+    "nextAction": "The latest authorization is revoked."
+  },
+  {
+    "scenario": "stale",
+    "url": "http://127.0.0.1:53456/?view=home",
+    "title": "AXIOM / operator console",
+    "width": 1280,
+    "height": 900,
+    "scrollWidth": 1265,
+    "bodyWidth": 1265,
+    "overflowX": false,
+    "duplicateIds": [],
+    "objectLeaks": false,
+    "headings": [
+      "Home",
+      "No active authorization",
+      "What is known now",
+      "Why no trades",
+      "Recent activity",
+      "No recent activity"
+    ],
+    "controls": [
+      {
+        "tag": "A",
+        "name": "A\nAxiom\nResearch and canary workspace",
+        "id": "",
+        "disabled": false,
+        "height": 94
+      },
+      {
+        "tag": "A",
+        "name": "Home",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Live trading",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Portfolio",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Markets",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Research",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Activity",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Settings & system",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Binance",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "BUTTON",
+        "name": "Review and start",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "BUTTON",
+        "name": "Stop canary",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Open settings",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      }
+    ],
+    "text": "A\nAxiom\nResearch and canary workspace\n\nOPERATE\n\nHome\nLive trading\nPortfolio\nMarkets\n\nEXPLORE\n\nResearch\nActivity\n\nMANAGE\n\nSettings & system\nLocal operator UI · guarded actions\n\nAxiom workspace\n\nHome\nBinance\n\nCurrent authority\n\nNo active authorization\n\nAuthorization no active authorization; control disarmed; worker last heartbeat 09/21/2026, 20:22:56 pht (utc 2026-09-21t12:22:56.109z); next no signal; readiness stale; connection connected.\n\nReview needed\nSession budget\n$0.73\nMax buy\n$0.73\nDuration\n321 seconds\nMode\nExploratory Micro Canary\nMembers\n1\nAuthorization status\nNo active authorization\nControl state\nDisarmed\nWorker observation\nLast heartbeat 09/21/2026, 20:22:56 PHT (UTC 2026-09-21T12:22:56.109Z); next No Signal\nReadiness\nStale\nCurrent decision\nNo signal\nResearch\nResearch only\nData freshness\nCurrent\nNext supported action\n\nThe latest authorization is revoked.\n\nReview and start\nStop canary\nOpen settings\n\nAt a glance\n\nWhat is known now\nValues are copied from bounded server projections.\nRemaining session budget\n$0.73\nAuthoritative lifetime allowance only\nOpen-position cost\n$0.105\nPersisted open-cost mark\nOpen-position value\nNot available\nServer-reported marked value\nKnown net result\nNot available\nNo totals reconstructed here\nSubmissions today\n1\nLatest action\nNot available\nWhy no trades\n\nA reason is shown only when the authoritative projection provides one.\n\nNo signal\n\nThe current strategy scan did not produce an actionable signal.\n\nNext: Wait for the next supported scan.\n\nRecent activity\n\nDurable action outcomes are never inferred from a button click.\n\nNo recent activity\n\nNo bounded activity entries are available.\n\nFIXTURE ONLY - sanitized read-only fixture; no production authority",
+    "errors": [],
+    "failedRequests": [],
+    "statusFields": {
+      "authorization": "No active authorization",
+      "control": "Disarmed",
+      "worker": "Last heartbeat 09/21/2026, 20:22:56 PHT (UTC 2026-09-21T12:22:56.109Z); next No Signal",
+      "readiness": "Stale",
+      "decision": "No signal",
+      "freshness": "Current",
+      "remaining": "$0.73"
+    },
+    "nextAction": "The latest authorization is revoked."
+  },
+  {
+    "scenario": "changed",
+    "url": "http://127.0.0.1:53456/?view=home",
+    "title": "AXIOM / operator console",
+    "width": 1280,
+    "height": 900,
+    "scrollWidth": 1265,
+    "bodyWidth": 1265,
+    "overflowX": false,
+    "duplicateIds": [],
+    "objectLeaks": false,
+    "headings": [
+      "Home",
+      "Review needed",
+      "What is known now",
+      "Why no trades",
+      "Recent activity",
+      "No recent activity"
+    ],
+    "controls": [
+      {
+        "tag": "A",
+        "name": "A\nAxiom\nResearch and canary workspace",
+        "id": "",
+        "disabled": false,
+        "height": 94
+      },
+      {
+        "tag": "A",
+        "name": "Home",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Live trading",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Portfolio",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Markets",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Research",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Activity",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Settings & system",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Binance",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "BUTTON",
+        "name": "Review and start",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "BUTTON",
+        "name": "Stop canary",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Open settings",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      }
+    ],
+    "text": "A\nAxiom\nResearch and canary workspace\n\nOPERATE\n\nHome\nLive trading\nPortfolio\nMarkets\n\nEXPLORE\n\nResearch\nActivity\n\nMANAGE\n\nSettings & system\nLocal operator UI · guarded actions\n\nAxiom workspace\n\nHome\nBinance\n\nCurrent authority\n\nReview needed\n\nAuthorization review needed; control disarmed; worker last heartbeat 09/21/2026, 20:22:56 pht (utc 2026-09-21t12:22:56.532z); next no signal; readiness ready; connection connected.\n\nNot active\nSession budget\n$0.73\nMax buy\n$0.73\nDuration\n321 seconds\nMode\nExploratory Micro Canary\nMembers\n1\nAuthorization status\nReview needed\nControl state\nDisarmed\nWorker observation\nLast heartbeat 09/21/2026, 20:22:56 PHT (UTC 2026-09-21T12:22:56.532Z); next No Signal\nReadiness\nReady\nCurrent decision\nNo signal\nResearch\nResearch only\nData freshness\nCurrent\nNext supported action\n\nNo active authorization is available.\n\nReview and start\nStop canary\nOpen settings\n\nAt a glance\n\nWhat is known now\nValues are copied from bounded server projections.\nRemaining session budget\n$0.73\nAuthoritative lifetime allowance only\nOpen-position cost\n$0.105\nPersisted open-cost mark\nOpen-position value\nNot available\nServer-reported marked value\nKnown net result\nNot available\nNo totals reconstructed here\nSubmissions today\n1\nLatest action\nNot available\nWhy no trades\n\nA reason is shown only when the authoritative projection provides one.\n\nNo signal\n\nThe current strategy scan did not produce an actionable signal.\n\nNext: Wait for the next supported scan.\n\nRecent activity\n\nDurable action outcomes are never inferred from a button click.\n\nNo recent activity\n\nNo bounded activity entries are available.\n\nFIXTURE ONLY - sanitized read-only fixture; no production authority",
+    "errors": [],
+    "failedRequests": [],
+    "statusFields": {
+      "authorization": "Review needed",
+      "control": "Disarmed",
+      "worker": "Last heartbeat 09/21/2026, 20:22:56 PHT (UTC 2026-09-21T12:22:56.532Z); next No Signal",
+      "readiness": "Ready",
+      "decision": "No signal",
+      "freshness": "Current",
+      "remaining": "$0.73"
+    },
+    "nextAction": "No active authorization is available."
+  },
+  {
+    "scenario": "missingaccount",
+    "url": "http://127.0.0.1:53456/?view=home",
+    "title": "AXIOM / operator console",
+    "width": 1280,
+    "height": 900,
+    "scrollWidth": 1265,
+    "bodyWidth": 1265,
+    "overflowX": false,
+    "duplicateIds": [],
+    "objectLeaks": false,
+    "headings": [
+      "Home",
+      "No active authorization",
+      "What is known now",
+      "Why no trades",
+      "Recent activity",
+      "No recent activity"
+    ],
+    "controls": [
+      {
+        "tag": "A",
+        "name": "A\nAxiom\nResearch and canary workspace",
+        "id": "",
+        "disabled": false,
+        "height": 94
+      },
+      {
+        "tag": "A",
+        "name": "Home",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Live trading",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Portfolio",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Markets",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Research",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Activity",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Settings & system",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Binance",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "BUTTON",
+        "name": "Review and start",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "BUTTON",
+        "name": "Stop canary",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Open settings",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      }
+    ],
+    "text": "A\nAxiom\nResearch and canary workspace\n\nOPERATE\n\nHome\nLive trading\nPortfolio\nMarkets\n\nEXPLORE\n\nResearch\nActivity\n\nMANAGE\n\nSettings & system\nLocal operator UI · guarded actions\n\nAxiom workspace\n\nHome\nBinance\n\nCurrent authority\n\nNo active authorization\n\nAuthorization no active authorization; control disarmed; worker last heartbeat 09/21/2026, 20:22:56 pht (utc 2026-09-21t12:22:56.973z); next no signal; readiness account disconnected; connection connected.\n\nReview needed\nSession budget\n$0.73\nMax buy\n$0.73\nDuration\n321 seconds\nMode\nExploratory Micro Canary\nMembers\n1\nAuthorization status\nNo active authorization\nControl state\nDisarmed\nWorker observation\nLast heartbeat 09/21/2026, 20:22:56 PHT (UTC 2026-09-21T12:22:56.973Z); next No Signal\nReadiness\nAccount Disconnected\nCurrent decision\nNo signal\nResearch\nResearch only\nData freshness\nCurrent\nNext supported action\n\nThe latest authorization is revoked.\n\nReview and start\nStop canary\nOpen settings\n\nAt a glance\n\nWhat is known now\nValues are copied from bounded server projections.\nRemaining session budget\n$0.73\nAuthoritative lifetime allowance only\nOpen-position cost\n$0.105\nPersisted open-cost mark\nOpen-position value\nNot available\nServer-reported marked value\nKnown net result\nNot available\nNo totals reconstructed here\nSubmissions today\n1\nLatest action\nNot available\nWhy no trades\n\nA reason is shown only when the authoritative projection provides one.\n\nNo signal\n\nThe current strategy scan did not produce an actionable signal.\n\nNext: Wait for the next supported scan.\n\nRecent activity\n\nDurable action outcomes are never inferred from a button click.\n\nNo recent activity\n\nNo bounded activity entries are available.\n\nFIXTURE ONLY - sanitized read-only fixture; no production authority",
+    "errors": [],
+    "failedRequests": [],
+    "statusFields": {
+      "authorization": "No active authorization",
+      "control": "Disarmed",
+      "worker": "Last heartbeat 09/21/2026, 20:22:56 PHT (UTC 2026-09-21T12:22:56.973Z); next No Signal",
+      "readiness": "Account Disconnected",
+      "decision": "No signal",
+      "freshness": "Current",
+      "remaining": "$0.73"
+    },
+    "nextAction": "The latest authorization is revoked."
+  },
+  {
+    "scenario": "missingauth",
+    "url": "http://127.0.0.1:53456/?view=home",
+    "title": "AXIOM / operator console",
+    "width": 1280,
+    "height": 900,
+    "scrollWidth": 1265,
+    "bodyWidth": 1265,
+    "overflowX": false,
+    "duplicateIds": [],
+    "objectLeaks": false,
+    "headings": [
+      "Home",
+      "Not active",
+      "What is known now",
+      "Why no trades",
+      "Recent activity",
+      "No recent activity"
+    ],
+    "controls": [
+      {
+        "tag": "A",
+        "name": "A\nAxiom\nResearch and canary workspace",
+        "id": "",
+        "disabled": false,
+        "height": 94
+      },
+      {
+        "tag": "A",
+        "name": "Home",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Live trading",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Portfolio",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Markets",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Research",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Activity",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Settings & system",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Binance",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "BUTTON",
+        "name": "Review and start",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "BUTTON",
+        "name": "Stop canary",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Open settings",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      }
+    ],
+    "text": "A\nAxiom\nResearch and canary workspace\n\nOPERATE\n\nHome\nLive trading\nPortfolio\nMarkets\n\nEXPLORE\n\nResearch\nActivity\n\nMANAGE\n\nSettings & system\nLocal operator UI · guarded actions\n\nAxiom workspace\n\nHome\nBinance\n\nCurrent authority\n\nNot active\n\nAuthorization not active; control disarmed; worker last heartbeat 09/21/2026, 20:22:57 pht (utc 2026-09-21t12:22:57.407z); next no signal; readiness ready; connection connected.\n\nNot active\nSession budget\nNot available\nMax buy\n$0.73\nDuration\n0 seconds\nMode\nNot Available\nMembers\n1\nAuthorization status\nNot active\nControl state\nDisarmed\nWorker observation\nLast heartbeat 09/21/2026, 20:22:57 PHT (UTC 2026-09-21T12:22:57.407Z); next No Signal\nReadiness\nReady\nCurrent decision\nNo signal\nResearch\nResearch only\nData freshness\nCurrent\nNext supported action\n\nNo active authorization is available.\n\nReview and start\nStop canary\nOpen settings\n\nAt a glance\n\nWhat is known now\nValues are copied from bounded server projections.\nRemaining session budget\n$0.73\nAuthoritative lifetime allowance only\nOpen-position cost\n$0.105\nPersisted open-cost mark\nOpen-position value\nNot available\nServer-reported marked value\nKnown net result\nNot available\nNo totals reconstructed here\nSubmissions today\n1\nLatest action\nNot available\nWhy no trades\n\nA reason is shown only when the authoritative projection provides one.\n\nNo signal\n\nThe current strategy scan did not produce an actionable signal.\n\nNext: Wait for the next supported scan.\n\nRecent activity\n\nDurable action outcomes are never inferred from a button click.\n\nNo recent activity\n\nNo bounded activity entries are available.\n\nFIXTURE ONLY - sanitized read-only fixture; no production authority",
+    "errors": [],
+    "failedRequests": [],
+    "statusFields": {
+      "authorization": "Not active",
+      "control": "Disarmed",
+      "worker": "Last heartbeat 09/21/2026, 20:22:57 PHT (UTC 2026-09-21T12:22:57.407Z); next No Signal",
+      "readiness": "Ready",
+      "decision": "No signal",
+      "freshness": "Current",
+      "remaining": "$0.73"
+    },
+    "nextAction": "No active authorization is available."
+  },
+  {
+    "scenario": "adverse_required",
+    "url": "http://127.0.0.1:53456/?view=home",
+    "title": "AXIOM / operator console",
+    "width": 1280,
+    "height": 900,
+    "scrollWidth": 1265,
+    "bodyWidth": 1265,
+    "overflowX": false,
+    "duplicateIds": [],
+    "objectLeaks": false,
+    "headings": [
+      "Home",
+      "No active authorization",
+      "What is known now",
+      "Why no trades",
+      "Recent activity",
+      "No recent activity"
+    ],
+    "controls": [
+      {
+        "tag": "A",
+        "name": "A\nAxiom\nResearch and canary workspace",
+        "id": "",
+        "disabled": false,
+        "height": 94
+      },
+      {
+        "tag": "A",
+        "name": "Home",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Live trading",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Portfolio",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Markets",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Research",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Activity",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Settings & system",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Binance",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "BUTTON",
+        "name": "Review and start",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "BUTTON",
+        "name": "Stop canary",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Open settings",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      }
+    ],
+    "text": "A\nAxiom\nResearch and canary workspace\n\nOPERATE\n\nHome\nLive trading\nPortfolio\nMarkets\n\nEXPLORE\n\nResearch\nActivity\n\nMANAGE\n\nSettings & system\nLocal operator UI · guarded actions\n\nAxiom workspace\n\nHome\nBinance\n\nCurrent authority\n\nNo active authorization\n\nAuthorization no active authorization; control disarmed; worker last heartbeat 09/21/2026, 20:22:57 pht (utc 2026-09-21t12:22:57.881z); next no signal; readiness ready; connection connected.\n\nReview needed\nSession budget\n$0.73\nMax buy\n$0.73\nDuration\n321 seconds\nMode\nExploratory Micro Canary\nMembers\n1\nAuthorization status\nNo active authorization\nControl state\nDisarmed\nWorker observation\nLast heartbeat 09/21/2026, 20:22:57 PHT (UTC 2026-09-21T12:22:57.881Z); next No Signal\nReadiness\nReady\nCurrent decision\nNo signal\nResearch\nResearch only\nData freshness\nCurrent\nNext supported action\n\nThe latest authorization is revoked.\n\nReview and start\nStop canary\nOpen settings\n\nAt a glance\n\nWhat is known now\nValues are copied from bounded server projections.\nRemaining session budget\n$0.73\nAuthoritative lifetime allowance only\nOpen-position cost\n$0.105\nPersisted open-cost mark\nOpen-position value\nNot available\nServer-reported marked value\nKnown net result\nNot available\nNo totals reconstructed here\nSubmissions today\n1\nLatest action\nNot available\nWhy no trades\n\nA reason is shown only when the authoritative projection provides one.\n\nNo signal\n\nThe current strategy scan did not produce an actionable signal.\n\nNext: Wait for the next supported scan.\n\nRecent activity\n\nDurable action outcomes are never inferred from a button click.\n\nNo recent activity\n\nNo bounded activity entries are available.\n\nFIXTURE ONLY - sanitized read-only fixture; no production authority",
+    "errors": [],
+    "failedRequests": [],
+    "statusFields": {
+      "authorization": "No active authorization",
+      "control": "Disarmed",
+      "worker": "Last heartbeat 09/21/2026, 20:22:57 PHT (UTC 2026-09-21T12:22:57.881Z); next No Signal",
+      "readiness": "Ready",
+      "decision": "No signal",
+      "freshness": "Current",
+      "remaining": "$0.73"
+    },
+    "nextAction": "The latest authorization is revoked."
+  },
+  {
+    "scenario": "adverse_not_required",
+    "url": "http://127.0.0.1:53456/?view=home",
+    "title": "AXIOM / operator console",
+    "width": 1280,
+    "height": 900,
+    "scrollWidth": 1265,
+    "bodyWidth": 1265,
+    "overflowX": false,
+    "duplicateIds": [],
+    "objectLeaks": false,
+    "headings": [
+      "Home",
+      "No active authorization",
+      "What is known now",
+      "Why no trades",
+      "Recent activity",
+      "No recent activity"
+    ],
+    "controls": [
+      {
+        "tag": "A",
+        "name": "A\nAxiom\nResearch and canary workspace",
+        "id": "",
+        "disabled": false,
+        "height": 94
+      },
+      {
+        "tag": "A",
+        "name": "Home",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Live trading",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Portfolio",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Markets",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Research",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Activity",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Settings & system",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Binance",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "BUTTON",
+        "name": "Review and start",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "BUTTON",
+        "name": "Stop canary",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Open settings",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      }
+    ],
+    "text": "A\nAxiom\nResearch and canary workspace\n\nOPERATE\n\nHome\nLive trading\nPortfolio\nMarkets\n\nEXPLORE\n\nResearch\nActivity\n\nMANAGE\n\nSettings & system\nLocal operator UI · guarded actions\n\nAxiom workspace\n\nHome\nBinance\n\nCurrent authority\n\nNo active authorization\n\nAuthorization no active authorization; control disarmed; worker last heartbeat 09/21/2026, 20:22:58 pht (utc 2026-09-21t12:22:58.314z); next no signal; readiness ready; connection connected.\n\nReview needed\nSession budget\n$0.73\nMax buy\n$0.73\nDuration\n321 seconds\nMode\nExploratory Micro Canary\nMembers\n1\nAuthorization status\nNo active authorization\nControl state\nDisarmed\nWorker observation\nLast heartbeat 09/21/2026, 20:22:58 PHT (UTC 2026-09-21T12:22:58.314Z); next No Signal\nReadiness\nReady\nCurrent decision\nNo signal\nResearch\nResearch only\nData freshness\nCurrent\nNext supported action\n\nThe latest authorization is revoked.\n\nReview and start\nStop canary\nOpen settings\n\nAt a glance\n\nWhat is known now\nValues are copied from bounded server projections.\nRemaining session budget\n$0.73\nAuthoritative lifetime allowance only\nOpen-position cost\n$0.105\nPersisted open-cost mark\nOpen-position value\nNot available\nServer-reported marked value\nKnown net result\nNot available\nNo totals reconstructed here\nSubmissions today\n1\nLatest action\nNot available\nWhy no trades\n\nA reason is shown only when the authoritative projection provides one.\n\nNo signal\n\nThe current strategy scan did not produce an actionable signal.\n\nNext: Wait for the next supported scan.\n\nRecent activity\n\nDurable action outcomes are never inferred from a button click.\n\nNo recent activity\n\nNo bounded activity entries are available.\n\nFIXTURE ONLY - sanitized read-only fixture; no production authority",
+    "errors": [],
+    "failedRequests": [],
+    "statusFields": {
+      "authorization": "No active authorization",
+      "control": "Disarmed",
+      "worker": "Last heartbeat 09/21/2026, 20:22:58 PHT (UTC 2026-09-21T12:22:58.314Z); next No Signal",
+      "readiness": "Ready",
+      "decision": "No signal",
+      "freshness": "Current",
+      "remaining": "$0.73"
+    },
+    "nextAction": "The latest authorization is revoked."
+  },
+  {
+    "scenario": "armed_no_permission",
+    "url": "http://127.0.0.1:53456/?view=home",
+    "title": "AXIOM / operator console",
+    "width": 1280,
+    "height": 900,
+    "scrollWidth": 1265,
+    "bodyWidth": 1265,
+    "overflowX": false,
+    "duplicateIds": [],
+    "objectLeaks": false,
+    "headings": [
+      "Home",
+      "Review needed",
+      "What is known now",
+      "Why no trades",
+      "Recent activity",
+      "No recent activity"
+    ],
+    "controls": [
+      {
+        "tag": "A",
+        "name": "A\nAxiom\nResearch and canary workspace",
+        "id": "",
+        "disabled": false,
+        "height": 94
+      },
+      {
+        "tag": "A",
+        "name": "Home",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Live trading",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Portfolio",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Markets",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Research",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Activity",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Settings & system",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Binance",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "BUTTON",
+        "name": "Review and start",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "BUTTON",
+        "name": "Stop canary",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Open settings",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      }
+    ],
+    "text": "A\nAxiom\nResearch and canary workspace\n\nOPERATE\n\nHome\nLive trading\nPortfolio\nMarkets\n\nEXPLORE\n\nResearch\nActivity\n\nMANAGE\n\nSettings & system\nLocal operator UI · guarded actions\n\nAxiom workspace\n\nHome\nBinance\n\nCurrent authority\n\nReview needed\n\nAuthorization review needed; control armed; worker last heartbeat 09/21/2026, 20:22:58 pht (utc 2026-09-21t12:22:58.737z); next no signal; readiness ready; connection connected.\n\nNot active\nSession budget\n$0.73\nMax buy\n$0.73\nDuration\n321 seconds\nMode\nExploratory Micro Canary\nMembers\n1\nAuthorization status\nReview needed\nControl state\nArmed\nWorker observation\nLast heartbeat 09/21/2026, 20:22:58 PHT (UTC 2026-09-21T12:22:58.737Z); next No Signal\nReadiness\nReady\nCurrent decision\nNo signal\nResearch\nResearch only\nData freshness\nCurrent\nNext supported action\n\nNo active authorization is available.\n\nReview and start\nStop canary\nOpen settings\n\nAt a glance\n\nWhat is known now\nValues are copied from bounded server projections.\nRemaining session budget\n$0.73\nAuthoritative lifetime allowance only\nOpen-position cost\n$0.105\nPersisted open-cost mark\nOpen-position value\nNot available\nServer-reported marked value\nKnown net result\nNot available\nNo totals reconstructed here\nSubmissions today\n1\nLatest action\nNot available\nWhy no trades\n\nA reason is shown only when the authoritative projection provides one.\n\nNo signal\n\nThe current strategy scan did not produce an actionable signal.\n\nNext: Wait for the next supported scan.\n\nRecent activity\n\nDurable action outcomes are never inferred from a button click.\n\nNo recent activity\n\nNo bounded activity entries are available.\n\nFIXTURE ONLY - sanitized read-only fixture; no production authority",
+    "errors": [],
+    "failedRequests": [],
+    "statusFields": {
+      "authorization": "Review needed",
+      "control": "Armed",
+      "worker": "Last heartbeat 09/21/2026, 20:22:58 PHT (UTC 2026-09-21T12:22:58.737Z); next No Signal",
+      "readiness": "Ready",
+      "decision": "No signal",
+      "freshness": "Current",
+      "remaining": "$0.73"
+    },
+    "nextAction": "No active authorization is available."
+  },
+  {
+    "scenario": "no_members",
+    "url": "http://127.0.0.1:53456/?view=home",
+    "title": "AXIOM / operator console",
+    "width": 1280,
+    "height": 900,
+    "scrollWidth": 1265,
+    "bodyWidth": 1265,
+    "overflowX": false,
+    "duplicateIds": [],
+    "objectLeaks": false,
+    "headings": [
+      "Home",
+      "No active authorization",
+      "What is known now",
+      "Why no trades",
+      "Recent activity",
+      "No recent activity"
+    ],
+    "controls": [
+      {
+        "tag": "A",
+        "name": "A\nAxiom\nResearch and canary workspace",
+        "id": "",
+        "disabled": false,
+        "height": 94
+      },
+      {
+        "tag": "A",
+        "name": "Home",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Live trading",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Portfolio",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Markets",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Research",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Activity",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Settings & system",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Binance",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "BUTTON",
+        "name": "Review and start",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "BUTTON",
+        "name": "Stop canary",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Open settings",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      }
+    ],
+    "text": "A\nAxiom\nResearch and canary workspace\n\nOPERATE\n\nHome\nLive trading\nPortfolio\nMarkets\n\nEXPLORE\n\nResearch\nActivity\n\nMANAGE\n\nSettings & system\nLocal operator UI · guarded actions\n\nAxiom workspace\n\nHome\nBinance\n\nCurrent authority\n\nNo active authorization\n\nAuthorization no active authorization; control disarmed; worker last heartbeat 09/21/2026, 20:22:59 pht (utc 2026-09-21t12:22:59.152z); next no signal; readiness ready; connection connected.\n\nReview needed\nSession budget\n$0.73\nMax buy\n$0.73\nDuration\n321 seconds\nMode\nExploratory Micro Canary\nMembers\n0\nAuthorization status\nNo active authorization\nControl state\nDisarmed\nWorker observation\nLast heartbeat 09/21/2026, 20:22:59 PHT (UTC 2026-09-21T12:22:59.152Z); next No Signal\nReadiness\nReady\nCurrent decision\nNo signal\nResearch\nResearch only\nData freshness\nCurrent\nNext supported action\n\nThe latest authorization is revoked.\n\nReview and start\nStop canary\nOpen settings\n\nAt a glance\n\nWhat is known now\nValues are copied from bounded server projections.\nRemaining session budget\n$0.73\nAuthoritative lifetime allowance only\nOpen-position cost\n$0.105\nPersisted open-cost mark\nOpen-position value\nNot available\nServer-reported marked value\nKnown net result\nNot available\nNo totals reconstructed here\nSubmissions today\n1\nLatest action\nNot available\nWhy no trades\n\nA reason is shown only when the authoritative projection provides one.\n\nNo signal\n\nThe current strategy scan did not produce an actionable signal.\n\nNext: Wait for the next supported scan.\n\nRecent activity\n\nDurable action outcomes are never inferred from a button click.\n\nNo recent activity\n\nNo bounded activity entries are available.\n\nFIXTURE ONLY - sanitized read-only fixture; no production authority",
+    "errors": [],
+    "failedRequests": [],
+    "statusFields": {
+      "authorization": "No active authorization",
+      "control": "Disarmed",
+      "worker": "Last heartbeat 09/21/2026, 20:22:59 PHT (UTC 2026-09-21T12:22:59.152Z); next No Signal",
+      "readiness": "Ready",
+      "decision": "No signal",
+      "freshness": "Current",
+      "remaining": "$0.73"
+    },
+    "nextAction": "The latest authorization is revoked."
+  },
+  {
+    "scenario": "unaffordable",
+    "url": "http://127.0.0.1:53456/?view=home",
+    "title": "AXIOM / operator console",
+    "width": 1280,
+    "height": 900,
+    "scrollWidth": 1265,
+    "bodyWidth": 1265,
+    "overflowX": false,
+    "duplicateIds": [],
+    "objectLeaks": false,
+    "headings": [
+      "Home",
+      "No active authorization",
+      "What is known now",
+      "Why no trades",
+      "Recent activity",
+      "No recent activity"
+    ],
+    "controls": [
+      {
+        "tag": "A",
+        "name": "A\nAxiom\nResearch and canary workspace",
+        "id": "",
+        "disabled": false,
+        "height": 94
+      },
+      {
+        "tag": "A",
+        "name": "Home",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Live trading",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Portfolio",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Markets",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Research",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Activity",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Settings & system",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Binance",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "BUTTON",
+        "name": "Review and start",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "BUTTON",
+        "name": "Stop canary",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Open settings",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      }
+    ],
+    "text": "A\nAxiom\nResearch and canary workspace\n\nOPERATE\n\nHome\nLive trading\nPortfolio\nMarkets\n\nEXPLORE\n\nResearch\nActivity\n\nMANAGE\n\nSettings & system\nLocal operator UI · guarded actions\n\nAxiom workspace\n\nHome\nBinance\n\nCurrent authority\n\nNo active authorization\n\nAuthorization no active authorization; control disarmed; worker last heartbeat 09/21/2026, 20:22:59 pht (utc 2026-09-21t12:22:59.552z); next no signal; readiness ready; connection connected.\n\nReview needed\nSession budget\n$0.73\nMax buy\n$0.73\nDuration\n321 seconds\nMode\nExploratory Micro Canary\nMembers\n1\nAuthorization status\nNo active authorization\nControl state\nDisarmed\nWorker observation\nLast heartbeat 09/21/2026, 20:22:59 PHT (UTC 2026-09-21T12:22:59.552Z); next No Signal\nReadiness\nReady\nCurrent decision\nBudget not available\nResearch\nResearch only\nData freshness\nCurrent\nNext supported action\n\nThe latest authorization is revoked.\n\nReview and start\nStop canary\nOpen settings\n\nAt a glance\n\nWhat is known now\nValues are copied from bounded server projections.\nRemaining session budget\n$0.00\nAuthoritative lifetime allowance only\nOpen-position cost\n$0.105\nPersisted open-cost mark\nOpen-position value\nNot available\nServer-reported marked value\nKnown net result\nNot available\nNo totals reconstructed here\nSubmissions today\n1\nLatest action\nNot available\nWhy no trades\n\nA reason is shown only when the authoritative projection provides one.\n\nBudget not available\n\nThe current authoritative allowance cannot support this action.\n\nNext: Review the limits and current usage.\n\nRecent activity\n\nDurable action outcomes are never inferred from a button click.\n\nNo recent activity\n\nNo bounded activity entries are available.\n\nFIXTURE ONLY - sanitized read-only fixture; no production authority",
+    "errors": [],
+    "failedRequests": [],
+    "statusFields": {
+      "authorization": "No active authorization",
+      "control": "Disarmed",
+      "worker": "Last heartbeat 09/21/2026, 20:22:59 PHT (UTC 2026-09-21T12:22:59.552Z); next No Signal",
+      "readiness": "Ready",
+      "decision": "Budget not available",
+      "freshness": "Current",
+      "remaining": "$0.00"
+    },
+    "nextAction": "The latest authorization is revoked."
+  },
+  {
+    "scenario": "network_failure",
+    "url": "http://127.0.0.1:53456/?view=home",
+    "title": "AXIOM / operator console",
+    "width": 1280,
+    "height": 900,
+    "scrollWidth": 1265,
+    "bodyWidth": 1265,
+    "overflowX": false,
+    "duplicateIds": [],
+    "objectLeaks": false,
+    "headings": [
+      "Home",
+      "No active authorization",
+      "What is known now",
+      "Why no trades",
+      "Recent activity",
+      "No recent activity"
+    ],
+    "controls": [
+      {
+        "tag": "A",
+        "name": "A\nAxiom\nResearch and canary workspace",
+        "id": "",
+        "disabled": false,
+        "height": 94
+      },
+      {
+        "tag": "A",
+        "name": "Home",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Live trading",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Portfolio",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Markets",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Research",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Activity",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Settings & system",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Binance",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "BUTTON",
+        "name": "Review and start",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "BUTTON",
+        "name": "Stop canary",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Open settings",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      }
+    ],
+    "text": "A\nAxiom\nResearch and canary workspace\n\nOPERATE\n\nHome\nLive trading\nPortfolio\nMarkets\n\nEXPLORE\n\nResearch\nActivity\n\nMANAGE\n\nSettings & system\nLocal operator UI · guarded actions\n\nAxiom workspace\n\nHome\nBinance\n\nCurrent authority\n\nNo active authorization\n\nAuthorization no active authorization; control disarmed; worker last heartbeat 09/21/2026, 20:22:59 pht (utc 2026-09-21t12:22:59.995z); next no signal; readiness ready; connection connected.\n\nReview needed\nSession budget\n$0.73\nMax buy\n$0.73\nDuration\n321 seconds\nMode\nExploratory Micro Canary\nMembers\n1\nAuthorization status\nNo active authorization\nControl state\nDisarmed\nWorker observation\nLast heartbeat 09/21/2026, 20:22:59 PHT (UTC 2026-09-21T12:22:59.995Z); next No Signal\nReadiness\nReady\nCurrent decision\nNo signal\nResearch\nResearch only\nData freshness\nCurrent\nNext supported action\n\nThe latest authorization is revoked.\n\nReview and start\nStop canary\nOpen settings\n\nAt a glance\n\nWhat is known now\nValues are copied from bounded server projections.\nRemaining session budget\n$0.73\nAuthoritative lifetime allowance only\nOpen-position cost\n$0.105\nPersisted open-cost mark\nOpen-position value\nNot available\nServer-reported marked value\nKnown net result\nNot available\nNo totals reconstructed here\nSubmissions today\n1\nLatest action\nNot available\nWhy no trades\n\nA reason is shown only when the authoritative projection provides one.\n\nNo signal\n\nThe current strategy scan did not produce an actionable signal.\n\nNext: Wait for the next supported scan.\n\nRecent activity\n\nDurable action outcomes are never inferred from a button click.\n\nNo recent activity\n\nNo bounded activity entries are available.\n\nFIXTURE ONLY - sanitized read-only fixture; no production authority",
+    "errors": [],
+    "failedRequests": [],
+    "statusFields": {
+      "authorization": "No active authorization",
+      "control": "Disarmed",
+      "worker": "Last heartbeat 09/21/2026, 20:22:59 PHT (UTC 2026-09-21T12:22:59.995Z); next No Signal",
+      "readiness": "Ready",
+      "decision": "No signal",
+      "freshness": "Current",
+      "remaining": "$0.73"
+    },
+    "nextAction": "The latest authorization is revoked."
+  },
+  {
+    "scenario": "active_no_signal",
+    "url": "http://127.0.0.1:53456/?view=home",
+    "title": "AXIOM / operator console",
+    "width": 1280,
+    "height": 900,
+    "scrollWidth": 1265,
+    "bodyWidth": 1265,
+    "overflowX": false,
+    "duplicateIds": [],
+    "objectLeaks": false,
+    "headings": [
+      "Home",
+      "Exploratory authorization active",
+      "What is known now",
+      "Why no trades",
+      "Recent activity",
+      "No recent activity"
+    ],
+    "controls": [
+      {
+        "tag": "A",
+        "name": "A\nAxiom\nResearch and canary workspace",
+        "id": "",
+        "disabled": false,
+        "height": 94
+      },
+      {
+        "tag": "A",
+        "name": "Home",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Live trading",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Portfolio",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Markets",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Research",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Activity",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Settings & system",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Binance",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Open Live trading",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "BUTTON",
+        "name": "Stop canary",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Open settings",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      }
+    ],
+    "text": "A\nAxiom\nResearch and canary workspace\n\nOPERATE\n\nHome\nLive trading\nPortfolio\nMarkets\n\nEXPLORE\n\nResearch\nActivity\n\nMANAGE\n\nSettings & system\nLocal operator UI · guarded actions\n\nAxiom workspace\n\nHome\nBinance\n\nCurrent authority\n\nExploratory authorization active\n\nAuthorization active; control armed; worker last heartbeat 09/21/2026, 20:23:00 pht (utc 2026-09-21t12:23:00.415z); next no signal; readiness ready; connection connected.\n\nAuthorization active\nSession budget\n$0.73\nMax buy\n$0.73\nDuration\n321 seconds\nMode\nExploratory Micro Canary\nMembers\n1\nCurrent authorization\nActive\nControl state\nArmed\nWorker observation\nLast heartbeat 09/21/2026, 20:23:00 PHT (UTC 2026-09-21T12:23:00.415Z); next No Signal\nReadiness\nReady\nCurrent decision\nNo signal\nResearch\nResearch only\nData freshness\nCurrent\nNext supported action\n\nCurrent checks report a supported ready state.\n\nOpen Live trading\nStop canary\nOpen settings\n\nAt a glance\n\nWhat is known now\nValues are copied from bounded server projections.\nRemaining session budget\n$0.73\nAuthoritative lifetime allowance only\nOpen-position cost\n$0.105\nPersisted open-cost mark\nOpen-position value\nNot available\nServer-reported marked value\nKnown net result\nNot available\nNo totals reconstructed here\nSubmissions today\n1\nLatest action\nNot available\nWhy no trades\n\nA reason is shown only when the authoritative projection provides one.\n\nNo signal\n\nThe current strategy scan did not produce an actionable signal.\n\nNext: Wait for the next supported scan.\n\nRecent activity\n\nDurable action outcomes are never inferred from a button click.\n\nNo recent activity\n\nNo bounded activity entries are available.\n\nFIXTURE ONLY - sanitized read-only fixture; no production authority",
+    "errors": [],
+    "failedRequests": [],
+    "statusFields": {
+      "authorization": null,
+      "control": "Armed",
+      "worker": "Last heartbeat 09/21/2026, 20:23:00 PHT (UTC 2026-09-21T12:23:00.415Z); next No Signal",
+      "readiness": "Ready",
+      "decision": "No signal",
+      "freshness": "Current",
+      "remaining": "$0.73"
+    },
+    "nextAction": "Current checks report a supported ready state."
+  },
+  {
+    "scenario": "open_position",
+    "url": "http://127.0.0.1:53456/?view=live&section=polymarket",
+    "title": "AXIOM / operator console",
+    "width": 1280,
+    "height": 900,
+    "scrollWidth": 1265,
+    "bodyWidth": 1265,
+    "overflowX": false,
+    "duplicateIds": [],
+    "objectLeaks": false,
+    "headings": [
+      "Live trading · Polymarket",
+      "No active authorization",
+      "Polymarket canary",
+      "Decision",
+      "Market input",
+      "Signal",
+      "Readiness",
+      "Resting records",
+      "Partial records",
+      "Per-outcome feasibility",
+      "Real canary portfolio",
+      "Execution authority",
+      "Closed positions and settled round trips",
+      "Resolution payouts",
+      "Unknown obligations"
+    ],
+    "controls": [
+      {
+        "tag": "A",
+        "name": "A\nAxiom\nResearch and canary workspace",
+        "id": "",
+        "disabled": false,
+        "height": 94
+      },
+      {
+        "tag": "A",
+        "name": "Home",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Live trading",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Portfolio",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Markets",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Research",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Activity",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Settings & system",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Binance",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Polymarket",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Binance",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "INPUT",
+        "name": "filter",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "SELECT",
+        "name": "Default order",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "SELECT",
+        "name": "10 per page\n25 per page\n50 per page\n100 per page",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "BUTTON",
+        "name": "Apply filters",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "BUTTON",
+        "name": "Previous",
+        "id": "",
+        "disabled": true,
+        "height": 44
+      },
+      {
+        "tag": "BUTTON",
+        "name": "Next",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "BUTTON",
+        "name": "Review and start",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "BUTTON",
+        "name": "Stop canary",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Open settings",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "fixture-submission-aurora",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "fixture-position-request-aurora",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "fixture-position-fill-aurora",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "fixture-position-aurora",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "fixture-position-aurora",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "SUMMARY",
+        "name": "Technical details",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      }
+    ],
+    "text": "A\nAxiom\nResearch and canary workspace\n\nOPERATE\n\nHome\nLive trading\nPortfolio\nMarkets\n\nEXPLORE\n\nResearch\nActivity\n\nMANAGE\n\nSettings & system\nLocal operator UI · guarded actions\n\nAxiom workspace\n\nLive trading · Polymarket\nBinance\nLive trading\nPolymarket\nBinance\nSearch\nSort\nDefault order\nRows\n10 per page\n25 per page\n50 per page\n100 per page\nApply filters\nPrevious\nPage 1\nNext\n\nCurrent authority\n\nNo active authorization\n\nAuthorization no active authorization; control disarmed; worker last heartbeat 09/21/2026, 20:23:00 pht (utc 2026-09-21t12:23:00.834z); next no signal; readiness ready; connection connected.\n\nReview needed\nSession budget\n$0.73\nMax buy\n$0.73\nDuration\n321 seconds\nMode\nExploratory Micro Canary\nMembers\n1\nAuthorization status\nNo active authorization\nControl state\nDisarmed\nWorker observation\nLast heartbeat 09/21/2026, 20:23:00 PHT (UTC 2026-09-21T12:23:00.834Z); next No Signal\nReadiness\nReady\nCurrent decision\nNo signal\nResearch\nResearch only\nData freshness\nCurrent\nNext supported action\n\nThe latest authorization is revoked.\n\nReview and start\nStop canary\nOpen settings\n\nLive decision boundary\n\nPolymarket canary\n\nDecision, market input, signal, readiness, and persisted execution evidence remain separate.\n\nDISARMED\nDecision\nNo Signal\n\nNot available\n\nMarket input\nNot available\n\nNot available\n\nSignal\nNot available\n\nNot available\n\nReadiness\nREADY\n\nNot available\n\nResting records\n1\n\nPersisted orders or fills currently marked resting/open/pending.\n\nPartial records\n1\n\nPersisted orders or fills currently marked partial.\n\nAffordability\n\nPer-outcome feasibility\nServer-provided values only\nNot available\nReal canary portfolio\n\nExecution records and accounting evidence from the canary only; practice results stay separate.\n\nExecution authority\nAuthorization\nREVOKED\nMode\nEXPLORATORY_MICRO_CANARY\nWorker decision\nNO_SIGNAL\nWorker tick\n09/21/2026, 20:23:00 PHT (UTC 2026-09-21T12:23:00.834Z)\nReadiness\nREADY\nAccount\nNot available\nControl state\nDISARMED\nDecision\nNO_SIGNAL\n\nReview is readable and non-activating. This page never grants permission or infers readiness.\n\nCanary status\nDISARMED\nRemaining daily capacity\n$0.625\nRealized result\n$0.00\nExecution events\n1\nToday orders\n1\nTotal exposure\n$0.105\nOpen positions\n1\nLast request\nNO_SIGNAL\nOrders and position requests\nRequest / position\tPhase\tSelected outcome\tFeasibility\tSide\tQuantity\tSubmitted price\tFees\tTime\nfixture-submission-aurora\tATTEMPTED\tNot available\tNot available\tBUY\t1\t0.42\tNot available\t09/21/2026, 20:23:00 PHT (UTC 2026-09-21T12:23:00.834Z)\nfixture-position-request-aurora\tPARTIAL\tNot available\tNot available\tBUY\t1\t0.42\t$0.0001\t09/21/2026, 20:23:00 PHT (UTC 2026-09-21T12:23:00.834Z)\nPosition fills\nFill / position\tPhase\tSelected outcome\tFeasibility\tSide\tFilled quantity\tSubmitted price\tFees\tTime\nfixture-position-fill-aurora\tSETTLED\tNot available\tNot available\tNot available\t0.25\t0.42\t$0.0001\t09/21/2026, 20:23:00 PHT (UTC 2026-09-21T12:23:00.834Z)\nClosed positions and settled round trips\n\nNo closed positions and settled round trips are present in this bounded projection; no value is inferred.\n\nResolution payouts\n\nNo resolution payouts are present in this bounded projection; no value is inferred.\n\nPosition inventory\nPosition / market\tToken\tQuantity\tCost basis\tStatus\nfixture-position-aurora\tYES\t0.25\t$0.105\tOPEN\nPosition marks\nPosition / market\tMark price\tMarked value\tMarked at\nfixture-position-aurora\t0.44\t$0.11\t09/21/2026, 20:23:00 PHT (UTC 2026-09-21T12:23:00.852Z)\nUnknown obligations\n\nNo unknown obligations are present in this bounded projection; no value is inferred.\n\nTechnical details\nFIXTURE ONLY - sanitized read-only fixture; no production authority",
+    "errors": [],
+    "failedRequests": [],
+    "statusFields": {
+      "authorization": "No active authorization",
+      "control": "Disarmed",
+      "worker": "Last heartbeat 09/21/2026, 20:23:00 PHT (UTC 2026-09-21T12:23:00.834Z); next No Signal",
+      "readiness": "Ready",
+      "decision": "No signal",
+      "freshness": "Current",
+      "remaining": null
+    },
+    "nextAction": "The latest authorization is revoked."
+  },
+  {
+    "scenario": "partial_fill",
+    "url": "http://127.0.0.1:53456/?view=live&section=polymarket",
+    "title": "AXIOM / operator console",
+    "width": 1280,
+    "height": 900,
+    "scrollWidth": 1265,
+    "bodyWidth": 1265,
+    "overflowX": false,
+    "duplicateIds": [],
+    "objectLeaks": false,
+    "headings": [
+      "Live trading · Polymarket",
+      "No active authorization",
+      "Polymarket canary",
+      "Decision",
+      "Market input",
+      "Signal",
+      "Readiness",
+      "Resting records",
+      "Partial records",
+      "Per-outcome feasibility",
+      "Real canary portfolio",
+      "Execution authority",
+      "Closed positions and settled round trips",
+      "Resolution payouts",
+      "Position inventory",
+      "Position marks",
+      "Unknown obligations"
+    ],
+    "controls": [
+      {
+        "tag": "A",
+        "name": "A\nAxiom\nResearch and canary workspace",
+        "id": "",
+        "disabled": false,
+        "height": 94
+      },
+      {
+        "tag": "A",
+        "name": "Home",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Live trading",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Portfolio",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Markets",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Research",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Activity",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Settings & system",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Binance",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Polymarket",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Binance",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "INPUT",
+        "name": "filter",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "SELECT",
+        "name": "Default order",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "SELECT",
+        "name": "10 per page\n25 per page\n50 per page\n100 per page",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "BUTTON",
+        "name": "Apply filters",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "BUTTON",
+        "name": "Previous",
+        "id": "",
+        "disabled": true,
+        "height": 44
+      },
+      {
+        "tag": "BUTTON",
+        "name": "Next",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "BUTTON",
+        "name": "Review and start",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "BUTTON",
+        "name": "Stop canary",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Open settings",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "fixture-submission-aurora",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "fixture-position-request-aurora",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "fixture-position-fill-aurora",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "SUMMARY",
+        "name": "Technical details",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      }
+    ],
+    "text": "A\nAxiom\nResearch and canary workspace\n\nOPERATE\n\nHome\nLive trading\nPortfolio\nMarkets\n\nEXPLORE\n\nResearch\nActivity\n\nMANAGE\n\nSettings & system\nLocal operator UI · guarded actions\n\nAxiom workspace\n\nLive trading · Polymarket\nBinance\nLive trading\nPolymarket\nBinance\nSearch\nSort\nDefault order\nRows\n10 per page\n25 per page\n50 per page\n100 per page\nApply filters\nPrevious\nPage 1\nNext\n\nCurrent authority\n\nNo active authorization\n\nAuthorization no active authorization; control disarmed; worker last heartbeat 09/21/2026, 20:23:01 pht (utc 2026-09-21t12:23:01.271z); next no signal; readiness ready; connection connected.\n\nReview needed\nSession budget\n$0.73\nMax buy\n$0.73\nDuration\n321 seconds\nMode\nExploratory Micro Canary\nMembers\n1\nAuthorization status\nNo active authorization\nControl state\nDisarmed\nWorker observation\nLast heartbeat 09/21/2026, 20:23:01 PHT (UTC 2026-09-21T12:23:01.271Z); next No Signal\nReadiness\nReady\nCurrent decision\nNo signal\nResearch\nResearch only\nData freshness\nCurrent\nNext supported action\n\nThe latest authorization is revoked.\n\nReview and start\nStop canary\nOpen settings\n\nLive decision boundary\n\nPolymarket canary\n\nDecision, market input, signal, readiness, and persisted execution evidence remain separate.\n\nDISARMED\nDecision\nNo Signal\n\nNot available\n\nMarket input\nNot available\n\nNot available\n\nSignal\nNot available\n\nNot available\n\nReadiness\nREADY\n\nNot available\n\nResting records\n1\n\nPersisted orders or fills currently marked resting/open/pending.\n\nPartial records\n1\n\nPersisted orders or fills currently marked partial.\n\nAffordability\n\nPer-outcome feasibility\nServer-provided values only\nNot available\nReal canary portfolio\n\nExecution records and accounting evidence from the canary only; practice results stay separate.\n\nExecution authority\nAuthorization\nREVOKED\nMode\nEXPLORATORY_MICRO_CANARY\nWorker decision\nNO_SIGNAL\nWorker tick\n09/21/2026, 20:23:01 PHT (UTC 2026-09-21T12:23:01.271Z)\nReadiness\nREADY\nAccount\nNot available\nControl state\nDISARMED\nDecision\nNO_SIGNAL\n\nReview is readable and non-activating. This page never grants permission or infers readiness.\n\nCanary status\nDISARMED\nRemaining daily capacity\n$0.625\nRealized result\n$0.00\nExecution events\n1\nToday orders\n1\nTotal exposure\n$0.105\nOpen positions\n0\nLast request\nNO_SIGNAL\nOrders and position requests\nRequest / position\tPhase\tSelected outcome\tFeasibility\tSide\tQuantity\tSubmitted price\tFees\tTime\nfixture-submission-aurora\tATTEMPTED\tNot available\tNot available\tBUY\t1\t0.42\tNot available\t09/21/2026, 20:23:01 PHT (UTC 2026-09-21T12:23:01.271Z)\nfixture-position-request-aurora\tPARTIAL\tNot available\tNot available\tBUY\t1\t0.42\t$0.0001\t09/21/2026, 20:23:01 PHT (UTC 2026-09-21T12:23:01.271Z)\nPosition fills\nFill / position\tPhase\tSelected outcome\tFeasibility\tSide\tFilled quantity\tSubmitted price\tFees\tTime\nfixture-position-fill-aurora\tSETTLED\tNot available\tNot available\tNot available\t0.25\t0.42\t$0.0001\t09/21/2026, 20:23:01 PHT (UTC 2026-09-21T12:23:01.271Z)\nClosed positions and settled round trips\n\nNo closed positions and settled round trips are present in this bounded projection; no value is inferred.\n\nResolution payouts\n\nNo resolution payouts are present in this bounded projection; no value is inferred.\n\nPosition inventory\n\nNo position inventory are present in this bounded projection; no value is inferred.\n\nPosition marks\n\nNo position marks are present in this bounded projection; no value is inferred.\n\nUnknown obligations\n\nNo unknown obligations are present in this bounded projection; no value is inferred.\n\nTechnical details\nFIXTURE ONLY - sanitized read-only fixture; no production authority",
+    "errors": [],
+    "failedRequests": [],
+    "statusFields": {
+      "authorization": "No active authorization",
+      "control": "Disarmed",
+      "worker": "Last heartbeat 09/21/2026, 20:23:01 PHT (UTC 2026-09-21T12:23:01.271Z); next No Signal",
+      "readiness": "Ready",
+      "decision": "No signal",
+      "freshness": "Current",
+      "remaining": null
+    },
+    "nextAction": "The latest authorization is revoked."
+  },
+  {
+    "scenario": "unknown_order",
+    "url": "http://127.0.0.1:53456/?view=live&section=polymarket",
+    "title": "AXIOM / operator console",
+    "width": 1280,
+    "height": 900,
+    "scrollWidth": 1265,
+    "bodyWidth": 1265,
+    "overflowX": false,
+    "duplicateIds": [],
+    "objectLeaks": false,
+    "headings": [
+      "Live trading · Polymarket",
+      "Authorization expired",
+      "Polymarket canary",
+      "Decision",
+      "Market input",
+      "Signal",
+      "Readiness",
+      "Resting records",
+      "Partial records",
+      "Per-outcome feasibility",
+      "Real canary portfolio",
+      "Execution authority",
+      "Closed positions and settled round trips",
+      "Resolution payouts",
+      "Position inventory",
+      "Position marks"
+    ],
+    "controls": [
+      {
+        "tag": "A",
+        "name": "A\nAxiom\nResearch and canary workspace",
+        "id": "",
+        "disabled": false,
+        "height": 94
+      },
+      {
+        "tag": "A",
+        "name": "Home",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Live trading",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Portfolio",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Markets",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Research",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Activity",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Settings & system",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Binance",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Polymarket",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Binance",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "INPUT",
+        "name": "filter",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "SELECT",
+        "name": "Default order",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "SELECT",
+        "name": "10 per page\n25 per page\n50 per page\n100 per page",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "BUTTON",
+        "name": "Apply filters",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "BUTTON",
+        "name": "Previous",
+        "id": "",
+        "disabled": true,
+        "height": 44
+      },
+      {
+        "tag": "BUTTON",
+        "name": "Next",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "BUTTON",
+        "name": "Review and start",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "BUTTON",
+        "name": "Stop canary",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Open settings",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "fixture-submission-aurora",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "fixture-position-request-aurora",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "fixture-position-fill-aurora",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Will the Aurora index close above 61 by the fixture cutoff?",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "SUMMARY",
+        "name": "Technical details",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      }
+    ],
+    "text": "A\nAxiom\nResearch and canary workspace\n\nOPERATE\n\nHome\nLive trading\nPortfolio\nMarkets\n\nEXPLORE\n\nResearch\nActivity\n\nMANAGE\n\nSettings & system\nLocal operator UI · guarded actions\n\nAxiom workspace\n\nLive trading · Polymarket\nBinance\nLive trading\nPolymarket\nBinance\nSearch\nSort\nDefault order\nRows\n10 per page\n25 per page\n50 per page\n100 per page\nApply filters\nPrevious\nPage 1\nNext\n\nCurrent authority\n\nAuthorization expired\n\nAuthorization authorization expired; control disarmed; worker last heartbeat 09/21/2026, 20:23:01 pht (utc 2026-09-21t12:23:01.706z); next no signal; readiness ready; connection connected.\n\nReview needed\nSession budget\n$0.73\nMax buy\n$0.73\nDuration\n321 seconds\nMode\nExploratory Micro Canary\nMembers\n1\nAuthorization status\nAuthorization expired\nControl state\nDisarmed\nWorker observation\nLast heartbeat 09/21/2026, 20:23:01 PHT (UTC 2026-09-21T12:23:01.706Z); next No Signal\nReadiness\nReady\nCurrent decision\nNo signal\nResearch\nResearch only\nData freshness\nCurrent\nNext supported action\n\nNo active authorization is available.\n\nReview and start\nStop canary\nOpen settings\n\nLive decision boundary\n\nPolymarket canary\n\nDecision, market input, signal, readiness, and persisted execution evidence remain separate.\n\nDISARMED\nDecision\nNo Signal\n\nNot available\n\nMarket input\nNot available\n\nNot available\n\nSignal\nNot available\n\nNot available\n\nReadiness\nREADY\n\nNot available\n\nResting records\n1\n\nPersisted orders or fills currently marked resting/open/pending.\n\nPartial records\n1\n\nPersisted orders or fills currently marked partial.\n\nAffordability\n\nPer-outcome feasibility\nServer-provided values only\nNot available\nReal canary portfolio\n\nExecution records and accounting evidence from the canary only; practice results stay separate.\n\nExecution authority\nAuthorization\nEXPIRED\nMode\nEXPLORATORY_MICRO_CANARY\nWorker decision\nNO_SIGNAL\nWorker tick\n09/21/2026, 20:23:01 PHT (UTC 2026-09-21T12:23:01.706Z)\nReadiness\nREADY\nAccount\nNot available\nControl state\nDISARMED\nDecision\nNO_SIGNAL\n\nReview is readable and non-activating. This page never grants permission or infers readiness.\n\nCanary status\nDISARMED\nRemaining daily capacity\n$0.625\nRealized result\n$0.00\nExecution events\n1\nToday orders\n1\nTotal exposure\n$0.105\nOpen positions\n0\nLast request\nNO_SIGNAL\nOrders and position requests\nRequest / position\tPhase\tSelected outcome\tFeasibility\tSide\tQuantity\tSubmitted price\tFees\tTime\nfixture-submission-aurora\tATTEMPTED\tNot available\tNot available\tBUY\t1\t0.42\tNot available\t09/21/2026, 20:23:01 PHT (UTC 2026-09-21T12:23:01.706Z)\nfixture-position-request-aurora\tPARTIAL\tNot available\tNot available\tBUY\t1\t0.42\t$0.0001\t09/21/2026, 20:23:01 PHT (UTC 2026-09-21T12:23:01.706Z)\nPosition fills\nFill / position\tPhase\tSelected outcome\tFeasibility\tSide\tFilled quantity\tSubmitted price\tFees\tTime\nfixture-position-fill-aurora\tSETTLED\tNot available\tNot available\tNot available\t0.25\t0.42\t$0.0001\t09/21/2026, 20:23:01 PHT (UTC 2026-09-21T12:23:01.706Z)\nClosed positions and settled round trips\n\nNo closed positions and settled round trips are present in this bounded projection; no value is inferred.\n\nResolution payouts\n\nNo resolution payouts are present in this bounded projection; no value is inferred.\n\nPosition inventory\n\nNo position inventory are present in this bounded projection; no value is inferred.\n\nPosition marks\n\nNo position marks are present in this bounded projection; no value is inferred.\n\nUnknown obligations\nRecord\tRequested cost\tFilled cost\tRemaining cost\tUnknown amount\tReason\nWill the Aurora index close above 61 by the fixture cutoff?\tNot available\tNot available\tNot available\t$0.42\tOUTCOME_UNCERTAIN\nTechnical details\nFIXTURE ONLY - sanitized read-only fixture; no production authority",
+    "errors": [],
+    "failedRequests": [],
+    "statusFields": {
+      "authorization": "Authorization expired",
+      "control": "Disarmed",
+      "worker": "Last heartbeat 09/21/2026, 20:23:01 PHT (UTC 2026-09-21T12:23:01.706Z); next No Signal",
+      "readiness": "Ready",
+      "decision": "No signal",
+      "freshness": "Current",
+      "remaining": null
+    },
+    "nextAction": "No active authorization is available."
+  },
+  {
+    "scenario": "expired",
+    "url": "http://127.0.0.1:53456/?view=home",
+    "title": "AXIOM / operator console",
+    "width": 1280,
+    "height": 900,
+    "scrollWidth": 1265,
+    "bodyWidth": 1265,
+    "overflowX": false,
+    "duplicateIds": [],
+    "objectLeaks": false,
+    "headings": [
+      "Home",
+      "Authorization expired",
+      "What is known now",
+      "Why no trades",
+      "Recent activity",
+      "No recent activity"
+    ],
+    "controls": [
+      {
+        "tag": "A",
+        "name": "A\nAxiom\nResearch and canary workspace",
+        "id": "",
+        "disabled": false,
+        "height": 94
+      },
+      {
+        "tag": "A",
+        "name": "Home",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Live trading",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Portfolio",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Markets",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Research",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Activity",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Settings & system",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Binance",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "BUTTON",
+        "name": "Review and start",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "BUTTON",
+        "name": "Stop canary",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Open settings",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      }
+    ],
+    "text": "A\nAxiom\nResearch and canary workspace\n\nOPERATE\n\nHome\nLive trading\nPortfolio\nMarkets\n\nEXPLORE\n\nResearch\nActivity\n\nMANAGE\n\nSettings & system\nLocal operator UI · guarded actions\n\nAxiom workspace\n\nHome\nBinance\n\nCurrent authority\n\nAuthorization expired\n\nAuthorization authorization expired; control disarmed; worker last heartbeat 09/21/2026, 20:23:02 pht (utc 2026-09-21t12:23:02.132z); next no signal; readiness ready; connection connected.\n\nReview needed\nSession budget\n$0.73\nMax buy\n$0.73\nDuration\n321 seconds\nMode\nExploratory Micro Canary\nMembers\n1\nAuthorization status\nAuthorization expired\nControl state\nDisarmed\nWorker observation\nLast heartbeat 09/21/2026, 20:23:02 PHT (UTC 2026-09-21T12:23:02.132Z); next No Signal\nReadiness\nReady\nCurrent decision\nNo signal\nResearch\nResearch only\nData freshness\nCurrent\nNext supported action\n\nNo active authorization is available.\n\nReview and start\nStop canary\nOpen settings\n\nAt a glance\n\nWhat is known now\nValues are copied from bounded server projections.\nRemaining session budget\n$0.73\nAuthoritative lifetime allowance only\nOpen-position cost\n$0.105\nPersisted open-cost mark\nOpen-position value\nNot available\nServer-reported marked value\nKnown net result\nNot available\nNo totals reconstructed here\nSubmissions today\n1\nLatest action\nNot available\nWhy no trades\n\nA reason is shown only when the authoritative projection provides one.\n\nNo signal\n\nThe current strategy scan did not produce an actionable signal.\n\nNext: Wait for the next supported scan.\n\nRecent activity\n\nDurable action outcomes are never inferred from a button click.\n\nNo recent activity\n\nNo bounded activity entries are available.\n\nFIXTURE ONLY - sanitized read-only fixture; no production authority",
+    "errors": [],
+    "failedRequests": [],
+    "statusFields": {
+      "authorization": "Authorization expired",
+      "control": "Disarmed",
+      "worker": "Last heartbeat 09/21/2026, 20:23:02 PHT (UTC 2026-09-21T12:23:02.132Z); next No Signal",
+      "readiness": "Ready",
+      "decision": "No signal",
+      "freshness": "Current",
+      "remaining": "$0.73"
+    },
+    "nextAction": "No active authorization is available."
+  },
+  {
+    "scenario": "revoked",
+    "url": "http://127.0.0.1:53456/?view=home",
+    "title": "AXIOM / operator console",
+    "width": 1280,
+    "height": 900,
+    "scrollWidth": 1265,
+    "bodyWidth": 1265,
+    "overflowX": false,
+    "duplicateIds": [],
+    "objectLeaks": false,
+    "headings": [
+      "Home",
+      "No active authorization",
+      "What is known now",
+      "Why no trades",
+      "Recent activity",
+      "No recent activity"
+    ],
+    "controls": [
+      {
+        "tag": "A",
+        "name": "A\nAxiom\nResearch and canary workspace",
+        "id": "",
+        "disabled": false,
+        "height": 94
+      },
+      {
+        "tag": "A",
+        "name": "Home",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Live trading",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Portfolio",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Markets",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Research",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Activity",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Settings & system",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Binance",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "BUTTON",
+        "name": "Review and start",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "BUTTON",
+        "name": "Stop canary",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Open settings",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      }
+    ],
+    "text": "A\nAxiom\nResearch and canary workspace\n\nOPERATE\n\nHome\nLive trading\nPortfolio\nMarkets\n\nEXPLORE\n\nResearch\nActivity\n\nMANAGE\n\nSettings & system\nLocal operator UI · guarded actions\n\nAxiom workspace\n\nHome\nBinance\n\nCurrent authority\n\nNo active authorization\n\nAuthorization no active authorization; control disarmed; worker last heartbeat 09/21/2026, 20:23:02 pht (utc 2026-09-21t12:23:02.556z); next no signal; readiness ready; connection connected.\n\nReview needed\nSession budget\n$0.73\nMax buy\n$0.73\nDuration\n321 seconds\nMode\nExploratory Micro Canary\nMembers\n1\nAuthorization status\nNo active authorization\nControl state\nDisarmed\nWorker observation\nLast heartbeat 09/21/2026, 20:23:02 PHT (UTC 2026-09-21T12:23:02.556Z); next No Signal\nReadiness\nReady\nCurrent decision\nNo signal\nResearch\nResearch only\nData freshness\nCurrent\nNext supported action\n\nThe latest authorization is revoked.\n\nReview and start\nStop canary\nOpen settings\n\nAt a glance\n\nWhat is known now\nValues are copied from bounded server projections.\nRemaining session budget\n$0.73\nAuthoritative lifetime allowance only\nOpen-position cost\n$0.105\nPersisted open-cost mark\nOpen-position value\nNot available\nServer-reported marked value\nKnown net result\nNot available\nNo totals reconstructed here\nSubmissions today\n1\nLatest action\nNot available\nWhy no trades\n\nA reason is shown only when the authoritative projection provides one.\n\nNo signal\n\nThe current strategy scan did not produce an actionable signal.\n\nNext: Wait for the next supported scan.\n\nRecent activity\n\nDurable action outcomes are never inferred from a button click.\n\nNo recent activity\n\nNo bounded activity entries are available.\n\nFIXTURE ONLY - sanitized read-only fixture; no production authority",
+    "errors": [],
+    "failedRequests": [],
+    "statusFields": {
+      "authorization": "No active authorization",
+      "control": "Disarmed",
+      "worker": "Last heartbeat 09/21/2026, 20:23:02 PHT (UTC 2026-09-21T12:23:02.556Z); next No Signal",
+      "readiness": "Ready",
+      "decision": "No signal",
+      "freshness": "Current",
+      "remaining": "$0.73"
+    },
+    "nextAction": "The latest authorization is revoked."
+  },
+  {
+    "scenario": "missing",
+    "url": "http://127.0.0.1:53456/?view=home",
+    "title": "AXIOM / operator console",
+    "width": 1280,
+    "height": 900,
+    "scrollWidth": 1265,
+    "bodyWidth": 1265,
+    "overflowX": false,
+    "duplicateIds": [],
+    "objectLeaks": false,
+    "headings": [
+      "Home",
+      "No active authorization",
+      "What is known now",
+      "Why no trades",
+      "Recent activity",
+      "No recent activity"
+    ],
+    "controls": [
+      {
+        "tag": "A",
+        "name": "A\nAxiom\nResearch and canary workspace",
+        "id": "",
+        "disabled": false,
+        "height": 94
+      },
+      {
+        "tag": "A",
+        "name": "Home",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Live trading",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Portfolio",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Markets",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Research",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Activity",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Settings & system",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Binance",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "BUTTON",
+        "name": "Review and start",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "BUTTON",
+        "name": "Stop canary",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Open settings",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      }
+    ],
+    "text": "A\nAxiom\nResearch and canary workspace\n\nOPERATE\n\nHome\nLive trading\nPortfolio\nMarkets\n\nEXPLORE\n\nResearch\nActivity\n\nMANAGE\n\nSettings & system\nLocal operator UI · guarded actions\n\nAxiom workspace\n\nHome\nBinance\n\nCurrent authority\n\nNo active authorization\n\nAuthorization no active authorization; control disarmed; worker last heartbeat 09/21/2026, 20:23:02 pht (utc 2026-09-21t12:23:02.971z); next no signal; readiness not available; connection connected.\n\nReview needed\nSession budget\n$0.73\nMax buy\n$0.73\nDuration\n321 seconds\nMode\nExploratory Micro Canary\nMembers\n1\nAuthorization status\nNo active authorization\nControl state\nDisarmed\nWorker observation\nLast heartbeat 09/21/2026, 20:23:02 PHT (UTC 2026-09-21T12:23:02.971Z); next No Signal\nReadiness\nNot available\nCurrent decision\nNo signal\nResearch\nResearch only\nData freshness\nCurrent\nNext supported action\n\nThe latest authorization is revoked.\n\nReview and start\nStop canary\nOpen settings\n\nAt a glance\n\nWhat is known now\nValues are copied from bounded server projections.\nRemaining session budget\nNot available\nAuthoritative lifetime allowance only\nOpen-position cost\n$0.105\nPersisted open-cost mark\nOpen-position value\nNot available\nServer-reported marked value\nKnown net result\nNot available\nNo totals reconstructed here\nSubmissions today\n1\nLatest action\nNot available\nWhy no trades\n\nA reason is shown only when the authoritative projection provides one.\n\nNo signal\n\nThe current strategy scan did not produce an actionable signal.\n\nNext: Wait for the next supported scan.\n\nRecent activity\n\nDurable action outcomes are never inferred from a button click.\n\nNo recent activity\n\nNo bounded activity entries are available.\n\nFIXTURE ONLY - sanitized read-only fixture; no production authority",
+    "errors": [],
+    "failedRequests": [],
+    "statusFields": {
+      "authorization": "No active authorization",
+      "control": "Disarmed",
+      "worker": "Last heartbeat 09/21/2026, 20:23:02 PHT (UTC 2026-09-21T12:23:02.971Z); next No Signal",
+      "readiness": "Not available",
+      "decision": "No signal",
+      "freshness": "Current",
+      "remaining": "Not available"
+    },
+    "nextAction": "The latest authorization is revoked."
+  },
+  {
+    "scenario": "empty",
+    "url": "http://127.0.0.1:53456/?view=home",
+    "title": "AXIOM / operator console",
+    "width": 1280,
+    "height": 900,
+    "scrollWidth": 1265,
+    "bodyWidth": 1265,
+    "overflowX": false,
+    "duplicateIds": [],
+    "objectLeaks": false,
+    "headings": [
+      "Home",
+      "No active authorization",
+      "What is known now",
+      "Why no trades",
+      "Recent activity",
+      "No recent activity"
+    ],
+    "controls": [
+      {
+        "tag": "A",
+        "name": "A\nAxiom\nResearch and canary workspace",
+        "id": "",
+        "disabled": false,
+        "height": 94
+      },
+      {
+        "tag": "A",
+        "name": "Home",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Live trading",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Portfolio",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Markets",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Research",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Activity",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Settings & system",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Binance",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "BUTTON",
+        "name": "Review and start",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "BUTTON",
+        "name": "Stop canary",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      },
+      {
+        "tag": "A",
+        "name": "Open settings",
+        "id": "",
+        "disabled": false,
+        "height": 44
+      }
+    ],
+    "text": "A\nAxiom\nResearch and canary workspace\n\nOPERATE\n\nHome\nLive trading\nPortfolio\nMarkets\n\nEXPLORE\n\nResearch\nActivity\n\nMANAGE\n\nSettings & system\nLocal operator UI · guarded actions\n\nAxiom workspace\n\nHome\nBinance\n\nCurrent authority\n\nNo active authorization\n\nAuthorization no active authorization; control disarmed; worker last heartbeat 09/21/2026, 20:23:03 pht (utc 2026-09-21t12:23:03.377z); next no signal; readiness ready; connection connected.\n\nReview needed\nSession budget\n$0.73\nMax buy\n$0.73\nDuration\n321 seconds\nMode\nExploratory Micro Canary\nMembers\n1\nAuthorization status\nNo active authorization\nControl state\nDisarmed\nWorker observation\nLast heartbeat 09/21/2026, 20:23:03 PHT (UTC 2026-09-21T12:23:03.377Z); next No Signal\nReadiness\nReady\nCurrent decision\nNo signal\nResearch\nResearch only\nData freshness\nCurrent\nNext supported action\n\nThe latest authorization is revoked.\n\nReview and start\nStop canary\nOpen settings\n\nAt a glance\n\nWhat is known now\nValues are copied from bounded server projections.\nRemaining session budget\n$0.73\nAuthoritative lifetime allowance only\nOpen-position cost\n$0.105\nPersisted open-cost mark\nOpen-position value\nNot available\nServer-reported marked value\nKnown net result\nNot available\nNo totals reconstructed here\nSubmissions today\n1\nLatest action\nNot available\nWhy no trades\n\nA reason is shown only when the authoritative projection provides one.\n\nNo signal\n\nThe current strategy scan did not produce an actionable signal.\n\nNext: Wait for the next supported scan.\n\nRecent activity\n\nDurable action outcomes are never inferred from a button click.\n\nNo recent activity\n\nNo bounded activity entries are available.\n\nFIXTURE ONLY - sanitized read-only fixture; no production authority",
+    "errors": [],
+    "failedRequests": [],
+    "statusFields": {
+      "authorization": "No active authorization",
+      "control": "Disarmed",
+      "worker": "Last heartbeat 09/21/2026, 20:23:03 PHT (UTC 2026-09-21T12:23:03.377Z); next No Signal",
+      "readiness": "Ready",
+      "decision": "No signal",
+      "freshness": "Current",
+      "remaining": "$0.73"
+    },
+    "nextAction": "The latest authorization is revoked."
+  }
+]

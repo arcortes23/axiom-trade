@@ -1,0 +1,239 @@
+{
+  "review": "AXIOM UI visual final review",
+  "status": "complete",
+  "overall_correctness": "correct",
+  "source_hashes": {
+    "axiom/ui/styles.css": "f4af47a3bc73271a804fa9631758b5b7640920b3c5386f80bcfb16e2fd2f1f13",
+    "axiom/ui/app.js": "e27a85167f40771b1b27c68af2cfbfad8f7bd151dda93d1b298dace15f7db978",
+    "axiom/ui/pages.js": "5424f1ec9fd5560f2f02211b1c2950c422a0ab9095d6ce166233515271c1eeeb"
+  },
+  "fixture": {
+    "process": "UiVisualFixture",
+    "scenario": "prepared",
+    "url": "http://127.0.0.1:50903",
+    "legacy_url": "http://127.0.0.1:50904",
+    "upstream_url": "http://127.0.0.1:50902",
+    "admin_url": "http://127.0.0.1:50905",
+    "legacy_html": "C:/Users/User/.omp/agent/sessions/-projects-axiom/2026-09-10T09-29-23-148Z_01a08aa6-81cc-7720-8e98-296666c0152d/local/axiom-ui-before.html",
+    "browser_process": "UiVisualChrome",
+    "browser_session": "ui-visual-2c7b34f99bdc",
+    "isolation": "private fixture, private Chrome profile; synthetic prepared scenario only"
+  },
+  "before_mapping": [
+    {
+      "destination": "home",
+      "legacy_tab": "overview",
+      "file": "reports/ui-release/before-home-1280.png"
+    },
+    {
+      "destination": "live-polymarket",
+      "legacy_tab": "canary",
+      "file": "reports/ui-release/before-live-polymarket-1280.png"
+    },
+    {
+      "destination": "live-binance",
+      "legacy_tab": "binance-canary",
+      "file": "reports/ui-release/before-live-binance-1280.png"
+    },
+    {
+      "destination": "portfolio-real",
+      "legacy_tab": "canary",
+      "file": "reports/ui-release/before-portfolio-real-1280.png"
+    },
+    {
+      "destination": "portfolio-practice",
+      "legacy_tab": "portfolio",
+      "file": "reports/ui-release/before-portfolio-practice-1280.png"
+    },
+    {
+      "destination": "portfolio-allocations",
+      "legacy_tab": "rolling-portfolio",
+      "file": "reports/ui-release/before-portfolio-allocations-1280.png"
+    },
+    {
+      "destination": "markets-polymarket",
+      "legacy_tab": "polymarket",
+      "file": "reports/ui-release/before-markets-polymarket-1280.png"
+    },
+    {
+      "destination": "research-strategies",
+      "legacy_tab": "candidates",
+      "file": "reports/ui-release/before-research-strategies-1280.png"
+    },
+    {
+      "destination": "research-crypto",
+      "legacy_tab": "crypto",
+      "file": "reports/ui-release/before-research-crypto-1280.png"
+    },
+    {
+      "destination": "research-automation",
+      "legacy_tab": "hermes",
+      "file": "reports/ui-release/before-research-automation-1280.png"
+    },
+    {
+      "destination": "research-data",
+      "legacy_tab": "datasets",
+      "file": "reports/ui-release/before-research-data-1280.png"
+    },
+    {
+      "destination": "activity",
+      "legacy_tab": "activity",
+      "file": "reports/ui-release/before-activity-1280.png"
+    },
+    {
+      "destination": "settings",
+      "legacy_tab": "canary",
+      "file": "reports/ui-release/before-settings-1280.png",
+      "note": "legacy reference had no settings tab; canary risk/system surface is nearest visual mapping"
+    }
+  ],
+  "screenshots": {
+    "before_1280": [
+      "reports/ui-release/before-activity-1280.png",
+      "reports/ui-release/before-home-1280.png",
+      "reports/ui-release/before-live-binance-1280.png",
+      "reports/ui-release/before-live-polymarket-1280.png",
+      "reports/ui-release/before-markets-polymarket-1280.png",
+      "reports/ui-release/before-portfolio-allocations-1280.png",
+      "reports/ui-release/before-portfolio-practice-1280.png",
+      "reports/ui-release/before-portfolio-real-1280.png",
+      "reports/ui-release/before-research-automation-1280.png",
+      "reports/ui-release/before-research-crypto-1280.png",
+      "reports/ui-release/before-research-data-1280.png",
+      "reports/ui-release/before-research-strategies-1280.png",
+      "reports/ui-release/before-settings-1280.png"
+    ],
+    "after_1280": [
+      "reports/ui-release/after-activity-1280.png",
+      "reports/ui-release/after-home-1280.png",
+      "reports/ui-release/after-live-binance-1280.png",
+      "reports/ui-release/after-live-polymarket-1280.png",
+      "reports/ui-release/after-markets-polymarket-1280.png",
+      "reports/ui-release/after-portfolio-allocations-1280.png",
+      "reports/ui-release/after-portfolio-practice-1280.png",
+      "reports/ui-release/after-portfolio-real-1280.png",
+      "reports/ui-release/after-research-automation-1280.png",
+      "reports/ui-release/after-research-crypto-1280.png",
+      "reports/ui-release/after-research-data-1280.png",
+      "reports/ui-release/after-research-strategies-1280.png",
+      "reports/ui-release/after-settings-1280.png"
+    ],
+    "responsive_390": [
+      "reports/ui-release/responsive-390-activity.png",
+      "reports/ui-release/responsive-390-home.png",
+      "reports/ui-release/responsive-390-live-binance.png",
+      "reports/ui-release/responsive-390-live-polymarket.png",
+      "reports/ui-release/responsive-390-markets-polymarket.png",
+      "reports/ui-release/responsive-390-portfolio-allocations.png",
+      "reports/ui-release/responsive-390-portfolio-practice.png",
+      "reports/ui-release/responsive-390-portfolio-real.png",
+      "reports/ui-release/responsive-390-research-automation.png",
+      "reports/ui-release/responsive-390-research-crypto.png",
+      "reports/ui-release/responsive-390-research-data.png",
+      "reports/ui-release/responsive-390-research-strategies.png",
+      "reports/ui-release/responsive-390-settings.png"
+    ],
+    "responsive_768": [
+      "reports/ui-release/responsive-768-activity.png",
+      "reports/ui-release/responsive-768-home.png",
+      "reports/ui-release/responsive-768-live-binance.png",
+      "reports/ui-release/responsive-768-live-polymarket.png",
+      "reports/ui-release/responsive-768-markets-polymarket.png",
+      "reports/ui-release/responsive-768-portfolio-allocations.png",
+      "reports/ui-release/responsive-768-portfolio-practice.png",
+      "reports/ui-release/responsive-768-portfolio-real.png",
+      "reports/ui-release/responsive-768-research-automation.png",
+      "reports/ui-release/responsive-768-research-crypto.png",
+      "reports/ui-release/responsive-768-research-data.png",
+      "reports/ui-release/responsive-768-research-strategies.png",
+      "reports/ui-release/responsive-768-settings.png"
+    ],
+    "responsive_1440": [
+      "reports/ui-release/responsive-1440-activity.png",
+      "reports/ui-release/responsive-1440-home.png",
+      "reports/ui-release/responsive-1440-live-binance.png",
+      "reports/ui-release/responsive-1440-live-polymarket.png",
+      "reports/ui-release/responsive-1440-markets-polymarket.png",
+      "reports/ui-release/responsive-1440-portfolio-allocations.png",
+      "reports/ui-release/responsive-1440-portfolio-practice.png",
+      "reports/ui-release/responsive-1440-portfolio-real.png",
+      "reports/ui-release/responsive-1440-research-automation.png",
+      "reports/ui-release/responsive-1440-research-crypto.png",
+      "reports/ui-release/responsive-1440-research-data.png",
+      "reports/ui-release/responsive-1440-research-strategies.png",
+      "reports/ui-release/responsive-1440-settings.png"
+    ],
+    "offline_final": [
+      "reports/ui-release/offline-final-1280.png",
+      "reports/ui-release/offline-final-mobile-390.png"
+    ]
+  },
+  "viewports": {
+    "before_after_1280": "1280x900 CSS px",
+    "responsive_390": "390x844 CSS px",
+    "responsive_768": "768x900 CSS px",
+    "responsive_1440": "1440x900 CSS px",
+    "zoom": "Attempted actual Ctrl+= twice in headless Chrome; devicePixelRatio remained 1 and innerWidth remained 1280, so no true 200% browser zoom evidence was claimed"
+  },
+  "checks": [
+    {
+      "name": "13 destination visual review",
+      "result": "pass",
+      "details": "All 13 refreshed after-*-1280 images were visually inspected after final fixture freeze; all 13 before mappings were captured and visually inspected from sanitized legacy fixture. Current prepared records visibly include practice and allocation data."
+    },
+    {
+      "name": "responsive review",
+      "result": "pass_with_scope",
+      "details": "390 and 768 route screenshots were captured for all 13 destinations; 1440 route screenshots were captured for all 13. Refreshed affected practice/allocations at all three widths after fixture freeze; unchanged routes were re-captured. Cards/forms stack cleanly at 390, two-column layouts remain readable at 768, sidebar/panels are balanced at 1440."
+    },
+    {
+      "name": "page overflow",
+      "result": "pass",
+      "evidence": "Final DOM checks: 390 markets scrollWidth=390, 768 automation scrollWidth=768, 1280 markets scrollWidth=1280, 1440 settings scrollWidth=1440; pageOverflow=false in each. Tables use local .table-scroll regions."
+    },
+    {
+      "name": "duplicate IDs/global leaks",
+      "result": "pass",
+      "evidence": "Final DOM checks report duplicateIds=0 at 390/768/1280/1440 representative routes; window leak filter for appState/currentRoute/controlToken/authToken/apiKey/secret returned []. app.js is an ES module."
+    },
+    {
+      "name": "accessibility",
+      "result": "pass",
+      "evidence": "Final axe 4.12.1 audit on prepared Home at 1280: 0 violations, 0 incomplete, 31 passes."
+    },
+    {
+      "name": "drawer keyboard/focus",
+      "result": "pass_after_correction",
+      "evidence": "At final fixture 390px, focus Menu, Enter, Escape; immediate and settled activeElement is Menu and aria-expanded=false. Tab loop cycled only drawer links and wrapped to brand. Resize open drawer 390\u21921280\u2192390 closed menu and cleared main inert state."
+    },
+    {
+      "name": "offline reference",
+      "result": "pass",
+      "evidence": "offline-reference.html regenerated from current _dashboard_html using venv interpreter; file:// reload captured only the file document, API resource count=0. All anchors aria-disabled=true/tabIndex=-1; Menu button disabled. offline-final-1280.png and offline-final-mobile-390.png captured."
+    },
+    {
+      "name": "copy controls",
+      "result": "limited",
+      "evidence": "Final market detail exposes synthetic fixture-market-aurora target length 21 and synthetic market-id target length 21 without logging clipboard contents. Headless Clipboard permission denied; actual UI reports Copy unavailable, so end-to-end OS clipboard delivery is not claimed."
+    },
+    {
+      "name": "safety",
+      "result": "pass_with_scope",
+      "details": "No production URL/8080/venue request was used; no financial/control POST was submitted. Fixture logs showed only 127.0.0.1 fixture APIs. Browser actions were navigation, read-only detail/copy, drawer, and accessibility checks."
+    }
+  ],
+  "privacy": {
+    "result": "pass",
+    "details": "Before screenshots were taken only after legacy fixture rendered. Visuals show fixture-* synthetic IDs/questions, FIXTURE ONLY banner, and no historical account/balance/private identifiers. Body audit found 0 long hex/private-ID patterns; generic Secret/account/balance words only, with no token value."
+  },
+  "correction_recheck": {
+    "issue": "Mobile drawer Escape focus restoration initially landed on Home Review and start instead of Menu. UiShell patched app.js; final 390px recheck passes as recorded above. No remaining visual finding."
+  },
+  "offline_reference_sha256": "54f4c0dccbdcd1d44b16351545f1afc9cb9b8836b7840a91dfab627c18fdda0b",
+  "limitations": [
+    "True 200% browser zoom could not be activated in this headless Chrome session; no emulated zoom pass was substituted.",
+    "Clipboard write/read permission is denied by headless browser, so copy target wiring was checked without exposing clipboard contents but OS-level delivery remains unverified.",
+    "DOM overflow checks are representative routes at each viewport; visual screenshots cover all 13 destinations.",
+    "No production venue/auth/backend fence was exercised; this is intentionally a synthetic UI visual review."
+  ]
+}

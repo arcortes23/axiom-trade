@@ -13,8 +13,10 @@ import ipaddress
 import json
 import logging
 import math
-from decimal import Decimal
 import re
+from decimal import Decimal
+from html import escape as _html_escape
+from pathlib import Path
 import secrets
 import sqlite3
 from . import canary as canary_module
@@ -59,6 +61,8 @@ def _loopback_host(value: str) -> bool:
 _ENDPOINTS = (
     "overview",
     "operator",
+    "ui-state",
+    "ui-record",
     "datasets",
     "research",
     "research-summary",
@@ -81,6 +85,24 @@ _ENDPOINTS = (
     "evidence-maturity",
     "strategy",
 )
+_UI_RECORD_KINDS = frozenset(
+    {
+        "market",
+        "order",
+        "submission",
+        "reservation",
+        "fill",
+        "risk-fill",
+        "position",
+        "mark",
+        "cashflow",
+    }
+)
+_UI_ASSETS = {
+    "/assets/app.js": ("app.js", "text/javascript; charset=utf-8"),
+    "/assets/pages.js": ("pages.js", "text/javascript; charset=utf-8"),
+    "/assets/styles.css": ("styles.css", "text/css; charset=utf-8"),
+}
 _V2_ENDPOINTS = ("overview-summary", "canary", "rolling-portfolio", "binance-canary", "datasets", "activity", "candidates", "polymarket", "hermes", "crypto-research", "crypto", "paper", "shadow")
 
 _DEFAULT_PAGE_SIZE = 25
@@ -659,9 +681,14 @@ _HTTP_PUBLIC_SECTION_FIELDS: dict[str, tuple[str, ...]] = {
         "duration_seconds", "expires_at", "stop_rules", "status", "approved",
     ),
     "selected_setups": (
-        "strategy_version_id", "candidate_id", "setup_id", "setup_version", "setup_hash",
-        "operational_setup_hash", "entry_predicate", "outcome_mapping", "direction",
-        "sizing", "holding_semantics", "exit_semantics", "lookback",
+        "name", "strategy_name", "setup_name", "family", "experiment_family",
+        "strategy_id", "strategy_version_id", "strategy_version", "strategy_hash",
+        "candidate_id", "setup_id", "setup_version", "setup_hash", "operational_setup_hash",
+        "entry_predicate", "entry", "outcome_mapping", "direction", "sizing",
+        "holding", "holding_semantics", "exit", "exit_semantics", "lookback", "parameters",
+        "strategy", "strategy_document", "operational_setup", "setup_policy",
+        "scope", "market_scope", "scope_restrictions", "restrictions", "exclusions",
+        "excluded_markets", "frozen_scope",
     ),
     "scope_binding": (
         "draft_id", "draft_hash", "draft_version", "scope_hash", "scope_version",
@@ -2631,6 +2658,10 @@ class DashboardData:
             for item in result.get("items", []):
                 if not isinstance(item, Mapping):
                     continue
+                market_id = item.get("market_id")
+                if market_id not in (None, ""):
+                    item["record_kind"] = "market"
+                    item["record_id"] = market_id
                 snapshot = item.get("snapshot")
                 if not isinstance(snapshot, Mapping):
                     payload = item.get("payload")
@@ -2652,6 +2683,10 @@ class DashboardData:
             items = [item for item in items if needle in json.dumps(_jsonable(item), sort_keys=True).lower()]
         for item in items:
             if isinstance(item, Mapping):
+                market_id = item.get("market_id")
+                if market_id not in (None, ""):
+                    item["record_kind"] = "market"
+                    item["record_id"] = market_id
                 label, context = _polymarket_quality_display(item)
                 item["quality_label"] = label
                 item["quality_context"] = context
@@ -9546,6 +9581,733 @@ class DashboardData:
             }
         )
 
+    def ui_record_data(self, kind: str, record_id: str) -> dict[str, Any] | None:
+        """Return one exact, bounded persisted record for a UI deep link."""
+        identifier = str(record_id or "").strip()
+        kind_value = str(kind or "").strip().lower()
+        if not identifier or len(identifier) > 256 or any(ord(char) < 32 for char in identifier):
+            return None
+        specs: dict[str, tuple[str, str, str]] = {
+            "order": (
+                "canary_position_requests",
+                "request_id",
+                "SELECT request_id,position_id,reservation_id,event_id,venue,market_id,token_id,side,order_id,requested_quantity,requested_price,filled_quantity,average_price,fees,status,submitted_at,updated_at,last_error,settlement_status FROM canary_position_requests WHERE request_id=?",
+            ),
+            "submission": (
+                "canary_submission_attempts",
+                "attempt_id",
+                "SELECT attempt_id,intent_id,side,attempted_at,status,candidate_id,execution_authorization_id FROM canary_submission_attempts WHERE attempt_id=?",
+            ),
+            "reservation": (
+                "canary_risk_reservations",
+                "reservation_id",
+                "SELECT reservation_id,intent_id,side,market_id,event_id,requested_cost,filled_cost,remaining_cost,quantity,filled_quantity,status,created_at,updated_at,released_at,candidate_id,execution_authorization_id FROM canary_risk_reservations WHERE reservation_id=?",
+            ),
+            "fill": (
+                "canary_position_fills",
+                "fill_id",
+                "SELECT fill_id,request_id,position_id,quantity,price,fee,status,filled_at FROM canary_position_fills WHERE fill_id=?",
+            ),
+            "risk-fill": (
+                "canary_risk_fills",
+                "fill_id",
+                "SELECT fill_id,reservation_id,quantity,price,cost,fee,filled_at,candidate_id,execution_authorization_id FROM canary_risk_fills WHERE fill_id=?",
+            ),
+            "position": (
+                "canary_position_lots",
+                "position_id",
+                "SELECT position_id,reservation_id,event_id,venue,market_id,token_id,candidate_id,strategy_version_id,portfolio_selection_id,quantity,sold_quantity,cost_basis,fees,gross_proceeds,exit_fees,realized_pnl,pending_exit_quantity,status,opened_at,updated_at FROM canary_position_lots WHERE position_id=?",
+            ),
+            "mark": (
+                "canary_equity_marks",
+                "mark_id",
+                "SELECT mark_id,market_id,token_id,side,quantity,mark_price,cost_basis_usd,mark_fee,observed_at,source,candidate_id FROM canary_equity_marks WHERE mark_id=?",
+            ),
+            "cashflow": (
+                "canary_risk_cashflows",
+                "flow_id",
+                "SELECT flow_id,kind,amount,occurred_at,candidate_id FROM canary_risk_cashflows WHERE flow_id=?",
+            ),
+        }
+        connection = getattr(self.store, "connection", None) if self.store is not None else None
+        if connection is None:
+            return None
+        lock = getattr(self.store, "_lock", None)
+        try:
+            if kind_value == "market":
+                market_query = (
+                    "SELECT market_id,observed_at,metadata_hash,payload_json,source_type,created_at "
+                    "FROM polymarket_markets WHERE market_id=? "
+                    "ORDER BY observed_at DESC,metadata_hash DESC LIMIT 1"
+                )
+                snapshot_query = (
+                    "SELECT snapshot_id,market_id,source_timestamp,observed_at,payload_json,quality,source_type,created_at "
+                    "FROM polymarket_snapshots WHERE market_id=? "
+                    "ORDER BY observed_at DESC,source_timestamp DESC,snapshot_id DESC LIMIT 1"
+                )
+                def exact_market() -> Any:
+                    row = connection.execute(market_query, (identifier,)).fetchone()
+                    source = "polymarket_markets"
+                    if row is None:
+                        row = connection.execute(snapshot_query, (identifier,)).fetchone()
+                        source = "polymarket_snapshots"
+                    return row, source
+                if lock is None:
+                    row, source = exact_market()
+                else:
+                    with lock:
+                        row, source = exact_market()
+                if row is None:
+                    return None
+                record = dict(row)
+                payload = record.pop("payload_json", None)
+                try:
+                    decoded = json.loads(payload) if isinstance(payload, str) else payload
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    decoded = None
+                if isinstance(decoded, Mapping):
+                    record["payload"] = _bounded_value(decoded)
+                return {
+                    "kind": kind_value,
+                    "id": identifier,
+                    "record": _bounded_value(record),
+                    "provenance": {"source": source, "lookup": "exact market_id"},
+                }
+            spec = specs.get(kind_value)
+            if spec is None:
+                return None
+            table, primary_key, query = spec
+            def exact_row() -> Any:
+                return connection.execute(query, (identifier,)).fetchone()
+            if lock is None:
+                row = exact_row()
+            else:
+                with lock:
+                    row = exact_row()
+        except (AttributeError, sqlite3.Error, TypeError, ValueError):
+            return None
+        if row is None:
+            return None
+        return {
+            "kind": kind_value,
+            "id": identifier,
+            "record": _bounded_value(dict(row)),
+            "provenance": {"source": table, "primary_key": primary_key, "lookup": "exact primary key"},
+        }
+
+    def _ui_ledger_data(self, limit: int = 64) -> dict[str, Any]:
+        """Return bounded, read-only canary ledger evidence for the UI."""
+        def unavailable(reason: str) -> dict[str, Any]:
+            return {"status": "unavailable", "reason": reason}
+
+        empty = {
+            "source": "persisted canary ledger",
+            "orders": [],
+            "reservations": [],
+            "fills": [],
+            "round_trips": [],
+            "settled_positions": [],
+            "cashflows": [],
+            "payouts": [],
+            "inventory": [],
+            "marks": [],
+            "unknown_obligations": [],
+            "availability": {
+                "orders": unavailable("STORE_UNAVAILABLE"),
+                "reservations": unavailable("STORE_UNAVAILABLE"),
+                "fills": unavailable("STORE_UNAVAILABLE"),
+                "round_trips": unavailable("STORE_UNAVAILABLE"),
+                "settled_positions": unavailable("STORE_UNAVAILABLE"),
+                "cashflows": unavailable("STORE_UNAVAILABLE"),
+                "inventory": unavailable("STORE_UNAVAILABLE"),
+                "marks": unavailable("STORE_UNAVAILABLE"),
+                "unknown_obligations": unavailable("STORE_UNAVAILABLE"),
+            },
+        }
+        if self.store is None:
+            return empty
+        connection = getattr(self.store, "connection", None)
+        if connection is None:
+            return empty
+        try:
+            bounded_limit = max(1, min(int(limit), 100))
+        except (TypeError, ValueError):
+            bounded_limit = 64
+        lock = getattr(self.store, "_lock", None)
+        fetch_errors: dict[str, str] = {}
+
+        def fetch(query: str, source: str) -> list[dict[str, Any]]:
+            try:
+                if lock is None:
+                    rows = connection.execute(query, (bounded_limit,)).fetchall()
+                else:
+                    with lock:
+                        rows = connection.execute(query, (bounded_limit,)).fetchall()
+            except (AttributeError, sqlite3.Error) as exc:
+                fetch_errors[source] = type(exc).__name__
+                return []
+            return [dict(row) for row in rows]
+
+        submissions = fetch(
+            """
+            SELECT attempt.attempt_id,attempt.intent_id,attempt.side,
+                   attempt.attempted_at,attempt.status,
+                   reservation.market_id,reservation.event_id,
+                   attempt.candidate_id,attempt.execution_authorization_id
+            FROM canary_submission_attempts AS attempt
+            LEFT JOIN canary_risk_reservations AS reservation
+              ON reservation.intent_id=attempt.intent_id
+            ORDER BY attempt.attempted_at DESC,attempt.attempt_id DESC
+            LIMIT ?
+            """,
+            "submissions",
+        )
+        reservations = fetch(
+            """
+            SELECT reservation_id,intent_id,side,market_id,event_id,
+                   requested_cost,filled_cost,remaining_cost,quantity,
+                   filled_quantity,status,created_at,updated_at,released_at,
+                   candidate_id,execution_authorization_id
+            FROM canary_risk_reservations
+            ORDER BY updated_at DESC,reservation_id DESC
+            LIMIT ?
+            """,
+            "reservations",
+        )
+        risk_fills = fetch(
+            """
+            SELECT fill.fill_id,fill.reservation_id,fill.quantity,fill.price,
+                   fill.cost,fill.fee,fill.filled_at,fill.candidate_id,
+                   fill.execution_authorization_id,
+                   reservation.market_id,reservation.event_id
+            FROM canary_risk_fills AS fill
+            LEFT JOIN canary_risk_reservations AS reservation
+              ON reservation.reservation_id=fill.reservation_id
+            ORDER BY fill.filled_at DESC,fill.fill_id DESC
+            LIMIT ?
+            """,
+            "risk_fills",
+        )
+        marks = fetch(
+            """
+            SELECT mark_id,market_id,token_id,side,quantity,mark_price,
+                   cost_basis_usd,mark_fee,observed_at,source,candidate_id
+            FROM canary_equity_marks
+            ORDER BY observed_at DESC,mark_id DESC
+            LIMIT ?
+            """,
+            "marks",
+        )
+        position_lots = fetch(
+            """
+            SELECT position_id,reservation_id,event_id,venue,market_id,token_id,
+                   candidate_id,strategy_version_id,portfolio_selection_id,
+                   quantity,sold_quantity,cost_basis,fees,gross_proceeds,
+                   exit_fees,realized_pnl,pending_exit_quantity,status,
+                   opened_at,updated_at
+            FROM canary_position_lots
+            ORDER BY updated_at DESC,position_id DESC
+            LIMIT ?
+            """,
+            "position_lots",
+        )
+        position_requests = fetch(
+            """
+            SELECT request_id,position_id,reservation_id,event_id,venue,market_id,
+                   token_id,side,order_id,requested_quantity,requested_price,
+                   filled_quantity,average_price,fees,status,submitted_at,
+                   updated_at,last_error,settlement_status
+            FROM canary_position_requests
+            ORDER BY updated_at DESC,request_id DESC
+            LIMIT ?
+            """,
+            "position_requests",
+        )
+        position_fills = fetch(
+            """
+            SELECT fill_id,request_id,position_id,quantity,price,fee,status,
+                   filled_at
+            FROM canary_position_fills
+            ORDER BY filled_at DESC,fill_id DESC
+            LIMIT ?
+            """,
+            "position_fills",
+        )
+        cashflows = fetch(
+            """
+            SELECT flow_id,kind,amount,occurred_at,candidate_id
+            FROM canary_risk_cashflows
+            ORDER BY occurred_at DESC,flow_id DESC
+            LIMIT ?
+            """,
+            "cashflows",
+        )
+
+        def with_link(rows: list[dict[str, Any]], kind: str, key: str) -> list[dict[str, Any]]:
+            return [
+                {**row, "record_kind": kind, "record_id": row.get(key)}
+                for row in rows
+                if row.get(key) not in (None, "")
+            ]
+
+        submissions = with_link(submissions, "submission", "attempt_id")
+        reservations = with_link(reservations, "reservation", "reservation_id")
+        risk_fills = with_link(risk_fills, "risk-fill", "fill_id")
+        position_requests = with_link(position_requests, "order", "request_id")
+        position_fills = with_link(position_fills, "fill", "fill_id")
+        position_lots = with_link(position_lots, "position", "position_id")
+        marks = with_link(marks, "mark", "mark_id")
+        cashflows = with_link(cashflows, "cashflow", "flow_id")
+        orders = submissions + position_requests
+        fills = risk_fills + position_fills
+        closed_lots = [
+            row for row in position_lots
+            if str(row.get("status") or "").upper() == "CLOSED"
+        ]
+        settled_positions = [
+            row for row in position_lots
+            if str(row.get("status") or "").upper() == "SETTLED"
+        ]
+        open_lots = [
+            row for row in position_lots
+            if str(row.get("status") or "").upper() in {"OPEN", "EXIT_PENDING", "DUST", "MANAGEMENT_BLOCKED"}
+        ]
+        unknown = [
+            row
+            for row in reservations + orders + fills
+            if str(row.get("status") or "").strip().upper() == "UNKNOWN"
+        ]
+        unknown = unknown[:bounded_limit]
+
+        def availability(name: str, sources: Sequence[str], rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+            failed = [f"{source}:{fetch_errors[source]}" for source in sources if source in fetch_errors]
+            if failed:
+                return {"status": "unavailable", "reason": "QUERY_FAILED", "sources": failed}
+            return {"status": "persisted", "count": len(rows)}
+
+        empty.update(
+            {
+                "orders": orders,
+                "reservations": reservations,
+                "fills": fills,
+                "round_trips": closed_lots,
+                "settled_positions": settled_positions,
+                "cashflows": cashflows,
+                "payouts": [
+                    row
+                    for row in cashflows
+                    if str(row.get("kind") or "").strip().upper()
+                    in {"PAYOUT", "SETTLEMENT", "RESOLUTION"}
+                ],
+                "inventory": open_lots,
+                "marks": marks,
+                "unknown_obligations": unknown,
+                "availability": {
+                    "orders": availability("orders", ("submissions", "position_requests"), orders),
+                    "reservations": availability("reservations", ("reservations",), reservations),
+                    "fills": availability("fills", ("risk_fills", "position_fills"), fills),
+                    "round_trips": availability("round_trips", ("position_lots",), closed_lots),
+                    "settled_positions": availability("settled_positions", ("position_lots",), settled_positions),
+                    "cashflows": availability("cashflows", ("cashflows",), cashflows),
+                    "inventory": availability("inventory", ("position_lots",), open_lots),
+                    "marks": availability("marks", ("marks",), marks),
+                    "unknown_obligations": availability("unknown_obligations", ("reservations", "submissions", "position_requests", "risk_fills", "position_fills"), unknown),
+                },
+            }
+        )
+        return empty
+
+    def ui_state_data(self) -> dict[str, Any]:
+        """Return the safe read-only projection consumed by the UI shell."""
+        actions: list[dict[str, Any]] = []
+        get_config = getattr(self.store, "get_operator_config", None)
+        try:
+            raw_actions = get_config("operator_action_state", {}) if callable(get_config) else {}
+        except Exception:
+            raw_actions = {}
+        raw_actions = raw_actions if isinstance(raw_actions, Mapping) else {}
+        entries = raw_actions.get("actions", [])
+        for entry in reversed(entries[-32:]) if isinstance(entries, list) else []:
+            if not isinstance(entry, Mapping):
+                continue
+            result = entry.get("result")
+            result = result if isinstance(result, Mapping) else {}
+            def safe_text(value: Any) -> str | None:
+                if value is None or isinstance(value, (dict, list, tuple, set)):
+                    return None
+                text = str(value).strip()
+                return text[:240] if text else None
+            pid = entry.get("pid")
+            if isinstance(pid, bool) or not isinstance(pid, int):
+                pid = None
+            actions.append(
+                {
+                    "action_id": safe_text(entry.get("action_id")),
+                    "action": safe_text(entry.get("action")),
+                    "target": safe_text(entry.get("target")),
+                    "status": safe_text(entry.get("status")),
+                    "started_at": safe_text(entry.get("started_at")),
+                    "completed_at": safe_text(entry.get("completed_at")),
+                    "pid": pid,
+                    "reason": safe_text(entry.get("reason")),
+                    "result": {
+                        key: result.get(key) if key in {"ok", "generation"} else safe_text(result.get(key))
+                        for key in ("ok", "reason", "status", "action_id", "authorization_id", "generation")
+                        if key in result
+                    },
+                }
+            )
+        node: dict[str, Any] = {}
+        try:
+            workers = self.store.list_worker_states(limit=32)
+        except Exception:
+            workers = []
+        for worker in workers if isinstance(workers, (list, tuple)) else ():
+            if not isinstance(worker, Mapping) or str(worker.get("worker_name") or "") != "axiom-node":
+                continue
+            payload = worker.get("payload")
+            payload = payload if isinstance(payload, Mapping) else {}
+            node = {
+                "worker_name": "axiom-node",
+                "status": worker.get("status") or payload.get("status"),
+                "state": worker.get("state") or payload.get("state"),
+                "heartbeat_at": worker.get("heartbeat_at") or payload.get("heartbeat_at"),
+                "reason": worker.get("reason") or payload.get("reason"),
+            }
+            break
+        configured_operator = self._configured("operator")
+        if not isinstance(configured_operator, Mapping):
+            configured_operator = {}
+        configured_controls = configured_operator.get("operator_controls")
+        if not isinstance(configured_controls, Mapping):
+            configured_controls = self._configured("operator_controls")
+        configured_controls = (
+            self._operator_controls_projection(configured_controls)
+            if isinstance(configured_controls, Mapping)
+            else {}
+        )
+        authorization = _bounded_value(self.execution_authorization_data())
+        risk_settings = _bounded_value(self.risk_settings_data())
+        canary = _bounded_value(self.canary_data())
+        if isinstance(configured_operator.get("execution_authorization"), Mapping):
+            authorization = _bounded_value(configured_operator["execution_authorization"])
+        if isinstance(configured_operator.get("risk_settings"), Mapping):
+            risk_settings = _bounded_value(configured_operator["risk_settings"])
+        if isinstance(configured_operator.get("canary"), Mapping):
+            canary = _bounded_value(configured_operator["canary"])
+        rolling = canary.get("rolling_portfolio") if isinstance(canary, Mapping) else None
+        if isinstance(rolling, Mapping):
+            selection = rolling.get("selection")
+            selection = selection if isinstance(selection, Mapping) else {}
+            rows = rolling.get("active_rows")
+            rows = rows if isinstance(rows, list) else []
+            native_members: list[dict[str, Any]] = []
+            for raw in rows[:16]:
+                if not isinstance(raw, Mapping):
+                    continue
+                member = {
+                    key: raw.get(key)
+                    for key in (
+                        "candidate_id",
+                        "strategy_version_id",
+                        "research_trial_id",
+                        "setup_id",
+                        "setup_hash",
+                        "scope_hash",
+                        "scope_version",
+                        "allocation",
+                        "proposed_allocation",
+                        "allocation_active",
+                        "status",
+                    )
+                    if raw.get(key) not in (None, "")
+                }
+                candidate_id = member.get("candidate_id")
+                if candidate_id and self.store is not None:
+                    try:
+                        lifecycle = self.store.load_candidate_lifecycle(str(candidate_id))
+                    except Exception:
+                        lifecycle = None
+                    payload = lifecycle.get("payload") if isinstance(lifecycle, Mapping) else {}
+                    if isinstance(payload, Mapping):
+                        for key in ("strategy_name", "setup_name", "family", "experiment_family"):
+                            if payload.get(key) not in (None, ""):
+                                member[key] = payload[key]
+                if member:
+                    native_members.append(member)
+            current_review = {
+                "status": str(rolling.get("status") or selection.get("status") or "UNKNOWN").upper(),
+                "proposal_status": str(selection.get("status") or rolling.get("status") or "UNKNOWN").upper(),
+                "members": native_members,
+                "proposal": {
+                    "status": str(selection.get("status") or "UNKNOWN").upper(),
+                    "selection_id": selection.get("portfolio_selection_id") or selection.get("selection_id"),
+                    "selection_hash": selection.get("selection_hash"),
+                    "members": native_members,
+                    "proposed_allocation_total": rolling.get("allocation_review", {}).get("proposed_total") if isinstance(rolling.get("allocation_review"), Mapping) else None,
+                },
+                "authorization_bindings": {
+                    key: selection.get(key)
+                    for key in ("portfolio_selection_id", "selection_id", "selection_hash", "policy_id", "policy_version", "config_hash")
+                    if selection.get(key) not in (None, "")
+                },
+                "provenance": "DashboardData.canary_data.rolling_portfolio persisted selection",
+            }
+            existing_review = configured_controls.get("exploratory_live_review") if isinstance(configured_controls, Mapping) else {}
+            existing_review = existing_review if isinstance(existing_review, Mapping) else {}
+            merged_review = dict(existing_review)
+            merged_review.update(current_review)
+            configured_controls = dict(configured_controls) if isinstance(configured_controls, Mapping) else {}
+            configured_controls["exploratory_live_review"] = merged_review
+        # The canonical exploratory proposal is the immutable selection pointed
+        # to by rolling_exploratory_proposal, not rolling_portfolio.active_rows.
+        proposal_pointer = get_config("rolling_exploratory_proposal", None) if callable(get_config) else None
+        proposal_pointer = proposal_pointer if isinstance(proposal_pointer, Mapping) else {}
+        proposal_selection_id = str(
+            proposal_pointer.get("selection_id")
+            or proposal_pointer.get("portfolio_selection_id")
+            or ""
+        ).strip()
+        proposal_selection = None
+        proposal_hash_valid = False
+        if proposal_selection_id and self.store is not None:
+            try:
+                candidate_selection = self.store.load_portfolio_selection(proposal_selection_id)
+            except Exception:
+                candidate_selection = None
+            if isinstance(candidate_selection, Mapping):
+                expected_hash = str(proposal_pointer.get("selection_hash") or "").strip()
+                actual_hash = str(candidate_selection.get("selection_hash") or "").strip()
+                proposal_hash_valid = bool(expected_hash and actual_hash and expected_hash == actual_hash)
+                if proposal_hash_valid:
+                    proposal_selection = candidate_selection
+            setup_fields = (
+                "name", "strategy_name", "setup_name", "family", "experiment_family",
+                "candidate_id", "research_trial_id", "allocation", "proposed_allocation",
+                "allocation_active", "status",
+                "strategy_id", "strategy_version", "strategy_version_id", "strategy_hash",
+                "setup_id", "setup_version", "setup_hash", "operational_setup_hash",
+                "entry_predicate", "entry", "outcome_mapping", "direction", "sizing", "description",
+                "holding", "holding_semantics",
+                "exit", "exit_semantics", "lookback", "parameters", "strategy", "strategy_document",
+                "operational_setup", "setup_policy", "scope", "market_scope", "scope_restrictions",
+                "restrictions", "exclusions", "excluded_markets", "frozen_scope",
+            )
+            def enrich_review_setup(raw: Mapping[str, Any]) -> dict[str, Any]:
+                result = {
+                    key: raw.get(key)
+                    for key in setup_fields
+                    if raw.get(key) not in (None, "")
+                }
+                nested_sources: list[Mapping[str, Any]] = []
+                for key in ("setup", "operational_setup", "strategy", "strategy_document", "setup_policy"):
+                    value = raw.get(key)
+                    if isinstance(value, Mapping):
+                        nested_sources.append(value)
+                for source in tuple(nested_sources):
+                    parameters = source.get("parameters")
+                    if isinstance(parameters, Mapping):
+                        nested_sources.append(parameters)
+                strategy_version_id = str(result.get("strategy_version_id") or "").strip()
+                expected_version = str(result.get("strategy_version") or "").strip()
+                expected_hash = str(result.get("strategy_hash") or "").strip()
+                resolved_strategy: Mapping[str, Any] | None = None
+                if self.store is not None:
+                    try:
+                        if strategy_version_id:
+                            candidate = self.store.load_strategy_version(strategy_version_id)
+                        else:
+                            strategy_id = str(result.get("strategy_id") or "").strip()
+                            candidate = (
+                                self.store.load_strategy(strategy_id, expected_version)
+                                if strategy_id and expected_version
+                                else None
+                            )
+                    except Exception:
+                        candidate = None
+                    if isinstance(candidate, Mapping):
+                        actual_version = str(candidate.get("version") or candidate.get("strategy_version") or "").strip()
+                        candidate_hashes = {
+                            str(candidate.get(key) or "").strip()
+                            for key in ("strategy_hash", "code_hash", "config_hash", "hash")
+                        }
+                        if (
+                            (expected_version and expected_version != actual_version)
+                            or (expected_hash and expected_hash not in candidate_hashes)
+                        ):
+                            candidate = None
+                    if isinstance(candidate, Mapping):
+                        resolved_strategy = candidate
+                        nested_sources.insert(0, candidate)
+                        parameters = candidate.get("parameters")
+                        if isinstance(parameters, Mapping):
+                            nested_sources.insert(1, parameters)
+                for source in nested_sources:
+                    for key in setup_fields:
+                        if result.get(key) in (None, "") and source.get(key) not in (None, ""):
+                            result[key] = source[key]
+                if result.get("entry_predicate") in (None, "") and result.get("entry") not in (None, ""):
+                    result["entry_predicate"] = result["entry"]
+                if result.get("exit_semantics") in (None, "") and result.get("exit") not in (None, ""):
+                    result["exit_semantics"] = result["exit"]
+                if resolved_strategy:
+                    setup_source = resolved_strategy.get("operational_setup") or resolved_strategy.get("setup")
+                    if isinstance(setup_source, Mapping):
+                        expected_setup_version = str(result.get("setup_version") or "").strip()
+                        actual_setup_version = str(setup_source.get("setup_version") or setup_source.get("version") or "").strip()
+                        expected_setup_hash = str(result.get("setup_hash") or result.get("operational_setup_hash") or "").strip()
+                        actual_setup_hash = str(setup_source.get("setup_hash") or setup_source.get("hash") or setup_source.get("operational_setup_hash") or "").strip()
+                        if (
+                            (expected_setup_version and expected_setup_version != actual_setup_version)
+                            or (expected_setup_hash and expected_setup_hash != actual_setup_hash)
+                        ):
+                            setup_source = None
+                        if isinstance(setup_source, Mapping):
+                            for key in setup_fields:
+                                if result.get(key) in (None, "") and setup_source.get(key) not in (None, ""):
+                                    result[key] = setup_source[key]
+                return result
+
+        if isinstance(proposal_selection, Mapping):
+            raw_members = proposal_selection.get("members", proposal_selection.get("selected_members", []))
+            raw_members = raw_members if isinstance(raw_members, (list, tuple)) else []
+            proposal_members: list[dict[str, Any]] = []
+            for raw in raw_members[:16]:
+                member = enrich_review_setup(raw)
+                proposal_members.append(member)
+            proposal_setups = proposal_selection.get("selected_setups") or proposal_selection.get("setups") or []
+            if not isinstance(proposal_setups, (list, tuple)):
+                proposal_setups = []
+            proposal_setups = [
+                enrich_review_setup(raw) if isinstance(raw, Mapping) else raw
+                for raw in proposal_setups[:16]
+            ]
+            if not proposal_setups:
+                proposal_setups = [
+                    enrich_review_setup(raw)
+                    for raw in raw_members[:16]
+                    if isinstance(raw, Mapping)
+                ]
+            proposal_limits = risk_settings.get("effective_limits", risk_settings.get("active_limits", {}))
+            proposal_limits = proposal_limits if isinstance(proposal_limits, Mapping) else {}
+            proposal_readiness = proposal_selection.get("readiness") or proposal_selection.get("blockers") or {}
+            proposal_adverse = proposal_selection.get("adverse_evidence") or proposal_selection.get("adverse") or []
+            if not isinstance(proposal_adverse, (list, tuple, Mapping)):
+                proposal_adverse = []
+            proposal_review = {
+                "status": str(proposal_selection.get("status") or "UNACTIVATED").upper(),
+                "proposal_status": str(proposal_selection.get("status") or "UNACTIVATED").upper(),
+                "members": proposal_members,
+                "scope": _bounded_value(proposal_selection.get("scope") or proposal_selection.get("market_scope") or {}),
+                "scope_binding": {
+                    key: proposal_selection.get(key) or proposal_pointer.get(key)
+                    for key in (
+                        "scope_draft_id", "scope_draft_hash", "scope_draft_version",
+                        "scope_hash", "scope_version", "active_scope_hash",
+                        "active_scope_version", "frozen_scope_hash", "frozen_scope_version",
+                    )
+                    if proposal_selection.get(key) is not None or proposal_pointer.get(key) is not None
+                },
+                "selected_setups": _bounded_value(list(proposal_setups)[:16]),
+                "adverse_evidence": _bounded_value(proposal_adverse),
+                "limits": _bounded_value(proposal_limits),
+                "affordability": _bounded_value(proposal_selection.get("affordability") or proposal_selection.get("outcome_limits") or risk_settings.get("remaining") or {}),
+                "readiness": _bounded_value(proposal_readiness),
+                "blockers": _bounded_value(proposal_selection.get("blockers") or []),
+                "setup_bindings": _bounded_value(proposal_selection.get("setup_bindings") or proposal_selection.get("draft_member_bindings") or []),
+                "proposal": {
+                    "status": str(proposal_selection.get("status") or "UNACTIVATED").upper(),
+                    "selection_id": proposal_selection.get("selection_id") or proposal_selection.get("portfolio_selection_id") or proposal_selection_id,
+                    "selection_hash": proposal_selection.get("selection_hash") or proposal_pointer.get("selection_hash"),
+                    "policy_id": proposal_selection.get("policy_id") or proposal_pointer.get("policy_id"),
+                    "policy_version": proposal_selection.get("policy_version") or proposal_pointer.get("policy_version"),
+                    "policy_hash": proposal_selection.get("policy_hash") or proposal_pointer.get("policy_hash"),
+                    "scope_draft_id": proposal_selection.get("scope_draft_id") or proposal_pointer.get("scope_draft_id"),
+                    "scope_draft_version": proposal_selection.get("scope_draft_version") or proposal_pointer.get("scope_draft_version"),
+                    "scope_draft_hash": proposal_selection.get("scope_draft_hash") or proposal_pointer.get("scope_draft_hash"),
+                    "proposed_allocation_total": proposal_selection.get("proposed_allocation_total"),
+                    "proposed_allocation_risk_digest": proposal_selection.get("proposed_allocation_risk_digest"),
+                    "members": proposal_members,
+                },
+                "authorization_bindings": {
+                    key: proposal_selection.get(key) or proposal_pointer.get(key)
+                    for key in (
+                        "selection_id", "selection_hash", "policy_id", "policy_version",
+                        "policy_hash", "scope_draft_id", "scope_draft_hash", "scope_draft_version",
+                        "active_settings_hash", "active_settings_generation",
+                    )
+                    if proposal_selection.get(key) is not None or proposal_pointer.get(key) is not None
+                },
+                "provenance": "store.load_portfolio_selection via rolling_exploratory_proposal pointer",
+            }
+            existing_review = configured_controls.get("exploratory_live_review") if isinstance(configured_controls, Mapping) else {}
+            existing_review = existing_review if isinstance(existing_review, Mapping) else {}
+            for field in ("selected_setups", "adverse_evidence", "limits", "affordability", "readiness", "blockers", "scope", "setup_bindings"):
+                if proposal_review.get(field) in (None, "", [], {}):
+                    proposal_review[field] = _bounded_value(existing_review.get(field))
+            configured_controls = dict(configured_controls) if isinstance(configured_controls, Mapping) else {}
+            configured_controls["exploratory_live_review"] = {**dict(existing_review), **proposal_review}
+        elif proposal_selection_id:
+            configured_controls = dict(configured_controls) if isinstance(configured_controls, Mapping) else {}
+            configured_controls["exploratory_live_review"] = {
+                "status": "UNAVAILABLE",
+                "proposal_status": "UNAVAILABLE",
+                "members": [],
+                "proposal": {
+                    "status": "UNAVAILABLE",
+                    "selection_id": proposal_selection_id,
+                    "selection_hash": proposal_pointer.get("selection_hash"),
+                    "members": [],
+                },
+                "blockers": ["EXPLORATORY_LIVE_PROPOSAL_BINDING_STALE"],
+                "provenance": "rolling_exploratory_proposal pointer unresolved or selection hash mismatch",
+            }
+        if callable(get_config):
+            try:
+                review_draft = get_config("execution_authorization_review", None)
+            except Exception:
+                review_draft = None
+            if isinstance(review_draft, Mapping):
+                choices = {
+                    key: _safe_value(review_draft.get(key))
+                    for key in (
+                        "purpose",
+                        "shared_allocation",
+                        "lifetime_budget",
+                        "expiry_anchor",
+                        "duration_seconds",
+                        "expires_at",
+                        "stop_rules",
+                        "adverse_evidence_ack_required",
+                    )
+                    if key in review_draft
+                }
+                review = configured_controls.get("exploratory_live_review") if isinstance(configured_controls, Mapping) else {}
+                review = dict(review) if isinstance(review, Mapping) else {}
+                review.setdefault("status", review_draft.get("status"))
+                review.setdefault("authorization", _authorization_public_projection(review_draft))
+                review.setdefault("choices", choices)
+                configured_controls = dict(configured_controls) if isinstance(configured_controls, Mapping) else {}
+                configured_controls["exploratory_live_review"] = review
+        return {
+            "schema": "ui-state.v1",
+            "operator_controls": configured_controls,
+            "execution_authorization": authorization,
+            "risk_settings": risk_settings,
+            "canary": canary,
+            "actions": actions,
+            "node": node,
+            "ledger": self._ui_ledger_data(),
+            "provenance": {
+                "authorization": "DashboardData.execution_authorization_data",
+                "risk": "DashboardData.risk_settings_data",
+                "current_review": "DashboardData.canary_data.rolling_portfolio and store.load_candidate_lifecycle",
+                "canary": "DashboardData.canary_data",
+                "actions": "operator_action_state",
+                "ledger": "read-only canary_* tables",
+            },
+        }
+
 
     def _operator_controls_projection(self, value: Any) -> Any:
         """Bound controls while preserving the already-public nested review scope."""
@@ -9574,6 +10336,23 @@ class DashboardData:
         if isinstance(review, Mapping) and isinstance(raw_readiness, Mapping):
             review = dict(review)
             review["readiness"] = _connectivity_safe_diagnostics(raw_readiness)
+        raw_choices = raw_review.get("choices")
+        if isinstance(raw_choices, Mapping) and isinstance(review, Mapping):
+            review = dict(review)
+            review["choices"] = {
+                key: _safe_value(raw_choices.get(key))
+                for key in (
+                    "purpose",
+                    "shared_allocation",
+                    "lifetime_budget",
+                    "expiry_anchor",
+                    "duration_seconds",
+                    "expires_at",
+                    "stop_rules",
+                    "adverse_evidence_ack_required",
+                )
+                if key in raw_choices
+            }
         if isinstance(review, Mapping) and isinstance(raw_review.get("authorization_bindings"), Mapping):
             raw_bindings = raw_review["authorization_bindings"]
             bindings: dict[str, Any] = {
@@ -10447,6 +11226,8 @@ class DashboardData:
             return self.overview()
         if endpoint == "operator":
             return self.operator_data()
+        if endpoint == "ui-state":
+            return self.ui_state_data()
         if endpoint == "datasets":
             return self.dataset_catalog_data()
         if endpoint == "research":
@@ -10496,920 +11277,98 @@ class DashboardData:
 
 
 def _dashboard_html(
-    control_token: str | None = None,
     *,
     binance_nav_label: str = "BINANCE SPOT CANARY",
 ) -> str:
-    """Return the bounded operator dashboard surface."""
-    return """<!doctype html>
+    """Return the framework-free shell; controls fetch their token in memory."""
+    binance = _html_escape(str(binance_nav_label or "BINANCE SPOT CANARY"), quote=True)
+    offline_css = """<style id="offline-reference-style">
+html,body{margin:0;min-height:100%;background:#f7f8fb;color:#172033;font:16px/1.5 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+.app-shell{display:flex;min-height:100vh}.sidebar{box-sizing:border-box;width:16rem;padding:1.5rem;background:#101827;color:#f4f7fb}.brand{display:block;color:inherit;text-decoration:none}.brand small{display:block;color:#b7c1d3}.nav-groups{display:grid;gap:1.25rem;margin-top:2rem}.nav-group p{margin:.25rem 0;color:#b7c1d3;font-size:.75rem;text-transform:uppercase;letter-spacing:.08em}.nav-group a{display:block;padding:.6rem .7rem;color:#f4f7fb;border-radius:.4rem;text-decoration:none}.nav-group a[aria-disabled=true],.header-destination[aria-disabled=true]{opacity:.55;cursor:not-allowed}.app-main{flex:1;min-width:0}.shell-header{display:flex;align-items:center;gap:1rem;padding:1.25rem 2rem;border-bottom:1px solid #dce1ea;background:#fff}.shell-header h1{margin:.15rem 0 0}.menu-toggle{display:none;padding:.6rem .8rem}.shell-main{max-width:72rem;margin:0 auto;padding:2.25rem}.section{padding:1.5rem;border:1px solid #dce1ea;border-radius:.7rem;background:#fff;box-shadow:0 8px 24px #17203312}.section h2{margin-top:0}.muted{color:#5f6b7d}.offline-note{max-width:72rem;margin:1rem auto;padding:0 2.25rem;color:#5f6b7d}@media(max-width:48rem){.sidebar{position:fixed;inset:0 auto 0 0;z-index:2;transform:translateX(-100%)}.app-shell.menu-open .sidebar{transform:translateX(0)}.menu-toggle{display:inline-block}.shell-header,.shell-main{padding-left:1rem;padding-right:1rem}.offline-note{padding:0 1rem}}
+</style>"""
+    offline_guard = """<script>
+(function () {
+  function renderOfflineReference() {
+    var root = document.getElementById("app");
+    var content = document.getElementById("content");
+    if (!root || !content) return;
+    document.documentElement.classList.add("offline-reference");
+    root.classList.add("offline-reference");
+    content.innerHTML = '<section class="section" aria-labelledby="offline-reference-title"><p class="eyebrow">Offline reference</p><h2 id="offline-reference-title">Read-only workspace copy</h2><p>This saved page is a safe reference only. It does not load live data, request an operator token, or send controls.</p><p class="muted">Start the local Axiom dashboard to inspect current bounded projections. Navigation and control actions are intentionally disabled in this file copy.</p></section>';
+    root.querySelectorAll("a[data-nav-view],a[data-route-link],a.header-destination").forEach(function (link) {
+      link.setAttribute("aria-disabled", "true");
+      link.setAttribute("tabindex", "-1");
+      link.addEventListener("click", function (event) { event.preventDefault(); event.stopPropagation(); });
+    });
+    root.querySelectorAll("[data-action]").forEach(function (control) {
+      control.setAttribute("aria-disabled", "true");
+      if ("disabled" in control) control.disabled = true;
+      control.hidden = true;
+      control.addEventListener("click", function (event) { event.preventDefault(); event.stopPropagation(); });
+    });
+  }
+  function loadLiveAssets() {
+    if (!/^https?:$/.test(window.location.protocol)) { renderOfflineReference(); return; }
+    var stylesheet = document.createElement("link");
+    stylesheet.rel = "stylesheet";
+    stylesheet.href = "/assets/styles.css";
+    document.head.appendChild(stylesheet);
+    var module = document.createElement("script");
+    module.type = "module";
+    module.src = "/assets/app.js";
+    document.body.appendChild(module);
+  }
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", loadLiveAssets, { once: true });
+  else loadLiveAssets();
+})();
+</script>"""
+    return f"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="axiom-control-token" content="__AXIOM_CONTROL_TOKEN__">
-  <title>AXIOM / Operator Research Console</title>
-  <style>
-    :root { color-scheme: dark; --bg:#080d17; --panel:#101827; --panel2:#0c1422; --line:#213047; --text:#e8eef8; --muted:#8b9ab0; --blue:#67b7ff; --cyan:#58e0d0; --green:#65d39b; --amber:#f4bf64; --red:#f27d8d; font-family:Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif; }
-    * { box-sizing: border-box; }
-    body { width:100%; max-width:100vw; margin:0; overflow-x:hidden; background:radial-gradient(circle at 85% 0%,#13233d 0,var(--bg) 36rem); color:var(--text); }
-    header { border-bottom:1px solid var(--line); background:rgba(8,13,23,.94); position:sticky; top:0; z-index:2; backdrop-filter:blur(12px); }
-    .topbar, main { width:min(100% - 32px, 1400px); margin:0 auto; }
-    .topbar { padding:20px 0 12px; display:flex; align-items:flex-start; justify-content:space-between; gap:20px; }
-    h1,h2,h3,p { margin:0; } h1 { font-size:1.3rem; letter-spacing:.08em; text-transform:uppercase; } h2 { font-size:.95rem; letter-spacing:.04em; text-transform:uppercase; } h3 { font-size:.8rem; color:var(--muted); text-transform:uppercase; letter-spacing:.08em; }
-    .eyebrow { color:var(--blue); font-size:.68rem; letter-spacing:.15em; text-transform:uppercase; margin-bottom:7px; } .subtitle,.muted,.page-note { color:var(--muted); } .subtitle { margin-top:6px; font-size:.86rem; }
-    .live-lock { border:1px solid #276a62; background:#0c2b2c; color:#9bf1d3; border-radius:6px; padding:9px 11px; font-size:.7rem; text-transform:uppercase; letter-spacing:.08em; white-space:nowrap; }
-    nav { width:min(100% - 32px, 1400px); margin:0 auto; display:flex; gap:4px; padding:0 0 11px; overflow-x:auto; } nav button,button.link { border:1px solid transparent; color:var(--muted); background:transparent; cursor:pointer; } nav button { padding:7px 10px; border-radius:5px; font-size:.7rem; letter-spacing:.06em; text-transform:uppercase; } nav button.tab:hover:not(.active) { color:var(--text); border-color:var(--line); background:#122039; } nav button.tab.active { color:var(--text); border-color:var(--line); background:#122039; } nav button.tab:focus-visible { outline:2px solid var(--blue); outline-offset:2px; }
-    main { padding:22px 0 55px; } .view { display:none; } .view.active { display:block; }
-    .grid,.two-col,.three-col,.status-grid,.card-grid { display:grid; gap:12px; } .status-grid { grid-template-columns:repeat(5,minmax(0,1fr)); margin-bottom:14px; } .card-grid { grid-template-columns:repeat(6,minmax(0,1fr)); margin-bottom:14px; } .two-col { grid-template-columns:minmax(0,1.45fr) minmax(260px,.8fr); } .three-col { grid-template-columns:repeat(3,minmax(0,1fr)); }
-    .panel { min-width:0; border:1px solid var(--line); background:linear-gradient(145deg,rgba(16,24,39,.96),rgba(10,17,29,.96)); border-radius:8px; padding:15px; box-shadow:0 10px 34px rgba(0,0,0,.14); } .panel + .panel { margin-top:12px; } .status-card { padding:12px 13px; }
-    .status-head,.section-title,.pager { display:flex; align-items:center; justify-content:space-between; gap:10px; } .status-name { font-size:.68rem; color:var(--muted); letter-spacing:.07em; text-transform:uppercase; } .status-value { margin-top:12px; font-size:.88rem; font-weight:650; }
-    .badge { display:inline-block; border-radius:999px; padding:3px 7px; font-size:.6rem; letter-spacing:.05em; text-transform:uppercase; border:1px solid var(--line); color:var(--muted); } .badge.good { color:#9bf1d3; border-color:#276a62; background:#102d2d; } .badge.warn { color:#ffd99a; border-color:#765424; background:#2d2414; } .badge.bad { color:#ffb4bd; border-color:#713844; background:#2d161d; }
-    .metric { font-size:1.45rem; font-variant-numeric:tabular-nums; margin-top:8px; } .metric-label { color:var(--muted); font-size:.69rem; margin-top:3px; } .empty { border:1px dashed #33445d; border-radius:6px; color:var(--muted); padding:17px; font-size:.8rem; line-height:1.5; background:var(--panel2); } .empty strong { color:var(--text); display:block; margin-bottom:5px; }
-    .scroll { width:100%; overflow-x:auto; } table { width:100%; border-collapse:collapse; font-size:.75rem; } th,td { text-align:left; padding:8px; border-bottom:1px solid #1c2a3f; white-space:nowrap; } th { position:sticky; top:0; z-index:1; background:#101827; color:var(--muted); font-weight:600; text-transform:uppercase; letter-spacing:.05em; font-size:.62rem; } tbody tr:hover { background:#142139; }
-    button.link { color:var(--blue); padding:0; font:inherit; text-align:left; } button.link:hover { text-decoration:underline; } input,select { min-width:0; border:1px solid var(--line); border-radius:5px; background:#0a1220; color:var(--text); padding:7px 9px; font-size:.73rem; } .filters { display:flex; gap:7px; flex-wrap:wrap; margin:10px 0; } .filters input { flex:1 1 180px; }
-    .timeline { display:grid; gap:2px; } .timeline-item { display:grid; grid-template-columns:95px 75px minmax(0,1fr); gap:9px; padding:8px 0; border-bottom:1px solid #1c2a3f; align-items:baseline; } .timeline-time { color:var(--muted); font-size:.65rem; } .timeline-kind { color:var(--cyan); text-transform:uppercase; letter-spacing:.05em; font-size:.61rem; }
-    .funnel { display:grid; gap:7px; } .funnel-row { display:grid; grid-template-columns:145px 1fr 35px; gap:8px; align-items:center; font-size:.69rem; } .funnel-track { height:8px; background:#172238; border-radius:5px; overflow:hidden; } .funnel-bar { height:100%; background:linear-gradient(90deg,var(--blue),var(--cyan)); border-radius:5px; }
-    .key-value { display:grid; grid-template-columns:145px minmax(0,1fr); gap:7px; font-size:.76rem; } .key { color:var(--muted); } .key-value + .key-value { margin-top:7px; } details { margin-top:12px; } summary { color:var(--muted); cursor:pointer; font-size:.72rem; } pre { margin:9px 0 0; max-height:350px; overflow:auto; white-space:pre-wrap; word-break:break-word; color:#b7c7dc; font-size:.68rem; line-height:1.4; } .page-note { font-size:.74rem; line-height:1.5; margin-top:9px; } .notice { border-left:3px solid var(--amber); padding:8px 11px; color:#e7d4a8; background:#211b10; font-size:.73rem; line-height:1.4; } .right { text-align:right; } .pager { margin-top:11px; color:var(--muted); font-size:.72rem; } .pager button { border:1px solid var(--line); border-radius:4px; color:var(--text); background:#0a1220; padding:5px 8px; cursor:pointer; } .pager button:disabled { opacity:.4; cursor:default; }
-    @media (max-width:1050px) { .status-grid { grid-template-columns:repeat(3,1fr); } .card-grid { grid-template-columns:repeat(3,1fr); } .two-col,.three-col { grid-template-columns:1fr; } } @media (max-width:620px) { .topbar,main,nav { width:min(100% - 24px,1400px); } .status-grid,.card-grid { grid-template-columns:repeat(2,1fr); } .timeline-item { grid-template-columns:72px 60px minmax(0,1fr); } }
-    .identity { display:flex; flex-direction:column; gap:2px; min-width:160px; } .identity-main { color:var(--text); font-weight:650; } .identity-sub { color:var(--muted); font-size:.65rem; } .copy { border:1px solid var(--line); border-radius:4px; background:transparent; color:var(--blue); cursor:pointer; font-size:.62rem; padding:2px 5px; margin-left:5px; } .copy:hover { background:#122039; } .refresh-note { min-height:1.1em; color:var(--muted); font-size:.68rem; } .refresh-note.slow { color:var(--amber); } .quality-context { display:block; color:var(--muted); font-size:.62rem; white-space:normal; max-width:260px; } .activity-compact { border-bottom:1px solid #1c2a3f; padding:8px 0; } .activity-compact + .activity-compact { margin-top:2px; } .detail-grid { display:grid; gap:10px; } .detail-section { border-top:1px solid #1c2a3f; padding-top:9px; } .detail-section h3 { margin-bottom:6px; } .progress { height:7px; background:#172238; border-radius:5px; overflow:hidden; } .progress > i { display:block; height:100%; background:linear-gradient(90deg,var(--blue),var(--cyan)); }
-    .binance-view .identity,.binance-view td,.binance-view strong { overflow-wrap:anywhere; word-break:break-word; white-space:normal; } .binance-view table { table-layout:fixed; } .binance-view details pre { max-height:420px; } .binance-action { border:1px solid var(--line); border-radius:5px; background:#0a1220; color:var(--text); cursor:pointer; padding:7px 9px; font-size:.7rem; } .binance-action.danger { color:#ffb4bd; border-color:#713844; }
-  </style>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  {offline_css}
+  <title>AXIOM / operator console</title>
 </head>
 <body>
-  <header><div class="topbar"><div><div class="eyebrow">Paper-first research operations</div><h1>AXIOM / operator console</h1><p class="subtitle">Historical evidence, forward observation, and paper lifecycle in one view.</p></div><div class="live-lock">Live trading <strong>Disabled</strong><br>Paper risk engine <strong>Active</strong></div></div>
-    <nav aria-label="Research sections">
-      <button class="tab active" data-view="overview">Overview</button><button class="tab" data-view="datasets">DATASETS</button><button class="tab" data-view="activity">ACTIVITY</button><button class="tab" data-view="crypto">CRYPTO RESEARCH</button><button class="tab" data-view="polymarket">Polymarket</button><button class="tab" data-view="candidates">Candidates</button><button class="tab" data-view="hermes">Hermes</button><button class="tab" data-view="portfolio">Paper Portfolio</button><button class="tab" data-view="rolling-portfolio">Rolling Portfolio</button><button class="tab" data-view="canary">Polymarket Canary</button><button class="tab" data-view="binance-canary">__BINANCE_NAV_LABEL__</button>
-    </nav>
-  </header>
-  <main>
-    <section id="view-overview" class="view active"><div id="component-grid" class="status-grid"></div><div id="overview-readiness-snapshot"></div><div id="research-cards" class="card-grid"></div>
-      <article id="research-progress" class="panel"><div class="section-title"><h2>AUTOMATIC RESEARCH</h2><span class="badge warn">persisted · paper-only</span></div><div id="research-progress-content" class="three-col"></div></article>
-      <article id="research-feed" class="panel"><div class="section-title"><h2>RESEARCH FEED</h2><span class="badge warn">observability · paper-only</span></div><div id="research-feed-content"><section class="panel"><div class="section-title"><h3>External Hermes feed</h3><span class="badge warn">External status UNKNOWN</span></div><p class="page-note">Waiting for live external feed evidence.</p></section></div></article>
-      <article class="panel"><div class="section-title"><h2>SYSTEM CONTROL</h2><span class="badge good">localhost + token</span></div><div id="operator-controls" class="three-col"></div><div id="control-result" class="page-note"></div></article>
-      <div class="two-col"><div><article class="panel"><div class="section-title"><h2>Historical / forward coverage</h2><a class="link" href="#datasets" data-link="datasets">View all</a></div><div id="coverage"></div></article>
-        <article class="panel"><div class="section-title"><h2>Candidate lifecycle funnel</h2><a class="link" href="#candidates" data-link="candidates">View all</a></div><div id="funnel" class="funnel"></div></article>
-        <article class="panel"><div class="section-title"><h2>Research → order funnel</h2><span class="badge">persisted handoff</span></div><div id="market-scope-funnel" class="funnel"></div><p class="page-note">Qualification is historical evidence only. Readiness and execution feasibility are persisted separately.</p></article>
-        <article class="panel"><div class="section-title"><h2>Latest candidates</h2><a class="link" href="#candidates" data-link="candidates">View all</a></div><div id="overview-candidates" class="scroll"></div></article></div>
-        <div><article class="panel"><div class="section-title"><h2>Latest activity</h2><a class="link" href="#activity" data-link="activity">View all</a></div><div id="overview-activity" class="timeline"></div></article>
-        <article class="panel"><div class="section-title"><h2>Selected detail</h2><span class="muted">preserved on refresh</span></div><div id="detail" class="empty"><strong>Select an item</strong>Dataset and candidate evidence appears here.</div></article></div></div>
-      <details><summary>Technical details · raw APIs and retained debug surfaces</summary><p class="page-note">Existing JSON APIs remain available for automation. Research maturity, Paper forward, and Research queue and node status are retained below as raw endpoint links.</p><div id="api-links"><a href="/api/v2/datasets">datasets</a> · <a href="/api/v2/activity">activity</a> · <a href="/api/v2/candidates">candidates</a> · <a href="/api/v2/polymarket">polymarket</a> · <a href="/api/v2/binance-canary">binance-canary</a> · <a href="/api/v2/hermes">hermes</a> · <a href="/api/v2/paper">paper</a> · <a href="/api/autonomous-research">autonomous-research</a></div><pre id="raw-overview"></pre></details>
-    </section>
-    <section id="view-datasets" class="view"><article class="panel"><div class="section-title"><h2>DATASETS</h2><span id="dataset-total" class="muted"></span></div><div class="filters"><input id="datasets-filter" placeholder="Filter dataset, instrument, source" aria-label="Filter datasets"><select id="datasets-source"><option value="">All sources</option><option>HISTORICAL</option><option>FORWARD_COLLECTED</option></select><select id="datasets-size"><option>25</option><option>50</option><option>100</option></select></div><div id="datasets-table" class="scroll"></div><div id="datasets-pager" class="pager"></div></article><article id="dataset-detail" class="panel"></article></section>
-    <section id="view-activity" class="view"><article class="panel"><div class="section-title"><h2>ACTIVITY</h2><span id="activity-total" class="muted"></span></div><div class="filters"><input id="activity-filter" placeholder="Filter activity" aria-label="Filter activity"><select id="activity-status"><option value="">All statuses</option><option>PENDING</option><option>RUNNING</option><option>COMPLETE</option><option>COMPLETED</option><option>ACCEPTED</option><option>FAILED</option><option>ERROR</option><option>REJECTED</option></select><select id="activity-size"><option>25</option><option>50</option><option>100</option></select></div><div id="activity-table" class="scroll"></div><div id="activity-pager" class="pager"></div></article></section>
-    <section id="view-crypto" class="view"><article class="panel"><div class="section-title"><h2>CRYPTO RESEARCH</h2><span class="badge good">historical and forward · paper-only</span></div><div class="filters"><input id="crypto-filter" placeholder="Filter crypto catalog, report, symbol" aria-label="Filter crypto research"><input id="crypto-symbol" placeholder="Symbol" aria-label="Filter crypto symbol"><select id="crypto-size"><option>25</option><option>50</option><option>100</option></select></div><div id="crypto-summary"></div><div id="crypto-table" class="scroll"></div><div id="crypto-pager" class="pager"></div><div id="crypto-detail"></div><div class="notice">All crypto catalogs and reports are bounded, versioned, and paper-only; no live execution path exists.</div></article></section>
-    <section id="view-polymarket" class="view"><article class="panel"><div class="section-title"><h2>Polymarket opportunities</h2><span class="badge warn">price proxy unless timestamped depth exists</span></div><div class="filters"><input id="polymarket-filter" placeholder="Filter questions or markets" aria-label="Filter Polymarket"><select id="polymarket-category"><option value="">All categories</option></select><select id="polymarket-size"><option>25</option><option>50</option><option>100</option></select></div><div id="pm-summary"></div><div id="pm-markets" class="scroll"></div><div id="polymarket-pager" class="pager"></div><p class="page-note">Historical price history is separate from forward order-book observations. No historical depth, spread, fills, or executable quotes are fabricated.</p></article></section>
-    <section id="view-candidates" class="view"><article class="panel"><div class="section-title"><h2>CANDIDATES</h2><span id="candidate-total" class="muted"></span></div><div class="filters"><input id="candidates-filter" placeholder="Filter strategy, family, market" aria-label="Filter candidates"><select id="candidates-stage"><option value="">All stages</option></select><select id="candidates-size"><option>25</option><option>50</option><option>100</option></select></div><div id="candidates-table" class="scroll"></div><div id="candidates-pager" class="pager"></div></article></section>
-    <article id="candidate-detail" class="panel"><div class="section-title"><h2>Candidate detail</h2><span class="muted">historical → forward → lifecycle</span></div><div class="empty">Select a candidate to inspect evidence.</div></article>
-    <section id="view-hermes" class="view"><article class="panel"><div class="section-title"><h2>Hermes / research loop</h2><span class="badge">research only · no canary control</span></div><div id="hermes-summary"></div><div class="filters"><input id="hermes-filter" placeholder="Filter queue" aria-label="Filter Hermes queue"><select id="hermes-status"><option value="">All statuses</option><option>PENDING</option><option>TESTING</option><option>COMPLETED</option><option>ACCEPTED</option><option>REJECTED</option><option>FAILED</option><option>ERROR</option></select><select id="hermes-size"><option>25</option><option>50</option><option>100</option></select></div><div id="hermes-table" class="scroll"></div><div id="hermes-pager" class="pager"></div><div id="hermes-detail"></div></article></section>
-    <section id="view-portfolio" class="view"><article class="panel"><div class="section-title"><h2>Paper Portfolio</h2><span class="badge warn">paper-only · no live execution</span></div><div class="filters"><input id="paper-filter" placeholder="Filter paper records" aria-label="Filter paper records"><select id="paper-status"><option value="">All statuses</option><option>OPEN</option><option>CLOSED</option><option>RESOLVED</option><option>UNKNOWN</option></select><select id="paper-size"><option>25</option><option>50</option><option>100</option></select></div><div id="portfolio-summary"></div><div id="portfolio-states" class="scroll"></div><div id="paper-pager" class="pager"></div></article></section>
-    <section id="view-rolling-portfolio" class="view"><article class="panel"><div class="section-title"><h2>Rolling Portfolio</h2><span id="rolling-status" class="badge warn">paper-only · no live execution</span></div><div id="rolling-action-result" class="page-note"></div><div id="rolling-summary"></div><div id="rolling-policy-controls"></div><div id="rolling-members" class="scroll"></div><div id="rolling-reasons"></div><div id="rolling-jobs"></div><p class="page-note">Rolling membership is append-only and each displayed member is bound to its persisted strategy, research trial, candidate, and exact evidence window. Missing lineage remains non-executable. Policy/allocation review is a non-active draft; activation is separate, deliberate, and remains paper-only.</p></article></section>
-    <section id="view-canary" class="view"><article class="panel" style="border-color:var(--red)"><div class="section-title"><h2>REAL CANARY MONEY</h2><span class="badge bad">PRODUCTION LIVE TRADING: DISABLED</span></div><div id="canary-action-result" class="page-note"></div><div id="canary-readiness-snapshot"></div><div id="canary-controls"></div><div id="risk-settings"></div><div id="canary-connectivity"></div><div id="canary-summary"></div><div id="canary-trades" class="scroll"></div><p class="notice">Autonomous canary is independent from paper research. No secrets are stored or displayed. It remains prediction-only, bounded by active settings, and killable from this console.</p></article></section>
-    <article id="canary-recovery-form" class="panel"><div class="section-title"><h2>UNKNOWN ENTRY RECOVERY</h2><span class="badge warn">READ-ONLY · PRODUCTION PROFILE</span></div><p class="page-note">Attach only an operator-supplied canonical exchange order ID. This does not post, retry, activate, or release an entry.</p><div class="three-col"><label>Event ID<input id="canary-recovery-event" autocomplete="off"></label><label>Signal ID<input id="canary-recovery-signal" autocomplete="off"></label><label>Canonical exchange order ID<input id="canary-recovery-order" autocomplete="off"></label></div><label>Exact confirmation<input id="canary-recovery-confirm" placeholder="RECOVER UNKNOWN ENTRY" autocomplete="off"></label><p class="page-note"><button id="canary-recovery-submit" class="link">Recover and reconcile</button> <span id="canary-recovery-result"></span></p></article>
-    <article id="execution-authorization-panel" class="panel" style="border-color:var(--amber)"><div class="section-title"><h2>EXPLORATORY MICRO-CANARY AUTHORIZATION</h2><span class="badge warn">REVIEWED · DISARMED BY DEFAULT</span></div><div id="execution-auth-state" class="page-note">Loading authorization state…</div><pre id="execution-auth-details" class="scroll"></pre><div class="three-col"><label>Purpose<input id="execution-auth-purpose" value="commission exploratory automation and measure actual net results; profitability unproven" maxlength="120" autocomplete="off"></label><label>Shared allocation (USD)<input id="execution-auth-shared-allocation" value="5.00" inputmode="decimal" maxlength="16" readonly></label><label>Cumulative all-in BUY budget (USD)<input id="execution-auth-budget" value="5.00" inputmode="decimal" maxlength="16" readonly></label></div><p class="page-note"><strong>Expiry:</strong> 24 hours from final confirmation; UTC assigned atomically on confirmation. No fixed review-time UTC expiry is presented.</p><label>Stop rules (JSON)<input id="execution-auth-stop-rules" value='{"on_any_blocker":"STOP","halt_on_unknown_execution":true}' maxlength="512" autocomplete="off"></label><label class="page-note"><input id="execution-auth-adverse-evidence" type="checkbox"> I acknowledge the adverse evidence; this review remains paper-only and disarmed.</label><p class="page-note">Review binds the exact proposed exploratory selection, policy/setup/evidence identities, risk settings, scope, and stop rules. Shared allocation and cumulative lifetime budget are distinct; existing per-order, daily, exposure, position, submission, slippage, and loss limits remain unchanged.</p><p><button id="execution-auth-review" class="link">Review exploratory authorization</button> <button id="execution-auth-activate" class="link">Activate reviewed authorization</button> <button id="execution-auth-revoke" class="link">Revoke active authorization</button> <span id="execution-auth-result"></span></p></article>
-    <article id="exploratory-live-review-panel" class="panel" style="border-color:var(--red)"><div class="section-title"><h2>EXPLORATORY LIVE FINAL REVIEW</h2><span class="badge bad">PROFITABILITY UNPROVEN · DISARMED BY DEFAULT</span></div><p class="page-note">One confirmation coordinates the existing reviewed authorization, bounded allocation, arm, and autonomous-enable fences. It never submits an order.</p><div id="exploratory-live-review" class="scroll">Loading final review…</div><label>Exact confirmation<input id="exploratory-live-confirm" placeholder="CONFIRM EXPLORATORY LIVE" autocomplete="off"></label><button id="exploratory-live-confirm-action" type="button">Review and confirm EXPLORATORY LIVE</button><div id="exploratory-live-result" class="page-note"></div></article>
-    <p class="page-note"><strong>Unactivated broad scope draft:</strong> canonical RULE_BASED_MARKETS / POLYMARKET with all categories, standard binary prediction markets only. COMBO, unsupported/non-binary/closed/not-accepting/no-book/stale/insufficient-liquidity-or-depth/invalid-token-or-setup/data/evaluation failures remain excluded; the active operating scope and each selected member's frozen scope are shown separately. Discovery and evaluation stay paper-only; no scope activation or order submission is available here.</p>
-    <p class="page-note">Review disclosure: setup entry predicate/direction/sizing/exit/lookback · bounded scope and ≤3 members · $1 all-in, $0.01 fee reserve, $5 gross daily, $5 aggregate exposure and independent open-cost · 3 positions · 5 submissions/day · $2 realized/equity stops · 100bp slippage · authoritative pending/UNKNOWN usage and reserved exit capacity · explicit finite lifetime budget and expiration · stop rules · trusted account/geoblock/balance/allowance · selected-market book/minimum/depth readiness. Optional 20 submissions/day remains reviewed-only and is never auto-set.</p>
-    <section id="view-binance-canary" class="view binance-view"><article class="panel" style="border-color:var(--amber)"><div class="section-title"><h2>BINANCE SPOT CANARY</h2><span class="badge warn">DEVELOPMENT / PAPER|TESTNET</span></div><p class="page-note">Separate from the Polymarket canary. <strong>POLYMARKET TRANSPORT: DISABLED</strong> · Binance Spot only · no implicit control-plane construction.</p><div id="binance-action-result" class="page-note"></div><div id="binance-identity"></div><div id="binance-connectivity"></div><div id="binance-qualification"></div><div id="binance-risk"></div><div id="binance-controls"></div><div id="binance-records" class="scroll"></div><details><summary>Full Binance projection and identifiers</summary><pre id="binance-raw"></pre></details><p class="notice">Credentials are never displayed. Connectivity checks are read-only; order validation is an explicit test action. No browser action can place an order.</p></article></section>
-    <div id="binance-testnet-static-labels" hidden>BINANCE SPOT TESTNET · TESTNET CONNECTIVITY · ORDER VALIDATION · TESTNET EXECUTION PROBE · AUTONOMOUS TESTNET · localhost</div>
-  </main>
-  <script>
-    const $ = (id) => document.getElementById(id), safe = (v) => String(v ?? "—").replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c])), json = (v) => JSON.stringify(v ?? {}, null, 2);
-    const count = (v) => v == null ? "UNKNOWN" : Number.isFinite(Number(v)) ? String(v) : "UNKNOWN", phtDateFormatter = new Intl.DateTimeFormat("en-PH-u-hc-h23", { timeZone:"Asia/Manila", year:"numeric", month:"2-digit", day:"2-digit", hour:"2-digit", minute:"2-digit", second:"2-digit", hourCycle:"h23" }), dateText = (v) => { if(!v || typeof v !== "string" || !/(?:Z|[+-][0-9]{2}:[0-9]{2})$/.test(v)) return "—"; const date = new Date(v); if(Number.isNaN(date.getTime())) return "—"; const parts = Object.fromEntries(phtDateFormatter.formatToParts(date).filter(i => i.type !== "literal").map(i => [i.type, i.value])); return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second} PHT`; }, usd = (v) => { const number=Number(v); return Number.isFinite(number)?`$${number.toFixed(2)}`:"—"; }, arr = (v) => Array.isArray(v) ? v : [];
-    const empty = (title,body) => `<div class="empty"><strong>${safe(title)}</strong>${safe(body)}</div>`, statusClass = (v) => { const s=String(v||"").toUpperCase(); return ["READY","RUNNING","ACTIVE","COMPLETE","COMPLETED","HEALTHY","ELIGIBLE","PASSED","PROMOTABLE","A","B"].includes(s)?"good":["DEGRADED","STOPPED","UPDATING","SUBMITTING","UNKNOWN","C"].includes(s)?"warn":["ERROR","STALE","REJECTED","KILLED","BLOCKED","FAIL","INSUFFICIENT","UNAVAILABLE","D","F"].includes(s)?"bad":""; };
-    function readinessSnapshotMarkup(data) { const snapshot=data?.canary&&typeof data.canary==="object"?data.canary:(data||{}),status=String(snapshot.readiness_snapshot_status||"STALE").toUpperCase(),current=status==="CURRENT"&&snapshot.readiness_snapshot_stale===false,label=current?"READINESS SNAPSHOT CURRENT":"READINESS SNAPSHOT STALE",updated=snapshot.readiness_snapshot_updated_at||data?.readiness_snapshot_updated_at; return `<p class="page-note readiness-snapshot"><span class="badge ${statusClass(current?"CURRENT":"STALE")}">${label}</span> · Updated ${safe(dateText(updated))}</p>`; }
-    let params = new URLSearchParams(location.search); const state = { tab: params.get("tab") || "overview", page: Math.max(1,Number(params.get("page")||1)), page_size: [10,25,50,100].includes(Number(params.get("page_size"))) ? Number(params.get("page_size")) : 25, filter: params.get("filter") || "", sort: params.get("sort") || "", direction: params.get("direction") === "asc" ? "asc" : "desc", selected: params.get("selected") || "", expanded: params.get("expanded") === "1" };
-    let operator = {}, current = {}, loadInFlight = false, operatorControlsRendered = false, binanceTestnetMode = false;
-    let riskReview = {active:null,draft:null};
-    let rollingReview = {active:{},proposed:{},caps:{},allocation:{},canary_binding:{}};
-    const controlToken = document.querySelector('meta[name="axiom-control-token"]')?.content || "";
-    function controlButton(action,label,target="",confirmation="",payload=null) { const encodedPayload=payload&&typeof payload==="object"&&!Array.isArray(payload)?JSON.stringify(payload):""; return `<button class="link control-action" data-control-action="${safe(action)}" data-control-target="${safe(target)}" data-control-confirm="${safe(confirmation)}" data-control-payload="${safe(encodedPayload)}">${safe(label)}</button>`; }
-    function isCanaryAction(action) { return String(action||"").startsWith("canary."); }
-    function isRollingAction(action) { const value=String(action||""); return value.startsWith("rolling.")||value.startsWith("admission_policy."); }
-    function actionResultNode(action) { return $(isCanaryAction(action)?"canary-action-result":isRollingAction(action)?"rolling-action-result":"control-result"); }
-    function actionResultMessage(action,message) { const node=actionResultNode(action); if(node)node.textContent=message||""; }
-    async function controlPost(action,target="",confirmation="",extra={}) {
-      const payload={action,target}; if(extra&&typeof extra==="object"&&!Array.isArray(extra)&&Object.keys(extra).length)payload.payload=extra; if(confirmation)payload.confirm=confirmation;
-      try {
-        const response=await fetch("/api/control",{method:"POST",headers:{"Content-Type":"application/json","X-Axiom-Control-Token":controlToken},body:JSON.stringify(payload),cache:"no-store"});
-        const result=await response.json();
-        const connectivity=result?.result?.connectivity||result?.connectivity;
-        if(isCanaryAction(action)&&connectivity) {
-          if(lastGood.canary&&typeof lastGood.canary==="object"&&!Array.isArray(lastGood.canary)) lastGood.canary={...lastGood.canary,connectivity};
-          renderCanaryConnectivity(connectivity);
-        }
-        const actionIdentity=result?.action_id?` · ${result.action_id}`:"";
-        actionResultMessage(action,result.ok?`${action} completed${actionIdentity}`:`${action} blocked: ${result.reason||"CONTROL_FAILED"}${actionIdentity}`);
-        if(activeController)activeController.abort();
-        refreshGeneration++;
-        activeController=null;
-        loadInFlight=false;
-        clearTimeout(slowRefreshTimer);
-        slowRefreshTimer=null;
-        nextRefreshAt=0; await loadPage(state.tab,true);
-        return result;
-      } catch(error) {
-        actionResultMessage(action,`${action} unavailable: ${error?.message||"network failure"}`);
-        return {ok:false,reason:"CONTROL_UNAVAILABLE"};
-      }
-    }
-    function renderOperatorControls(data) {
-      const controls=data.operator_controls||{};
-      if(!Object.keys(controls).length){
-        if(!operatorControlsRendered)$("operator-controls").innerHTML=empty("Operator controls unavailable","Launch with python -m axiom.cli operator to enable typed localhost controls.");
-        return;
-      }
-      operatorControlsRendered=true;
-      const n=controls.node||{},b=controls.bootstrap||{},h=controls.hermes||{},p=controls.paper||{},c=controls.collector||{},cred=controls.credentials||{};
-      const progress=b.total_datasets?`${count(b.completed_datasets)} / ${count(b.total_datasets)} datasets`:"—";
-      $("operator-controls").innerHTML=[
-        `<article><h3>AXIOM NODE</h3><div class="key-value"><span class="key">Status</span><strong>${safe(n.status)}</strong></div><div class="key-value"><span class="key">PID / heartbeat</span><strong>${safe(n.pid)} · ${safe(dateText(n.heartbeat_at))}</strong></div><p class="page-note">${controlButton("node.restart","Restart node","node")}</p></article>`,
-        `<article><h3>CRYPTO BOOTSTRAP</h3><div class="key-value"><span class="key">Status</span><strong>${safe(b.status)}</strong></div><div class="key-value"><span class="key">Current</span><strong>${safe(b.current_symbol)} · ${safe(b.current_timeframe)}</strong></div><div class="key-value"><span class="key">Progress</span><strong>${safe(progress)}</strong></div><p class="page-note">${b.status==="FAILED"||b.resumable?controlButton("bootstrap.resume","Resume bootstrap","crypto-universe"):controlButton("bootstrap.start","Start bootstrap","crypto-universe")}</p></article>`,
-        `<article><h3>INTERNAL RESEARCH QUEUE</h3><div class="key-value"><span class="key">Internal queue status</span><strong>${safe(h.status||"UNKNOWN")}</strong></div><div class="key-value"><span class="key">Last / next</span><strong>${safe(dateText(h.last_run_at))} · ${safe(dateText(h.next_run_at))}</strong></div><p class="page-note">${String(h.status||"").toUpperCase()==="PAUSED"?controlButton("hermes.resume","Resume processing"):controlButton("hermes.pause","Pause processing")} · ${controlButton("hermes.run_now","Process next pending item now")}</p></article>`,
-        `<article><h3>PAPER ENGINE</h3><div class="key-value"><span class="key">Status</span><strong>${safe(p.status)}</strong></div><p class="page-note">Read-only paper status. No browser configuration or trading controls.</p></article>`,
-        `<article><h3>COLLECTOR</h3><div class="key-value"><span class="key">Status</span><strong>${safe(c.status)}</strong></div><p class="page-note">Safe independent restart is unavailable; restart the node instead.</p></article>`,
-        `<article><h3>CREDENTIALS</h3><div class="key-value"><span class="key">Configured</span><strong>${cred.configured?"YES":"NO"}</strong></div><p class="page-note">Configuration is CLI-only. Secret values are never returned.</p></article>`
-      ].join("");
-    }
-    function saveState(push=false) { const q=new URLSearchParams(); q.set("tab",state.tab); q.set("page",state.page); q.set("page_size",state.page_size); if(state.filter)q.set("filter",state.filter); if(state.sort)q.set("sort",state.sort); if(state.direction!=="desc")q.set("direction",state.direction); if(state.selected)q.set("selected",state.selected); if(state.expanded)q.set("expanded","1"); document.querySelectorAll("select.facet").forEach(el=>{if(el.value)q.set(el.dataset.param||el.id,el.value)}); (push?history.pushState:history.replaceState).call(history,{}, "", `${location.pathname}?${q}`); }
-    function activate(tab,push=true) { if(tab!==state.tab){state.selected="";state.expanded=false;state.filter="";state.sort="";state.direction="desc";state.page=1;} state.tab=tab; document.querySelectorAll(".tab").forEach(b=>b.classList.toggle("active",b.dataset.view===tab)); document.querySelectorAll(".view").forEach(v=>v.classList.toggle("active",v.id===`view-${tab}`)); saveState(push); if(tab!=="overview"&&tab!=="canary") loadPage(tab); }
-    function sortButton(key,label) { const active=state.sort===key, arrow=active?(state.direction==="asc"?" ▲":" ▼"):""; return `<button class="link sort" data-sort="${safe(key)}">${safe(label)}${arrow}</button>`; }
-    function restoreFacets() { document.querySelectorAll("select.facet").forEach(el=>{const value=params.get(el.dataset.param||el.id);if(value!==null&&Array.from(el.options).some(o=>o.value===value))el.value=value;}); document.querySelectorAll('select[id$="-size"]').forEach(el=>{el.value=String(state.page_size);}); document.querySelectorAll(".filters input").forEach(el=>{el.value=state.filter;}); }
-    function ensureFacets() { const specs={datasets:[["datasets-market","Market","market",["crypto_spot","prediction"]],["datasets-timeframe","Timeframe","timeframe",["1m","1h","1d","live"]],["datasets-quality","Quality","quality",["OHLCV","PRICE_PROXY","ORDER_BOOK_SIMULATED"]]],polymarket:[["polymarket-settlement","Settlement","settlement",["open","resolved_yes","resolved_no","void"]],["polymarket-quality","Quality","quality",["PRICE_PROXY","ORDER_BOOK_SIMULATED"]]]}; Object.entries(specs).forEach(([view,entries])=>{const host=document.querySelector(`#view-${view} .filters`);if(!host)return;entries.forEach(([id,label,param,options])=>{if($(id))return;const s=document.createElement("select");s.id=id;s.className="facet";s.dataset.param=param;s.innerHTML=`<option value="">All ${label.toLowerCase()}</option>${options.map(o=>`<option value="${safe(o)}">${safe(o)}</option>`).join("")}`;host.appendChild(s);});}); document.querySelectorAll(".filters select").forEach(el=>{el.classList.add("facet");if(el.id.endsWith("-size")){el.dataset.param="page_size";if(!Array.from(el.options).some(o=>o.value==="10")){const option=document.createElement("option");option.value="10";option.textContent="10";el.insertBefore(option,el.firstChild);}}else if(!el.dataset.param)el.dataset.param=el.id.includes("source")?"source_type":el.id.includes("stage")?"stage":el.id.includes("status")?"status":el.id.includes("category")?"category":el.id;}); restoreFacets(); }
-    function pager(name,data) { const total=Number(data?.total)||0,page=Number(data?.page)||1,size=Number(data?.page_size)||25,pages=Number(data?.pages)||0,start=total?(page-1)*size+1:0,end=Math.min(page*size,total),windowStart=Math.min(Math.max(1,page-3),Math.max(1,pages-6)); const numbers=pages?Array.from({length:Math.min(pages,7)},(_,i)=>windowStart+i):[]; $(`${name}-pager`).innerHTML=`<span>Showing ${start}–${end} of ${total} · Page ${page} of ${pages||1}</span><span><button data-page="${page-1}" ${page<=1?"disabled":""}>Previous</button> ${numbers.map(n=>`<button data-page="${n}" ${n===page?"disabled":""}>${n}</button>`).join(" ")} <button data-page="${page+1}" ${!pages||page>=pages?"disabled":""}>Next</button></span>`; $(`${name}-pager`).querySelectorAll("button").forEach(b=>b.addEventListener("click",()=>{const next=Number(b.dataset.page);if(name==="dataset-ranges")loadDataset(state.selected,next,false);else if(name==="candidate-events")loadCandidate(state.selected,next,false);else{state.page=next;saveState(true);loadPage(name==="paper"?"portfolio":name);}})); }
-    async function fetchV2(name) { const q=new URLSearchParams({page:String(state.page),page_size:String(state.page_size),direction:state.direction}); if(state.filter)q.set("filter",state.filter); if(state.sort)q.set("sort",state.sort); const controls={datasets:[["datasets-source","source_type"],["datasets-market","market"],["datasets-timeframe","timeframe"],["datasets-quality","quality"]],activity:[["activity-status","status"]],candidates:[["candidates-stage","stage"]],polymarket:[["polymarket-category","category"],["polymarket-settlement","settlement"],["polymarket-quality","quality"]],hermes:[["hermes-status","status"]],paper:[["paper-status","status"]]}; for(const [id,key] of (controls[state.tab]||[])){const el=$(id);if(el&&el.value)q.set(key,el.value);} const response=await fetch(`/api/v2/${name}?${q}`,{cache:"no-store"}); if(!response.ok)throw new Error(`${name} HTTP ${response.status}`); return response.json(); }
-    function renderComponents(data) { $("component-grid").innerHTML=arr(data.components).map(i=>{const s=String(i.state||"NOT INITIALIZED"),reason=i.detail?.reason||i.detail?.error||"";return `<article class="panel status-card"><div class="status-head"><span class="status-name">${safe(i.name)}</span><span class="badge ${statusClass(s)}">${safe(s)}</span></div><div class="status-value">${safe(i.detail?.status||i.detail?.symbol||"read-only")}</div>${reason?`<p class="page-note">${safe(reason)}</p>`:""}</article>`}).join("")||empty("System not initialized","Start the normal AXIOM node to populate worker status."); }
-    function renderOverview(data) { renderComponents(data); const cards=data.research_cards||{}; $("research-cards").innerHTML=[["experiments_run","Experiments run"],["active_hypotheses","Active hypotheses"],["candidates_alive","Candidates alive"],["rejected","Rejected"],["paper_forward","Paper forward"],["paper_promotable","Paper promotable"]].map(([k,l])=>`<article class="panel"><div class="metric">${count(cards[k])}</div><div class="metric-label">${l}</div></article>`).join(""); const c=data.coverage||{}; $("coverage").innerHTML=`<div class="three-col"><div class="key-value"><span class="key">Historical datasets</span><strong>${count(c.historical_count)}</strong></div><div class="key-value"><span class="key">Forward datasets</span><strong>${count(c.forward_count)}</strong></div><div class="key-value"><span class="key">Rows observed</span><strong>${count((c.historical_rows||0)+(c.forward_rows||0))}</strong></div></div><p class="page-note">Prediction market datasets are available in DATASETS; overview intentionally shows summaries only.</p>`; const funnel=data.lifecycle_funnel||{}; const max=Math.max(1,...Object.values(funnel).map(Number)); $("funnel").innerHTML=Object.entries(funnel).map(([k,v])=>`<div class="funnel-row"><span>${safe(k)}</span><span class="funnel-track"><span class="funnel-bar" style="width:${Math.min(100,Number(v)/max*100)}%"></span></span><span class="right">${count(v)}</span></div>`).join("")||empty("No candidate lifecycle","Hermes hypotheses appear after a durable queue item is processed."); $("overview-candidates").innerHTML=tableCandidates(arr(data.candidates).slice(0,10),false); $("overview-activity").innerHTML=arr(data.activity).slice(0,10).map(i=>`<div class="timeline-item"><span class="timeline-time">${safe(dateText(i.timestamp))}</span><span class="timeline-kind">${safe(i.kind)}</span><span>${safe(i.message)}</span></div>`).join("")||empty("No research activity yet","Durable bootstrap, collection, and Hermes activity will appear here."); $("raw-overview").textContent=json(data.raw||{}); }
-    function tableCandidates(items,interactive=true) { if(!items.length)return empty("No candidates yet","Submit a bounded paper-only hypothesis through Hermes."); const sortable={strategy_id:"candidate_id",stage:"stage",updated_at:"updated_at"}; return `<table><thead><tr>${[["strategy_id","Strategy"],["family","Family"],["market","Market"],["stage","Stage"],["historical_gates","Historical gates"],["canary_status","Micro-live canary"],["paper_forward_status","Paper forward status"],["paper_promotable_status","Paper promotable"],["updated_at","Updated"]].map(([k,l])=>`<th>${interactive&&sortable[k]?sortButton(sortable[k],l):safe(l)}</th>`).join("")}</tr></thead><tbody>${items.map(i=>`<tr><td>${interactive?`<button class="link candidate" data-id="${encodeURIComponent(i.candidate_id||"")}">${safe(i.strategy_id||i.candidate_id)}</button>`:safe(i.strategy_id||i.candidate_id)}</td><td>${safe(i.family)}</td><td>${safe(i.market)}</td><td><span class="badge ${statusClass(i.stage)}">${safe(i.stage)}</span></td><td><span class="badge ${statusClass(i.historical_gates)}">${safe(i.historical_gates||"NOT_PASSED")}</span></td><td><span class="badge ${statusClass(i.canary_status)}">${safe(i.canary_status||"NOT_ELIGIBLE")}</span></td><td><span class="badge ${statusClass(i.paper_forward_status)}">${safe(i.paper_forward_status||"NOT_STARTED")}</span></td><td><span class="badge ${statusClass(i.paper_promotable_status)}">${safe(i.paper_promotable_status||"NOT_YET")}</span></td><td>${safe(dateText(i.updated_at))}</td></tr>`).join("")}</tbody></table>`; }
-    function bindTable() { document.querySelectorAll(".sort").forEach(b=>b.addEventListener("click",()=>{const k=b.dataset.sort;state.direction=state.sort===k&&state.direction==="desc"?"asc":"desc";state.sort=k;state.page=1;saveState(true);loadPage(state.tab)})); document.querySelectorAll(".candidate").forEach(b=>b.addEventListener("click",()=>{const id=decodeURIComponent(b.dataset.id);loadCandidate(id).then(()=>renderCandidateOperations(id));})); document.querySelectorAll(".dataset").forEach(b=>b.addEventListener("click",()=>loadDataset(decodeURIComponent(b.dataset.id)))); }
-    async function renderCandidateOperations(id) {
-      try {
-        const response=await fetch(`/api/v2/candidates/${encodeURIComponent(id)}`,{cache:"no-store"});
-        const candidate=await response.json(), provenance=candidate.provenance||{};
-        const host=$("candidate-detail"); if(!host)return;
-        host.insertAdjacentHTML("afterbegin",`<article id="candidate-operator-actions" class="panel"><div class="section-title"><h2>AUTHORITATIVE ELIGIBILITY</h2><span class="badge ${statusClass(candidate.canary_status)}">${safe(candidate.canary_status||"NOT_ELIGIBLE")}</span></div><div class="key-value"><span class="key">Market / dataset</span><strong>${safe(provenance.market_type)} · ${safe(provenance.dataset_id)} / ${safe(provenance.dataset_version)}</strong></div><p class="page-note">Eligibility is evaluated and persisted by the autonomous ranker. The dashboard cannot mark, arm, or submit a candidate.</p></article>`);
-      } catch(error) {}
-    }
-    async function loadDataset(id,rangePage=1,persist=true) { state.selected=id; state.expanded=true; if(persist)saveState(true); try { const detailResponse=await fetch(`/api/v2/datasets/${encodeURIComponent(id)}`,{cache:"no-store"}),d=await detailResponse.json(),version=d.dataset_version||d.catalog?.dataset_version||"",rangeQuery=new URLSearchParams({page:String(rangePage),page_size:String(state.page_size)}); if(version)rangeQuery.set("dataset_version",version); const rangesResponse=await fetch(`/api/v2/datasets/${encodeURIComponent(id)}/missing-ranges?${rangeQuery}`,{cache:"no-store"}),rangesData=rangesResponse.ok?await rangesResponse.json():{}; const markup=d.available?`<div class="key-value"><span class="key">Dataset</span><strong>${safe(d.dataset_id||id)}</strong></div><div class="key-value"><span class="key">Version</span><strong>${safe(d.dataset_version||d.catalog?.dataset_version)}</strong></div><div class="key-value"><span class="key">Quality</span><span class="badge">${safe(d.catalog?.quality)}</span></div><details open><summary>Health and missing ranges</summary><pre>${safe(json({health:d.health,missing_ranges:arr(rangesData.items)}))}</pre><div id="dataset-ranges-pager" class="pager"></div></details>`:empty("Dataset unavailable",d.error||"Dataset not found"); $("detail").innerHTML=markup; if($("dataset-detail"))$("dataset-detail").innerHTML=markup; if(d.available&&$("dataset-ranges-pager"))pager("dataset-ranges",rangesData); } catch(e) { const markup=empty("Dataset detail unavailable",e.message); $("detail").innerHTML=markup; if($("dataset-detail"))$("dataset-detail").innerHTML=markup; } }
-    async function loadHermes(id,persist=true) { state.selected=id; state.expanded=true; if(persist)saveState(true); try { const r=await fetch(`/api/v2/hermes/${encodeURIComponent(id)}`,{cache:"no-store"}),d=await r.json(); const item=arr(d.items)[0],outcome=d.outcome||{},label=outcome.label||item?.outcome_label||"",datasetId=d.dataset_id||item?.dataset_id||"",datasetVersion=d.dataset_version||item?.dataset_version||"",outcomeMarkup=label?`<div class="three-col"><div class="key-value"><span class="key">Outcome</span><strong>${safe(label)}</strong></div><div class="key-value"><span class="key">Dataset ID</span><strong>${safe(datasetId||"—")}</strong></div><div class="key-value"><span class="key">Dataset version</span><strong>${safe(datasetVersion||"—")}</strong></div></div>`:""; $("hermes-detail").innerHTML=item?`${outcomeMarkup}<details open><summary>Hermes item ${safe(id)}</summary><pre>${safe(json(item))}</pre></details>`:empty("Hermes item unavailable","The queue item no longer exists."); } catch(e) { $("hermes-detail").innerHTML=empty("Hermes detail unavailable",e.message); } }
-    function renderDatasets(data) { $("dataset-total").textContent=`${count(data.total)} datasets`; const rows=arr(data.items); $("datasets-table").innerHTML=rows.length?`<table><thead><tr>${[["dataset_id","Dataset"],["source_type","Source"],["market_type","Market"],["instrument","Instrument"],["timeframe","Timeframe"],["quality","Quality"],["row_count","Rows"],["updated_at","Updated"]].map(([k,l])=>`<th>${sortButton(k,l)}</th>`).join("")}</tr></thead><tbody>${rows.map(i=>`<tr><td><button class="link dataset" data-id="${encodeURIComponent(i.dataset_id||"")}">${safe(i.dataset_id)}</button></td><td>${safe(i.source_type)}</td><td>${safe(i.market_type)}</td><td>${safe(i.instrument)}</td><td>${safe(i.timeframe)}</td><td>${safe(i.quality)}</td><td>${count(i.row_count)}</td><td>${safe(dateText(i.updated_at))}</td></tr>`).join("")}</tbody></table>`:empty("No datasets","Catalog history has not been initialized."); pager("datasets",data); bindTable(); if(state.tab==="datasets"&&state.selected)loadDataset(state.selected,1,false); }
-    function renderActivity(data) { $("activity-total").textContent=`${count(data.total)} events`; $("activity-table").innerHTML=arr(data.items).length?`<table><thead><tr>${[["timestamp","Time"],["kind","Kind"],["message","Activity"]].map(([k,l])=>`<th>${k==="message"?safe(l):sortButton(k,l)}</th>`).join("")}</tr></thead><tbody>${arr(data.items).map(i=>`<tr><td>${safe(dateText(i.timestamp))}</td><td>${safe(i.kind)}</td><td>${safe(i.message)}${i.details&&Object.keys(i.details).length?` <details><summary>details</summary><pre>${safe(json(i.details))}</pre></details>`:""}</td></tr>`).join("")}</tbody></table>`:empty("No research activity","Durable activity will appear after workers run."); pager("activity",data); bindTable(); }
-    function renderCandidates(data) { $("candidate-total").textContent=`${count(data.total)} candidates`; const stages=[...new Set(arr(data.items).map(i=>i.stage).filter(Boolean))].sort(),select=$("candidates-stage"),selected=select.value||params.get("stage")||""; select.innerHTML=`<option value="">All stages</option>${stages.map(s=>`<option value="${safe(s)}">${safe(s)}</option>`).join("")}`; if(selected&&!stages.includes(selected))select.insertAdjacentHTML("beforeend",`<option value="${safe(selected)}">${safe(selected)}</option>`); select.value=selected; $("candidates-table").innerHTML=tableCandidates(arr(data.items)); pager("candidates",data); bindTable(); if(state.tab==="candidates"&&state.selected)loadCandidate(state.selected,1,false); }
-    function renderPolymarket(data) { const items=arr(data.items),categories=[...new Set(items.map(i=>i.category).filter(Boolean))].sort(),cat=$("polymarket-category"),old=cat.value||params.get("category")||""; cat.innerHTML=`<option value="">All categories</option>${categories.map(c=>`<option value="${safe(c)}">${safe(c)}</option>`).join("")}`; if(old&&!categories.includes(old))cat.insertAdjacentHTML("beforeend",`<option value="${safe(old)}">${safe(old)}</option>`); cat.value=old; const quality=items.map(i=>i.quality||i.research_quality).find(Boolean)||"—"; $("pm-summary").innerHTML=`<div class="three-col"><div class="key-value"><span class="key">Markets</span><strong>${count(data.total)}</strong></div><div class="key-value"><span class="key">Page</span><strong>${count(data.page)}</strong></div><div class="key-value"><span class="key">Quality</span><strong>${safe(quality)}</strong></div></div>`; const sortable={market_id:"market_id",category:"category",settlement:"settlement",quality:"quality"}; $("pm-markets").innerHTML=items.length?`<table><thead><tr>${[["market_id","Market"],["question","Question"],["category","Category"],["yes_mid","YES"],["liquidity","Liquidity"],["settlement","Settlement"],["quality","Quality"]].map(([k,l])=>`<th>${sortable[k]?sortButton(sortable[k],l):safe(l)}</th>`).join("")}</tr></thead><tbody>${items.map(i=>`<tr><td>${safe(i.market_id)}</td><td><details><summary>${safe(String(i.question||i.snapshot?.question||i.market_id).slice(0,90))}</summary><p class="page-note">${safe(i.question||i.snapshot?.question||i.market_id)}</p></details></td><td>${safe(i.category)}</td><td>${safe(i.yes_mid??i.snapshot?.yes_mid??i.payload?.snapshot?.yes_mid)}</td><td>${safe(i.liquidity??i.snapshot?.liquidity??i.payload?.snapshot?.liquidity)}</td><td>${safe(i.settlement??i.snapshot?.settlement??i.payload?.snapshot?.settlement)}</td><td>${safe(i.quality||i.research_quality||"—")}</td></tr>`).join("")}</tbody></table>`:empty("No forward market observations","Run the normal node or collect-data for forward-only quotes."); pager("polymarket",data); bindTable(); }
-    function renderHermes(data) { const h=operator.hermes||{},latest=operator.hermes_latest_outcome||{}; $("hermes-summary").innerHTML=`<div class="three-col"><div class="key-value"><span class="key">Submitted</span><strong>${count(h.submitted)}</strong></div><div class="key-value"><span class="key">Accepted</span><strong>${count(h.accepted)}</strong></div><div class="key-value"><span class="key">Pending</span><strong>${count(h.pending)}</strong></div><div class="key-value"><span class="key">Latest outcome</span><strong>${safe(latest.outcome_label||latest.status||"—")}</strong></div><div class="key-value"><span class="key">Selected dataset</span><strong>${safe(latest.dataset_id||"—")} / ${safe(latest.dataset_version||"—")}</strong></div></div><p class="page-note">Hermes status reflects queue execution state, not integration availability. ${safe(h.reason||"")}</p>`; $("hermes-table").innerHTML=arr(data.items).length?`<table><thead><tr>${[["item_id","Item"],["item_type","Type"],["status","Status"],["created_at","Created"]].map(([k,l])=>`<th>${sortButton(k,l)}</th>`).join("")}</tr></thead><tbody>${arr(data.items).map(i=>`<tr><td><button class="link hermes-item" data-id="${encodeURIComponent(i.item_id||"")}">${safe(i.item_id)}</button></td><td>${safe(i.item_type)}</td><td><span class="badge ${statusClass(i.status)}">${safe(i.status)}</span></td><td>${safe(dateText(i.created_at||i.updated_at))}</td></tr>`).join("")}</tbody></table>`:empty("Hermes not initialized","Start the research node or submit a paper-only proposal."); pager("hermes",data); bindTable(); document.querySelectorAll(".hermes-item").forEach(b=>b.addEventListener("click",()=>loadHermes(decodeURIComponent(b.dataset.id)))); if(state.tab==="hermes"&&state.selected)loadHermes(state.selected,false); }
-    async function loadCandidate(id,eventPage=1,persist=true) { state.selected=id; state.expanded=true; if(persist)saveState(true); try { const q=new URLSearchParams({page:String(eventPage),page_size:String(state.page_size)}),candidateResponse=await fetch(`/api/v2/candidates/${encodeURIComponent(id)}`,{cache:"no-store"}),r=await fetch(`/api/v2/candidates/${encodeURIComponent(id)}/events?${q}`,{cache:"no-store"}),candidate=candidateResponse.ok?await candidateResponse.json():{},d=await r.json(); const checks=[["Historical gates",candidate.historical_gates||"NOT_PASSED"],["Historical data integrity",candidate.historical_data_integrity||"FAIL"],["Historical execution fidelity",candidate.historical_execution_fidelity||"UNKNOWN"],["Canary data quality",candidate.canary_data_quality_gate||"NOT PASSED"],["Production evidence",candidate.production_evidence||"INSUFFICIENT"],["Micro-live canary",candidate.canary_status||"NOT_ELIGIBLE"],["Paper forward status",candidate.paper_forward_status||"NOT_STARTED"],["Paper promotable",candidate.paper_promotable_status||"NOT_YET"]]; const markup=`<div class="key-value"><span class="key">Candidate</span><strong>${safe(candidate.candidate_id||id)}</strong></div><div class="three-col">${checks.map(([label,value])=>`<div class="key-value"><span class="key">${safe(label)}</span><strong><span class="badge ${statusClass(value)}">${safe(value)}</span></strong></div>`).join("")}</div>${arr(d.items).length?`<table><thead><tr><th>Time</th><th>Stage</th><th>Reason</th></tr></thead><tbody>${arr(d.items).map(i=>`<tr><td>${safe(dateText(i.created_at||i.timestamp))}</td><td><span class="badge">${safe(i.stage||i.to_stage)}</span></td><td>${safe(i.reason||i.message)}</td></tr>`).join("")}</tbody></table>`:empty("No lifecycle events","No persisted lifecycle evidence exists for this candidate.")}<div id="candidate-events-pager" class="pager"></div>`; $("detail").innerHTML=markup; if(state.tab==="candidates")$("dataset-detail").innerHTML=markup; if($("candidate-events-pager")){const total=Number(d.total)||0,page=Number(d.page)||1,size=Number(d.page_size)||state.page_size,pages=Number(d.pages)||0,start=total?(page-1)*size+1:0,end=Math.min(page*size,total); $("candidate-events-pager").innerHTML=`<span>Showing ${start}–${end} of ${total}</span><span><button data-page="${page-1}" ${page<=1?"disabled":""}>Previous</button> <button data-page="${page+1}" ${!pages||page>=pages?"disabled":""}>Next</button></span>`; $("candidate-events-pager").querySelectorAll("button").forEach(b=>b.addEventListener("click",()=>loadCandidate(id,Number(b.dataset.page),false)));} } catch(e) { $("detail").innerHTML=empty("Candidate detail unavailable",e.message); } }
-    function renderPaper(data) { const p=operator.paper_portfolio||{}; $("portfolio-summary").innerHTML=`<div class="card-grid"><div class="panel"><div class="metric">${p.state_count?Number(p.total_equity||0).toFixed(2):"—"}</div><div class="metric-label">paper equity</div></div><div class="panel"><div class="metric">${p.state_count?Number(p.total_pnl||0).toFixed(2):"—"}</div><div class="metric-label">paper P/L</div></div><div class="panel"><div class="metric">${count(data.total)}</div><div class="metric-label">paper records</div></div><div class="panel"><div class="metric">${p.state_count?`${(Number(p.win_rate||0)*100).toFixed(1)}%`:"—"}</div><div class="metric-label">win rate</div></div></div>`; $("portfolio-states").innerHTML=arr(data.items).length?`<table><thead><tr><th>${sortButton("timestamp","Time")}</th><th>${sortButton("record_type","Type")}</th><th>Experiment</th><th>Market</th><th>Status</th><th>Details</th></tr></thead><tbody>${arr(data.items).map(i=>`<tr><td>${safe(dateText(i.timestamp||i.created_at||i.updated_at))}</td><td>${safe(i.record_type)}</td><td>${safe(i.experiment_id)}</td><td>${safe(i.market_id||i.symbol)}</td><td><span class="badge ${statusClass(i.status)}">${safe(i.status)}</span></td><td><details><summary>view</summary><pre>${safe(json(i))}</pre></details></td></tr>`).join("")}</tbody></table>`:empty("Waiting for PAPER_FORWARD","Paper portfolio initializes only after a candidate enters PAPER_FORWARD and observations are persisted."); pager("paper",data); bindTable(); }
-    function renderRollingPortfolio(data) {
-      const status=String(data?.status||"UNKNOWN").toUpperCase(), identity=data?.policy_identity||{}, rows=arr(data?.active_rows), cold=arr(data?.cold_start_requirements), review=data?.policy_review&&typeof data.policy_review==="object"?data.policy_review:{}, active=review.active||{}, proposed=review.proposed||{}, caps=review.caps||{}, allocation=review.allocation||{};
-      rollingReview={active,proposed,caps,allocation,canary_binding:review.canary_binding||{}};
-      const badge=$("rolling-status"); if(badge){badge.textContent=status==="COLD_START"?"COLD_START · requirements pending":`${status} · paper-only`;badge.className=`badge ${statusClass(status)}`;}
-      $("rolling-summary").innerHTML=`<div class="three-col"><div class="key-value"><span class="key">Controller</span><strong>${safe(status)}</strong></div><div class="key-value"><span class="key">Selected / active K</span><strong>${safe(data?.k)} / ${safe(data?.actual_k)}</strong></div><div class="key-value"><span class="key">Active policy</span><strong>${safe(active.policy_id||identity.active_policy_id)} / ${safe(active.version||identity.active_policy_version)}</strong></div><div class="key-value"><span class="key">Active budget</span><strong>${safe(active.global_budget??"—")}</strong></div><div class="key-value"><span class="key">Policy hash</span><strong>${safe(active.config_hash||identity.active_policy_hash||identity.config_hash)}</strong></div><div class="key-value"><span class="key">Effective risk caps</span><strong>${safe(json(caps))}</strong></div></div>`;
-      const draftStatus=String(review.status||"NOT_REVIEWED").toUpperCase(), venue=allocation.venue_minimum_feasibility||{};
-      const draftControls=draftStatus==="REVIEWED"&&proposed.draft_id&&proposed.draft_version
-        ? `<button class="link rolling-policy-action" data-rolling-action="activate" data-draft-id="${safe(proposed.draft_id)}" data-draft-version="${safe(proposed.draft_version)}" data-risk-id="${safe(review.canary_binding?.risk_config_id)}" data-risk-generation="${safe(review.canary_binding?.risk_config_generation)}" data-risk-hash="${safe(review.canary_binding?.risk_config_hash)}">Review and activate this draft</button>`
-        : "";
-      $("rolling-policy-controls").innerHTML=`<article class="panel"><div class="section-title"><h3>POLICY / ALLOCATION REVIEW</h3><span class="badge ${statusClass(draftStatus)}">${safe(draftStatus)}</span></div><p class="page-note">Active policy and canary settings remain authoritative. Review creates a non-active immutable draft; activation is a separate deliberate operation and never enables canary execution.</p><div class="three-col"><label class="key-value"><span class="key">Proposed portfolio budget (USD)</span><input id="rolling-budget" aria-label="Proposed portfolio budget" inputmode="decimal" value="${safe(proposed.global_budget??allocation.global_budget_usd??active.global_budget??"0.00")}"></label><div class="key-value"><span class="key">Max active strategies</span><strong>${safe(proposed.max_active_strategies??allocation.max_active_strategies??"—")}</strong></div><div class="key-value"><span class="key">Max open positions</span><strong>${safe(caps.max_open_positions??allocation.max_open_positions??"—")}</strong></div><div class="key-value"><span class="key">Submissions/day</span><strong>${safe(caps.submissions_per_day??allocation.active_submissions_per_day??"—")}</strong></div><div class="key-value"><span class="key">Per-buy / daily buy</span><strong>${safe(caps.per_buy_usd??allocation.active_per_buy_usd??"—")} / ${safe(caps.daily_buy_usd??allocation.active_daily_buy_usd??"—")}</strong></div><div class="key-value"><span class="key">Exposure / venue minimum</span><strong>${safe(caps.open_exposure_usd??allocation.active_open_exposure_usd??"—")} / ${safe(venue.status||"UNKNOWN")}</strong></div></div><p class="page-note"><button class="link rolling-policy-action" data-rolling-action="review" data-risk-id="${safe(review.canary_binding?.risk_config_id)}" data-risk-generation="${safe(review.canary_binding?.risk_config_generation)}" data-risk-hash="${safe(review.canary_binding?.risk_config_hash)}">Review proposed allocation</button>${draftControls?` · ${draftControls}`:""}</p>${proposed.draft_id?`<p class="page-note">Draft identity generated internally: ${safe(proposed.draft_id)} / ${safe(proposed.draft_version)} · bound canary config ${safe(review.proposed_canary_binding?.risk_config_id)} generation ${safe(review.proposed_canary_binding?.risk_config_generation)}.</p>`:""}</article>`;
-      function rollingEvaluationStage(row) {
-        const evaluation=row?.evaluation&&typeof row.evaluation==="object"?row.evaluation:{};
-        const accounting=row?.portfolio_accounting&&typeof row.portfolio_accounting==="object"?row.portfolio_accounting:{};
-        const countValue=(value)=>value==null?"?":String(value);
-        const yesNo=(value)=>value===true?"YES":value===false?"NO":"UNKNOWN";
-        const details=[evaluation.evaluator_error,evaluation.evaluator_prerequisite].filter(Boolean).map(value=>`<div>${safe(value)}</div>`).join("");
-        return `<div><strong>${countValue(evaluation.loaded_rows)} loaded / ${countValue(evaluation.valid_input_rows)} valid</strong> → invoked ${yesNo(evaluation.evaluator_invoked)} / completed ${yesNo(evaluation.evaluator_completed)} → ${countValue(evaluation.evaluated_observations)} observations / ${countValue(evaluation.signal_count)} signals</div>${details?`<small>${details}</small>`:""}`;
-      }
-      function rollingAccountingStage(row) {
-        const accounting=row?.portfolio_accounting&&typeof row.portfolio_accounting==="object"?row.portfolio_accounting:{};
-        const available=accounting.accounting_available===true?"AVAILABLE":accounting.accounting_available===false?"UNAVAILABLE":"UNKNOWN";
-        const fills=[accounting.opening_fills,accounting.closing_fills,accounting.partial_closing_fills].map(value=>Array.isArray(value)?value.length:Number(value||0));
-        const exits=fills[1]+fills[2];
-        return `<strong>${safe(available)}</strong> · fills ${safe(fills[0]+exits)} / exits ${safe(exits)} · round trips ${safe(accounting.completed_round_trips??"—")} → admission ${safe(row?.admitted===true?"ADMITTED":"BLOCKED")}`;
-      }
-      $("rolling-members").innerHTML=rows.length?`<table><thead><tr><th>Strategy version</th><th>Research trial</th><th>Candidate</th><th>Evidence window</th><th>Evidence digest</th><th>Status</th><th>Allocation</th><th>Coverage</th><th>Evaluation pipeline</th><th>Accounting / admission</th><th>Reason</th></tr></thead><tbody>${rows.map(row=>`<tr><td>${safe(row.strategy_version_id)}</td><td>${safe(row.research_trial_id)}</td><td>${safe(row.candidate_id)}</td><td>${safe(row.evidence_window_id)}</td><td>${safe(row.evidence_digest)}</td><td><span class="badge ${statusClass(row.executable?"ACTIVE":"BLOCKED")}">${safe(row.executable?"EXECUTABLE":"NON-EXECUTABLE")}</span></td><td>${safe(row.allocation)}</td><td>${safe(row.actual_coverage_seconds)}</td><td>${rollingEvaluationStage(row)}</td><td>${rollingAccountingStage(row)}</td><td>${safe(arr(row.reasons).join(", ")||row.reason||arr(row.blockers).join(", ")||row.evaluation_error||row.evaluation_prerequisite||"—")}</td></tr>`).join("")}</tbody></table>`:empty("No active rolling members","No persisted active rolling selection is available.");
-      $("rolling-reasons").innerHTML=`<article class="panel"><div class="section-title"><h3>Admission / replacement history</h3><span class="badge">${arr(data?.reason_history).length} retained</span></div>${arr(data?.reason_history).length?`<pre>${safe(json(arr(data.reason_history).slice(-32)))}</pre>`:empty("No rolling review history","Admission and replacement reasons are retained after members leave active K.")}</article>${cold.length?`<article class="panel"><div class="section-title"><h3>Cold-start requirements</h3><span class="badge warn">BLOCKED</span></div><ul>${cold.slice(0,16).map(item=>`<li>${safe(researchFeedValue(item))}</li>`).join("")}</ul></article>`:""}`;
-      const jobs=data?.next_jobs; $("rolling-jobs").innerHTML=jobs&&((Array.isArray(jobs)&&jobs.length)||(typeof jobs==="object"&&Object.keys(jobs).length))?`<article class="panel"><div class="section-title"><h3>Next rolling jobs</h3><span class="badge">durable</span></div><pre>${safe(json(jobs))}</pre></article>`:empty("No next rolling jobs","The durable worker has not persisted a next action.");
-    }
-    function renderCanaryConnectivity(value) {
-      const c=value||{}, checkedAt=c.checked_at, checkedPht=dateText(checkedAt), checkedMs=checkedAt?Date.parse(checkedAt):NaN, ageMs=Number.isFinite(checkedMs)?Date.now()-checkedMs:NaN, fresh=Number.isFinite(ageMs)&&ageMs>=0&&ageMs<=60000, displayedStatus=c.status==="READY"&&!fresh?"STALE":c.status, sdk=c.sdk||{}, credentials=c.credentials||{}, authentication=c.authentication||{}, account=c.account||{}, geo=c.geoblock||{}, balance=c.balance||{}, allowance=c.allowance||{}, market=c.market||{}, book=c.order_book||{};
-      if(!value){ $("canary-connectivity").innerHTML=empty("No connectivity check persisted","Run Connectivity check to perform a read-only pre-arming check."); return; }
-      const failures=arr(c.failure_reasons), failureMarkup=failures.length?`<div class="key-value"><span class="key">Failure codes</span><strong>${safe(arr(c.failure_codes).join(", ")||"—")}</strong></div><div class="key-value"><span class="key">Failure reasons</span><strong>${failures.map(item=>`${safe(item.code)}: ${safe(item.reason)}`).join("<br>")}</strong></div>`:"";
-      const marketMarkup=String(market.status||"SKIPPED").toUpperCase()!=="SKIPPED"?`<div class="key-value"><span class="key">Market</span><strong>${safe(market.status)}</strong></div>`:"";
-      const bookMarkup=String(book.status||"SKIPPED").toUpperCase()!=="SKIPPED"?`<div class="key-value"><span class="key">Order book</span><strong>${safe(book.status)}</strong></div>`:"";
-      $("canary-connectivity").innerHTML=`<article class="panel"><div class="section-title"><h2>CONNECTIVITY</h2><span class="badge ${statusClass(displayedStatus)}">${safe(displayedStatus||"BLOCKED")}</span></div><div class="three-col"><div class="key-value"><span class="key">SDK</span><strong>${safe(sdk.status)} · ${safe(sdk.name)} · ${safe(sdk.version)}</strong></div><div class="key-value"><span class="key">Credentials</span><strong>${safe(credentials.status)}</strong></div><div class="key-value"><span class="key">Authentication</span><strong>${safe(authentication.status)}</strong></div><div class="key-value"><span class="key">Account</span><strong>${safe(account.status)}${account.wallet_type?` · ${safe(account.wallet_type)}`:""}</strong></div><div class="key-value"><span class="key">Geoblock</span><strong>${safe(geo.status)}${geo.country?` · ${safe(geo.country)}`:""}${geo.region?` / ${safe(geo.region)}`:""}</strong></div><div class="key-value"><span class="key">Balance</span><strong>${safe(balance.status)}${balance.available_usd!=null?` · ${usd(balance.available_usd)}`:""}</strong></div><div class="key-value"><span class="key">Allowance</span><strong>${safe(allowance.status)}</strong></div>${marketMarkup}${bookMarkup}<div class="key-value"><span class="key">Checked</span><strong>${safe(dateText(c.checked_at))}</strong></div></div>${failureMarkup?`<p class="page-note">${failureMarkup}</p>`:""}</article>`;
-    }
-    async function binanceControlPost(action,payload={}) {
-      const node=$("binance-action-result");
-      try {
-        const response=await fetch("/api/binance/control",{method:"POST",headers:{"Content-Type":"application/json","X-Axiom-Control-Token":controlToken},body:JSON.stringify({action,payload}),cache:"no-store"});
-        const result=await response.json();
-        if(node)node.textContent=result.ok?`${action} completed · ${result.action_id||"persisted"}`:`${action} blocked: ${result.reason||"CONTROL_FAILED"}`;
-        if(activeController)activeController.abort();
-        refreshGeneration++; activeController=null; loadInFlight=false; clearTimeout(slowRefreshTimer); slowRefreshTimer=null; nextRefreshAt=0;
-        if(state.tab==="binance-canary")await loadPage("binance-canary",true);
-        return result;
-      } catch(error) {
-        if(node)node.textContent=`${action} unavailable: ${error?.message||"network failure"}`;
-        return {ok:false,reason:"BINANCE_CONTROL_UNAVAILABLE"};
-      }
-    }
-    function binanceRecordTable(title,rows) {
-      const values=arr(rows), keys=[...new Set(values.flatMap(item=>Object.keys(item||{})).filter(key=>!/(?:secret|token|password|credential|authorization)/i.test(key)))].slice(0,8);
-      if(!values.length)return empty(`No ${title.toLowerCase()}`,"No bounded records are available.");
-      const visible=values.slice(0,100);
-      return `<article class="panel"><div class="section-title"><h3>${safe(title)}</h3><span class="badge">${visible.length} shown</span></div><table><thead><tr>${keys.map(key=>`<th>${safe(key.replaceAll("_"," "))}</th>`).join("")}</tr></thead><tbody>${visible.map(item=>`<tr>${keys.map(key=>`<td>${safe(typeof item[key]==="object"?JSON.stringify(item[key]):item[key])}</td>`).join("")}</tr>`).join("")}</tbody></table><details><summary>Full IDs and bounded detail records</summary><pre>${safe(json(visible))}</pre></details></article>`;
-    }
-    function setBinanceNavLabel(label) { const tab=document.querySelector('nav button.tab[data-view="binance-canary"]'); if(tab)tab.textContent=label; }
-    function renderBinanceCanary(data) {
-      setBinanceNavLabel("BINANCE SPOT CANARY");
-      const status=data?.status&&typeof data.status==="object"?data.status:data||{}, profile=data.profile||data.development_profile||status.profile||status.development_profile||{}, connectivity=data.connectivity||status.connectivity||{}, readiness=data.readiness||status.readiness||{}, qualification=data.qualification||status.qualification||{}, risk=data.risk||data.budgets||status.risk||status.budgets||{}, heartbeat=data.heartbeat||status.heartbeat||{}, signal=data.latest_signal||status.latest_signal||null, actions=arr(data.actions||status.actions);
-      const identityRows=[["Environment",profile.environment||"PAPER / TESTNET"],["Instance",profile.feature_instance||profile.runtime_identity||profile.runtime||"binance-dev"],["DB path",profile.db_path||"—"],["Schema revision",profile.schema_revision||profile.revision||"unknown"],["Transport","BINANCE SPOT ENABLED · POLYMARKET DISABLED"],["Credentials",data.credentials?.configured?"CONFIGURED (safe status only)":"NOT CONFIGURED"]];
-      $("binance-identity").innerHTML=`<article class="panel"><div class="section-title"><h2>DEVELOPMENT / PAPER|TESTNET IDENTITY</h2><span class="badge warn">${safe(profile.environment||"PAPER|TESTNET")}</span></div><div class="three-col">${identityRows.map(([key,value])=>`<div class="key-value"><span class="key">${safe(key)}</span><strong>${safe(value)}</strong></div>`).join("")}</div><p class="page-note">Status ${safe(dateText(data.timestamp||status.timestamp))} · UTC→PHT display enabled</p></article>`;
-      $("binance-connectivity").innerHTML=`<article class="panel"><div class="section-title"><h2>READ-ONLY CONNECTIVITY / READINESS</h2><span class="badge ${statusClass(readiness.status||connectivity.readiness||connectivity.status)}">${safe(readiness.status||connectivity.readiness||connectivity.status||"UNKNOWN")}</span></div><div class="three-col"><div class="key-value"><span class="key">Connectivity</span><strong>${safe(connectivity.status||"UNKNOWN")} · ${connectivity.stale?"STALE":"CURRENT"}</strong></div><div class="key-value"><span class="key">Checked UTC / PHT</span><strong>${safe(connectivity.checked_at||"—")} · ${safe(dateText(connectivity.checked_at))}</strong></div><div class="key-value"><span class="key">Heartbeat</span><strong>${safe(heartbeat.status||"UNKNOWN")} · ${safe(dateText(heartbeat.timestamp||heartbeat.heartbeat_at))}</strong></div></div><p class="page-note"><button class="binance-action" data-binance-action="CONNECTIVITY_CHECK">Connectivity check (read-only)</button> · no order placement</p></article>`;
-      const selected=qualification.selection||status.selection||null, selectedId=selected?.candidate_id||selected?.strategy_id||selected?.id||"—";
-      $("binance-qualification").innerHTML=`<article class="panel"><div class="section-title"><h2>QUALIFICATION / RANKING</h2><span class="badge ${statusClass(qualification.current_vs_stale||qualification.selection_status)}">${safe(qualification.current_vs_stale||qualification.selection_status||"NONE")}</span></div><div class="three-col"><div class="key-value"><span class="key">Eligibility</span><strong>${safe(qualification.eligible_count??qualification.eligibility??"—")}</strong></div><div class="key-value"><span class="key">Rankable</span><strong>${safe(qualification.rankable_count??arr(qualification.rankable).length)}</strong></div><div class="key-value"><span class="key">Selection / family</span><strong>${safe(selectedId)} · ${safe(qualification.family||selected?.family||"—")}</strong></div><div class="key-value"><span class="key">Reason</span><strong>${safe(qualification.reason||status.reason||"—")}</strong></div></div><details><summary>Ranking selection and reasons</summary><pre>${safe(json({qualification,selection:selected}))}</pre></details></article>`;
-      const limits=risk.limits||risk.envelope||{}, remaining=risk.remaining||{}, riskKeys=[...new Set([...Object.keys(limits),...Object.keys(remaining)])].slice(0,32);
-      $("binance-risk").innerHTML=`<article class="panel"><div class="section-title"><h2>RISK ENVELOPE / BUDGETS</h2><span class="badge">bounded</span></div><div class="three-col">${riskKeys.map(key=>`<div class="key-value"><span class="key">${safe(key.replaceAll("_"," "))}</span><strong>${safe(limits[key]??"—")} / remaining ${safe(remaining[key]??"—")}</strong></div>`).join("")}<div class="key-value"><span class="key">Net PnL / fees</span><strong>${safe(risk.net_pnl||"—")} / ${safe(risk.fees||"—")}</strong></div><div class="key-value"><span class="key">Exposure / reservations</span><strong>${safe(risk.exposure||"—")} / ${safe(risk.reservations||"—")}</strong></div></div></article>`;
-      const currentState=String(status.control?.state||status.state||"UNKNOWN"), confirm=String(status.enable_phrase||"ENABLE BINANCE AUTO CANARY");
-      $("binance-controls").innerHTML=`<article class="panel"><div class="section-title"><h2>BINANCE CONTROL</h2><span class="badge ${statusClass(currentState)}">${safe(currentState)}</span></div><div class="filters"><input id="binance-confirm" aria-label="Exact enable phrase" placeholder="${safe(confirm)}"><input id="binance-order-symbol" aria-label="Order validation symbol" placeholder="BTCUSDT"><input id="binance-order-price" aria-label="Order validation price" placeholder="price"><input id="binance-order-quantity" aria-label="Order validation quantity" placeholder="quantity"></div><p class="page-note"><button class="binance-action" data-binance-action="ORDER_VALIDATION_TEST">Order validation test</button> <button class="binance-action" data-binance-action="ENABLE">ENABLE</button> <button class="binance-action" data-binance-action="PAUSE">PAUSE</button> <button class="binance-action" data-binance-action="RESUME">RESUME</button> <button class="binance-action" data-binance-action="DISARM">DISARM</button> <button class="binance-action danger" data-binance-action="KILL">KILL</button></p><p class="page-note">Enable/resume require the exact phrase: <code>${safe(confirm)}</code>. Actions are persisted per action.</p></article>`;
-      const records=[binanceRecordTable("Positions",data.positions?.items||status.positions?.items||data.positions),binanceRecordTable("Orders",data.orders?.items||status.orders?.items||data.orders),binanceRecordTable("Fills",data.fills?.items||status.fills?.items||data.fills),binanceRecordTable("UNKNOWN orders",data.unknown?.items||status.unknown?.items||data.unknown)].join("");
-      $("binance-records").innerHTML=`<div class="three-col">${records}</div><article class="panel"><div class="section-title"><h3>LATEST SIGNAL / NO-TRADE</h3><span class="badge ${statusClass(signal?.status||"UNKNOWN")}">${safe(signal?.status||"UNKNOWN")}</span></div><div class="key-value"><span class="key">Signal</span><strong>${safe(signal?.signal_id||signal?.id||"—")}</strong></div><div class="key-value"><span class="key">No-trade reason</span><strong>${safe(data.no_trade_reason||status.no_trade_reason||signal?.no_trade_reason||"—")}</strong></div><div class="key-value"><span class="key">Pause / disarm / kill</span><strong>${status.pause?"PAUSED":"RUNNING"} / ${status.disarmed?"DISARMED":"ARMED"} / ${status.killed?"KILLED":"NOT KILLED"}</strong></div></article>`;
-      $("binance-raw").textContent=json({status,actions});
-    }
-    const _renderBinanceCanaryPaper = renderBinanceCanary;
-    function _binanceTestnetData(data) {
-      const status=data?.status&&typeof data.status==="object"?data.status:{};
-      return status.strict_testnet===true||data?.strict_testnet===true;
-    }
-    function _binanceTestnetValue(value) {
-      return value&&typeof value==="object"?safe(json(value)):safe(value);
-    }
-    function _binanceTestnetField(object, keys) {
-      const source=object&&typeof object==="object"?object:{};
-      for(const key of keys) {
-        const value=source[key];
-        if(value!==undefined&&value!==null&&value!=="")return _binanceTestnetValue(value);
-      }
-      return "—";
-    }
-    function renderBinanceTestnet(data) {
-      setBinanceNavLabel("BINANCE SPOT TESTNET");
-      const status=data?.status&&typeof data.status==="object"?data.status:{}, profile=data?.profile||status.profile||{}, credentials=data?.credentials||status.credentials||{}, connectivity=data?.connectivity||status.connectivity||{}, validation=data?.validation||status.validation||{}, probe=data?.probe||status.probe||{}, isolation=data?.isolation||status.isolation||{}, autonomous=data?.autonomous||status.autonomous||{}, account=connectivity.account||status.account||{}, entry=probe.intent||probe.entry||probe.buy||{}, exit=probe.exit||probe.exit_order||probe.sell||{}, orders=probe.orders||probe.order_records||[], fills=probe.fills||probe.trade_fills||probe.fill_records||[], reconciliation=probe.reconciliation||probe.reconcile||status.reconciliation||{}, actions=arr(data?.actions||status.actions);
-      const checked=connectivity.checked_at||connectivity.timestamp||status.checked_at||status.timestamp||{}, checkedPht=typeof checked==="object"?checked.pht:checked, balances=account.balances||connectivity.balances||[], state=autonomous.state||status.control?.state||status.state||"DISARMED";
-      document.querySelector("#view-binance-canary > article > .section-title h2")?.replaceChildren(document.createTextNode("BINANCE SPOT TESTNET"));
-      const badge=document.querySelector("#view-binance-canary > article > .section-title .badge"); if(badge)badge.textContent="TESTNET / LOCALHOST ONLY";
-      $("binance-identity").innerHTML=`<article class="panel"><div class="section-title"><h2>BINANCE SPOT TESTNET</h2><span class="badge warn">${safe(profile.environment||"TESTNET")}</span></div><div class="three-col"><div class="key-value"><span class="key">Environment</span><strong>TESTNET</strong></div><div class="key-value"><span class="key">Profile</span><strong>${_binanceTestnetField(profile,["identity","name","runtime_identity","profile"])}</strong></div><div class="key-value"><span class="key">Database</span><strong>${_binanceTestnetField(profile,["db_path","database","database_path"])}</strong></div><div class="key-value"><span class="key">Configured</span><strong>${credentials.configured===true?"CONFIGURED":"NOT CONFIGURED"}</strong></div><div class="key-value"><span class="key">Isolation</span><strong>${_binanceTestnetField(isolation,["status","reason","boundary"])}</strong></div><div class="key-value"><span class="key">Credentials</span><strong>STATUS ONLY · VALUES NEVER RENDERED</strong></div></div><p class="page-note">Status ${safe(typeof checked==="object"?(checked.utc||"—"):checked)} · localhost control token required.</p></article>`;
-      $("binance-connectivity").innerHTML=`<article class="panel"><div class="section-title"><h2>TESTNET CONNECTIVITY</h2><span class="badge ${statusClass(connectivity.status||"BLOCKED")}">${safe(connectivity.status||"BLOCKED")}</span></div><div class="three-col"><div class="key-value"><span class="key">Configured status</span><strong>${credentials.configured===true?"CONFIGURED":"NOT CONFIGURED"}</strong></div><div class="key-value"><span class="key">Authentication</span><strong>${_binanceTestnetField(connectivity,["authentication","auth_status","reason"])}</strong></div><div class="key-value"><span class="key">Account / Spot</span><strong>${_binanceTestnetField(account,["account_type","type"])} · ${account.can_trade===true?"CAN TRADE":"BLOCKED"}</strong></div><div class="key-value"><span class="key">Server time</span><strong>${_binanceTestnetField(connectivity,["server_time_ms","server_time","serverTime"])}</strong></div><div class="key-value"><span class="key">Bounded balances</span><strong>${Array.isArray(balances)?`${balances.length} shown`:_binanceTestnetValue(balances)}</strong></div><div class="key-value"><span class="key">Check PHT</span><strong>${safe(checkedPht||"—")}</strong></div><div class="key-value"><span class="key">Reason</span><strong>${_binanceTestnetField(connectivity,["reason","error"])}</strong></div></div>${Array.isArray(balances)&&balances.length?`<details><summary>Bounded balances</summary><pre>${safe(json(balances.slice(0,64)))}</pre></details>`:""}</article>`;
-      $("binance-qualification").innerHTML=`<article class="panel"><div class="section-title"><h2>ORDER VALIDATION</h2><span class="badge ${statusClass(validation.status||"BLOCKED")}">${safe(validation.status||"BLOCKED")}</span></div><div class="three-col"><div class="key-value"><span class="key">Symbol</span><strong>${_binanceTestnetField(validation,["symbol"])}</strong></div><div class="key-value"><span class="key">Side</span><strong>${_binanceTestnetField(validation,["side","order_side"])}</strong></div><div class="key-value"><span class="key">Price</span><strong>${_binanceTestnetField(validation,["price"])}</strong></div><div class="key-value"><span class="key">Quantity</span><strong>${_binanceTestnetField(validation,["quantity"])}</strong></div><div class="key-value"><span class="key">Fee reserve</span><strong>${_binanceTestnetField(validation,["fee_reserve","fee","fee_reservation"])}</strong></div><div class="key-value"><span class="key">Reservation</span><strong>${_binanceTestnetField(validation,["reservation","risk_reservation","planned_exit"])}</strong></div><div class="key-value"><span class="key">Status</span><strong>${_binanceTestnetField(validation,["status","reason"])}</strong></div></div></article>`;
-      $("binance-risk").innerHTML=`<article class="panel"><div class="section-title"><h2>TESTNET EXECUTION PROBE</h2><span class="badge ${statusClass(probe.status||"BLOCKED")}">${safe(probe.status||"BLOCKED")}</span></div><div class="three-col"><div class="key-value"><span class="key">Probe label</span><strong>${_binanceTestnetField(probe,["label","probe_kind","name"])}</strong></div><div class="key-value"><span class="key">Entry exchange ID</span><strong>${_binanceTestnetField(entry,["exchange_order_id","exchangeOrderId","order_id"])}</strong></div><div class="key-value"><span class="key">Entry client ID</span><strong>${_binanceTestnetField(entry,["client_order_id","clientOrderId","newClientOrderId"])}</strong></div><div class="key-value"><span class="key">Fills / fees</span><strong>${Array.isArray(fills)?`${fills.length} fills · ${_binanceTestnetField(probe,["fee_paid","fees","commission"])}`:_binanceTestnetField(probe,["fills","fees"])}</strong></div><div class="key-value"><span class="key">Owned quantity</span><strong>${_binanceTestnetField(probe,["owned_quantity","owned_qty","quantity_owned"])}</strong></div><div class="key-value"><span class="key">Exit</span><strong>${_binanceTestnetField(exit,["state","status","reason"])}</strong></div><div class="key-value"><span class="key">Exit exchange / client IDs</span><strong>${_binanceTestnetField(exit,["exchange_order_id","client_order_id","order_id"])}</strong></div><div class="key-value"><span class="key">Realized PnL</span><strong>${_binanceTestnetField(probe,["realized_pnl","realizedPnL"])}</strong></div><div class="key-value"><span class="key">Reconciliation</span><strong>${_binanceTestnetField(reconciliation,["status","reason","state"])}</strong></div><div class="key-value"><span class="key">DUST</span><strong>${String(probe.status||exit.state||exit.status||"").toUpperCase()==="DUST"?"DUST":"—"}</strong></div></div>${orders.length||fills.length?`<details><summary>Probe orders and fills</summary><pre>${safe(json({orders:orders.slice(0,100),fills:fills.slice(0,100)}))}</pre></details>`:""}</article>`;
-      $("binance-controls").innerHTML=`<article class="panel"><div class="section-title"><h2>AUTONOMOUS TESTNET</h2><span class="badge ${statusClass(state)}">${safe(state)}</span></div><p class="page-note">Price and quantity are computed automatically from Binance exchange filters and the frozen bounded Testnet envelope.</p><p class="page-note"><button class="binance-action" data-binance-action="CONNECTIVITY_CHECK">Connectivity check</button> <button class="binance-action" data-binance-action="ORDER_VALIDATION_TEST">Validate order</button> <button class="binance-action" data-binance-action="PAUSE">Pause</button> <button class="binance-action" data-binance-action="DISARM">Disarm</button> <button class="binance-action danger" data-binance-action="KILL">Kill</button></p><p class="notice">Execution probe and reconciliation actions are CLI/runtime-only. Browser controls are limited to read-only connectivity, order validation, and risk-reducing pause, disarm, or kill.</p></article><article class="panel"><div class="section-title"><h2>AUTONOMOUS TESTNET STATUS</h2><span class="badge ${statusClass(autonomous.state||state)}">${safe(autonomous.state||state)}</span></div><div class="three-col"><div class="key-value"><span class="key">Enabled</span><strong>${_binanceTestnetField(autonomous,["enabled"])}</strong></div><div class="key-value"><span class="key">State</span><strong>${_binanceTestnetField(autonomous,["state"])}</strong></div><div class="key-value"><span class="key">Blocked reason</span><strong>${_binanceTestnetField(autonomous,["blocked_reason","blocker","reason"])}</strong></div><div class="key-value"><span class="key">Selected candidate</span><strong>${_binanceTestnetField(autonomous,["selected_candidate","candidate"])}</strong></div><div class="key-value"><span class="key">Current signal</span><strong>${_binanceTestnetField(autonomous,["current_signal","signal"])}</strong></div><div class="key-value"><span class="key">No-trade reason</span><strong>${_binanceTestnetField(autonomous,["no_trade_reason"])}</strong></div><div class="key-value"><span class="key">Frozen envelope</span><strong>${_binanceTestnetField(autonomous,["risk_envelope","frozen_envelope","risk"])}</strong></div><div class="key-value"><span class="key">Bounded window</span><strong>${_binanceTestnetField(autonomous,["bounded_window","window","window_seconds"])}</strong></div></div></article>`;
-      $("binance-controls").firstElementChild?.insertAdjacentHTML("beforeend",'<p class="page-note">Autonomous enable/resume is CLI-only; window-seconds 30..900.</p>');
-      const records=[binanceRecordTable("TESTNET PROBE ORDERS",orders),binanceRecordTable("TESTNET PROBE FILLS",fills)].join("");
-      $("binance-records").innerHTML=`<div class="three-col">${records}</div><article class="panel"><div class="section-title"><h3>TESTNET ISOLATION</h3><span class="badge">${safe(_binanceTestnetField(isolation,["status","reason","boundary"]))}</span></div><p class="page-note">Probe evidence is isolated from strategy signals and execution ledgers. No Polymarket transport is available.</p><pre>${safe(json({isolation,actions:actions.slice(0,100)}))}</pre></article>`;
-      $("binance-raw").textContent=json({status,connectivity,validation,probe,isolation,autonomous,actions});
-    }
-    renderBinanceCanary = function(data) {
-      binanceTestnetMode = _binanceTestnetData(data);
-      if(binanceTestnetMode) { renderBinanceTestnet(data); return; }
-      _renderBinanceCanaryPaper(data);
-    };
-
-    function renderCanarySetup(data) {
-      const payload=data&&typeof data==="object"?data:{}, canary=payload.canary&&typeof payload.canary==="object"?payload.canary:{};
-      // Keep this setup boundary explicit: the canary view owns the
-      // connectivity/settings sub-surfaces, while the autonomous renderer
-      // below owns the bounded readiness and execution summary.
-      renderCanaryConnectivity(payload.connectivity??canary.connectivity??null);
-      renderRiskSettings(payload);
-      const readiness=payload.readiness&&typeof payload.readiness==="object"?payload.readiness:{};
-      const updated=payload.readiness_snapshot_updated_at??canary.readiness_snapshot_updated_at??readiness.updated_at;
-      if($("canary-readiness-snapshot"))$("canary-readiness-snapshot").innerHTML=readinessSnapshotMarkup({...payload,canary:{...canary,readiness_snapshot_updated_at:updated}});
-    }
-    function renderRiskSettings(data) {
-      const snapshot=data?.risk_settings||data?.canary?.risk_settings||{},
-        active=snapshot.active||snapshot.active_config||{},
-        rawDraft=snapshot.draft||snapshot.draft_config||null,
-        draft=rawDraft&&typeof rawDraft==="object"&&rawDraft.config_id?rawDraft:null,
-        source=(draft?.values&&typeof draft.values==="object"?draft.values:(draft?.limits&&typeof draft.limits==="object"?draft.limits:(active.values&&typeof active.values==="object"?active.values:(active.limits&&typeof active.limits==="object"?active.limits:(snapshot.effective_limits||snapshot.active_limits||{})))));
-      const value=(name,fallback="")=>source?.[name]??active?.[name]??fallback;
-      const submissionValue=Number(value("max_submitted_orders_per_day",value("max_orders_per_day","5")));
-      const submissionPreset=[5,10,20].includes(submissionValue)?String(submissionValue):"custom";
-      const fields=[
-        ["max_all_in_buy_usd","Maximum all-in buy","decimal"],
-        ["max_gross_daily_buy_usd","Gross daily buy budget","decimal"],
-        ["max_aggregate_exposure_usd","Open exposure","decimal"],
-        ["max_positions","Maximum positions","number"],
-        ["realized_loss_entry_stop_usd","Realized loss stop","decimal"],
-        ["equity_loss_entry_stop_usd","Equity loss stop","decimal"],
-        ["max_slippage_bps","Slippage (bps)","number"]
-      ];
-      const advanced=[
-        ["max_fee_reserve_usd","Fee reserve","decimal"],
-        ["per_market_buy_cap_usd","Per-market buy limit","decimal"],
-        ["per_event_buy_cap_usd","Per-event buy limit","decimal"],
-        ["cumulative_buy_cap_usd","Cumulative buy limit","decimal"]
-      ];
-      riskReview={
-        active:{
-          values:active.values||active.settings||snapshot.effective_limits||snapshot.active_limits||{},
-          configId:active.config_id??active.id??snapshot.config_id??snapshot.active_config_id??null,
-          generation:active.generation??snapshot.generation??null,
-          hash:active.config_hash??snapshot.config_hash??null,
-          controlGeneration:snapshot.control_generation??active.control_generation??null
-        },
-        draft:draft&&draft.config_id?{
-          values:draft.values||draft.settings||{},
-          configId:draft.config_id??draft.id??null,
-          generation:draft.generation??null,
-          hash:draft.config_hash??null
-        }:null
-      };
-      const optionalAdvanced=new Set(["per_market_buy_cap_usd","per_event_buy_cap_usd","cumulative_buy_cap_usd"]);
-      const input=(name,label,type="decimal",current="")=>{const display=current==null?"":String(current),optional=optionalAdvanced.has(name),marker=optional?' data-risk-optional="clearable"':"";return `<label class="key-value"><span class="key">${safe(label)}</span><input data-risk-field="${safe(name)}"${marker} aria-label="${safe(label)}" value="${safe(display)}" inputmode="${type==="number"?"numeric":"decimal"}"></label>`;};
-      const reviewFields=[["max_submitted_orders_per_day","Submissions/day","number"],...fields,...advanced];
-      riskReview.labels=Object.fromEntries(reviewFields.map(([name,label])=>[name,label]));
-      const reviewValues=riskReview.draft?.values||{};
-      const activeValues=riskReview.active.values||{};
-      const diff=riskReview.draft?reviewFields.map(([name,label])=>({name,label,before:activeValues[name],after:reviewValues[name]})).filter(item=>JSON.stringify(item.before??null)!==JSON.stringify(item.after??null)):[];
-      const diffMarkup=diff.length
-        ? `<ul>${diff.map(item=>`<li>${safe(item.label)}: ${safe(item.before??"")} → <strong>${safe(item.after??"")}</strong></li>`).join("")}</ul>`
-        : `<p class="page-note">No saved changes are waiting for activation.</p>`;
-      const status=String(snapshot.status||"CURRENT").toUpperCase();
-      const cumulativeUsage=snapshot.usage?.cumulative_buy_usd??"0.00";
-      const cumulativeCap=snapshot.cumulative_buy_cap_usd??activeValues.cumulative_buy_cap_usd??null;
-      const cumulativeRemaining=snapshot.remaining_cumulative_buy_usd??snapshot.remaining?.cumulative_buy_usd??null;
-      const cumulativeState=String(snapshot.cumulative_buy_cap_state||(cumulativeCap==null?"UNCONFIGURED":"UNKNOWN")).toUpperCase();
-      const cumulativeReason=snapshot.cumulative_buy_over_limit_reason||"";
-      const cumulativeMarkup=`<section class="panel" data-risk-capacity="cumulative-buy"><div class="section-title"><h3>CUMULATIVE BUY CAP</h3><span class="badge ${statusClass(cumulativeState)}">${safe(cumulativeState)}</span></div><div class="three-col"><div class="key-value"><span class="key">Cumulative BUY usage</span><strong>${safe(cumulativeUsage)}</strong></div><div class="key-value"><span class="key">Active cumulative BUY cap</span><strong>${safe(cumulativeCap??"—")}</strong></div><div class="key-value"><span class="key">Remaining cumulative BUY</span><strong>${safe(cumulativeRemaining??"—")}</strong></div></div>${cumulativeReason?`<p class="page-note">Over-limit reason: ${safe(cumulativeReason)}</p>`:""}</section>`;
-      $("risk-settings").innerHTML=`<article class="panel"><div class="section-title"><h2>POLYMARKET RISK SETTINGS</h2><span class="badge ${statusClass(status)}">${safe(status)}</span></div><p class="page-note">Edit one bounded setting at a time, review the exact changes, then confirm activation. Active limits remain authoritative until activation succeeds.</p><div class="three-col"><label class="key-value"><span class="key">Submissions/day</span><select data-risk-field="max_submitted_orders_per_day" aria-label="Submissions per day"><option value="5"${submissionPreset==="5"?" selected":""}>5</option><option value="10"${submissionPreset==="10"?" selected":""}>10</option><option value="20"${submissionPreset==="20"?" selected":""}>20</option><option value="custom"${submissionPreset==="custom"?" selected":""}>Custom</option></select><input data-risk-submissions-custom aria-label="Custom submissions per day" value="${submissionPreset==="custom"?safe(submissionValue):""}" inputmode="numeric"${submissionPreset==="custom"?"":" hidden"}></label>${fields.map(([name,label,type])=>input(name,label,type,value(name))).join("")}</div><details><summary>Optional advanced limits</summary><div class="three-col">${advanced.map(([name,label,type])=>input(name,label,type,value(name))).join("")}</div></details><div class="filters"><label class="key-value"><span class="key">Operator</span><strong>Authenticated operator</strong></label><button class="risk-settings-action" data-risk-action="save">Review changes</button></div><div id="risk-review" class="page-note"><strong>Activation review</strong>${diffMarkup}</div>${riskReview.draft?`<p class="page-note"><button class="risk-settings-action" data-risk-action="activate">Confirm activation</button></p>`:""}</article>`;
-      $("risk-settings").firstElementChild?.insertAdjacentHTML("afterbegin",cumulativeMarkup);
-      const submissions=$("[data-risk-field='max_submitted_orders_per_day']"),custom=$("[data-risk-submissions-custom]");
-      submissions?.addEventListener("change",()=>{if(custom){custom.hidden=submissions.value!=="custom";if(submissions.value!=="custom")custom.value="";}});
-    }
-    function renderCanary(data) {
-      renderCanarySetup(data);
-      const payload=data&&typeof data==="object"?data:{}, c=payload.canary&&typeof payload.canary==="object"?payload.canary:{}, auto=payload.autonomous_canary&&typeof payload.autonomous_canary==="object"?payload.autonomous_canary:(c.autonomous&&typeof c.autonomous==="object"?c.autonomous:{});
-      const control=payload.control&&typeof payload.control==="object"?payload.control:(c.control&&typeof c.control==="object"?c.control:{});
-      const connectivity=payload.connectivity&&typeof payload.connectivity==="object"?payload.connectivity:(c.connectivity&&typeof c.connectivity==="object"?c.connectivity:null);
-      const risk=c.risk_envelope&&typeof c.risk_envelope==="object"?c.risk_envelope:(c.risk_limits&&typeof c.risk_limits==="object"?c.risk_limits:{});
-      const stateValue=String(c.control_state??control.state??c.micro_live_canary??"UNKNOWN").toUpperCase();
-      const backendState=stateValue, enabled=stateValue==="AUTONOMOUS_MICRO_LIVE"||stateValue==="ENABLED";
-      const selectionStatus=String(c.selection_status??control.selection_status??"UNKNOWN").toUpperCase();
-      const selectionValid=c.selection_valid===true&&selectionStatus==="CURRENT";
-      const signal=payload.canary_signal??c.latest_signal??null;
-      const currentCandidate=selectionValid?c.selected_candidate||"": "";
-      const currentWinnerId=selectionValid?c.winner_id||"": "";
-      const historicalCandidate=c.last_selected_candidate||"";
-      const selectionLabel=selectionStatus==="STALE"?"STALE · REEVALUATION REQUIRED":selectionStatus==="CURRENT"?"CURRENT":c.selection_invalidation_reason==="NO_ELIGIBLE_CANDIDATES"?"NO_ELIGIBLE_CANDIDATES":"UNKNOWN";
-      const rawEligible=c.eligibility_raw_count==null?null:Number(c.eligibility_raw_count);
-      const eligible=c.eligible_count==null?null:Number(c.eligible_count);
-      const rawRankable=c.rankable_raw_count==null?null:Number(c.rankable_raw_count);
-      const rankable=c.rankable_count==null?null:Number(c.rankable_count);
-      const events=data.real_execution_events??c.real_execution_events??c.execution_event_count??null;
-      const manualCandidate=backendState==="ARMED"&&c.candidate?`<div class="panel"><div class="metric">${safe(c.candidate)}</div><div class="metric-label">Manual armed candidate</div></div>`:"";
-      const connectivityCheckedAt=connectivity?.checked_at?Date.parse(connectivity.checked_at):NaN;
-      const connectivityAgeMs=Number.isFinite(connectivityCheckedAt)?Date.now()-connectivityCheckedAt:NaN;
-      const connectivityFresh=Number.isFinite(connectivityAgeMs)&&connectivityAgeMs>=0&&connectivityAgeMs<=60000;
-      const connectivityReady=connectivity?.ready===true&&connectivity?.status==="READY"&&connectivityFresh;
-      const connectivityBlocker=connectivityReady?"":connectivity?.ready===true&&!connectivityFresh?"CONNECTIVITY_CHECK_STALE":arr(connectivity?.failure_codes)[0]||"CONNECTIVITY_BLOCKED";
-      const selectionReason=c.selection_invalidation_reason||"", selectionBlocker=selectionValid&&currentCandidate?"":(selectionReason||(selectionStatus==="STALE"?"REEVALUATION_REQUIRED":selectionStatus==="UNKNOWN"?"READINESS_UNKNOWN":selectionStatus==="NONE"?"NO_CURRENT_SELECTION":"SELECTION_INVALID"));
-      const currentRank=selectionValid&&selectionStatus==="CURRENT"?auto.rank:"—", currentScore=selectionValid&&selectionStatus==="CURRENT"?auto.score:"—", selectionReasonLabel=c.selection_reason||"—", historicalMarkup=historicalCandidate?`<div class="panel"><div class="metric">${safe(historicalCandidate)}</div><div class="metric-label">Selected winner · Historical selected ID</div><p class="page-note"><span class="badge ${statusClass(selectionStatus)}">${safe(selectionLabel)}</span></p></div>`:"";
-      const autonomousBlocker=enabled?"ENABLED":!connectivity?"CONNECTIVITY_CHECK_REQUIRED":!connectivityReady?connectivityBlocker:backendState==="KILLED"?"CANARY_KILLED":selectionBlocker||String(auto.blocker||"AUTONOMOUS_CANARY_DISABLED");
-      const autoReady=connectivityReady&&backendState!=="KILLED"&&!enabled&&selectionValid&&Boolean(currentCandidate);
-      const activeBinding=riskReview.active||{};
-      const bindingReady=Boolean(activeBinding.configId)&&Number.isInteger(Number(activeBinding.generation))&&Number(activeBinding.generation)>0;
-      const enable=enabled?controlButton("canary.disarm","DISARM","","DISARM"):autoReady&&bindingReady?`<button class="risk-settings-action" data-risk-action="enable">Review active limits and enable</button>`:"";
-      const riskMarkup=Object.entries(risk).map(([key,value])=>`<div class="key-value"><span class="key">${safe(key.replaceAll("_"," "))}</span><strong>${safe(value)}</strong></div>`).join("")||empty("Risk envelope unavailable","No frozen risk limits are persisted.");
-      $("canary-controls").innerHTML=`<article class="panel"><div class="section-title"><h2>AUTONOMOUS CANARY CONTROL</h2><span class="badge ${statusClass(stateValue)}">${safe(stateValue)}</span></div><p class="page-note"><strong>${safe(enabled?"AUTO CANARY ENABLED":autoReady?"AUTO CANARY READY TO ENABLE":`AUTO CANARY BLOCKED: ${autonomousBlocker}`)}</strong></p><div class="page-note">${controlButton("canary.connectivity_check","Connectivity check")} · ${enable} · ${controlButton("canary.kill","KILL","","KILL")}</div><p class="page-note">One confirmation enables the prediction-only envelope using the active venue settings. Research, eligibility, ranking, and submission decisions run in the node worker; Hermes cannot change this envelope.</p></article>`;
-      $("canary-summary").innerHTML=`<div class="card-grid"><div class="panel"><div class="metric">${safe(stateValue)}</div><div class="metric-label">Autonomous canary state</div></div>${currentCandidate?`<div class="panel"><div class="metric">${safe(currentCandidate)}</div><div class="metric-label">Selected winner · Current selection</div><p class="page-note"><span class="badge ${statusClass(selectionStatus)}">${safe(selectionLabel)}</span></p></div>`:historicalMarkup||`<div class="panel"><div class="metric">—</div><div class="metric-label">Current selection</div><p class="page-note"><span class="badge ${statusClass(selectionStatus)}">${safe(selectionLabel)}</span></p></div>`}${manualCandidate}<div class="panel"><div class="metric">${safe(currentRank)} · ${safe(currentScore)}</div><div class="metric-label">Current rank / score</div></div><div class="panel"><div class="metric">${count(rawEligible)}</div><div class="metric-label">Eligible candidates (raw)</div></div><div class="panel"><div class="metric">${count(eligible)}</div><div class="metric-label">Eligible candidates (validated)</div></div><div class="panel"><div class="metric">${count(rawRankable)}</div><div class="metric-label">Rankable candidates (raw)</div></div><div class="panel"><div class="metric">${count(rankable)}</div><div class="metric-label">Rankable candidates (validated)</div></div><div class="panel"><div class="metric">${count(events)}</div><div class="metric-label">Real execution events</div></div></div><article class="panel"><div class="section-title"><h2>Autonomous readiness</h2><span class="badge ${statusClass(autonomousBlocker)}">${safe(autoReady?"READY":autonomousBlocker)}</span></div><div class="three-col"><div class="key-value"><span class="key">Selection status</span><strong>${safe(selectionLabel)}</strong></div><div class="key-value"><span class="key">Selection valid</span><strong>${safe(selectionValid)}</strong></div><div class="key-value"><span class="key">Current selection</span><strong>${safe(currentCandidate||"—")}</strong></div><div class="key-value"><span class="key">Historical selection</span><strong>${safe(historicalCandidate||"—")}</strong></div><div class="key-value"><span class="key">Selection reason</span><strong>${safe(selectionReasonLabel)}</strong></div><div class="key-value"><span class="key">Invalidation reason</span><strong>${safe(selectionReason||"—")}</strong></div><div class="key-value"><span class="key">Last ranking run ID</span><strong>${safe(c.ranking_run_id||"—")}</strong></div><div class="key-value"><span class="key">Last ranking timestamp</span><strong>${safe(dateText(c.ranking_timestamp))}</strong></div><div class="key-value"><span class="key">Historical data integrity</span><strong>${safe(c.historical_data_integrity||"UNKNOWN")}</strong></div><div class="key-value"><span class="key">Historical execution fidelity</span><strong>${safe(c.historical_execution_fidelity||"UNKNOWN")}</strong></div><div class="key-value"><span class="key">Current execution evidence</span><strong>${safe(c.current_execution_evidence||"CURRENT_ORDER_BOOK_REQUIRED")}</strong></div><div class="key-value"><span class="key">Next decision</span><strong>${safe(auto.next_decision||"—")}</strong></div><div class="key-value"><span class="key">Blocker</span><strong>${safe(selectionReason||auto.blocker||"—")}</strong></div></div></article><article class="panel"><div class="section-title"><h2>Risk envelope</h2><span class="badge warn">active settings</span></div>${riskMarkup}</article>`;
-      const readiness=signal?String(signal.status||"READY"):"NO SIGNAL", detail=signal?`<div class="three-col"><div class="key-value"><span class="key">Signal readiness</span><strong>${safe(readiness)}</strong></div><div class="key-value"><span class="key">Market / outcome</span><strong>${safe(signal.market_id)} / ${safe(signal.outcome)}</strong></div><div class="key-value"><span class="key">Expected price</span><strong>${safe(signal.paper_expected_price)}</strong></div><div class="key-value"><span class="key">Generated</span><strong>${safe(dateText(signal.generated_at))}</strong></div><div class="key-value"><span class="key">Order result</span><strong>${safe(c.last_request_status||"NO ORDER")}</strong></div></div>`:empty("No latest signal","No persisted signal is available.");
-      $("canary-summary").insertAdjacentHTML("beforeend",`<article class="panel"><div class="section-title"><h2>Latest signal</h2><span class="badge ${statusClass(readiness)}">${safe(readiness)}</span></div>${detail}<p class="page-note">Kill prevents new submissions; an in-flight request is recorded, in-flight not retracted, and never retried automatically.</p></article>`);
-      $("canary-trades").innerHTML=arr(c.trades).length?`<table><thead><tr><th>Time</th><th>Candidate</th><th>Market</th><th>Side</th><th>Status</th><th>Price Δ</th></tr></thead><tbody>${arr(c.trades).map(t=>`<tr><td>${safe(dateText(t.timestamp))}</td><td>${safe(t.candidate_id)}</td><td>${safe(t.market_id)}</td><td>${safe(t.side)}</td><td><span class="badge ${statusClass(t.status)}">${safe(t.status)}</span></td><td>${safe(t.price_difference)}</td></tr>`).join("")}</tbody></table>`:empty("No canary execution evidence","No order has been submitted by the autonomous worker.");
-    }
-    function renderCanaryAutonomousState(data) {
-      const c=data?.canary||{}, auto=data?.autonomous_canary||c.autonomous||{};
-      const read=(name)=>auto[name]??c[name]??null;
-      const selectionStatus=String(c.selection_status??auto.selection_status??"UNKNOWN").toUpperCase();
-      const selectionValid=(c.selection_valid??auto.selection_valid)===true;
-      const boundResearchCandidate=c.selected_candidate??auto.selected_candidate??null;
-      const currentSelectionBinding=selectionValid&&selectionStatus==="CURRENT"&&boundResearchCandidate!=null&&String(boundResearchCandidate).trim()!=="";
-      const researchCandidate=currentSelectionBinding?boundResearchCandidate:null;
-      const researchRank=currentSelectionBinding?(c.winner_rank??auto.winner_rank??auto.rank??null):null;
-      const actionableCandidate=read("selected_actionable_candidate");
-      const actionableFound=read("actionable_candidates_found");
-      const signalChecked=read("candidates_signal_checked");
-      const noSignal=read("candidates_no_signal");
-      const observed=actionableFound!=null||signalChecked!=null||noSignal!=null;
-      const actionableCountNumber=actionableFound==null?NaN:Number(actionableFound);
-      const actionableCountIsZero=Number.isFinite(actionableCountNumber)&&actionableCountNumber===0;
-      const hasActionable=!actionableCountIsZero&&actionableCandidate!=null&&String(actionableCandidate).trim()!=="";
-      const eligibleCount=c.eligible_count??auto.eligible_count,rankableCount=c.rankable_count??auto.rankable_count;
-      const noEligible=eligibleCount!=null&&rankableCount!=null&&Number(eligibleCount)===0&&Number(rankableCount)===0;
-      const noAction=observed&&(
-        actionableCountIsZero||
-        (!hasActionable&&actionableFound==null&&noSignal!=null&&Number(noSignal)>0)
-      );
-      const scanStatus=String(read("signal_scan_status")||"").toUpperCase();
-      const status=noEligible?"NO_ELIGIBLE_CANDIDATES":scanStatus==="IN_PROGRESS"?"IN_PROGRESS":noAction?"NO ACTIONABLE SIGNAL":hasActionable?"ACTIONABLE SIGNAL":scanStatus==="UNKNOWN"?"DATA MISSING":"UNKNOWN";
-      const currentCandidate=hasActionable?actionableCandidate:noAction?"NONE":null;
-      const scanWindow=`${safe(read("next_signal_scan_start_rank"))}–${safe(read("next_signal_scan_end_rank"))}`;
-      const existing=$("canary-actionable-opportunity");
-      if(existing)existing.remove();
-      $("canary-summary")?.insertAdjacentHTML("afterbegin",`<article id="canary-actionable-opportunity" class="panel"><div class="section-title"><h2>ACTIONABLE SIGNAL SCAN</h2><span class="badge ${statusClass(status)}">${safe(status)}</span></div><div class="three-col"><div class="key-value"><span class="key">Research winner · candidate</span><strong>${safe(researchCandidate)}</strong></div><div class="key-value"><span class="key">Research rank</span><strong>${safe(researchRank)}</strong></div><div class="key-value"><span class="key">Current actionable candidate</span><strong>${safe(currentCandidate)}</strong></div><div class="key-value"><span class="key">Candidates ranked</span><strong>${count(read("candidates_ranked"))}</strong></div><div class="key-value"><span class="key">Signal checked this tick</span><strong>${count(signalChecked)}</strong></div><div class="key-value"><span class="key">No signal</span><strong>${count(noSignal)}</strong></div><div class="key-value"><span class="key">Actionable</span><strong>${count(actionableFound)}</strong></div><div class="key-value"><span class="key">Chosen actionable rank</span><strong>${safe(read("selected_actionable_rank"))}</strong></div><div class="key-value"><span class="key">Chosen score</span><strong>${safe(read("selected_actionable_score"))}</strong></div></div>${noAction?`<p class="page-note"><strong>NO ACTIONABLE SIGNAL</strong> · checked ${count(signalChecked)} candidate(s) · next scan window ranks ${scanWindow}</p>`:""}<p class="page-note">Signal scan ranking run ${safe(read("signal_scan_ranking_run_id"))} · cursor ${safe(read("signal_scan_cursor"))}</p></article>`);
-      const forwardEvidence=data?.forward_evidence||c.forward_evidence||{}, reasonCounts=data?.signal_scan_reason_counts||auto.signal_scan_reason_counts||{};
-      const displayReason=(value)=>String(value||"").toUpperCase()==="CANDIDATE_FORWARD_MARKET_UNRESOLVED"?"UNRESOLVED_MARKET":value;
-      const evidenceRows=[["Candidate-bound markets",arr(forwardEvidence.candidate_bound_markets).length],["Scheduled",arr(forwardEvidence.scheduled).length],["Fresh",arr(forwardEvidence.fresh).length],["Stale",arr(forwardEvidence.stale).length],["Missing",arr(forwardEvidence.missing).length],["Grade",forwardEvidence.grade],["Reason",displayReason(forwardEvidence.reason_display||forwardEvidence.reason_code)],["Newest source",dateText(forwardEvidence.newest_required_source_timestamp)],["Oldest source",dateText(forwardEvidence.oldest_required_source_timestamp)],["Newest observed",dateText(forwardEvidence.newest_required_observed_at)],["Oldest observed",dateText(forwardEvidence.oldest_required_observed_at)]];
-      $("canary-summary")?.insertAdjacentHTML("beforeend",`<article id="canary-forward-evidence" class="panel"><div class="section-title"><h2>FORWARD EVIDENCE</h2><span class="badge ${statusClass(forwardEvidence.grade)}">${safe(forwardEvidence.grade||"UNKNOWN")}</span></div><div class="three-col">${evidenceRows.map(([label,value])=>`<div class="key-value"><span class="key">${safe(label)}</span><strong>${safe(value??"—")}</strong></div>`).join("")}</div><p class="page-note">Signal scan reason counts: ${safe(Object.entries(reasonCounts).map(([key,value])=>`${key}=${value}`).join(", ")||"—")}</p>${c.last_cycle_blocker?`<p class="page-note">Last-cycle blocker: ${safe(c.last_cycle_blocker)} (control state ${safe(c.control_state||"UNKNOWN")})</p>`:""}</article>`);
-      const universeHash=read("signal_scan_candidate_universe_hash");
-      const coverage=noEligible?0:universeHash==null||String(universeHash).trim()===""?0:Number(read("signal_scan_coverage_percentage")??0);
-      $("canary-summary")?.insertAdjacentHTML("beforeend",`<p class="page-note signal-scan-coverage">Signal scan coverage: ${safe(Number.isFinite(coverage)?coverage:0)}% · checked ${safe(read("signal_scan_checked_this_cycle")??0)} · remaining ${safe(read("signal_scan_remaining_this_cycle")??0)} · cycle ${safe(read("signal_scan_cycle_id"))} · status ${safe(read("signal_scan_status")||"UNKNOWN")}</p>`);
-    }
-    const _renderCanaryResearchAndAction = renderCanary;
-    renderCanary = (data) => { _renderCanaryResearchAndAction(data); renderCanaryAutonomousState(data); };
-    function renderBtc(data) { const b=operator.btc||{},summary=b.catalog_summary||{},rows=arr(summary.latest_by_timeframe||summary.timeframes),fallback=arr(b.catalog),catalogRows=rows.length?rows:fallback; $("btc-summary").innerHTML=catalogRows.length?`<div class="three-col"><div class="key-value"><span class="key">Catalog timeframes</span><strong>${count(catalogRows.length)}</strong></div><div class="key-value"><span class="key">Rows observed</span><strong>${count(catalogRows.reduce((total,item)=>total+Number(item.row_count||0),0))}</strong></div><div class="key-value"><span class="key">Latest report</span><strong>${safe(dateText(b.latest_report?.created_at))}</strong></div></div>`:empty("BTC history not initialized","Run bootstrap-history --crypto, then btc-research."); $("btc-experiments").innerHTML=""; }
-    async function loadCrypto(symbol,persist=true) { state.selected=symbol; state.expanded=true; if(persist)saveState(true); try { const response=await fetch(`/api/v2/crypto-research/${encodeURIComponent(symbol)}`,{cache:"no-store"}),data=await response.json(); $("crypto-detail").innerHTML=arr(data.items).length?`<details open><summary>Crypto detail · ${safe(symbol)}</summary><div class="three-col"><div class="key-value"><span class="key">Universe version</span><strong>${safe(data.universe_version)}</strong></div><div class="key-value"><span class="key">Strategies</span><strong>${count(arr(data.strategies).length)}</strong></div><div class="key-value"><span class="key">Families</span><strong>${count(arr(data.families).length)}</strong></div></div><pre>${safe(json({catalogs:data.items,reports:data.reports,validation:data.validation,coverage:data.coverage}))}</pre></details>`:empty("Crypto symbol unavailable","No catalog is persisted for this symbol."); } catch(e) { $("crypto-detail").innerHTML=empty("Crypto detail unavailable",e.message); } }
-    function renderCrypto(data) { const rows=arr(data.items),symbols=arr(data.symbols),summary={universe_version:data.universe_version,symbols:data.symbol_count??symbols.length,assets:data.asset_count??arr(data.assets).length,catalogs:data.total,reports:arr(data.reports).length}; $("crypto-summary").innerHTML=`<div class="three-col">${[["Universe version",summary.universe_version],["Symbols",summary.symbols],["Assets",summary.assets],["Catalogs",summary.catalogs],["Reports",summary.reports],["Families",arr(data.families).length]].map(([label,value])=>`<div class="key-value"><span class="key">${safe(label)}</span><strong>${safe(value)}</strong></div>`).join("")}</div>`; $("crypto-table").innerHTML=rows.length?`<table><thead><tr><th>Symbol</th><th>Dataset</th><th>Version</th><th>Source</th><th>Coverage</th><th>Strategies</th><th>Experiments</th><th>Validation</th><th>Families</th></tr></thead><tbody>${rows.map(i=>`<tr><td><button class="link crypto-symbol-row" data-symbol="${encodeURIComponent(i.symbol||"")}">${safe(i.symbol)}</button></td><td>${safe(i.dataset_id)}</td><td>${safe(i.dataset_version)}</td><td>${safe(i.source_type)}</td><td>${safe(json(i.coverage))}</td><td>${safe(json(i.strategies))}</td><td>${safe(json(i.experiments))}</td><td>${safe(json(i.validation))}</td><td>${safe(json(i.families))}</td></tr>`).join("")}</tbody></table>`:empty("No crypto catalogs","No crypto catalog or report has been persisted."); pager("crypto",data); document.querySelectorAll(".crypto-symbol-row").forEach(b=>b.addEventListener("click",()=>loadCrypto(decodeURIComponent(b.dataset.symbol)))); }
-    function renderOutcomeCards(data) { const cards=data.research_cards||{}, latest=data.hermes_latest_outcome||cards.newest_hermes_outcome||{}, latestLabel=latest.outcome_label||latest.status||"—"; $("research-cards").innerHTML=[["experiments_run","Experiments run"],["active_hypotheses","Active hypotheses"],["candidates_alive","Candidates alive"],["candidate_rejected","Candidate Rejected"],["research_rejected","Research Rejected"],["canary_eligible","Canary eligible"],["paper_forward","Paper forward"],["paper_promotable","Paper promotable"]].map(([k,l])=>`<article class="panel"><div class="metric">${count(cards[k])}</div><div class="metric-label">${l}</div></article>`).join("")+`<article class="panel"><div class="metric">${safe(latestLabel)}</div><div class="metric-label">Newest Hermes outcome · ${safe(latest.item_id||"none")}</div><div class="page-note">Dataset: ${safe(latest.dataset_id||"—")} / ${safe(latest.dataset_version||"—")}</div>${latest.human_reason?`<p class="page-note">${safe(latest.human_reason)}</p>`:""}</article>`; }
-    const _renderOverview=renderOverview; renderOverview=(data)=>{_renderOverview(data);renderOutcomeCards(data);};
-    const VIEW_ENDPOINT = {overview:"overview-summary",canary:"canary","binance-canary":"binance-canary",datasets:"datasets",activity:"activity",candidates:"candidates",polymarket:"polymarket",hermes:"hermes",crypto:"crypto-research",portfolio:"paper","rolling-portfolio":"rolling-portfolio"};
-    const VIEW_TARGET = {datasets:"datasets-table",activity:"activity-table",candidates:"candidates-table",polymarket:"pm-markets",hermes:"hermes-table",crypto:"crypto-table",portfolio:"portfolio-states","rolling-portfolio":"rolling-members","binance-canary":"binance-records"};
-    const VIEW_CADENCE = {overview:10000,canary:15000,"binance-canary":15000,datasets:30000,activity:15000,candidates:30000,polymarket:30000,hermes:30000,crypto:30000,portfolio:30000,"rolling-portfolio":15000};
-    let activeController = null, detailController = null, refreshGeneration = 0, nextRefreshAt = 0, slowRefreshTimer = null, startupPending = true;
-    const REFRESH_TIMEOUT_MS = 75000;
-    const lastGood = {overview:null,canary:null,"binance-canary":null,controls:null};
-    let lastSuccessful = 0;
-    function refreshError(error) {
-      if(error?.name==="AbortError") return "request cancelled";
-      if(error?.name==="TimeoutError") return "request timed out";
-      return "request unavailable";
-    }
-    async function fetchWithTimeout(url, options={}) {
-      const controller = new AbortController();
-      const parent = options.signal;
-      let timedOut = false;
-      const abort = () => controller.abort();
-      if(parent) {
-        if(parent.aborted) controller.abort();
-        else parent.addEventListener("abort", abort, {once:true});
-      }
-      const timeout = setTimeout(() => {timedOut=true;controller.abort();}, REFRESH_TIMEOUT_MS);
-      try {
-        const response = await fetch(url, {...options, signal:controller.signal});
-        if(!response.ok) throw new Error(`${url} HTTP ${response.status}`);
-        return await response.json();
-      } catch(error) {
-        if(timedOut) {
-          const timeoutError = new Error("refresh request timed out");
-          timeoutError.name = "TimeoutError";
-          throw timeoutError;
-        }
-        throw error;
-      } finally {
-        clearTimeout(timeout);
-        if(parent) parent.removeEventListener("abort", abort);
-      }
-    }
-    // Shared status classifier covers readiness, degradation, and terminal grades.
-    function refreshCadence(tab) { return VIEW_CADENCE[tab] || 30000; }
-    function refreshNote(tab) { const view=$(`view-${tab}`); if(!view)return null; let note=view.querySelector(".refresh-note"); if(!note){ const title=view.querySelector(".section-title"); if(!title)return null; note=document.createElement("span"); note.className="refresh-note"; title.appendChild(note); } return note; }
-    function refreshMessage(tab,message,slow=false) { const note=refreshNote(tab); if(note){note.textContent=message||"";note.classList.toggle("slow",slow);} }
-    function clearRefreshing(tab) {
-      const note=refreshNote(tab);
-      if(note && note.textContent==="Refreshing…")refreshMessage(tab,"");
-    }
-    function shortId(value) { const text=String(value??""); return text.length>30?`${text.slice(0,13)}…${text.slice(-11)}`:text||"—"; }
-    function copyButton(value) { const text=String(value??""); return text?`<span role="button" tabindex="0" class="copy" data-copy="${safe(text)}" title="Copy full value">copy</span>`:""; }
-    function identity(primary,full,secondary="") { return `<span class="identity" title="${safe(full||primary)}"><span class="identity-main">${safe(primary||"—")}${copyButton(full||primary)}</span>${secondary?`<span class="identity-sub">${safe(secondary)}</span>`:""}</span>`; }
-    function datasetPrimary(item) { const instrument=String(item.instrument||"").trim(),timeframe=String(item.timeframe||"").trim(); return String(item.market_type||"").toLowerCase()==="crypto_spot"&&instrument?`${instrument}${timeframe?` · ${timeframe}`:""}`:shortId(item.dataset_id); }
-    function activityKey(item) { const d=item.details||{}; return [String(d.selected_symbol||d.symbol||d.instrument||d.dataset_id||item.market_id||""),String(d.timeframe||"")].join("|"); }
-    function compactActivityRows(rows) { const compact=[]; for(const item of arr(rows)){ const previous=compact[compact.length-1]; if(previous&&item.kind==="bootstrap"&&previous.kind==="bootstrap"&&activityKey(previous)===activityKey(item)){previous.count++;previous.events.push(item);continue;} compact.push({...item,count:1,events:[item]}); } return compact; }
-    function activityMarkup(rows) { return compactActivityRows(rows).map(item=>{const suffix=item.count>1?` ×${item.count}`:"";const detail=item.events.length>1?` <details><summary>${item.events.length} adjacent bootstrap events</summary><pre>${safe(json(item.events))}</pre></details>`:(item.details&&Object.keys(item.details).length?` <details><summary>details</summary><pre>${safe(json(item.details))}</pre></details>`:"");return `<div class="activity-compact"><div class="timeline-item"><span class="timeline-time">${safe(dateText(item.timestamp))}</span><span class="timeline-kind">${safe(item.kind)}${suffix}</span><span>${safe(item.message)}${detail}</span></div></div>`; }).join("")||empty("No research activity","Durable activity will appear after workers run."); }
-    function ensureActivityKind() { const status=$("activity-status"); if(!status||$("activity-kind"))return; const select=document.createElement("select"); select.id="activity-kind"; select.className="facet"; select.dataset.param="kind"; select.setAttribute("aria-label","Filter activity type"); select.innerHTML='<option value="">All activity types</option>'+["bootstrap","dataset","research","lifecycle","collection","collection_error","report","operator"].map(v=>`<option value="${v}">${v.replace("_"," ")}</option>`).join(""); status.parentNode.insertBefore(select,status); }
-    fetchV2 = async function(name,signal) { const q=new URLSearchParams(); if(!["overview-summary","canary"].includes(name)){q.set("page",String(state.page));q.set("page_size",String(state.page_size));q.set("direction",state.direction);if(state.filter)q.set("filter",state.filter);if(state.sort)q.set("sort",state.sort);} const controls={datasets:[["datasets-source","source_type"],["datasets-market","market"],["datasets-timeframe","timeframe"],["datasets-quality","quality"]],activity:[["activity-status","status"],["activity-kind","kind"]],candidates:[["candidates-stage","stage"]],polymarket:[["polymarket-category","category"],["polymarket-settlement","settlement"],["polymarket-quality","quality"]],hermes:[["hermes-status","status"]],paper:[["paper-status","status"]]}; for(const [id,key] of (controls[state.tab]||[])){const el=$(id);if(el&&el.value)q.set(key,el.value);} if(state.tab==="crypto"&&$("crypto-symbol")?.value.trim())q.set("symbol",$("crypto-symbol").value.trim()); const url=`/api/v2/${name}${q.toString()?`?${q}`:""}`,response=await fetch(url,{cache:"no-store",signal}); if(!response.ok)throw new Error(`${name} HTTP ${response.status}`); return response.json(); };
-    const _fetchV2 = fetchV2;
-    async function fetchV2Bounded(name, parentSignal) {
-      const controller = new AbortController();
-      let timedOut = false;
-      const abort = () => controller.abort();
-      if(parentSignal) {
-        if(parentSignal.aborted) controller.abort();
-        else parentSignal.addEventListener("abort", abort, {once:true});
-      }
-      const timeout = setTimeout(() => {timedOut=true;controller.abort();}, REFRESH_TIMEOUT_MS);
-      try {
-        return await _fetchV2(name, controller.signal);
-      } catch(error) {
-        if(timedOut) {
-          const timeoutError = new Error("refresh request timed out");
-          timeoutError.name = "TimeoutError";
-          throw timeoutError;
-        }
-        throw error;
-      } finally {
-        clearTimeout(timeout);
-        if(parentSignal) parentSignal.removeEventListener("abort", abort);
-      }
-    }
-    function researchFeedValue(value) { if(value==null||value==="")return "UNKNOWN"; return typeof value==="object"?json(value):String(value); }
-    function researchFeedTimestamp(value) { if(value==null||value==="")return "UNKNOWN"; const formatted=dateText(value); return formatted==="—"?String(value):formatted; }
-    function researchFeedField(key,label,value,timestamp=false) { return `<div class="key-value" data-field="${safe(key)}"><span class="key">${safe(label)}</span><strong>${safe(timestamp?researchFeedTimestamp(value):researchFeedValue(value))}</strong></div>`; }
-    function renderResearchProgress(data) {
-      const progress=data?.research_progress&&typeof data.research_progress==="object"?data.research_progress:{};
-      const campaign=data?.campaign_progress&&typeof data.campaign_progress==="object"?data.campaign_progress:{};
-      const candidate=progress.candidate&&typeof progress.candidate==="object"?progress.candidate:{};
-      const job=progress.job&&typeof progress.job==="object"?progress.job:{};
-      const samples=candidate.samples&&typeof candidate.samples==="object"?candidate.samples:{};
-      const trades=candidate.trades&&typeof candidate.trades==="object"?candidate.trades:{};
-      const pair=(value,required)=>value==null&&required==null?"UNKNOWN":`${value==null?"UNKNOWN":value} / ${required==null?"UNKNOWN":required}`;
-      const dataset=progress.dataset_id||"UNKNOWN",version=progress.dataset_version||"UNKNOWN";
-      const blocker=progress.blocker||"—",status=String(progress.job_status||job.status||"NOT_INITIALIZED").toUpperCase();
-      const candidateStatus=progress.status||"—";
-      const budget=campaign.budget&&typeof campaign.budget==="object"?campaign.budget:{};
-      $("research-progress-content").innerHTML=[
-        researchFeedField("dataset","Dataset",dataset),
-        researchFeedField("dataset_version","Dataset version",version),
-        researchFeedField("job_status","Automatic research job",status),
-        researchFeedField("last_completion_at","Last completion",job.last_completion_at||progress.last_completion_at,true),
-        researchFeedField("next_run_at","Next run",job.next_run_at||progress.next_run_at,true),
-        researchFeedField("candidate_stage","Candidate stage",candidate.stage||progress.candidate_stage),
-        researchFeedField("samples","Samples available / required",pair(samples.available??progress.samples_available,samples.required??progress.samples_required)),
-        researchFeedField("trades","Trades available / required",pair(trades.available??progress.trades_available,trades.required??progress.trades_required)),
-        researchFeedField("forward_observations","Forward observations",candidate.forward_observations??progress.forward_observations),
-        researchFeedField("blocker","Blocker",blocker),
-        researchFeedField("status","Validation status",candidateStatus),
-        researchFeedField("campaign_economic_rejections","Economic rejections",campaign.counts?.economic_rejection??"UNKNOWN"),
-        researchFeedField("campaign_market_resolution_failures","Market resolution failures",campaign.counts?.market_resolution_failure??"UNKNOWN"),
-        researchFeedField("campaign_id","Synthetic campaign",campaign.campaign_id),
-        researchFeedField("campaign_status","Campaign status",campaign.status),
-        researchFeedField("campaign_budget","Campaign budget",`${budget.used??campaign.budget_used??0} / ${budget.limit??campaign.budget_limit??0} (${budget.remaining??campaign.budget_remaining??0} remaining)`),
-        researchFeedField("campaign_completed","Campaign trials completed",campaign.completed??campaign.completed_trials??0),
-        researchFeedField("campaign_remaining","Campaign trials remaining",campaign.remaining??campaign.remaining_trials??0),
-        researchFeedField("campaign_last_result","Campaign last result",campaign.last_result),
-        researchFeedField("campaign_qualified","Campaign qualified (synthetic)",campaign.qualified??campaign.qualified_candidate_ids),
-        researchFeedField("campaign_next_real_job","Next real job",campaign.next_real_job),
-        researchFeedField("campaign_waiting_prerequisite","Waiting prerequisite",campaign.waiting_prerequisite)
-      ].join("");
-    }
-    function renderResearchFeed(data) {
-      const feed=data?.research_feed&&typeof data.research_feed==="object"?data.research_feed:{},external=feed.external_hermes||{},internal=feed.internal_queue||{},proposals=feed.proposals||{},candidates=feed.candidates||{},budgets=feed.budgets||{};
-      const externalStatus=String(external.status??"UNKNOWN").toUpperCase(),internalStatus=String(internal.status??"UNKNOWN").toUpperCase();
-      const fields=(source,specs)=>specs.map(([key,label,timestamp])=>researchFeedField(key,label,source[key],timestamp)).join("");
-      const externalEvidence=researchFeedValue(external.evidence);
-      $("research-feed-content").innerHTML=`<div class="two-col">
-        <section class="panel"><div class="section-title"><h3>External Hermes feed</h3><span class="badge ${statusClass(externalStatus)}">External status ${safe(externalStatus)}</span></div>${researchFeedField("job_id","Job ID",external.job_id)}${researchFeedField("status","External status",externalStatus)}${researchFeedField("evidence","Evidence",externalEvidence)}</section>
-        <section class="panel"><div class="section-title"><h3>Internal research queue processing</h3><span class="badge ${statusClass(internalStatus)}">Internal queue ${safe(internalStatus)}</span></div>${researchFeedField("status","Status",internal.status)}${researchFeedField("trigger","Trigger",internal.trigger)}${researchFeedField("last_cycle_at","Last cycle at",internal.last_cycle_at,true)}</section>
-      </div>
-      <div class="two-col">
-        <section class="panel"><h3>Proposals</h3>${fields(proposals,[["latest_submitted_at","Latest submitted at",true],["latest_accepted_at","Latest accepted at",true],["submitted_24h","Submitted 24h"],["accepted_24h","Accepted 24h"],["rejected_24h","Rejected 24h"],["failed_24h","Failed 24h"],["pending","Pending"],["processing","Processing"],["completed","Completed"],["rejected","Rejected"]])}</section>
-        <section class="panel"><h3>Candidates</h3>${fields(candidates,[["latest_created_at","Latest created at",true],["created_24h","Created 24h"],["mutations_24h","Mutations 24h"],["total","Total"],["new","New"],["eligible","Eligible"],["rejected","Rejected"]])}</section>
-      </div>
-      <div class="two-col">
-        <section class="panel"><h3>Budgets</h3>${fields(budgets,[["total_limit","Total limit"],["total_used","Total used"],["total_remaining","Total remaining"],["families","Families"]])}</section>
-        <section class="panel"><h3>Candidate admission</h3>${researchFeedField("no_new_candidates_reason","No new candidates reason",feed.no_new_candidates_reason)}</section>
-      </div>`;
-    }
-    function renderMarketScopeFunnel(data) {
-      const funnel=data.market_scope_funnel||{}, stages=funnel.stages||{}, counts=funnel.stage_counts||{};
-      const names=["historically_qualified","valid_frozen_scope","matching_current_markets","fresh_complete_inputs","strategy_evaluated","ready_signal","execution_feasible","submitted","filled"];
-      const max=Math.max(1,...names.map(name=>Number(stages[name]?.count??counts[name]??0)));
-      const rows=names.map(name=>{
-        const stage=stages[name]||{}, value=Number(stage.count??counts[name]??0)||0, blockers=stage.blocker_counts||stage.blockers||{}, ts=stage.timestamps||{};
-        const blockerText=Object.entries(blockers).map(([key,count])=>`${safe(key)}=${safe(count)}`).join(", ");
-        const when=ts.latest||stage.latest_at||"";
-        return `<div class="funnel-row" title="${safe(blockerText)}"><span>${safe(name.replaceAll("_"," "))}</span><span class="funnel-track"><span class="funnel-bar" style="width:${Math.min(100,Math.round(value/max*100))}%"></span></span><strong>${count(value)}</strong></div><p class="page-note">${blockerText?`Blockers: ${blockerText} · `:""}${when?`latest ${safe(dateText(when))}`:"No persisted timestamp"}</p>`;
-      }).join("");
-      $("market-scope-funnel").innerHTML=rows||empty("No persisted market-scope handoff","Resolution workers have not persisted a bounded funnel yet.");
-    }
-    renderOverview = (data) => { renderComponents(data); renderOutcomeCards(data); const c=data.coverage||{},h=data.collector_health||{}; $("coverage").innerHTML=`<div class="three-col"><div class="key-value"><span class="key">Historical datasets</span><strong>${count(c.historical_count)}</strong></div><div class="key-value"><span class="key">Historical rows</span><strong>${count(c.historical_rows)}</strong></div><div class="key-value"><span class="key">Forward datasets</span><strong>${count(c.forward_count)}</strong></div><div class="key-value"><span class="key">Forward rows</span><strong>${count(c.forward_rows)}</strong></div><div class="key-value"><span class="key">Logical observations</span><strong>${count((c.logical_rows||{}).bars)}</strong></div><div class="key-value"><span class="key">Collector errors</span><strong>${count(h.collection_errors)}</strong></div><div class="key-value"><span class="key">Last cycle duration</span><strong>${h.last_cycle_duration_seconds==null?"—":`${Number(h.last_cycle_duration_seconds).toFixed(1)}s`}</strong></div><div class="key-value"><span class="key">Effective cadence</span><strong>${h.effective_collection_cadence_seconds==null?"—":`${Number(h.effective_collection_cadence_seconds).toFixed(1)}s`}</strong></div><div class="key-value"><span class="key">Markets A / S / F</span><strong>${count(h.last_cycle_markets_attempted)} / ${count(h.last_cycle_markets_successful)} / ${count(h.last_cycle_markets_failed)}</strong></div></div><p class="page-note">Configured interval ${safe(h.configured_interval_seconds??"—")}s · stale threshold ${safe(h.stale_after_seconds??"—")}s · last successful cycle ${safe(dateText(h.last_successful_cycle))}</p>`; $("overview-activity").innerHTML=activityMarkup(arr(data.latest_activity||data.activity)); $("overview-candidates").innerHTML=empty("Candidate list is lazy","Open Candidates to load the bounded lifecycle page."); $("raw-overview").textContent=json({counts:data.counts,collector_health:h,latest_outcome:data.hermes_latest_outcome}); };
-    const _renderOverviewScheduling = renderOverview;
-    renderOverview = (data) => {
-      _renderOverviewScheduling(data);
-      renderResearchProgress(data);
-      renderResearchFeed(data);
-      renderMarketScopeFunnel(data);
-      $("overview-readiness-snapshot").innerHTML=readinessSnapshotMarkup(data);
-      if(Object.prototype.hasOwnProperty.call(data,"operator_controls")||!operatorControlsRendered)renderOperatorControls(data);
-      const h = data.collector_health || {};
-      const components = Object.fromEntries(arr(data.components).map(item => [item.name, item]));
-      const collector = components["POLYMARKET COLLECTOR"]?.detail || {};
-      const paper = components["PAPER ENGINE"]?.detail || {};
-      const research = components["RESEARCH ENGINE"]?.detail || {};
-      $("coverage").insertAdjacentHTML("beforeend", `<p class="page-note">Next collection ${safe(dateText(h.next_scheduled_collection_at || collector.next_scheduled_collection_at))} · collector heartbeat ${safe(dateText(h.worker_heartbeat_at || collector.worker_heartbeat_at))} · PAPER_FORWARD pass ${safe(paper.status || "—")} · research pass ${safe(research.status || "—")}</p>`);
-      const forwardEvidence=data.forward_evidence||{}, reasonCounts=data.signal_scan_reason_counts||{};
-      $("coverage").insertAdjacentHTML("beforeend",`<article class="panel"><div class="section-title"><h3>Candidate-bound forward evidence</h3><span class="badge ${statusClass(forwardEvidence.grade)}">${safe(forwardEvidence.grade||"UNKNOWN")}</span></div><div class="three-col"><div class="key-value"><span class="key">Required / scheduled</span><strong>${count(arr(forwardEvidence.candidate_bound_markets).length)} / ${count(arr(forwardEvidence.scheduled).length)}</strong></div><div class="key-value"><span class="key">Fresh / stale / missing</span><strong>${count(arr(forwardEvidence.fresh).length)} / ${count(arr(forwardEvidence.stale).length)} / ${count(arr(forwardEvidence.missing).length)}</strong></div><div class="key-value"><span class="key">Reason</span><strong>${safe(forwardEvidence.reason_display||forwardEvidence.reason_code||"—")}</strong></div><div class="key-value"><span class="key">Newest source</span><strong>${safe(dateText(forwardEvidence.newest_required_source_timestamp))}</strong></div><div class="key-value"><span class="key">Oldest source</span><strong>${safe(dateText(forwardEvidence.oldest_required_source_timestamp))}</strong></div><div class="key-value"><span class="key">Newest observed</span><strong>${safe(dateText(forwardEvidence.newest_required_observed_at))}</strong></div></div><p class="page-note">Signal scan reason counts: ${safe(Object.entries(reasonCounts).map(([key,value])=>`${key}=${value}`).join(", ")||"—")}</p></article>`);
-      const latestCandidates = arr(data.latest_candidates || data.candidates);
-      $("overview-candidates").innerHTML = latestCandidates.length
-        ? tableCandidates(latestCandidates, false)
-        : empty("No candidates yet", "No persisted lifecycle candidates are available.");
-      const funnel = data.lifecycle_funnel || {};
-      const max = Math.max(1, ...Object.values(funnel).map(Number));
-    renderPolymarket = (data) => { const items=arr(data.items),categories=[...new Set(items.map(i=>i.category).filter(Boolean))].sort(),cat=$("polymarket-category"),old=cat.value||params.get("category")||""; cat.innerHTML=`<option value="">All categories</option>${categories.map(c=>`<option value="${safe(c)}">${safe(c)}</option>`).join("")}`;if(old&&!categories.includes(old))cat.insertAdjacentHTML("beforeend",`<option value="${safe(old)}">${safe(old)}</option>`);cat.value=old;const quality=items.map(i=>i.quality_label||i.quality).find(Boolean)||"—";$("pm-summary").innerHTML=`<div class="three-col"><div class="key-value"><span class="key">Markets</span><strong>${count(data.total)}</strong></div><div class="key-value"><span class="key">Evidence quality</span><strong>${safe(quality)}</strong></div><div class="key-value"><span class="key">Execution</span><strong>SIMULATED ONLY</strong></div></div>`;$("pm-markets").innerHTML=items.length?`<table><thead><tr><th>Priority</th><th>Market</th><th>Question</th><th>Category</th><th>Quality</th><th>Source</th><th>Observed</th><th>Age</th><th>State / reason</th><th>Candidate references</th></tr></thead><tbody>${items.map(i=>{const priority=i.candidate_bound_priority||i.candidate_bound,reason=i.reason_display||i.reason_code;return `<tr><td>${priority?`<span class="badge warn">REQUIRED</span>`:"—"}</td><td>${identity(shortId(i.market_id),i.market_id)}</td><td title="${safe(i.question||"")}">${safe(i.question||"—")}</td><td>${safe(i.category)}</td><td><strong>${safe(i.quality_label||i.quality||"UNKNOWN")}</strong><span class="quality-context">${safe(i.quality_context||"")}</span></td><td>${safe(dateText(i.source_timestamp))}</td><td>${safe(dateText(i.observed_at))}</td><td>${i.freshness_age_seconds==null?"—":safe(Number(i.freshness_age_seconds).toFixed(1)+"s")}</td><td>${safe(i.collection_state||"—")}${reason?` · ${safe(reason)}`:""}</td><td>${safe(arr(i.candidate_references).join(", ")||"—")}</td></tr>`}).join("")}</tbody></table>`:empty("No Polymarket observations","No persisted market page matches the current filters.");pager("polymarket",data);bindTable(); };
-    };
-    renderDatasets = (data) => { $("dataset-total").textContent=`${count(data.total)} datasets`; const rows=arr(data.items); $("datasets-table").innerHTML=rows.length?`<table><thead><tr>${[["dataset_id","Dataset"],["source_type","Source"],["market_type","Market"],["instrument","Instrument"],["timeframe","Timeframe"],["quality","Quality"],["row_count","Rows"],["updated_at","Updated"]].map(([k,l])=>`<th>${sortButton(k,l)}</th>`).join("")}</tr></thead><tbody>${rows.map(i=>`<tr><td><button class="link dataset" data-id="${encodeURIComponent(i.dataset_id||"")}">${identity(datasetPrimary(i),i.dataset_id,i.dataset_id===datasetPrimary(i)?"":`full ${shortId(i.dataset_id)}`)}</button></td><td>${safe(i.source_type)}</td><td>${safe(i.market_type)}</td><td>${safe(i.instrument)}</td><td>${safe(i.timeframe)}</td><td>${safe(i.quality)}</td><td>${count(i.row_count)}</td><td>${safe(dateText(i.updated_at))}</td></tr>`).join("")}</tbody></table>`:empty("No datasets","No catalog records match the current filters."); pager("datasets",data); bindTable(); };
-    renderActivity = (data) => { ensureActivityKind(); $("activity-total").textContent=`${count(data.total)} events`; $("activity-table").innerHTML=arr(data.items).length?`<div class="timeline">${activityMarkup(data.items)}</div>`:empty("No research activity","Durable activity will appear after workers run."); pager("activity",data); bindTable(); };
-    renderCrypto = (data) => { const rows=arr(data.items),u=data.bootstrap_universe||{}; $("crypto-summary").innerHTML=`<div class="three-col"><div class="key-value"><span class="key">Universe version</span><strong title="${safe(data.universe_version)}">${safe(shortId(data.universe_version))}${copyButton(data.universe_version)}</strong></div><div class="key-value"><span class="key">Selected universe</span><strong>${count(u.selected_count)}</strong></div><div class="key-value"><span class="key">Bootstrap progress</span><strong>${u.progress==null?"—":(Number(u.progress)*100).toFixed(1)+"%"}</strong></div><div class="key-value"><span class="key">Bootstrap datasets</span><strong>${count(u.dataset_count)}</strong></div><div class="key-value"><span class="key">Bootstrap reports</span><strong>${count(data.bootstrap_report_count??arr(data.bootstrap_reports).length)}</strong></div><div class="key-value"><span class="key">Strategy reports</span><strong>${count(arr(data.strategy_reports||data.reports).length)}</strong></div></div>`; $("crypto-table").innerHTML=rows.length?`<table><thead><tr><th>Symbol</th><th>Dataset</th><th>Source</th><th>Rows</th><th>Quality</th><th>Updated</th></tr></thead><tbody>${rows.map(i=>`<tr><td>${safe(i.symbol||arr(i.symbols)[0])}</td><td>${identity(shortId(i.dataset_id),i.dataset_id,shortId(i.dataset_version))}</td><td>${safe(i.source_type)}</td><td>${count(i.row_count)}</td><td>${safe(i.quality)}</td><td>${safe(dateText(i.updated_at))}</td></tr>`).join("")}</tbody></table>`:empty("No crypto catalogs","Crypto data is separate from strategy research; run the bounded bootstrap or select another symbol."); if(arr(data.bootstrap_progress).length){$("crypto-detail").innerHTML=`<article class="panel"><div class="section-title"><h2>Bootstrap cursors</h2><span class="muted">${count(u.completed_datasets)} complete / ${count(u.dataset_count)} datasets</span></div><div class="scroll"><table><thead><tr><th>Selected symbol</th><th>Timeframe</th><th>Status</th><th>Progress</th><th>Records</th><th>Errors</th></tr></thead><tbody>${arr(data.bootstrap_progress).map(i=>`<tr><td>${safe(i.selected_symbol||i.symbol)}</td><td>${safe(i.timeframe)}</td><td>${safe(i.status)}</td><td>${i.progress==null?"—":(Number(i.progress)*100).toFixed(1)+"%"}</td><td>${count(i.records)}</td><td>${count(i.error_count)}</td></tr>`).join("")}</tbody></table></div></article>`;} else $("crypto-detail").innerHTML=""; pager("crypto",data); bindTable(); };
-    renderPolymarket = (data) => { const items=arr(data.items),categories=[...new Set(items.map(i=>i.category).filter(Boolean))].sort(),cat=$("polymarket-category"),old=cat.value||params.get("category")||""; cat.innerHTML=`<option value="">All categories</option>${categories.map(c=>`<option value="${safe(c)}">${safe(c)}</option>`).join("")}`;if(old&&!categories.includes(old))cat.insertAdjacentHTML("beforeend",`<option value="${safe(old)}">${safe(old)}</option>`);cat.value=old;const quality=items.map(i=>i.quality_label||i.quality).find(Boolean)||"—";$("pm-summary").innerHTML=`<div class="three-col"><div class="key-value"><span class="key">Markets</span><strong>${count(data.total)}</strong></div><div class="key-value"><span class="key">Evidence quality</span><strong>${safe(quality)}</strong></div><div class="key-value"><span class="key">Execution</span><strong>SIMULATED ONLY</strong></div></div>`;$("pm-markets").innerHTML=items.length?`<table><thead><tr><th>Market</th><th>Question</th><th>Category</th><th>Quality</th><th>Settlement</th><th>Observed</th></tr></thead><tbody>${items.map(i=>`<tr><td>${identity(shortId(i.market_id),i.market_id)}</td><td title="${safe(i.question||"")}">${safe(i.question||"—")}</td><td>${safe(i.category)}</td><td><strong>${safe(i.quality_label||i.quality||"UNKNOWN")}</strong><span class="quality-context">${safe(i.quality_context||"")}</span></td><td>${safe(i.settlement)}</td><td>${safe(dateText(i.observed_at))}</td></tr>`).join("")}</tbody></table>`:empty("No Polymarket observations","No persisted market page matches the current filters.");pager("polymarket",data);bindTable(); };
-    function detailSection(title,value) { if(value==null||value===""||(Array.isArray(value)&&!value.length))return ""; return `<section class="detail-section"><h3>${safe(title)}</h3>${typeof value==="string"||typeof value==="number"?`<div>${safe(value)}</div>`:`<pre>${safe(json(value))}</pre>`}</section>`; }
-    loadHermes = async function(id,persist=true) { state.selected=id;state.expanded=true;if(persist)saveState(true);if(detailController)detailController.abort();detailController=new AbortController();try{const response=await fetch(`/api/v2/hermes/${encodeURIComponent(id)}`,{cache:"no-store",signal:detailController.signal});if(!response.ok)throw new Error(`Hermes HTTP ${response.status}`);const d=await response.json(),item=arr(d.items)[0]||d.item||{};$("hermes-detail").innerHTML=d.available?`<article class="panel"><div class="section-title"><h2>Proposal detail</h2><span class="badge ${statusClass(d.status||item.status)}">${safe(d.status||item.status||"UNKNOWN")}</span></div><div class="detail-grid">${detailSection("Statement",d.statement)}<div class="detail-section"><h3>Exact dataset and family</h3><div class="key-value"><span class="key">Dataset ID</span><strong>${identity(shortId(d.dataset_id||item.dataset_id),d.dataset_id||item.dataset_id)}</strong></div><div class="key-value"><span class="key">Dataset version</span><strong>${identity(shortId(d.dataset_version||item.dataset_version),d.dataset_version||item.dataset_version)}</strong></div><div class="key-value"><span class="key">Family</span><strong>${safe(d.family||item.family)}</strong></div></div>${detailSection("Parameters / experiment plan",d.plan)}${detailSection("Submission validation and tests",d.tests)}${detailSection("Queue lifecycle",d.lifecycle_events)}${detailSection("Terminal result",d.final_result)}${d.rejection?detailSection("Rejection code and reason",d.rejection):""}</div><details><summary>raw proposal evidence</summary><pre>${safe(json(d))}</pre></details></article>`:empty("Hermes item unavailable",d.error||"The queue item was not found.");}catch(error){if(error.name!=="AbortError")$("hermes-detail").innerHTML=empty("Hermes detail unavailable",error.message);} };
-    renderPaper = (data) => { const s=data.candidate_portfolio_summary||{},portfolios=arr(data.candidate_portfolios),t=data.paper_telemetry||{}; $("portfolio-summary").innerHTML=`<div class="card-grid"><div class="panel"><div class="metric">${portfolios.length?Number(s.total_equity||0).toFixed(2):"—"}</div><div class="metric-label">candidate paper equity</div></div><div class="panel"><div class="metric">${portfolios.length?Number(s.total_pnl||0).toFixed(2):"—"}</div><div class="metric-label">candidate paper P/L</div></div><div class="panel"><div class="metric">${count(portfolios.length)}</div><div class="metric-label">candidate portfolios</div></div><div class="panel"><div class="metric">${count(t.observation_records)}</div><div class="metric-label">paper telemetry observations</div></div><div class="panel"><div class="metric">${count(t.execution_events)}</div><div class="metric-label">paper execution events</div></div><div class="panel"><div class="metric">${count(t.resolved_bets)}</div><div class="metric-label">paper ledger bets</div></div></div><p class="page-note">Telemetry is persisted observation/execution history. Candidate portfolios are lifecycle-linked PAPER_FORWARD/PAPER_PROMOTABLE states only.</p>`; $("portfolio-states").innerHTML=arr(data.items).length?`<table><thead><tr><th>Record</th><th>Experiment</th><th>Market</th><th>Status</th><th>Timestamp</th></tr></thead><tbody>${arr(data.items).map(i=>`<tr><td>${safe(i.record_type)} · ${identity(shortId(i.record_id),i.record_id)}</td><td>${safe(i.experiment_id)}</td><td>${safe(i.market_id)}</td><td>${safe(i.status||i.resolution||i.outcome)}</td><td>${safe(dateText(i.timestamp))}</td></tr>`).join("")}</tbody></table>`:empty("No paper telemetry","No paper observations, execution events, or ledger records are persisted.");pager("paper",data);bindTable(); };
-    loadPage = async function(tab,force=false) {
-      if(tab!==state.tab||!VIEW_ENDPOINT[tab]||document.hidden||loadInFlight||(!force&&Date.now()<nextRefreshAt))return;
-      const generation=++refreshGeneration,controller=new AbortController();
-      activeController=controller; loadInFlight=true; refreshMessage(tab,"");
-      slowRefreshTimer=setTimeout(()=>{if(generation===refreshGeneration)refreshMessage(tab,"Refreshing…",true);},2000);
-      const renderPersisted=async(kind,url,render,target)=>{
-        try {
-          const data=await fetchWithTimeout(url,{cache:"no-store",signal:controller.signal});
-          if(generation!==refreshGeneration)return;
-          render(data);
-          lastGood[kind]=data;
-          lastSuccessful=Date.now();
-          refreshMessage(target,`Updated · ${new Date().toLocaleTimeString()}`);
-        } catch(error) {
-          if(generation!==refreshGeneration||error?.name==="AbortError")return;
-          if(lastGood[kind]) {
-            render(lastGood[kind]);
-            refreshMessage(target,`Refresh failed (${refreshError(error)}) · showing last successful content`,true);
-          } else {
-            refreshMessage(target,`Refresh failed (${refreshError(error)}) · no cached dashboard snapshot available`,true);
-          }
-        }
-      };
-      try {
-        if(tab==="overview") {
-          await Promise.all([
-            renderPersisted("overview","/api/v2/overview-summary",renderOverview,"overview"),
-            (async()=>{
-              try {
-                const controls=await fetchWithTimeout("/api/operator",{cache:"no-store",signal:controller.signal});
-                if(generation!==refreshGeneration)return;
-                renderOperatorControls({operator_controls:controls.operator_controls||controls});
-                lastGood.controls=controls;
-                operator=controls;
-              } catch(error) {
-                if(generation!==refreshGeneration||error?.name==="AbortError")return;
-                if(lastGood.controls) {
-                  operator=lastGood.controls;
-                  renderOperatorControls({operator_controls:operator.operator_controls||operator});
-                  refreshMessage(tab,`Refresh failed (${refreshError(error)}) · showing last successful content`,true);
-                } else {
-                  refreshMessage(tab,`Refresh failed (${refreshError(error)}) · no cached dashboard snapshot available`,true);
-                }
-              }
-            })()
-          ]);
-        } else if(tab==="canary") {
-          await renderPersisted("canary","/api/v2/canary",renderCanary,"canary");
-        } else {
-          const data=await fetchV2Bounded(VIEW_ENDPOINT[tab],controller.signal);
-          if(generation!==refreshGeneration)return;
-          lastGood[tab]=data; lastSuccessful=Date.now(); current=data;
-          ({datasets:renderDatasets,activity:renderActivity,candidates:renderCandidates,polymarket:renderPolymarket,hermes:renderHermes,crypto:renderCrypto,portfolio:renderPaper,"rolling-portfolio":renderRollingPortfolio,"binance-canary":renderBinanceCanary}[tab])(data);
-          refreshMessage(tab,`Updated · ${new Date().toLocaleTimeString()}`);
-        }
-      } catch(error) {
-        if(generation===refreshGeneration&&error?.name!=="AbortError") {
-          const cached=lastGood[tab];
-          if(cached) {
-            ({overview:renderOverview,canary:renderCanary,datasets:renderDatasets,activity:renderActivity,candidates:renderCandidates,polymarket:renderPolymarket,hermes:renderHermes,crypto:renderCrypto,portfolio:renderPaper,"rolling-portfolio":renderRollingPortfolio,"binance-canary":renderBinanceCanary}[tab])(cached);
-            refreshMessage(tab,`Refresh failed (${refreshError(error)}) · showing last successful content`,true);
-          } else {
-            refreshMessage(tab,`Refresh failed (${refreshError(error)}) · no cached dashboard snapshot available`,true);
-          }
-        }
-      } finally {
-        if(activeController===controller) {
-          clearRefreshing(tab);
-          clearTimeout(slowRefreshTimer);
-          slowRefreshTimer=null;
-          activeController=null;
-          loadInFlight=false;
-          if(generation===refreshGeneration)nextRefreshAt=Date.now()+refreshCadence(tab);
-        }
-      }
-    };
-    activate = function(tab,push=true) {
-      if(!VIEW_ENDPOINT[tab])tab="overview";
-      if(tab!==state.tab){state.selected="";state.expanded=false;state.filter="";state.sort="";state.direction="desc";state.page=1;}
-      state.tab=tab;
-      document.querySelectorAll(".tab").forEach(b=>b.classList.toggle("active",b.dataset.view===tab));
-      document.querySelectorAll(".view").forEach(v=>v.classList.toggle("active",v.id===`view-${tab}`));
-      if($("candidate-detail"))$("candidate-detail").style.display=tab==="candidates"?"block":"none";
-      if($("detail"))$("detail").style.display=tab==="overview"?"block":"none";
-      if(activeController)activeController.abort();
-      if(detailController)detailController.abort();
-      refreshGeneration++;
-      nextRefreshAt=0;
-      saveState(push);
-      const schedule=()=>{if(state.tab!==tab)return;if(loadInFlight){setTimeout(schedule,25);return;}loadPage(tab,true);};
-      setTimeout(schedule,0);
-    };
-    load = async function() {
-      if(startupPending){startupPending=false;return;}
-      if(document.hidden||loadInFlight)return;
-      return loadPage(state.tab,false);
-    };
-    document.addEventListener("click",async event=>{const button=event.target.closest?.(".binance-action");if(!button)return;const action=button.dataset.binanceAction||"",payload={};if(!binanceTestnetMode&&(action==="ENABLE"||action==="RESUME"))payload.confirmation=$("binance-confirm")?.value||"";if(action==="ORDER_VALIDATION_TEST"&&!binanceTestnetMode){payload.symbol=$("binance-order-symbol")?.value||"";payload.price=$("binance-order-price")?.value||"";payload.quantity=$("binance-order-quantity")?.value||"";}await binanceControlPost(action,payload);});
-    document.addEventListener("click",async event=>{
-      const button=event.target.closest?.(".rolling-policy-action");
-      if(!button||button.disabled)return;
-      button.disabled=true;
-      let rollingAction="rolling.admission.review";
-      try {
-        const action=button.dataset.rollingAction==="activate"?"rolling.admission.activate":"rolling.admission.review"; rollingAction=action; const binding=rollingReview.canary_binding||{},payload={expected_risk_config_id:binding.risk_config_id,expected_risk_config_generation:binding.risk_config_generation,expected_risk_config_hash:binding.risk_config_hash};
-        let confirmation="";
-        if(action==="rolling.admission.review"){
-          confirmation="REVIEW ROLLING ADMISSION POLICY";
-          const budget=$("rolling-budget")?.value;
-          if(budget!==undefined&&budget!=="")payload.values={global_budget:budget};
-        } else {
-          confirmation="ACTIVATE ROLLING ADMISSION POLICY";
-          if(!rollingReview.proposed?.draft_id||!rollingReview.proposed?.draft_version){
-            actionResultMessage(action,"rolling.admission.activate blocked: no internally generated reviewed draft");
-            return;
-          }
-          payload.draft_id=rollingReview.proposed.draft_id;
-          payload.draft_version=rollingReview.proposed.draft_version;
-        }
-        const typed=window.prompt(`Type ${confirmation} to continue`);
-        if(typed!==confirmation){
-          actionResultMessage(action,`${action} cancelled: exact confirmation required`);
-          return;
-        }
-        await controlPost(action,action==="rolling.admission.activate"?`${payload.draft_id}:${payload.draft_version}`:"rolling-admission",confirmation,payload);
-      } catch(error) {
-        actionResultMessage(rollingAction,`rolling policy action failed: ${error.message}`);
-      } finally {
-        button.disabled=false;
-      }
-    });
-    document.addEventListener("click",async event=>{
-      const button=event.target.closest?.(".control-action");
-      if(!button||button.disabled)return;
-      button.disabled=true;
-      try {
-        const action=button.dataset.controlAction||"",target=button.dataset.controlTarget||"",expected=button.dataset.controlConfirm||"",encodedPayload=button.dataset.controlPayload||"";
-        let actionPayload={};
-        if(encodedPayload){
-          const parsed=JSON.parse(encodedPayload);
-          if(parsed&&typeof parsed==="object"&&!Array.isArray(parsed))actionPayload=parsed;
-        }
-        if(expected){
-          const typed=window.prompt(`Type ${expected} to continue`);
-          if(typed!==expected){
-            actionResultMessage(action,`${action} cancelled: exact confirmation required`);
-            return;
-          }
-        }
-        const result=await controlPost(action,target,expected,actionPayload);
-        const local=$("candidate-control-result");
-        if(local&&target===state.selected&&!isCanaryAction(action))local.textContent=result.ok?`${action} completed`:`${action} blocked: ${result.reason||"CONTROL_FAILED"}`;
-      } finally {
-        button.disabled=false;
-      }
-    });
-    document.addEventListener("click",async event=>{
-      const button=event.target.closest?.(".risk-settings-action");
-      if(!button||button.disabled)return;
-      button.disabled=true;
-      try {
-        const action=button.dataset.riskAction||"",values={};
-        document.querySelectorAll("[data-risk-field]").forEach(input=>{
-          if(input.dataset.riskField==="max_submitted_orders_per_day"){
-            if(input.value==="custom"){
-              const custom=$("[data-risk-submissions-custom]");
-              if(!custom||custom.value==="")throw new Error("CUSTOM_ORDER_SUBMISSIONS_REQUIRED");
-              values.max_submitted_orders_per_day=custom.value;
-            } else values.max_submitted_orders_per_day=input.value;
-          } else if(input.dataset.riskField==="max_aggregate_exposure_usd"){
-            if(input.value!==""){
-              values.max_aggregate_exposure_usd=input.value;
-              values.max_aggregate_open_cost_usd=input.value;
-            }
-          } else if(input.value!=="" || input.dataset.riskOptional==="clearable") values[input.dataset.riskField]=input.value===""?null:input.value;
-        });
-        let result;
-        let confirmation="";
-        if(action==="save"){
-          confirmation="SAVE RISK SETTINGS DRAFT";
-          const typed=window.prompt("Type SAVE RISK SETTINGS DRAFT to review the changes");
-          if(typed!==confirmation){
-            actionResultMessage("canary.settings","Risk settings save cancelled: exact confirmation required");
-            return;
-          }
-          result=await controlPost("canary.settings.save_draft","",confirmation,{values});
-          if(result?.ok&&result?.result&&typeof result.result==="object"){
-            const saved=result.result.risk_settings||result.result;
-            const draft=saved.draft||saved;
-            if(draft.config_id)riskReview.draft={values:draft.values||draft.settings||{},configId:draft.config_id,generation:draft.generation,hash:draft.config_hash};
-          }
-        } else if(action==="activate"){
-          const draft=riskReview.draft,active=riskReview.active;
-          if(!draft?.configId||!active?.generation){
-            actionResultMessage("canary.settings","Activation blocked: review the changes again after refreshing active settings");
-            return;
-          }
-          confirmation="ACTIVATE RISK SETTINGS DRAFT";
-          const typed=window.prompt("Type ACTIVATE RISK SETTINGS DRAFT to confirm the reviewed changes");
-          if(typed!==confirmation){
-            actionResultMessage("canary.settings","Risk settings activation cancelled: exact confirmation required");
-            return;
-          }
-          result=await controlPost("canary.settings.activate_draft","",confirmation,{config_id:draft.configId,expected_generation:Number(active.generation)});
-        } else if(action==="enable"){
-          const active=riskReview.active;
-          if(!active?.configId||!Number.isInteger(Number(active.generation))||Number(active.generation)<1){
-            actionResultMessage("canary.settings","Enable blocked: active settings review is unavailable; refresh and review again");
-            return;
-          }
-          const summary=Object.entries(active.values||{}).filter(([name])=>riskReview.labels?.[name]).map(([name,value])=>`${riskReview.labels[name]}=${value}`).join(", ");
-          if(!window.confirm(`Review active limits before enabling:\n${summary||"No active limits available"}`)){
-            actionResultMessage("canary.settings","Enable cancelled: active limits were not confirmed");
-            return;
-          }
-          confirmation=`ENABLE AUTO CANARY POLYMARKET ${active.configId} ${Number(active.generation)}`;
-          result=await controlPost("canary.enable_auto","",confirmation,{venue:"polymarket",config_id:active.configId,expected_generation:Number(active.generation)});
-        } else result={ok:false,reason:"UNKNOWN_RISK_SETTINGS_ACTION"};
-        if(!result?.ok){
-          const reason=String(result?.reason||"CONTROL_FAILED"),detail=[result?.detail,result?.details,result?.error,result?.message,result?.result?.detail,result?.result?.reason].filter(value=>typeof value==="string").join(" ");
-          const conflict=reason.trim().toUpperCase()==="CANARYSETTINGSCONFLICT"||/settings (?:hash|generation)|control generation|draft review|reviewed settings/i.test(detail);
-          const stale=conflict||/generation|hash|stale|review/i.test(reason);
-          actionResultMessage("canary.settings",conflict?"Risk settings activation blocked: the reviewed settings or control generation changed. Refresh and review the settings again before activating.":`Risk settings action blocked: ${reason}${stale?" · refreshed active settings and review differences":""}`);
-        }
-      } finally {
-        button.disabled=false;
-      }
-    });
-    const recoveryForm=$("canary-recovery-form"),canaryView=$("view-canary"); if(recoveryForm&&canaryView){const wrapper=document.createElement("details");wrapper.className="panel";wrapper.innerHTML="<summary>Advanced entry recovery (operator-required only)</summary>";canaryView.appendChild(wrapper);wrapper.appendChild(recoveryForm);recoveryForm.classList.remove("panel");}
-    document.addEventListener("click",async event=>{const button=event.target.closest?.("#canary-recovery-submit");if(!button)return;const eventId=$("canary-recovery-event")?.value.trim()||"",signalId=$("canary-recovery-signal")?.value.trim()||"",orderId=$("canary-recovery-order")?.value.trim()||"",confirmation=$("canary-recovery-confirm")?.value||"",node=$("canary-recovery-result");if(!eventId||!signalId||!orderId||confirmation!=="RECOVER UNKNOWN ENTRY"){if(node)node.textContent="Recovery blocked: exact event, signal, order, and confirmation are required";return;}const result=await controlPost("canary.recover_entry",eventId,confirmation,{event_id:eventId,signal_id:signalId,exchange_order_id:orderId});if(node)node.textContent=result.ok?"Recovery attached and reconciled":`Recovery blocked: ${result.reason||"CONTROL_FAILED"}`;});
-    ensureActivityKind(); if($("crypto-symbol")){const oldSymbol=$("crypto-symbol"),newSymbol=oldSymbol.cloneNode(true);oldSymbol.replaceWith(newSymbol);newSymbol.addEventListener("input",()=>{state.page=1;saveState(true);loadPage("crypto",true);});} document.addEventListener("click",event=>{const button=event.target.closest?.(".copy");if(!button)return;navigator.clipboard?.writeText(button.dataset.copy||"").then(()=>{button.textContent="copied";setTimeout(()=>button.textContent="copy",1200);}).catch(()=>{});}); document.addEventListener("visibilitychange",()=>{if(document.hidden){if(activeController)activeController.abort();}else{nextRefreshAt=0;load();}});
-    ensureFacets(); document.querySelectorAll(".tab").forEach(b=>b.addEventListener("click",()=>activate(b.dataset.view))); document.querySelectorAll("[data-link]").forEach(b=>b.addEventListener("click",e=>{e.preventDefault();activate(b.dataset.link)})); document.querySelectorAll(".filters input,.filters select").forEach(el=>el.addEventListener(el.tagName==="INPUT"?"input":"change",()=>{if(el.id.endsWith("-size")){const n=Number(el.value);if([10,25,50,100].includes(n)){state.page_size=n;document.querySelectorAll('select[id$="-size"]').forEach(s=>s.value=String(n));}} else if(el.id.includes("-filter"))state.filter=el.value;state.page=1;saveState(true);loadPage(state.tab)})); window.addEventListener("popstate",()=>{const q=new URLSearchParams(location.search),nextTab=q.get("tab")||"overview",changed=nextTab!==state.tab;params=q;state.tab=nextTab;state.page=Math.max(1,Number(q.get("page")||1));state.page_size=[10,25,50,100].includes(Number(q.get("page_size")))?Number(q.get("page_size")):25;state.filter=changed?"":q.get("filter")||"";state.sort=changed?"":q.get("sort")||"";state.direction=changed?"desc":q.get("direction")==="asc"?"asc":"desc";state.selected=changed?"":q.get("selected")||"";state.expanded=changed?false:q.get("expanded")==="1";restoreFacets();activate(state.tab,false)}); load(); activate(state.tab,false); const refreshHandle=setInterval(load,10000); window.addEventListener("beforeunload",()=>clearInterval(refreshHandle));
-    if($("crypto-symbol"))$("crypto-symbol").addEventListener("input",async()=>{const symbol=$("crypto-symbol").value.trim(),q=new URLSearchParams({page:"1",page_size:String(state.page_size),direction:state.direction});if(symbol)q.set("symbol",symbol);const response=await fetch(`/api/v2/crypto-research?${q}`,{cache:"no-store"});if(response.ok)renderCrypto(await response.json());});
-    const executionAuthPanel=$("execution-authorization-panel"),executionCanaryView=$("view-canary"); if(executionAuthPanel&&executionCanaryView)executionCanaryView.appendChild(executionAuthPanel);
-    function renderExecutionAuthorization(value) {
-      const payload=value&&typeof value==="object"?value:{}, legacyAuth=payload.execution_authorization&&typeof payload.execution_authorization==="object"?payload.execution_authorization:{}, review=payload.exploratory_live_review&&typeof payload.exploratory_live_review==="object"?payload.exploratory_live_review:{}, reviewedAuthorization=review.authorization&&typeof review.authorization==="object"?review.authorization:null, auth=reviewedAuthorization?Object.assign({},legacyAuth,reviewedAuthorization):legacyAuth, active=auth.active&&typeof auth.active==="object"?auth.active:null, draft=auth.draft&&typeof auth.draft==="object"?auth.draft:null, row=active||draft||auth.authorization||{}, status=String(auth.status||row.status||"DISABLED").toUpperCase(), id=row.authorization_id||row.id||"", activeId=active?.authorization_id||active?.id||"", draftId=draft?.authorization_id||draft?.id||"", generationValue=row.generation??auth.generation, generation=Number.isInteger(Number(generationValue))&&Number(generationValue)>0?Number(generationValue):null;
-      const adverseEvidence=row.adverse_evidence_ack, adverseEvidenceRequired=Object.prototype.hasOwnProperty.call(row,"adverse_evidence_ack_required")?row.adverse_evidence_ack_required!==false:!(adverseEvidence&&typeof adverseEvidence==="object"&&adverseEvidence.required===false), adverseEvidenceAcknowledged=adverseEvidence===true||adverseEvidence?.acknowledged===true||adverseEvidence?.accepted===true;
-      const details={status,authorization_id:id,generation,mode:row.mode||auth.mode||"EXPLORATORY_MICRO_CANARY",admission_mode:row.admission_mode||auth.admission_mode||"EXPLORATORY_LIVE",proposal_only:row.proposal_only!==false,purpose:row.purpose||"—",strategy_versions:row.exact_strategy_versions||row.strategy_version_ids||"—",selection_policy_hash:row.reviewed_selection_policy_hash||row.selection_policy_hash||"—",selection_id:row.selection_id||"—",selection_hash:row.selection_hash||"—",adverse_evidence_ack:!adverseEvidenceRequired?"NOT REQUIRED":adverseEvidenceAcknowledged?"ACKNOWLEDGED":"NOT ACKNOWLEDGED",adverse_evidence_ack_required:adverseEvidenceRequired,shared_allocation:row.shared_allocation||review.shared_allocation||"—",lifetime_budget:row.lifetime_budget||review.lifetime_budget||"—",expiry_anchor:row.expiry_anchor||review.expiry_anchor||"—",duration_seconds:row.duration_seconds??review.duration_seconds??"—",stop_rules:row.stop_rules||"—",expires_at:row.expires_at||"UTC assigned on final confirmation",scope_hash:row.scope_hash||"—",scope_version:row.scope_version||"—",scope_draft_id:row.scope_draft_id||payload.scope_draft?.draft_id||"—",scope_draft_hash:row.scope_draft_hash||payload.scope_draft?.draft_hash||"—",scope_draft_version:row.scope_draft_version||payload.scope_draft?.scope_version||"—",supported_market_types:row.supported_market_types||payload.scope_draft?.supported_market_types||"—",category_restriction:row.category_restriction||payload.scope_draft?.category_restriction||"—",scope_exclusions:row.scope_exclusions||payload.scope_draft?.exclusions||"—",active_scope_hash:row.active_scope_hash||"—",active_scope_version:row.active_scope_version||"—",frozen_scope_hash:row.frozen_scope_hash||"—",frozen_scope_version:row.frozen_scope_version||"—",active_settings_hash:row.active_settings_hash||"—",active_settings_generation:row.active_settings_generation||"—"};
-      details.instance=payload.identity||payload.instance||auth.identity||"—";
-      details.operator_mode=payload.mode||auth.operator_mode||"observing";
-      details.economic_policy=payload.economic_policy||auth.economic_policy||"—";
-      const state=$("execution-auth-state"), out=$("execution-auth-details"), activate=$("execution-auth-activate"), revoke=$("execution-auth-revoke");
-      if(state)state.textContent=`${status} · ${status==="ACTIVE"?"reviewed authorization is active":"no active exploratory authorization"}${id?` · record ${id}`:""}`;
-      if(out)out.textContent=JSON.stringify(details,null,2);
-      if(activate)activate.disabled=!(draft&&String(draft.status||"").toUpperCase()==="DRAFT"&&draftId);
-      if(revoke)revoke.disabled=!(active&&String(active.status||"").toUpperCase()==="ACTIVE"&&activeId);
-      return {row,status,id,details,active,draft,activeId,draftId};
-    }
-    async function refreshExecutionAuthorization() {
-      try {
-        const response=await fetch("/api/operator",{cache:"no-store"});
-        if(!response.ok)throw new Error(`HTTP ${response.status}`);
-        const payload=await response.json();
-        const controls=payload?.operator_controls&&typeof payload.operator_controls==="object"&&!Array.isArray(payload.operator_controls)?payload.operator_controls:payload;
-        const finalReview=$("exploratory-live-review"); if(finalReview&&controls?.exploratory_live_review)finalReview.textContent=json(controls.exploratory_live_review);
-        lastGood.controls=controls;
-        renderExecutionAuthorization(controls);
-      } catch(error) {
-        const state=$("execution-auth-state"); if(state)state.textContent=`Authorization status unavailable: ${error?.message||"request failed"}`;
-      }
-    }
-    document.addEventListener("click",async event=>{
-      const button=event.target.closest?.("#execution-auth-review,#execution-auth-activate,#execution-auth-revoke"); if(!button)return;
-      const result=$("execution-auth-result"), current=renderExecutionAuthorization(lastGood.controls||lastGood.canary||lastGood.overview||{}), action=button.id;
-      if(action==="execution-auth-review"){
-        const purpose=$("execution-auth-purpose")?.value.trim()||"commission exploratory automation and measure actual net results; profitability unproven", shared=$("execution-auth-shared-allocation")?.value.trim()||"5.00", budget=$("execution-auth-budget")?.value.trim()||"5.00", stopText=$("execution-auth-stop-rules")?.value.trim()||"", adverseEvidence=$("execution-auth-adverse-evidence")?.checked===true;
-        if(!purpose||!shared||!budget||!stopText){if(result)result.textContent="Review blocked: purpose, shared allocation, lifetime budget, and stop rules are required";return;}
-        let stopRules;
-        try { stopRules=JSON.parse(stopText); } catch(error) { if(result)result.textContent="Review blocked: stop rules must be valid JSON"; return; }
-        if(!stopRules||typeof stopRules!=="object"||Array.isArray(stopRules)||!Object.keys(stopRules).length){if(result)result.textContent="Review blocked: stop rules must be a non-empty JSON object";return;}
-        const values={purpose,shared_allocation:shared,lifetime_budget:{max_notional_usd:budget},expiry_anchor:"FINAL_CONFIRMATION",duration_seconds:86400,stop_rules:stopRules};
-        if(adverseEvidence)values.adverse_evidence_ack=true;
-        const response=await controlPost("execution_authorization.review","", "REVIEW EXPLORATORY AUTHORIZATION",{values});
-        if(result)result.textContent=response.ok?"Review saved as DRAFT · paper-only":"Review blocked: "+(response.reason||"CONTROL_FAILED");
-        await refreshExecutionAuthorization(); return;
-      }
-      const target=action==="execution-auth-activate"?current.draft:current.active, targetId=target?.authorization_id||target?.id||"", targetGenerationValue=target?.generation, targetGeneration=Number.isInteger(Number(targetGenerationValue))&&Number(targetGenerationValue)>0?Number(targetGenerationValue):null;
-      if(!targetId){if(result)result.textContent="Authorization action blocked: no current server authorization record";return;}
-      const phrase=action==="execution-auth-activate"?"ACTIVATE EXPLORATORY AUTHORIZATION":"REVOKE EXPLORATORY AUTHORIZATION";
-      const confirmation=[phrase,`authorization_id=${targetId}`,`generation=${targetGeneration??"—"}`,`purpose=${target?.purpose||current.details.purpose}`,`strategy_versions=${JSON.stringify(target?.exact_strategy_versions||target?.strategy_version_ids||current.details.strategy_versions)}`,`selection_policy_hash=${target?.reviewed_selection_policy_hash||target?.selection_policy_hash||current.details.selection_policy_hash}`,`adverse_evidence_ack=${target?.adverse_evidence_ack===true||target?.adverse_evidence_ack?.acknowledged===true?"ACKNOWLEDGED":current.details.adverse_evidence_ack}`,`lifetime_budget=${target?.lifetime_budget||current.details.lifetime_budget}`,`stop_rules=${JSON.stringify(target?.stop_rules||current.details.stop_rules)}`,`expires_at=${target?.expires_at||current.details.expires_at}`,`scope_hash=${target?.scope_hash||current.details.scope_hash}`,`active_settings_hash=${target?.active_settings_hash||current.details.active_settings_hash}`].join(" · ");
-      const name=action==="execution-auth-activate"?"execution_authorization.activate":"execution_authorization.revoke";
-      const fencedPayload={authorization_id:targetId}; if(targetGeneration!=null)fencedPayload.expected_generation=targetGeneration;
-      const response=await controlPost(name,"",phrase,fencedPayload);
-      if(result)result.textContent=response.ok?`${phrase} completed · ${response.result?.execution_authorization?.status||"updated"}`:`${phrase} blocked: ${response.reason||"CONTROL_FAILED"}`;
-      await refreshExecutionAuthorization();
-    });
-    document.addEventListener("click",async event=>{
-      const button=event.target.closest?.("#exploratory-live-confirm-action"); if(!button)return;
-      const result=$("exploratory-live-result"), confirmation=$("exploratory-live-confirm")?.value.trim()||"";
-      const response=await controlPost("exploratory.live.review_confirm","",confirmation,{});
-      if(result)result.textContent=response.ok?"EXPLORATORY LIVE enabled after final review":"Final review blocked: "+(response.reason||"CONTROL_FAILED");
-      const review=$("exploratory-live-review");
-      if(review&&response.result?.exploratory_live)review.textContent=json(response.result.exploratory_live.review||response.result.exploratory_live);
-    });
-    refreshExecutionAuthorization();
-    setInterval(refreshExecutionAuthorization,10000);
-    // setInterval(load, 10000) is the ten-second refresh contract.
-  </script>
-</html>""".replace("__AXIOM_CONTROL_TOKEN__", str(control_token or "")).replace(
-        "__BINANCE_NAV_LABEL__", binance_nav_label
-    )
+  <div id="app" class="app-shell">
+    <aside class="sidebar" id="site-navigation" aria-label="Main navigation">
+      <a class="brand" href="?view=home" data-nav-view="home">
+        <span class="brand-mark" aria-hidden="true">A</span>
+        <span><strong>Axiom</strong><small>Research and canary workspace</small></span>
+      </a>
+      <nav class="nav-groups">
+        <div class="nav-group"><p>Operate</p>
+          <a href="?view=home" data-nav-view="home">Home</a>
+          <a href="?view=live&amp;section=polymarket" data-nav-view="live" data-nav-section="polymarket">Live trading</a>
+          <a href="?view=portfolio&amp;section=real" data-nav-view="portfolio" data-nav-section="real">Portfolio</a>
+          <a href="?view=markets" data-nav-view="markets">Markets</a>
+        </div>
+        <div class="nav-group"><p>Explore</p>
+          <a href="?view=research&amp;section=strategies" data-nav-view="research" data-nav-section="strategies">Research</a>
+          <a href="?view=activity" data-nav-view="activity">Activity</a>
+        </div>
+        <div class="nav-group"><p>Manage</p>
+          <a href="?view=settings" data-nav-view="settings">Settings &amp; system</a>
+        </div>
+      </nav>
+      <div class="sidebar-foot"><span class="status-dot"></span><span>Local operator UI · guarded actions</span></div>
+    </aside>
+    <div class="app-main">
+      <header class="shell-header">
+        <button class="menu-toggle button button-quiet" type="button" aria-controls="site-navigation" aria-expanded="false" data-action="toggle-menu">Menu</button>
+        <div><p class="eyebrow">Axiom workspace</p><h1 id="page-title">Home</h1></div>
+        <a class="header-destination" href="?view=live&amp;section=binance" data-nav-view="live" data-nav-section="binance">Binance</a>
+      </header>
+      <main class="shell-main">
+        <div id="content"><section class="loading-state" role="status"><strong>Loading workspace…</strong><span>Reading the bounded local projections.</span></section></div>
+      </main>
+    </div>
+  </div>
+  <div class="nav-scrim" data-action="close-menu" hidden></div>
+</body>
+{offline_guard}
+</html>"""
 
 class _DashboardHandler(BaseHTTPRequestHandler):
     server: "_BoundDashboardServer"
@@ -11419,7 +11378,13 @@ class _DashboardHandler(BaseHTTPRequestHandler):
 
     def _send(self, status: int, payload: Any, content_type: str = "application/json; charset=utf-8") -> None:
         try:
-            body = payload.encode("utf-8") if isinstance(payload, str) else _http_json_bytes(payload)
+            body = (
+                bytes(payload)
+                if isinstance(payload, (bytes, bytearray))
+                else payload.encode("utf-8")
+                if isinstance(payload, str)
+                else _http_json_bytes(payload)
+            )
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
@@ -11714,6 +11679,23 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             return
         parsed = urlparse(self.path)
         path = parsed.path.strip("/")
+        asset = _UI_ASSETS.get(f"/{path}")
+        if asset is not None:
+            filename, content_type = asset
+            try:
+                body = (Path(__file__).with_name("ui") / filename).read_bytes()
+            except (OSError, ValueError):
+                self._send(404, {"error": "asset not found"})
+                return
+            self._send(200, body, content_type)
+            return
+        if path == "api/control-token":
+            origin = self.headers.get("Origin")
+            if origin and not self._same_origin(str(origin)):
+                self._send(403, {"error": "same-origin dashboard required"})
+                return
+            self._send(200, {"token": str(self.server.control_token or "")})
+            return
         if path in {"api/control", "api/binance/control"}:
             self._send(405, {"error": "POST required"})
             return
@@ -11722,7 +11704,6 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 self._send(
                     200,
                     _dashboard_html(
-                        self.server.control_token,
                         binance_nav_label=self.server.dashboard_data.binance_nav_label(),
                     ),
                     "text/html; charset=utf-8",
@@ -11731,6 +11712,25 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 return
             return
         query = parse_qs(parsed.query, keep_blank_values=True)
+        if path == "api/ui-record":
+            kinds = query.get("kind", [])
+            identifiers = query.get("id", [])
+            kind = kinds[0].strip().lower() if len(kinds) == 1 else ""
+            identifier = identifiers[0].strip() if len(identifiers) == 1 else ""
+            invalid_identifier = (
+                not identifier
+                or len(identifier) > 256
+                or any(ord(char) < 32 for char in identifier)
+            )
+            if kind not in _UI_RECORD_KINDS or invalid_identifier or len(kinds) != 1 or len(identifiers) != 1:
+                self._send(400, {"error": "invalid record kind or id"})
+                return
+            record = self.server.dashboard_data.ui_record_data(kind, identifier)
+            if record is None:
+                self._send(404, {"error": "record unavailable", "kind": kind, "id": identifier})
+                return
+            self._send(200, record)
+            return
         if path.startswith("api/v2/"):
             endpoint = path[len("api/v2/") :]
             allowed = endpoint.lower() in _V2_ENDPOINTS or endpoint.lower().startswith(("datasets/", "candidates/", "hermes/", "crypto-research/", "shadow/"))

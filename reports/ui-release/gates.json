@@ -1,0 +1,53 @@
+{
+  "base_revision": "18babca0fbff71abfcef8a4e715f212cf70170cd",
+  "worktree": "feature/beginner-friendly-ui",
+  "source_hashes": {
+    "axiom/dashboard.py": "b0dc20898bb748dc4d180e89848b958831b978880e6b206f67ffca6e6bdac469",
+    "axiom/ui/app.js": "5f6f5fea9f417dc74366fc074db6ad4f10641ffcdb7e20a188617cff33dbd460",
+    "axiom/ui/pages.js": "93136c12a5ff0c3442197a331aff2b05964b58d534b269a48cded2f455956a77",
+    "axiom/ui/styles.css": "d17b131ab2e7c96e590e4200fc5ff9e1ef1a7adcd6ce901426a45c84c6a7468e"
+  },
+  "python_suite": {
+    "command": "uv run python -X utf8 -m pytest",
+    "passed": 1879,
+    "skipped": 3,
+    "subtests_passed": 582,
+    "warnings": 2,
+    "duration_seconds": 457.62,
+    "warning_detail": "Existing PytestCollectionWarnings for TestCredentials and TestVenue constructors in tests/test_autonomous_canary.py.",
+    "source_scope_note": "Python application, tests and fixture remained unchanged throughout the subsequent JavaScript-only corrections. Browser tests, identifier checks, bundle, wheel and actual installed-resource smoke were rerun against the final source hashes above."
+  },
+  "presentation_tests": {
+    "command": "npm exec --offline --yes --package=bun -- bun test tests/ui_presentation.test.mjs",
+    "bun_version": "1.4.2",
+    "passed": 14,
+    "failed": 0,
+    "expect_calls": 76
+  },
+  "eslint_no_undef": "Passed for both browser modules with explicit browser globals; no stop/status global suppressions.",
+  "compileall": "passed for axiom",
+  "changed_python_f821": "passed for dashboard.py and all changed Python tests/fixture",
+  "whole_repository_f821_note": "Earlier diagnostic found one inherited, out-of-scope undefined AxiomStore annotation at axiom/forward.py:682. No whole-repository F821 all-green claim.",
+  "browser_build": {
+    "command": "npm exec --offline --yes --package=bun -- bun build axiom/ui/app.js --target browser",
+    "modules": 2,
+    "output_kilobytes": 235.75,
+    "status": "passed"
+  },
+  "wheel": {
+    "command": "uv build --offline --wheel",
+    "status": "passed",
+    "byte_identical_source_files": [
+      "axiom/dashboard.py",
+      "axiom/ui/app.js",
+      "axiom/ui/pages.js",
+      "axiom/ui/styles.css"
+    ],
+    "extracted_wheel_import": "passed from an isolated temporary directory",
+    "packaged_ui_assets": 3,
+    "dashboard_html_generated": true,
+    "embedded_control_token": false
+  },
+  "formatter": "No project formatter configuration found; no new formatting convention introduced.",
+  "scope": "Gate evidence for the exact source hashes above. Independent runtime and safety acceptance is recorded separately. No production activation or venue order was performed by these gates."
+}

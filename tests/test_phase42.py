@@ -17,7 +17,7 @@ from axiom.bootstrap import (
     label_btc_regimes,
     run_btc_historical_research,
 )
-from axiom.dashboard import DashboardData, DashboardServer, _dashboard_html
+from axiom.dashboard import DashboardData, DashboardServer
 from axiom.domain import InstrumentMetadata, MarketType, OHLCVBar, PredictionMarketSnapshot, SettlementState, to_record
 from axiom.evaluation import dataset_version
 from axiom.data._http import HTTPFetchError
@@ -1258,9 +1258,6 @@ class Phase42PolymarketTests(unittest.TestCase):
 
 class Phase42DashboardTests(unittest.TestCase):
     def test_dashboard_empty_state_and_dynamic_json_api(self) -> None:
-        html = _dashboard_html()
-        for text in ("Live trading", "Paper risk engine", "Historical / forward coverage", "Candidate lifecycle funnel", "setInterval(load, 10000)", "Research maturity", "Paper forward", "Research queue and node status"):
-            self.assertIn(text, html)
         with AxiomStore(":memory:") as store:
             data = DashboardData(store=store)
             operator = data.operator_data()

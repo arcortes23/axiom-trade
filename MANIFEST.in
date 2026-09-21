@@ -1,0 +1,1 @@
+recursive-include axiom/ui *.js *.css

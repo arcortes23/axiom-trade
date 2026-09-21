@@ -1,0 +1,554 @@
+{
+  "report": "state-closure-review",
+  "scope": "Rendered fixture states only; no action/transport fault tests and no source edits.",
+  "completed_at": "2026-09-21",
+  "fixture": {
+    "url": "http://127.0.0.1:50798",
+    "admin_url": "http://127.0.0.1:50799",
+    "upstream_url": "http://127.0.0.1:50797",
+    "browser": "private headless Chrome via StateMatrixChrome/CDP 64525",
+    "processes": [
+      "StateMatrixFixture",
+      "StateMatrixChrome"
+    ],
+    "action_stats_final": {
+      "total": 0,
+      "pending": 0,
+      "completed": 0
+    },
+    "scenario_identity": "Every row was selected through fixture POST /admin/scenario and then rendered through the browser URL listed; admin responses returned fixture:true and the requested scenario."
+  },
+  "source_hashes": {
+    "matrix_capture": {
+      "axiom/ui/app.js": "060124c85078d23fe9196ae25025d3481b28956b3376eb7a5ce0919928e2d6af",
+      "axiom/ui/pages.js": "93136c12a5ff0c3442197a331aff2b05964b58d534b269a48cded2f455956a77",
+      "tests/ui_fixture_server.py": "4bcce66f2056fc190f5bc983d32dfc2fe5d45aae6160e07ccd70e0ba5e4173a7"
+    },
+    "final_representative": {
+      "axiom/ui/app.js": "5f6f5fea9f417dc74366fc074db6ad4f10641ffcdb7e20a188617cff33dbd460",
+      "axiom/ui/pages.js": "93136c12a5ff0c3442197a331aff2b05964b58d534b269a48cded2f455956a77",
+      "tests/ui_fixture_server.py": "4bcce66f2056fc190f5bc983d32dfc2fe5d45aae6160e07ccd70e0ba5e4173a7"
+    },
+    "version_note": "The matrix rendered while app.js=060124c8 before UiShellClosure corrections. Targeted missingauth Home/Live and network_failure Home were rerun in a fresh private browser against combined final app.js=5f6f5fea; pages.js/fixture hashes stayed unchanged."
+  },
+  "verification": {
+    "console_errors": "Fresh final 5f6f browser errors --json returned an empty errors array for missingauth Home, missingauth Live and network_failure Home; the earlier intermediate-browser syntax observation is not part of final evidence.",
+    "final_recheck": {
+      "source_hash": "5f6f5fea9f417dc74366fc074db6ad4f10641ffcdb7e20a188617cff33dbd460",
+      "scenario": "missingauth",
+      "urls": [
+        "http://127.0.0.1:50798/?view=home&finalfreeze=5f6f",
+        "http://127.0.0.1:50798/?view=live&section=polymarket&finalfreeze=5f6f"
+      ],
+      "evidence": [
+        "reports/ui-release/state-closure-final-5f6f-missingauth-home.png",
+        "reports/ui-release/state-closure-final-5f6f-missingauth-live.png"
+      ],
+      "observed": [
+        "Home and Live headings include Unavailable",
+        "Duration is Not available on both surfaces",
+        "fixture banner present",
+        "no loading state",
+        "fresh-browser errors --json returned an empty errors array"
+      ]
+    },
+    "final_network_recheck": {
+      "source_hash": "5f6f5fea9f417dc74366fc074db6ad4f10641ffcdb7e20a188617cff33dbd460",
+      "scenario": "network_failure",
+      "url": "http://127.0.0.1:50798/?view=home&finalfreeze=5f6f-network",
+      "evidence": "reports/ui-release/state-closure-final-5f6f-network-failure-home.png",
+      "observed": [
+        "Home includes overview unavailable notice and network text",
+        "no This view is unavailable replacement of the whole Home",
+        "fixture banner present",
+        "fresh-browser errors --json returned an empty errors array"
+      ]
+    }
+  },
+  "matrix": [
+    {
+      "state": "prepared",
+      "fixture_scenario": "prepared",
+      "urls": [
+        "http://127.0.0.1:50798/?view=home",
+        "http://127.0.0.1:50798/?view=live&section=polymarket"
+      ],
+      "observed": "Home rendered No active authorization, Disarmed, readiness Current, decision No signal, budget $0.73, open-position cost $0.105, value Not available. Live rendered the separated decision/input/signal/readiness panels and real-canary ledger without a crash.",
+      "evidence": [
+        "reports/ui-release/state-closure-prepared-home.png",
+        "reports/ui-release/state-closure-prepared-live.png"
+      ],
+      "failures": "Initial Home text showed Data freshness Checks need refreshing while readiness was Current; Live showed the same fixture's readiness as Current. No account failure was invented."
+    },
+    {
+      "state": "stale",
+      "fixture_scenario": "stale",
+      "urls": [
+        "http://127.0.0.1:50798/?view=home",
+        "http://127.0.0.1:50798/?view=live&section=polymarket"
+      ],
+      "observed": "Live rendered Readiness STALE and preserved Account Not available/No signal separately; Home remained rendered and did not say account disconnected. The stale state did not crash or invent an account failure.",
+      "evidence": [
+        "reports/ui-release/state-closure-stale-home.png",
+        "reports/ui-release/state-closure-stale-live.png"
+      ],
+      "failures": "Live Data freshness was Current despite Readiness STALE; this distinction is recorded, not treated as a pass for a freshness claim."
+    },
+    {
+      "state": "changed",
+      "fixture_scenario": "changed",
+      "urls": [
+        "http://127.0.0.1:50798/?view=home",
+        "http://127.0.0.1:50798/?view=live&section=polymarket"
+      ],
+      "observed": "Home and Live rendered Review needed, Duration 86,401 seconds, readiness Ready, control Disarmed and No signal. The changed terms were not exposed in the non-dialog surfaces.",
+      "evidence": [
+        "reports/ui-release/state-closure-changed-home.png",
+        "reports/ui-release/state-closure-changed-live.png"
+      ],
+      "failures": "Changed-term details were not re-opened because canonical review/material-change semantics belong to UiActionClosure."
+    },
+    {
+      "state": "missing_account",
+      "fixture_scenario": "missingaccount",
+      "urls": [
+        "http://127.0.0.1:50798/?view=home",
+        "http://127.0.0.1:50798/?view=live&section=polymarket"
+      ],
+      "observed": "Home and Live rendered Access/readiness Account Disconnected, while Current decision remained No signal and the rest of the page stayed available. No stale state was converted into account failure.",
+      "evidence": [
+        "reports/ui-release/state-closure-missingaccount-home.png",
+        "reports/ui-release/state-closure-missingaccount-live.png"
+      ],
+      "failures": "No renderer failure observed."
+    },
+    {
+      "state": "missing_auth",
+      "fixture_scenario": "missingauth",
+      "urls": [
+        "http://127.0.0.1:50798/?view=home",
+        "http://127.0.0.1:50798/?view=live&section=polymarket"
+      ],
+      "observed": "Home and Live rendered Authorization unavailable, budget Not available, readiness Ready and fixture banner; the final dede8c representative still rendered the page.",
+      "evidence": [
+        "reports/ui-release/state-closure-missingauth-home.png",
+        "reports/ui-release/state-closure-missingauth-live.png",
+        "reports/ui-release/state-closure-final-5f6f-missingauth-home.png",
+        "reports/ui-release/state-closure-final-5f6f-missingauth-live.png"
+      ],
+      "failures": "Final combined freeze renders Duration Not available on Home and Live when authorization is missing; no zero-value substitution remains."
+    },
+    {
+      "state": "adverse_required",
+      "fixture_scenario": "adverse_required",
+      "urls": [
+        "http://127.0.0.1:50798/?view=home",
+        "http://127.0.0.1:50798/?view=live&section=polymarket"
+      ],
+      "observed": "Both surfaces rendered safely as No active authorization, Disarmed and No signal. The required-adverse field was not visible outside the review dialog.",
+      "evidence": [
+        "reports/ui-release/state-closure-adverse-required-home.png",
+        "reports/ui-release/state-closure-adverse-required-live.png"
+      ],
+      "failures": "Required adverse acknowledgment was not independently re-opened; canonical review interaction is owned by UiActionClosure."
+    },
+    {
+      "state": "adverse_not_required",
+      "fixture_scenario": "adverse_not_required",
+      "urls": [
+        "http://127.0.0.1:50798/?view=home",
+        "http://127.0.0.1:50798/?view=live&section=polymarket"
+      ],
+      "observed": "Both surfaces rendered safely as No active authorization, Disarmed and No signal. No optional adverse checkbox was shown on the non-dialog surfaces.",
+      "evidence": [
+        "reports/ui-release/state-closure-adverse-not-required-home.png",
+        "reports/ui-release/state-closure-adverse-not-required-live.png"
+      ],
+      "failures": "Not-required adverse details were not independently re-opened; canonical review interaction is owned by UiActionClosure."
+    },
+    {
+      "state": "armed_no_permission",
+      "fixture_scenario": "armed_no_permission",
+      "urls": [
+        "http://127.0.0.1:50798/?view=home",
+        "http://127.0.0.1:50798/?view=live&section=polymarket"
+      ],
+      "observed": "Home rendered Review needed with Control state Armed, Authorization status Review needed/Not active, readiness Ready and No signal. Live retained the same separation and did not imply permission from Armed.",
+      "evidence": [
+        "reports/ui-release/state-closure-armed-no-permission-home.png",
+        "reports/ui-release/state-closure-armed-no-permission-live.png"
+      ],
+      "failures": "No renderer failure observed."
+    },
+    {
+      "state": "no_members",
+      "fixture_scenario": "no_members",
+      "urls": [
+        "http://127.0.0.1:50798/?view=home",
+        "http://127.0.0.1:50798/?view=live&section=polymarket",
+        "http://127.0.0.1:50798/?view=portfolio&section=allocations"
+      ],
+      "observed": "Home and Live rendered Members 0, Control state Disarmed, readiness Ready and No signal. Allocations rendered Active members 0, Current authority Members 0, Proposed members 0 and explicit empty bounded-projection messages.",
+      "evidence": [
+        "reports/ui-release/state-closure-no-members-home.png",
+        "reports/ui-release/state-closure-no-members-live.png",
+        "reports/ui-release/state-closure-no-members-allocations.png"
+      ],
+      "failures": "No renderer failure observed."
+    },
+    {
+      "state": "unaffordable",
+      "fixture_scenario": "unaffordable",
+      "urls": [
+        "http://127.0.0.1:50798/?view=home",
+        "http://127.0.0.1:50798/?view=live&section=polymarket"
+      ],
+      "observed": "Home rendered Current decision Budget not available and Remaining session budget $0.00. Live rendered UNAFFORDABLE/ Budget not available and Per-outcome feasibility, without treating zero as missing.",
+      "evidence": [
+        "reports/ui-release/state-closure-unaffordable-home.png",
+        "reports/ui-release/state-closure-unaffordable-live.png"
+      ],
+      "failures": "The human label is Budget not available rather than the native UNAFFORDABLE term on Home; Live exposed the native term."
+    },
+    {
+      "state": "network_failure",
+      "fixture_scenario": "network_failure",
+      "urls": [
+        "http://127.0.0.1:50798/?view=home",
+        "http://127.0.0.1:50798/?view=live&section=polymarket"
+      ],
+      "observed": "Live rendered This view is unavailable from the fixture canary error while preserving the surrounding ledger. Home rendered normally with No active authorization and no network/error notice despite overview-summary carrying FIXTURE_NETWORK_FAILURE.",
+      "evidence": [
+        "reports/ui-release/state-closure-network-failure-home.png",
+        "reports/ui-release/state-closure-network-failure-live.png",
+        "reports/ui-release/state-closure-final-5f6f-network-failure-home.png"
+      ],
+      "failures": "Final combined freeze renders an overview unavailable notice on Home. This was the fixture shaped-data scenario, not an HTTP/offline transport test."
+    },
+    {
+      "state": "active_no_signal",
+      "fixture_scenario": "active_no_signal",
+      "urls": [
+        "http://127.0.0.1:50798/?view=home",
+        "http://127.0.0.1:50798/?view=live&section=polymarket",
+        "http://127.0.0.1:50798/?view=portfolio&section=real"
+      ],
+      "observed": "Home, Live and Real rendered Exploratory authorization active, control Armed, readiness Ready, decision No signal and explicit Real canary portfolio. The fixture's active state is the micro canary and the UI did not turn it into a production claim.",
+      "evidence": [
+        "reports/ui-release/state-closure-active-no-signal-home.png",
+        "reports/ui-release/state-closure-active-no-signal-live.png",
+        "reports/ui-release/state-closure-active-no-signal-real.png"
+      ],
+      "failures": "No production_live_trading field was displayed in the primary surface; the underlying fixture mixes active micro permission with legacy production false as intended."
+    },
+    {
+      "state": "open_position",
+      "fixture_scenario": "open_position",
+      "urls": [
+        "http://127.0.0.1:50798/?view=home",
+        "http://127.0.0.1:50798/?view=live&section=polymarket",
+        "http://127.0.0.1:50798/?view=portfolio&section=real"
+      ],
+      "observed": "Home separated Open-position cost $0.105 from Open-position value Not available. Live and Real rendered Position inventory with quantity 0.25/cost basis $0.105 and Position marks with marked value $0.11; no totals were reconstructed.",
+      "evidence": [
+        "reports/ui-release/state-closure-open-position-home.png",
+        "reports/ui-release/state-closure-open-position-live.png",
+        "reports/ui-release/state-closure-open-position-real.png"
+      ],
+      "failures": "Home did not display the $0.11 mark because its bounded overview projection did not provide marked value; Live/Real displayed the native mark."
+    },
+    {
+      "state": "partial_fill",
+      "fixture_scenario": "partial_fill",
+      "urls": [
+        "http://127.0.0.1:50798/?view=home",
+        "http://127.0.0.1:50798/?view=live&section=polymarket",
+        "http://127.0.0.1:50798/?view=portfolio&section=real"
+      ],
+      "observed": "Live and Real rendered Partial records, Position fills and Filled quantity 0.25; Home stayed a summary surface and did not show the partial row.",
+      "evidence": [
+        "reports/ui-release/state-closure-partial-fill-home.png",
+        "reports/ui-release/state-closure-partial-fill-live.png",
+        "reports/ui-release/state-closure-partial-fill-real.png"
+      ],
+      "failures": "No renderer failure observed."
+    },
+    {
+      "state": "unknown_order",
+      "fixture_scenario": "unknown_order",
+      "urls": [
+        "http://127.0.0.1:50798/?view=home",
+        "http://127.0.0.1:50798/?view=live&section=polymarket",
+        "http://127.0.0.1:50798/?view=portfolio&section=real"
+      ],
+      "observed": "Live and Real rendered Unknown obligations with requested amount $0.42 and reason OUTCOME_UNCERTAIN; authorization was expired/disarmed. Home rendered Authorization expired but did not surface the unknown obligation.",
+      "evidence": [
+        "reports/ui-release/state-closure-unknown-order-home.png",
+        "reports/ui-release/state-closure-unknown-order-live.png",
+        "reports/ui-release/state-closure-unknown-order-real.png"
+      ],
+      "failures": "No repeated action occurred; action stats remained zero. Home did not summarize the unknown obligation, while Live/Real retained the native record."
+    },
+    {
+      "state": "expired",
+      "fixture_scenario": "expired",
+      "urls": [
+        "http://127.0.0.1:50798/?view=home",
+        "http://127.0.0.1:50798/?view=live&section=polymarket",
+        "http://127.0.0.1:50798/?view=portfolio&section=real"
+      ],
+      "observed": "Home and Live rendered Authorization expired, Review and start and Disarmed; Real rendered the real portfolio and Disarmed execution authority without a crash.",
+      "evidence": [
+        "reports/ui-release/state-closure-expired-home.png",
+        "reports/ui-release/state-closure-expired-live.png",
+        "reports/ui-release/state-closure-expired-real.png"
+      ],
+      "failures": "No renderer failure observed."
+    },
+    {
+      "state": "revoked",
+      "fixture_scenario": "revoked",
+      "urls": [
+        "http://127.0.0.1:50798/?view=home",
+        "http://127.0.0.1:50798/?view=live&section=polymarket",
+        "http://127.0.0.1:50798/?view=portfolio&section=real"
+      ],
+      "observed": "Home and Live rendered No active authorization, Review and start and Disarmed; Real rendered the real portfolio and Disarmed execution authority.",
+      "evidence": [
+        "reports/ui-release/state-closure-revoked-home.png",
+        "reports/ui-release/state-closure-revoked-live.png",
+        "reports/ui-release/state-closure-revoked-real.png"
+      ],
+      "failures": "No renderer failure observed."
+    },
+    {
+      "state": "missing",
+      "fixture_scenario": "missing",
+      "urls": [
+        "http://127.0.0.1:50798/?view=home",
+        "http://127.0.0.1:50798/?view=live&section=polymarket",
+        "http://127.0.0.1:50798/?view=portfolio&section=real"
+      ],
+      "observed": "Home rendered readiness Not available and budget Not available rather than invented zeros; Live and Real rendered bounded ledger sections, Not available/Unknown values and fixture banner. All 13 destinations were separately opened under this scenario with no crash.",
+      "evidence": [
+        "reports/ui-release/state-closure-missing-home.png",
+        "reports/ui-release/state-closure-missing-live.png",
+        "reports/ui-release/state-closure-missing-real.png"
+      ],
+      "failures": "Missing-data destination sweep is listed under empty_missing_destination_checks."
+    },
+    {
+      "state": "empty",
+      "fixture_scenario": "empty",
+      "urls": [
+        "http://127.0.0.1:50798/?view=home",
+        "http://127.0.0.1:50798/?view=live&section=polymarket",
+        "http://127.0.0.1:50798/?view=portfolio&section=real"
+      ],
+      "observed": "Home, Live and Real rendered empty bounded sections with explicit no-record/Not available text and fixture banner; no crash or default-zero collapse was observed. All 13 destinations were separately opened under this scenario with no crash.",
+      "evidence": [
+        "reports/ui-release/state-closure-empty-home.png",
+        "reports/ui-release/state-closure-empty-live.png",
+        "reports/ui-release/state-closure-empty-settings.png"
+      ],
+      "failures": "Empty-data destination sweep is listed under empty_missing_destination_checks."
+    }
+  ],
+  "empty_missing_destination_checks": {
+    "routes": [
+      "?view=home",
+      "?view=live&section=polymarket",
+      "?view=live&section=binance",
+      "?view=portfolio&section=real",
+      "?view=portfolio&section=practice",
+      "?view=portfolio&section=allocations",
+      "?view=markets&section=polymarket",
+      "?view=research&section=strategies",
+      "?view=research&section=crypto",
+      "?view=research&section=automation",
+      "?view=research&section=data",
+      "?view=activity",
+      "?view=settings"
+    ],
+    "missing": {
+      "all_rendered": true,
+      "evidence": [
+        "reports/ui-release/state-closure-missing-home.png",
+        "reports/ui-release/state-closure-missing-live.png",
+        "reports/ui-release/state-closure-missing-live-binance.png",
+        "reports/ui-release/state-closure-missing-real.png",
+        "reports/ui-release/state-closure-missing-portfolio-practice.png",
+        "reports/ui-release/state-closure-missing-portfolio-allocations.png",
+        "reports/ui-release/state-closure-missing-markets-polymarket.png",
+        "reports/ui-release/state-closure-missing-research-strategies.png",
+        "reports/ui-release/state-closure-missing-research-crypto.png",
+        "reports/ui-release/state-closure-missing-research-automation.png",
+        "reports/ui-release/state-closure-missing-research-data.png",
+        "reports/ui-release/state-closure-missing-activity.png",
+        "reports/ui-release/state-closure-missing-settings.png"
+      ],
+      "headings_by_route": {
+        "home": [
+          "Home",
+          "No active authorization",
+          "What is known now",
+          "Why no trades",
+          "Recent activity",
+          "No recent activity"
+        ],
+        "live-polymarket": [
+          "Live trading · Polymarket",
+          "No active authorization",
+          "Polymarket canary",
+          "Decision",
+          "Market input",
+          "Signal",
+          "Readiness",
+          "Resting records",
+          "Partial records",
+          "Per-outcome feasibility",
+          "Real canary portfolio",
+          "Execution authority",
+          "Closed positions and settled round trips",
+          "Unknown obligations"
+        ],
+        "live-binance": [
+          "Live trading · Binance",
+          "Binance",
+          "Autonomous Testnet controls",
+          "Venue identity and restrictions",
+          "Observed Binance records"
+        ],
+        "portfolio-real": [
+          "Portfolio · Real",
+          "Real canary portfolio",
+          "Execution authority",
+          "Closed positions and settled round trips",
+          "Unknown obligations"
+        ],
+        "portfolio-practice": [
+          "Portfolio · Practice",
+          "Practice portfolio",
+          "Practice observations"
+        ],
+        "portfolio-allocations": [
+          "Portfolio · Allocations",
+          "Portfolio allocations",
+          "Current authority",
+          "Proposed review",
+          "Current allocation members"
+        ],
+        "markets-polymarket": [
+          "Markets",
+          "Markets",
+          "Bounded Polymarket market list"
+        ],
+        "research-strategies": [
+          "Research · Strategies",
+          "Research strategies",
+          "Research candidates"
+        ],
+        "research-crypto": [
+          "Research · Crypto",
+          "Crypto research",
+          "Crypto research datasets and catalogs"
+        ],
+        "research-automation": [
+          "Research · Automation",
+          "Research automation",
+          "Research queue",
+          "Hermes research queue",
+          "Shadow jobs"
+        ],
+        "research-data": [
+          "Research · Data",
+          "Data catalog",
+          "Bounded dataset catalog"
+        ],
+        "activity": [
+          "Activity",
+          "Activity",
+          "Activity evidence"
+        ],
+        "settings": [
+          "Settings & system",
+          "Settings & system",
+          "Risk limits",
+          "Supported stop rules",
+          "Connections and system",
+          "Advanced operations",
+          "Restart node",
+          "Start historical bootstrap",
+          "Resume historical bootstrap",
+          "Pause Hermes queue",
+          "Resume Hermes queue",
+          "Run Hermes now",
+          "Refresh connectivity checks",
+          "Verify candidate eligibility",
+          "Mark candidate eligible",
+          "Generate candidate signal",
+          "Arm canary",
+          "Enable auto canary",
+          "Kill canary",
+          "Recover unknown entry",
+          "Activate risk draft",
+          "Activate authorization",
+          "Revoke authorization",
+          "Review rolling policy",
+          "Activate rolling policy",
+          "AXIOM node",
+          "Paper engine",
+          "Collector"
+        ]
+      }
+    },
+    "empty": {
+      "all_rendered": true,
+      "evidence": [
+        "reports/ui-release/state-closure-empty-home.png",
+        "reports/ui-release/state-closure-empty-live.png",
+        "reports/ui-release/state-closure-empty-live-binance.png",
+        "reports/ui-release/state-closure-empty-portfolio-practice.png",
+        "reports/ui-release/state-closure-empty-portfolio-allocations.png",
+        "reports/ui-release/state-closure-empty-markets-polymarket.png",
+        "reports/ui-release/state-closure-empty-research-strategies.png",
+        "reports/ui-release/state-closure-empty-research-crypto.png",
+        "reports/ui-release/state-closure-empty-research-automation.png",
+        "reports/ui-release/state-closure-empty-research-data.png",
+        "reports/ui-release/state-closure-empty-activity.png",
+        "reports/ui-release/state-closure-empty-settings.png"
+      ],
+      "headings_by_route": "The empty sweep produced the same heading inventory as the missing sweep; each URL was opened and screenshot saved."
+    }
+  },
+  "uncovered_criteria": [
+    "No POST action, final confirmation, Stop, Revoke or transport-fault test was performed; fixture action stats stayed at zero by scope.",
+    "The adverse required/not-required fields and changed-term detail were not re-opened in the canonical review dialog; UiActionClosure owns that work.",
+    "network_failure used the fixture's shaped error payload; no GET503/offline interception was run because this slice is rendered-state-only.",
+    "The primary matrix was captured against app.js 060124c8 before UiShellClosure corrections; targeted final 5f6f5fea rechecks cover the two affected presentation states and pages.js/fixture hashes stayed unchanged.",
+    "No claim is made about native economic backend fences, production readiness, real accounts, stores, venues, credentials or money operations."
+  ],
+  "findings_observed": [
+    {
+      "severity": "P1",
+      "title": "Do not render a zero duration when authorization is unavailable",
+      "trigger": "missingauth Home/Live and final dede8c representative",
+      "impact": "The rendered Duration field says 0 seconds although the authorization projection is missing. This violates missing-is-unknown and can mislead operators into treating absent authority as a zero-valued limit.",
+      "evidence": [
+        "reports/ui-release/state-closure-final-5f6f-missingauth-home.png",
+        "reports/ui-release/state-closure-final-5f6f-missingauth-live.png"
+      ],
+      "status": "fixed and rechecked in combined final freeze"
+    },
+    {
+      "severity": "P2",
+      "title": "Expose shaped overview failure on Home",
+      "trigger": "network_failure Home while Live renders This view is unavailable",
+      "impact": "The fixture overview-summary carries FIXTURE_NETWORK_FAILURE but Home renders ordinary no-signal content without an unavailable/error notice, so a failed bounded summary can be mistaken for healthy empty data.",
+      "evidence": [
+        "reports/ui-release/state-closure-final-5f6f-network-failure-home.png"
+      ],
+      "status": "fixed and rechecked in combined final freeze"
+    }
+  ]
+}

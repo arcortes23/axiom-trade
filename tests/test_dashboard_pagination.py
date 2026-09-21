@@ -1362,18 +1362,20 @@ class DashboardPaginationEndpointTests(DashboardPaginationFixture):
         self.assertEqual(feed["internal_queue"]["status"], "ACTIVE")
         self.assertEqual(feed["no_new_candidates_reason"], "NO_NEW_HERMES_PROPOSALS")
 
-    def test_research_feed_ui_labels_keep_external_and_internal_controls_truthful(self) -> None:
-        html = _dashboard_html()
-        for label in (
-            "External Hermes feed",
-            "External status UNKNOWN",
-            "Internal research queue processing",
-            "Pause processing",
-            "Resume processing",
-            "Process next pending item now",
+    def test_dashboard_root_is_framework_free_shell(self) -> None:
+        html = _dashboard_html(binance_nav_label="BINANCE")
+        for marker in (
+            'href="?view=home"',
+            'data-nav-view="settings"',
+            'id="content"',
+            "Offline reference",
+            "loadLiveAssets",
         ):
-            self.assertIn(label, html)
-        self.assertNotIn("External status ACTIVE", html)
+            self.assertIn(marker, html)
+        self.assertNotIn("token-value", html)
+        self.assertNotIn('meta name="axiom-control-token"', html)
+        self.assertNotIn("<style>", html)
+        self.assertNotIn("dataset-00", html)
 
     def test_datasets_cover_page_navigation_filters_and_detail_path(self) -> None:
         first = self._page(
@@ -3059,64 +3061,29 @@ class DashboardPaginationSurfaceTests(DashboardPaginationFixture):
 
 
 
-    def test_independent_operator_controls_preserve_both_response_orders(self) -> None:
-        html = _dashboard_html()
+    def test_ui_state_projection_is_separate_from_persisted_overview(self) -> None:
         status, overview, _ = self._request("api/v2/overview-summary")
         self.assertEqual(status, 200)
         self.assertIsInstance(overview, dict)
         assert isinstance(overview, dict)
         self.assertNotIn("operator_controls", overview)
-        overview_start = html.rfind("const _renderOverviewScheduling = renderOverview;")
-        overview_end = html.index("renderDatasets =", overview_start)
-        final_renderer = html[overview_start:overview_end]
-        render_call = "renderOperatorControls(data)"
-        self.assertIn(render_call, final_renderer)
-        call_prefix = final_renderer[:final_renderer.index(render_call)]
-        self.assertRegex(
-            call_prefix,
-            r'if\s*\(\s*Object\.prototype\.hasOwnProperty\.call\(\s*data\s*,\s*["\']operator_controls["\']\s*\)\s*\|\|\s*!operatorControlsRendered\s*\)\s*$',
-            "v2 overview data must not clear an already-rendered control response",
-        )
-
-        controls_start = html.index("function renderOperatorControls(data)")
-        controls_end = html.index("function saveState", controls_start)
-        controls_renderer = html[controls_start:controls_end]
-        self.assertRegex(
-            controls_renderer,
-            r"if\s*\(\s*!operatorControlsRendered\s*\)\s*\$\(\s*['\"]operator-controls['\"]\s*\)\.innerHTML\s*=",
-            "an overview-first empty control render may show unavailable state but must not clear known controls",
-        )
-        self.assertIn("operatorControlsRendered=true", controls_renderer)
-
-        fetch_start = html.index('const controls=await fetchWithTimeout("/api/operator"')
-        fetch_end = html.index("} catch(error)", fetch_start)
-        control_success = html[fetch_start:fetch_end]
-        self.assertRegex(
-            control_success,
-
-            r"renderOperatorControls\(\{\s*operator_controls\s*:\s*controls\.operator_controls\s*\|\|\s*controls\s*\}\)[\s\S]*"
-            r"lastGood\.controls\s*=\s*controls;[\s\S]*operator\s*=\s*controls;",
-            "the independent control-fetch success path must render its own response",
-        )
-    def test_real_canary_renderer_consumes_forward_evidence_and_reason_counts(self) -> None:
-        html = _dashboard_html()
-        start = html.index("function renderCanary(data)")
-        end = html.index("function renderBtc", start)
-        renderer = html[start:end]
-        for marker in (
-            "forward_evidence",
-            "candidate_bound_markets",
-            "scheduled",
-            "stale",
-            "missing",
-            "newest_required",
-            "oldest_required",
-            "signal_scan_reason_counts",
-            "signal_scan_coverage_percentage",
-            "last_cycle_blocker",
-        ):
-            self.assertIn(marker, renderer)
-        self.assertIn("REAL CANARY MONEY", html)
+        status, ui_state, _ = self._request("api/ui-state")
+        self.assertEqual(status, 200)
+        self.assertIsInstance(ui_state, dict)
+        assert isinstance(ui_state, dict)
+        self.assertEqual(ui_state["schema"], "ui-state.v1")
+        self.assertIn("execution_authorization", ui_state)
+        self.assertIn("risk_settings", ui_state)
+        self.assertIn("ledger", ui_state)
+        self.assertLessEqual(len(ui_state.get("actions", [])), 32)
+    def test_canary_projection_keeps_nested_execution_and_risk_sections(self) -> None:
+        status, payload, body = self._request("api/v2/canary")
+        self.assertEqual(status, 200, body)
+        self.assertIsInstance(payload, dict)
+        assert isinstance(payload, dict)
+        self.assertIn("execution", payload)
+        self.assertIn("risk_settings", payload)
+        self.assertIn("execution_authorization", payload)
 
     def test_dashboard_research_feed_preserves_no_new_hermes_reason_text(self) -> None:
         with AxiomStore(":memory:") as store:
@@ -3139,138 +3106,40 @@ class DashboardPaginationSurfaceTests(DashboardPaginationFixture):
         self.assertEqual(payload["research_feed"]["no_new_candidates_reason"], "NO_NEW_HERMES_PROPOSALS")
         self.assertIn("NO_NEW_HERMES_PROPOSALS", body)
 
-    def test_html_has_paginated_views_url_state_and_responsive_sticky_layout(self) -> None:
+    def test_html_shell_uses_http_only_assets_and_responsive_layout(self) -> None:
         html = _dashboard_html()
-        for marker in (
-            'id="view-datasets"',
-            'id="view-activity"',
-            'data-view="datasets"',
-            'data-view="activity"',
-            "URLSearchParams",
-            "page_size",
-            "Showing ${start}",
-            "windowStart",
-            "numbers.map",
-            "Previous",
-            "Next",
-            "select.facet",
-            "dataset.param",
-            "datasets-market",
-            "datasets-timeframe",
-            "datasets-quality",
-            "AbortController",
-            "polymarket-quality",
-            "fetch(",
-            "canary_eligible",
-            "historical_gates",
-            "Historical gates",
-            "Micro-live canary",
-            "Paper forward status",
-            "Paper promotable",
-        ):
-            self.assertIn(marker, html)
-        self.assertRegex(html, r"history\.(?:replaceState|pushState)")
-        self.assertRegex(html, r"body\s*\{[^}]*max-width|main\s*\{[^}]*max-width")
-        self.assertRegex(html, r"overflow-x\s*:\s*auto")
-        self.assertRegex(html, r"header\s*\{[^}]*position\s*:\s*sticky[^}]*top\s*:\s*0")
-        self.assertIn("box-sizing: border-box", html)
-        # Data is fetched after load; it is not rendered as a giant inline JS
-        # literal in the initial HTML document.
-        self.assertNotIn("dataset-00", html)
-        self.assertNotIn("market-00", html)
-    def test_paper_portfolio_surface_projects_refresh_status(self) -> None:
-        html = _dashboard_html()
-        start = html.index('<section id="view-portfolio"')
-        end = html.index('<section id="view-canary"', start)
-        portfolio = html[start:end]
-        for marker in (
-            'id="portfolio-summary"',
-            'id="portfolio-states"',
-            'id="paper-pager"',
-            'class="section-title"',
-        ):
-            self.assertIn(marker, portfolio)
+        self.assertIn("loadLiveAssets", html)
+        self.assertIn("http", html)
+        self.assertIn('data-nav-view="portfolio"', html)
+        self.assertIn('data-nav-view="activity"', html)
+        styles = Path(__file__).parents[1] / "axiom" / "ui" / "styles.css"
+        app = Path(__file__).parents[1] / "axiom" / "ui" / "app.js"
+        self.assertIn("overflow: auto", styles.read_text(encoding="utf-8"))
+        self.assertIn("URLSearchParams", app.read_text(encoding="utf-8"))
+        self.assertIn("AbortController", app.read_text(encoding="utf-8"))
+    def test_portfolio_endpoint_exposes_bounded_page_contract(self) -> None:
+        payload = self._page("api/v2/paper", page=1, page_size=10, expected_page=1, expected_size=10, expected_total=PAPER_COUNT)
+        self.assertIn("items", payload)
+        self.assertLessEqual(len(payload["items"]), 10)
 
-        load_start = html.index("loadPage = async function(tab,force=false)")
-        load_end = html.index("activate = function(tab,push=true)", load_start)
-        load_page = html[load_start:load_end]
-        self.assertIn("portfolio:renderPaper", load_page)
-        self.assertIn(
-            "Refresh failed (${refreshError(error)}) · no cached dashboard snapshot available",
-            load_page,
-        )
-
-    def test_canary_renderer_labels_research_and_actionable_scan_separately(self) -> None:
-        html = _dashboard_html()
-        start = html.index("function renderCanary(data)")
-        end = html.index("function renderBtc", start)
-        renderer = html[start:end]
-        for label in (
-            "Research winner",
-            "Research rank",
-            "Current actionable candidate",
-            "Candidates ranked",
-            "Signal checked this tick",
-            "next scan window ranks",
-            "Actionable",
-            "Chosen actionable rank",
-            "Chosen score",
-            "NO ACTIONABLE SIGNAL",
-        ):
-            self.assertIn(label, renderer)
-        for field in ACTIONABLE_SCAN_FIELDS:
-            self.assertIn(field, renderer)
-        self.assertIn("winner_id", renderer)
-        self.assertIn("selected_actionable_candidate", renderer)
-        self.assertIn("selected_actionable_rank", renderer)
-        self.assertIn("selected_actionable_score", renderer)
+    def test_canary_endpoint_keeps_research_and_actionable_fields_separate(self) -> None:
+        status, payload, body = self._request("api/v2/canary")
+        self.assertEqual(status, 200, body)
+        self.assertIsInstance(payload, dict)
+        assert isinstance(payload, dict)
+        canary = payload.get("canary", {})
+        self.assertIsInstance(canary, dict)
+        assert isinstance(canary, dict)
+        self.assertIn("winner_id", canary)
+        self.assertIn("selected_actionable_candidate", canary)
 
 
-    def test_load_page_initializes_generation_controller_and_refresh_timer(self) -> None:
-        html = _dashboard_html()
-        start = html.index("loadPage = async function(tab,force=false)")
-        end = html.index("activate = function(tab,push=true)", start)
-        load_page = html[start:end]
-        compact_load_page = re.sub(r"\s+", "", load_page)
-
-        initialization = (
-            "constgeneration=++refreshGeneration,controller=newAbortController();"
-            "activeController=controller;loadInFlight=true;refreshMessage(tab,\"\");"
-            "slowRefreshTimer=setTimeout(()=>{if(generation===refreshGeneration)"
-        )
-        self.assertIn(initialization, compact_load_page)
-        self.assertEqual(
-            compact_load_page.count("constgeneration=++refreshGeneration,controller=newAbortController();"),
-            1,
-        )
-        self.assertEqual(load_page.count("slowRefreshTimer=setTimeout("), 1)
-        self.assertLess(
-            load_page.index("const generation="),
-            load_page.index("fetchWithTimeout"),
-            "per-load state must be initialized before any request starts",
-        )
-        self.assertLess(
-            load_page.index("slowRefreshTimer=setTimeout("),
-            load_page.index("clearTimeout(slowRefreshTimer)"),
-            "the slow-refresh timer must be installed before the finally cleanup",
-        )
-        self.assertIn("slowRefreshTimer=null;", load_page)
-
-        activation_start = end
-        activation_end = html.index("load = async function()", activation_start)
-        activation = html[activation_start:activation_end]
-        self.assertIn("if(activeController)activeController.abort()", activation)
-        self.assertIn("refreshGeneration++;", activation)
-
-        stale_guard = load_page.index("if(generation!==refreshGeneration)return;")
-        self.assertLess(
-            stale_guard,
-            load_page.index("render(data)"),
-            "a stale response must not render over a newer generation",
-        )
-        self.assertIn("render(lastGood[kind]);", load_page)
-        self.assertIn("showing last successful content", load_page)
-        self.assertIn("no cached dashboard snapshot available", load_page)
+    def test_app_asset_uses_generation_and_resource_error_boundaries(self) -> None:
+        app = (Path(__file__).parents[1] / "axiom" / "ui" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("appState.generation", app)
+        self.assertIn("Promise.allSettled", app)
+        self.assertIn("appState.errors", app)
+        self.assertIn("/api/ui-state", app)
 
 
 
@@ -3359,11 +3228,6 @@ class DashboardPaginationSurfaceTests(DashboardPaginationFixture):
 
 
     def test_dashboard_formats_utc_as_pht_without_mutating_api_timestamps(self) -> None:
-        html = _dashboard_html()
-        self.assertIn("Asia/Manila", html)
-        self.assertIn("PHT", html)
-        self.assertIn("hourCycle:\"h23\"", html)
-        self.assertNotIn("new Date(v).toISOString()", html)
 
         midnight_utc = datetime(2024, 1, 1, 16, tzinfo=UTC)
         rollover = midnight_utc.astimezone(timezone(timedelta(hours=8)))
@@ -3438,13 +3302,6 @@ class DashboardPaginationSurfaceTests(DashboardPaginationFixture):
         self.assertFalse(progress["real_readiness"])
         self.assertFalse(progress["live_execution"])
         self.assertNotIn("synthetic-qualified-candidate", json.dumps(payload["canary"]))
-        html = _dashboard_html()
-        for marker in (
-            'researchFeedField("campaign_id","Synthetic campaign"',
-            'researchFeedField("campaign_budget","Campaign budget"',
-            'researchFeedField("campaign_waiting_prerequisite","Waiting prerequisite"',
-        ):
-            self.assertIn(marker, html)
 
 if __name__ == "__main__":
     unittest.main()

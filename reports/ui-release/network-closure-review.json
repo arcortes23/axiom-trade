@@ -1,0 +1,374 @@
+{
+  "review": "transport/polling/race closure",
+  "scope": "axiom/ui/app.js; tests/ui_fixture_server.py; transport, polling, route-abort, and selected-record disclosure identity only",
+  "fixture_only": true,
+  "production_touched": false,
+  "owned_processes": {
+    "fixture": "ui-network-fixture",
+    "fixture_url": "http://127.0.0.1:58901",
+    "fixture_admin_url": "http://127.0.0.1:58902",
+    "fixture_upstream_url": "http://127.0.0.1:58900",
+    "browser": "ui-network-chrome",
+    "browser_cdp": "ws://127.0.0.1:58581/devtools/browser/e8e2b893-f570-4954-ba6b-998141b73e39",
+    "browser_profile": "C:/Users/User/AppData/Local/Temp/axiom-ui-network-closure-final2",
+    "fixture_scenario": "prepared"
+  },
+  "reviewed_source": {
+    "source_state": "transport/poll captures retained at dede8c2 unchanged-path revision; final recovery action race rechecked against 5f6f5fea with network paths unchanged; no source edits by reviewer",
+    "app_sha256": "5f6f5fea9f417dc74366fc074db6ad4f10641ffcdb7e20a188617cff33dbd460",
+    "network_capture_app_sha256": "dede8c2d5182fd4405dbbe8d7919b0dc9b5c25c19964d0e333f5a6fdfc07c93f",
+    "app_final_freeze_marker": "5f6f5fea9f417dc74366fc074db6ad4f10641ffcdb7e20a188617cff33dbd460",
+    "pages_sha256": "93136c12a5ff0c3442197a331aff2b05964b58d534b269a48cded2f455956a77",
+    "styles_sha256": "d17b131ab2e7c96e590e4200fc5ff9e1ef1a7adcd6ce901426a45c84c6a7468e",
+    "fixture_sha256": "4bcce66f2056fc190f5bc983d32dfc2fe5d45aae6160e07ccd70e0ba5e4173a7"
+  },
+  "completed_checks": {
+    "ancillary_get503_isolation": {
+      "scenario": "prepared",
+      "admin_behavior": {
+        "fail_ancillary": true,
+        "delay_ms": 0
+      },
+      "requests": [
+        {
+          "method": "GET",
+          "url": "/api/v2/candidates?page=1&page_size=25&direction=desc",
+          "status": 200,
+          "aborted": false,
+          "count": 1
+        },
+        {
+          "method": "GET",
+          "url": "/api/v2/candidates/fixture-candidate-aurora",
+          "status": 200,
+          "aborted": false,
+          "count": 1
+        },
+        {
+          "method": "GET",
+          "url": "/api/v2/candidates/fixture-candidate-aurora/events?page=1&page_size=10",
+          "status": 503,
+          "aborted": false,
+          "count": 1
+        }
+      ],
+      "rendered_state": {
+        "primary_content": "Research strategies list and Aurora threshold study detail remained rendered",
+        "partial_state": "Partial or stale data / Some supporting records need a refresh; unknown values remain unknown.",
+        "error_isolation": "Only ancillary events request failed; primary list/detail remained usable"
+      },
+      "evidence": [
+        "reports/ui-release/network-closure-get503.png"
+      ]
+    },
+    "native_client_deadline": {
+      "scenario": "prepared",
+      "admin_behavior": {
+        "delay_ms": 10000,
+        "fail_ancillary": false
+      },
+      "client_timeout_constant_changed": false,
+      "requests": [
+        {
+          "method": "GET",
+          "url": "/api/v2/canary?page=1&page_size=25&direction=desc",
+          "status": null,
+          "status_label": "aborted/no response status",
+          "aborted": true,
+          "count": 1
+        }
+      ],
+      "rendered_state": {
+        "visible": "Unavailable; Authorization unavailable; connection disconnected; This view is unavailable; The server returned an error. Try again without changing any controls.",
+        "last_known_authority": "No active authorization / no optimistic authority"
+      },
+      "delay_evidence": "Fixture transport slept 10000ms; browser request was canceled by native requestJson deadline without changing timeout source",
+      "evidence": [
+        "reports/ui-release/network-closure-timeout.png"
+      ]
+    },
+    "route_abort_and_late_previous_response": {
+      "admin_behavior": {
+        "delay_ms": 500,
+        "fail_ancillary": false
+      },
+      "sequence": [
+        "settings route started",
+        "100ms later home route started",
+        "settings controller aborted",
+        "late settings responses arrived where already committed",
+        "home responses committed last"
+      ],
+      "requests": [
+        {
+          "route": "settings",
+          "url": "/api/risk-settings",
+          "status": null,
+          "status_label": "aborted/no response status",
+          "aborted": true,
+          "count": 1
+        },
+        {
+          "route": "settings",
+          "url": "/api/ui-state",
+          "status": null,
+          "status_label": "aborted/no response status",
+          "aborted": true,
+          "count": 1
+        },
+        {
+          "route": "settings",
+          "url": "/api/system",
+          "status": 200,
+          "aborted": false,
+          "late": true,
+          "count": 1
+        },
+        {
+          "route": "settings",
+          "url": "/api/status",
+          "status": 200,
+          "aborted": false,
+          "late": true,
+          "count": 1
+        },
+        {
+          "route": "home",
+          "url": "/api/ui-state",
+          "status": 200,
+          "aborted": false,
+          "newer": true,
+          "count": 1
+        },
+        {
+          "route": "home",
+          "url": "/api/v2/overview-summary",
+          "status": 200,
+          "aborted": false,
+          "newer": true,
+          "count": 1
+        },
+        {
+          "route": "home",
+          "url": "/api/v2/canary",
+          "status": 200,
+          "aborted": false,
+          "newer": true,
+          "count": 1
+        }
+      ],
+      "ordering_result": "Final URL and heading were Home; late settings responses did not overwrite newer Home route state",
+      "evidence": [
+        "reports/ui-release/network-closure-route-abort.png"
+      ]
+    },
+    "settings_natural_poll_after_62s": {
+      "poll_contract_seconds": 60,
+      "waited_at_least_seconds": 62,
+      "observed_request_statuses": {
+        "initial": 200,
+        "poll_after_wait": 200
+      },
+      "before": {
+        "value": "0.61",
+        "focus": "max_all_in_buy_usd",
+        "selection": [
+          0,
+          4
+        ],
+        "scroll_y": 1450,
+        "disclosures": [
+          {
+            "summary": "Connection and storage provenance",
+            "open": true
+          },
+          {
+            "summary": "Advanced status provenance",
+            "open": false
+          }
+        ]
+      },
+      "after": {
+        "value": "0.61",
+        "focus": "max_all_in_buy_usd",
+        "selection": [
+          0,
+          4
+        ],
+        "scroll_y": 1450,
+        "disclosures": [
+          {
+            "summary": "Connection and storage provenance",
+            "open": true
+          },
+          {
+            "summary": "Advanced status provenance",
+            "open": false
+          }
+        ]
+      },
+      "preserved": true,
+      "evidence": [
+        "reports/ui-release/network-closure-settings-before.png",
+        "reports/ui-release/network-closure-settings-after62s.png"
+      ]
+    },
+    "live_natural_poll_after_17s": {
+      "poll_contract_seconds": 15,
+      "waited_at_least_seconds": 17,
+      "observed_request_statuses": {
+        "initial": 200,
+        "poll_after_wait": 200
+      },
+      "before": {
+        "scroll_y": 1100,
+        "disclosures": [
+          {
+            "summary": "Technical details",
+            "open": true
+          }
+        ]
+      },
+      "after": {
+        "scroll_y": 1100,
+        "disclosures": [
+          {
+            "summary": "Technical details",
+            "open": true
+          }
+        ],
+        "heading": "Live trading \u00b7 Polymarket"
+      },
+      "preserved": true,
+      "evidence": [
+        "reports/ui-release/network-closure-live-before.png",
+        "reports/ui-release/network-closure-live-after17s.png"
+      ]
+    },
+    "selected_record_disclosure_identity": {
+      "source_record": "fixture-submission-aurora",
+      "source_record_kind": "submission",
+      "source_before": {
+        "selected": "fixture-submission-aurora",
+        "expanded_detail_disclosure": true,
+        "scroll_y": 3000
+      },
+      "selected_record_change": "fixture-position-request-aurora",
+      "selected_record_kind": "order",
+      "after": {
+        "selected": "fixture-position-request-aurora",
+        "disclosures": [
+          {
+            "summary": "Technical details",
+            "open": false
+          },
+          {
+            "summary": "Technical details",
+            "open": false
+          }
+        ],
+        "scroll_y": 3000
+      },
+      "inherited_previous_expansion": false,
+      "evidence": [
+        "reports/ui-release/network-closure-identity-after.png"
+      ]
+    },
+    "late_read_cannot_overwrite_newer_native_action_outcome": {
+      "source_sha256": "5f6f5fea9f417dc74366fc074db6ad4f10641ffcdb7e20a188617cff33dbd460",
+      "canonical_flow": {
+        "review_phrase": "REVIEW EXPLORATORY AUTHORIZATION",
+        "final_phrase": "CONFIRM EXPLORATORY LIVE",
+        "final_payload": {},
+        "review_post_count": 1,
+        "final_post_count": 1
+      },
+      "admin_behavior": {
+        "delayed_poll_delay_ms": 10000,
+        "released_for_action_delay_ms": 0
+      },
+      "requests": [
+        {
+          "id": "44368.21",
+          "method": "GET",
+          "url": "/api/v2/canary?page=1&page_size=25&direction=desc",
+          "status": null,
+          "status_label": "aborted/no response status",
+          "late_previous_read": true,
+          "count": 1
+        },
+        {
+          "id": "44368.22",
+          "method": "GET",
+          "url": "/api/ui-state",
+          "status": null,
+          "status_label": "aborted/no response status",
+          "late_previous_read": true,
+          "count": 1
+        },
+        {
+          "id": "44368.28",
+          "method": "POST",
+          "url": "/api/control",
+          "status": 200,
+          "action": "exploratory.live.review_confirm",
+          "newer_native_outcome": true,
+          "count": 1
+        },
+        {
+          "id": "44368.29",
+          "method": "GET",
+          "url": "/api/ui-state",
+          "status": 200,
+          "newer_native_outcome_read": true,
+          "count": 1
+        },
+        {
+          "id": "44368.30",
+          "method": "GET",
+          "url": "/api/v2/canary?page=1&page_size=25&direction=desc",
+          "status": 200,
+          "newer_route_refresh": true,
+          "count": 1
+        }
+      ],
+      "ordering": "Delayed prior canary/ui-state reads were aborted before their 10s response; after release, fresh preflight GETs and final POST completed 200, then newer outcome/read/refresh responses completed 200.",
+      "rendered_outcome": "Exploratory live authorization dialog showed Completed with the final button disabled; after 8s late-read wait, outcome remained Completed and no replay POST appeared.",
+      "fixture_admin_action_stats": "review total1; final confirmation total1; calls total2; no production or venue operations",
+      "evidence": [
+        "reports/ui-release/network-closure-action-late.png"
+      ]
+    }
+  },
+  "held_checks": {},
+  "limitations": [
+    "Synthetic loopback fixture only; no production, credentials, venue APIs, DB, Binance enable/resume, or real-money operations.",
+    "No source edits, repository tests, builds, linters, or formatters were run.",
+    "Settings >=62s and Live >=17s polling/disclosure proof is retained at network_capture_app_sha256; UiShell confirms those polling paths were unchanged in the final recovery status-poll pass.",
+    "Screenshots contain only sanitized fixture values and no token material."
+  ],
+  "screenshots": [
+    "reports/ui-release/network-closure-get503.png",
+    "reports/ui-release/network-closure-timeout.png",
+    "reports/ui-release/network-closure-route-abort.png",
+    "reports/ui-release/network-closure-settings-before.png",
+    "reports/ui-release/network-closure-settings-after62s.png",
+    "reports/ui-release/network-closure-live-before.png",
+    "reports/ui-release/network-closure-live-after17s.png",
+    "reports/ui-release/network-closure-identity-after.png",
+    "reports/ui-release/network-closure-action-late.png"
+  ],
+  "findings": [],
+  "verdict": "transport_polling_route_closure_pass",
+  "final_source_transport_route_confirmation": {
+    "source_sha256": "5f6f5fea9f417dc74366fc074db6ad4f10641ffcdb7e20a188617cff33dbd460",
+    "status": "confirmed_unchanged_by_UiShell",
+    "transport_route_capture_source_sha256": "dede8c2d5182fd4405dbbe8d7919b0dc9b5c25c19964d0e333f5a6fdfc07c93f",
+    "scope": [
+      "GET503 ancillary isolation",
+      "native client deadline",
+      "route abort and late previous-route response"
+    ],
+    "note": "UiShell final recovery pass restored only native status-poll/declaration behavior; network request/route paths were unchanged, so prior transport/route evidence remains valid by captured source version."
+  }
+}

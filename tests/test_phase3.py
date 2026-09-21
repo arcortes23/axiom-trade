@@ -2925,7 +2925,7 @@ class Phase3NodeDashboardTests(unittest.TestCase):
 
 
     def test_dashboard_facade_exposes_phase3_fields(self) -> None:
-        from axiom.dashboard import DashboardData, _dashboard_html
+        from axiom.dashboard import DashboardData
 
         with AxiomStore(":memory:") as store:
             data = DashboardData(store=store)
@@ -2939,10 +2939,7 @@ class Phase3NodeDashboardTests(unittest.TestCase):
                 heartbeat_at=T0,
             )
             self.assertEqual(data.status_data()["status"], "degraded")
-            html = _dashboard_html()
-            self.assertIn("Research maturity", html)
-            self.assertIn("Paper forward", html)
-            self.assertIn("Research queue and node status", html)
+            # UI presentation is covered by the pure adapter and fixture HTTP tests.
 
 
 class CandidateForwardAuthorityTests(unittest.TestCase):

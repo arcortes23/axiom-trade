@@ -1,0 +1,203 @@
+{
+  "review": "AXIOM UI visual closure review",
+  "status": "complete",
+  "overall_correctness": "correct",
+  "scope": "Read-only runtime closure for axiom/ui/app.js and axiom/ui/styles.css after the final app and styles freeze. No source edits, repository tests/build/lint/formatters, production access, credentials, venue traffic, financial/control POSTs, or changes to prior reports.",
+  "fixture": {
+    "process": "UiVisualClosureFixture",
+    "url": "http://127.0.0.1:58487",
+    "upstream_url": "http://127.0.0.1:58486",
+    "admin_url": "http://127.0.0.1:58489",
+    "scenario": "prepared",
+    "terms_observed": "synthetic native fixture budget 5.00, duration 86400 seconds",
+    "isolation": "private synthetic fixture only; process stopped after evidence",
+    "control_post_log": "No POST/control/action lines were emitted during the authorized 5f6 final recheck"
+  },
+  "browser": {
+    "process": "UiVisualClosureChrome",
+    "cdp": "ws://127.0.0.1:54682/devtools/browser/660c95e7-6480-4f04-8c11-41e8a801ef1a",
+    "session": "ui-visual-closure-authorized-final",
+    "profile": "C:/Users/User/AppData/Local/Temp/axiom-ui-visual-closure-authorized-final-profile",
+    "isolation": "private profile, released after authorized final evidence",
+    "zoom_method": "Chrome Settings > Appearance > Page zoom combobox selected 200%; no CSS zoom or emulation substitution",
+    "desktop_measurement": {
+      "physical_viewport": "1280x900",
+      "css_inner_viewport": "640x450",
+      "device_pixel_ratio": 2,
+      "visual_viewport_scale": 1
+    },
+    "mobile_drawer_measurement": {
+      "physical_viewport": "780x844",
+      "css_inner_viewport": "390x422",
+      "device_pixel_ratio": 2
+    }
+  },
+  "source": {
+    "freeze": "Main authorized 5f6f5fea as final after restoring the prior-final native poll declaration; no CSS/layout changes",
+    "axiom/ui/app.js_sha256": "5f6f5fea9f417dc74366fc074db6ad4f10641ffcdb7e20a188617cff33dbd460",
+    "axiom/ui/styles.css_sha256": "d17b131ab2e7c96e590e4200fc5ff9e1ef1a7adcd6ce901426a45c84c6a7468e",
+    "prior_visual_report": "reports/ui-release/visual-final-review.json",
+    "prior_visual_styles_sha256": "f4af47a3bc73271a804fa9631758b5b7640920b3c5386f80bcfb16e2fd2f1f13",
+    "final_recheck_scope": "Authorized final 5f6 affected paths: technical detail/copy path and no-authority review dialog focus; native 200 zoom and unaffected layout proof retained honestly from preceding freeze because Main confirmed no visual/CSS changes"
+  },
+  "screenshots": [
+    "reports/ui-release/visual-closure-home-200.png",
+    "reports/ui-release/visual-closure-markets-200.png",
+    "reports/ui-release/visual-closure-dense-table-200.png",
+    "reports/ui-release/visual-closure-settings-200.png",
+    "reports/ui-release/visual-closure-review-dialog-200.png",
+    "reports/ui-release/visual-closure-copy-control-200.png"
+  ],
+  "checks": [
+    {
+      "name": "actual browser 200 percent",
+      "result": "pass",
+      "evidence": "Authorized 5f6 final recheck used Chrome Settings Page zoom 200%; measured dpr=2, visualViewport.scale=1, physical1280x900 represented as CSS640x450. No CSS zoom or emulation substitution."
+    },
+    {
+      "name": "Home at actual 200 percent",
+      "result": "pass",
+      "evidence": "Combined FINAL FREEZE Home screenshot is visual-closure-home-200.png; root clientWidth=632 and scrollWidth=632, pageOverflow=false. Home controls remained reachable and the final shaped-overview-error presentation path was exercised against the frozen fixture."
+    },
+    {
+      "name": "dense table at actual 200 percent",
+      "result": "pass",
+      "evidence": "Final-source market list is visual-closure-markets-200.png and table viewport evidence is visual-closure-dense-table-200.png. The table region had role=region, aria-label=Bounded Polymarket market list, tabIndex=0, clientWidth=545, scrollWidth=996; focusing it and moving local scrollLeft from 0 to 451 left page scrollX=0 and pageOverflow=false."
+    },
+    {
+      "name": "Settings at actual 200 percent",
+      "result": "pass",
+      "evidence": "Final-source screenshot is visual-closure-settings-200.png. DOM measured root 632/632 and body 633/633 with pageOverflow=false; 111 buttons/inputs/selects/textareas/links were present and visible risk controls remained readable and reachable."
+    },
+    {
+      "name": "no-authority review dialog at actual 200 percent",
+      "result": "pass",
+      "evidence": "Authorized 5f6 final affected-path recheck opened the no-authority dialog at dpr=2 and CSS640x450: rect x=19,y=19,width=594.5,height=412, pageOverflow=false, 41 visible controls, focus on Type REVIEW EXPLORATORY AUTHORIZATION, prepared-scenario adverse field absent as not required. Escape restored Review and start. Screenshot: visual-closure-review-dialog-200.png."
+    },
+    {
+      "name": "mobile drawer Escape focus",
+      "result": "pass",
+      "evidence": "Combined FINAL FREEZE app.js SHA dee1fe8f... at actual 200% mobile CSS390x422: Menu then Escape resulted in aria-expanded=false, activeElement Menu, main.inert=false, pageOverflow=false."
+    },
+    {
+      "name": "Clipboard API copy",
+      "result": "pass",
+      "evidence": "Against authorized app.js SHA 5f6f5fea... and styles SHA d17b131a..., private Chrome read permission was granted only to the fixture origin; clicking full synthetic Market ID copy yielded navigator.clipboard.readText length=21 and matchesExpected=true for fixture-market-aurora. Screenshot: visual-closure-copy-control-200.png."
+    },
+    {
+      "name": "Aurora technical-detail overflow after styles fix",
+      "result": "pass",
+      "evidence": "Against authorized app.js SHA 5f6f5fea... and styles SHA d17b131a..., native 200% technical pre measured clientWidth=593, scrollWidth=593, whiteSpace=pre-wrap, overflowWrap=anywhere; root632/632, body633/633, pageOverflow=false, scrollX=0."
+    },
+    {
+      "name": "prior 13-destination artifacts",
+      "result": "accepted_as_prior_evidence",
+      "evidence": "The unchanged prior report lists all 13 after-1280 screenshots plus responsive 390, 768, and 1440 artifacts. This closure run did not duplicate that sweep; it refreshed only visual-closure-* evidence after the final styles hash."
+    },
+    {
+      "name": "safety and cleanup",
+      "result": "pass",
+      "evidence": "Only the authorized-final private prepared fixture and private Chrome profile were used. Final fixture logs showed no POST/control/action lines. Authorized-final browser and fixture were released; no source or earlier reviewer report was edited."
+    }
+  ],
+  "resolved_findings": [
+    {
+      "id": "VISUAL-CLOSURE-001",
+      "title": "Contain technical detail JSON at 200% zoom",
+      "initial_failure": "Before the final styles fix, the technical pre had clientWidth=593 and scrollWidth=669, producing documentElement 632/688 and body 633/689 at native 200%.",
+      "resolution": "Final d17 styles constrain technical/summary/pre intrinsic widths and use local overflow with pre-wrap/anywhere. Authorized 5f6 final recheck measured pre593/593 and pageOverflow=false.",
+      "final_evidence": "reports/ui-release/visual-closure-copy-control-200.png"
+    }
+  ],
+  "offline_reference": {
+    "status": "verified_current",
+    "dashboard_py_sha256": "b0dc20898bb748dc4d180e89848b958831b978880e6b206f67ffca6e6bdac469",
+    "saved_template_sha256": "e399e436093aee12636d77d5c21ff1a3942d1880801c083432cf5f4ab7e0a226",
+    "current_template_sha256": "e399e436093aee12636d77d5c21ff1a3942d1880801c083432cf5f4ab7e0a226",
+    "exact_match_current_template": true,
+    "browser_process": "UiVisualClosureChrome",
+    "browser_cdp": "ws://127.0.0.1:57262/devtools/browser/b4f02eb9-5ec4-4e4f-b819-46738f0b81c6",
+    "browser_profile": "C:/Users/User/AppData/Local/Temp/axiom-ui-visual-closure-offline-profile",
+    "file_url": "file:///C:/Users/User/projects/axiom-ui/reports/ui-release/offline-reference.html",
+    "runtime_checks": {
+      "protocol": "file:",
+      "offline_title": "Read-only workspace copy",
+      "resource_urls": [],
+      "network_like_resources": 0,
+      "link_count": 9,
+      "links_disabled": true,
+      "actions_hidden_or_disabled": true,
+      "href_unchanged_after_home_click": true,
+      "long_hex_count": 0,
+      "credential_literal_count": 0
+    },
+    "prior_paths": [
+      "reports/ui-release/offline-reference.html",
+      "reports/ui-release/offline-final-1280.png",
+      "reports/ui-release/offline-final-mobile-390.png",
+      "reports/ui-release/offline-evidence.json"
+    ],
+    "mapping": "Saved offline-reference.html exactly matches the current _dashboard_html() output at dashboard.py SHA b0dc2089...; prior offline screenshots/evidence remain valid historical artifacts and were not refreshed because the current dashboard template and rendered offline document are byte-identical."
+  },
+  "limitations": [
+    "No production, LIVE8080, venue, credentials, real database, or financial/control POST was used.",
+    "The prior report remains the source of truth for the complete 13-destination before/after and responsive screenshot sweep; this report does not replace those artifacts."
+  ],
+  "screenshot_attribution": {
+    "current_app5f6": [
+      "reports/ui-release/visual-closure-copy-control-200.png",
+      "reports/ui-release/visual-closure-review-dialog-200.png"
+    ],
+    "prior_appdee1_no_visual_change": [
+      "reports/ui-release/visual-closure-home-200.png"
+    ],
+    "prior_app001b4_no_visual_change": [
+      "reports/ui-release/visual-closure-markets-200.png",
+      "reports/ui-release/visual-closure-dense-table-200.png",
+      "reports/ui-release/visual-closure-settings-200.png"
+    ],
+    "styles_hash_all": "d17b131ab2e7c96e590e4200fc5ff9e1ef1a7adcd6ce901426a45c84c6a7468e"
+  },
+  "current_source_recheck": {
+    "app_js_sha256": "5f6f5fea9f417dc74366fc074db6ad4f10641ffcdb7e20a188617cff33dbd460",
+    "styles_css_sha256": "d17b131ab2e7c96e590e4200fc5ff9e1ef1a7adcd6ce901426a45c84c6a7468e",
+    "actual_zoom": {
+      "dpr": 2,
+      "innerWidth": 640,
+      "innerHeight": 450,
+      "visualScale": 1
+    },
+    "technical_detail": {
+      "pre_clientWidth": 593,
+      "pre_scrollWidth": 593,
+      "whiteSpace": "pre-wrap",
+      "overflowWrap": "anywhere",
+      "rootClientWidth": 632,
+      "rootScrollWidth": 632,
+      "bodyClientWidth": 633,
+      "bodyScrollWidth": 633,
+      "pageOverflow": false,
+      "scrollX": 0
+    },
+    "clipboard": {
+      "permission": "granted",
+      "matchesExpected": true,
+      "length": 21,
+      "expected": "fixture-market-aurora"
+    },
+    "review_dialog": {
+      "dialogRect": "x=19,y=19,width=594.5,height=412",
+      "pageOverflow": false,
+      "visibleControls": 41,
+      "focusLabel": "Type REVIEW EXPLORATORY AUTHORIZATION",
+      "adverseFieldPresent": false,
+      "escapeRestored": "Review and start",
+      "postEscapePageOverflow": false
+    },
+    "screenshots": [
+      "reports/ui-release/visual-closure-copy-control-200.png",
+      "reports/ui-release/visual-closure-review-dialog-200.png"
+    ],
+    "unaffected_paths": "Home/dense-table/Settings/mobile-drawer prior evidence retained at preceding app hashes because final owner confirmed no visual/CSS changes."
+  }
+}

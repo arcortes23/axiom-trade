@@ -1,0 +1,15 @@
+{
+  "reviewer": "UiSafetyReview",
+  "overall_correctness": "correct",
+  "explanation": "Independent recheck of the combined final app freeze confirms fresh-term fencing, cancellation/version ownership, exact pending-action correlation, terminal read-only recovery, and failed-review retry behavior. No unresolved source-safety defect remains in the reviewed UI paths.",
+  "confidence": 0.99,
+  "findings": [],
+  "source_hashes": {
+    "axiom/ui/app.js": "5f6f5fea9f417dc74366fc074db6ad4f10641ffcdb7e20a188617cff33dbd460",
+    "axiom/ui/pages.js": "93136c12a5ff0c3442197a331aff2b05964b58d534b269a48cded2f455956a77",
+    "tests/test_dashboard_ui.py": "5694d546cb4422a4c3652c7a9b8e75cc4d26fa53d7be3f0279be1e9d31421469",
+    "tests/ui_fixture_server.py": "4bcce66f2056fc190f5bc983d32dfc2fe5d45aae6160e07ccd70e0ba5e4173a7",
+    "axiom/operator.py": "f1e4ef2e15cc9c415fdce33cfb73142905c20ca182d5b6281ece385b068d8483",
+    "axiom/dashboard.py": "b0dc20898bb748dc4d180e89848b958831b978880e6b206f67ffca6e6bdac469"
+  }
+}
