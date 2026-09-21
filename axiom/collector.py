@@ -5166,7 +5166,6 @@ class PolymarketCollector:
                 for snapshot in direct_snapshots.values()
             ]
             current_records = [*direct_records, *carried_records]
-
             self._scope_direct_protected_lookup_cursor = (
                 protected_cursor_start
                 + len(pre_direct_attempted_ids)
@@ -5196,6 +5195,11 @@ class PolymarketCollector:
             _MAX_SCOPE_RESOLUTION_MARKETS,
             max(0, len(current_records)),
         )
+        requested_rule_direct_ids = {
+            str(market_id).strip()
+            for market_id in requested_rule_ids
+            if str(market_id).strip() in pre_direct_snapshots
+        }
 
         candidate_markets: dict[str, list[str]] = {}
         deferred_resolution_ids: list[str] = []
@@ -5230,16 +5234,44 @@ class PolymarketCollector:
                     self._scope_exact_market_ids((document,))
                 )
             )
+            rule_scope = (
+                policy is not None
+                and str(getattr(policy, "mode", "")).upper()
+                == "RULE_BASED_MARKETS"
+            )
+            direct_rule_scope = (
+                coverage != "COMPLETE"
+                and not suitability_configured
+                and rule_scope
+                and bool(requested_rule_direct_ids)
+            )
             if (
                 coverage != "COMPLETE"
                 and not suitability_configured
                 and not direct_exact_scope
+                and not direct_rule_scope
             ):
                 # A page-local match is not authority without a current
-                # selected-token suitability proof.  Exact ids are resolved
-                # early only after their bounded direct lookup has run.
+                # selected-token suitability proof. Exact ids and explicit
+                # requested RULE ids are resolved early only after their
+                # bounded direct lookup has run.
                 deferred_resolution_ids.append(candidate_id)
                 continue
+            if direct_rule_scope:
+                candidate_records = [
+                    record
+                    for record in candidate_records
+                    if (
+                        isinstance(record, Mapping)
+                        and str(record.get("market_id", "")).strip()
+                        in requested_rule_direct_ids
+                    )
+                ]
+                candidate_snapshots = {
+                    market_id: snapshot
+                    for market_id, snapshot in candidate_snapshots.items()
+                    if market_id in requested_rule_direct_ids
+                }
             if candidate_id in refresh_candidate_set:
                 self._scope_observation_refresh_attempted_ids.add(candidate_id)
 
