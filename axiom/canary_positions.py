@@ -5017,6 +5017,19 @@ def manage_positions(
         if available <= DUST or (not forced and not _policy_due(lot, now)):
             continue
         try:
+            opening_context = _opening_lot_lineage(service, lot)
+            current_controller = _require_controller_lease(
+                service,
+                context=None,
+                now=now,
+            )
+            opening_context.update(
+                {
+                    "controller_owner_id": current_controller.get("owner_id"),
+                    "controller_generation": current_controller.get("generation"),
+                    "controller_lease_generation": current_controller.get("generation"),
+                }
+            )
             config = service.settings.snapshot(now=now) if service.settings is not None else {}
             result = submit_exit(
                 service,
@@ -5025,7 +5038,7 @@ def manage_positions(
                 expected_generation=int(config.get("generation", 0)),
                 config_id=str(config.get("config_id") or ""),
                 allow_test_venue=allow_test_venue,
-                rolling_context=_opening_lot_lineage(service, lot),
+                rolling_context=opening_context,
                 force_exit=forced,
             )
             submitted.append(result)

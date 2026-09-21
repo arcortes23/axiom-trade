@@ -27,8 +27,10 @@ from axiom.operator import (
     DEFAULT_HERMES_JOB_ID,
     OperatorControlError,
     OperatorControlPlane,
+    ROLLING_EXPLORATORY_PROPOSAL_CONFIG_KEY,
     ROLLING_EXPLORATORY_SCOPE_DRAFT_CONFIG_KEY,
     _loopback_host,
+    _project_connectivity,
 )
 from axiom.forward import _operational_setup_hash
 from axiom.ranker import CandidateCanaryRanker
@@ -113,76 +115,23 @@ def _safe_connectivity_projection(
     checked_at: str = "2026-01-02T12:00:00+00:00",
     credentials_configured: bool = True,
 ) -> dict[str, object]:
-    projected_ready = bool(ready and credentials_configured)
-    if not credentials_configured:
-        failure_codes = ["CREDENTIALS_NOT_CONFIGURED"]
-        failure_reasons = [
-            {
-                "code": "CREDENTIALS_NOT_CONFIGURED",
-                "reason": "Polymarket credentials are not configured.",
-            }
-        ]
-        sdk = {
-            "installed": False,
-            "name": "polymarket-client",
-            "version": None,
-            "status": "NOT INSTALLED",
-        }
-        credentials = {"status": "NOT CONFIGURED"}
-        authentication = {"status": "SKIPPED"}
-        account = {
-            "status": "SKIPPED",
-            "wallet_type": None,
-            "credential_fingerprint": None,
-        }
-        geoblock = {"status": "SKIPPED", "country": None, "region": None}
-        balance = {"status": "SKIPPED", "available_usd": None}
-        allowance = {"status": "SKIPPED"}
-    else:
-        failure_codes = [] if projected_ready else ["CANARY_ALLOWANCE_INSUFFICIENT"]
-        failure_reasons = (
-            []
-            if projected_ready
-            else [
-                {
-                    "code": "CANARY_ALLOWANCE_INSUFFICIENT",
-                    "reason": "Current allowance is below the active canary requirement.",
-                }
-            ]
+    raw = _raw_connectivity_result(
+        allowance_status=(
+            "OK"
+            if allowance_status in {"OK", "AVAILABLE", "SUFFICIENT"}
+            else allowance_status
         )
-        sdk = {
-            "installed": True,
-            "name": "polymarket-client",
-            "version": "0.9.0",
-            "status": "INSTALLED",
-        }
-        credentials = {"status": "CONFIGURED"}
-        authentication = {"status": "PASS"}
-        account = {
-            "status": "PASS",
-            "wallet_type": "EOA",
-            "credential_fingerprint": CONNECTIVITY_CREDENTIAL_FINGERPRINT,
-        }
-        geoblock = {"status": "PASS", "country": "ZZ", "region": "T"}
-        balance = {"status": "PASS", "available_usd": "10"}
-        allowance = {"status": allowance_status}
-    return {
-        "ready": projected_ready,
-        "status": "READY" if projected_ready else "BLOCKED",
-        "checked_at": checked_at,
-        "sdk": sdk,
-        "credentials": credentials,
-        "authentication": authentication,
-        "account": account,
-        "geoblock": geoblock,
-        "balance": balance,
-        "allowance": allowance,
-        "market": {"status": "SKIPPED"},
-        "order_book": {"status": "SKIPPED"},
-        "failure_codes": failure_codes,
-        "failure_reasons": failure_reasons,
-        "live_execution": False,
-    }
+    )
+    raw["ready"] = bool(ready and credentials_configured)
+    raw["checked_at"] = checked_at
+    return _project_connectivity(
+        raw,
+        checked_at=checked_at,
+        authoritative_credentials_configured=credentials_configured,
+        authoritative_fingerprint=(
+            CONNECTIVITY_CREDENTIAL_FINGERPRINT if credentials_configured else None
+        ),
+    )
 
 
 class ConnectivityVenueSentinel:
@@ -257,6 +206,50 @@ class ConnectivityVenueSentinel:
     def approve(self, **_: object) -> None:
         self.approval_calls += 1
         raise AssertionError("connectivity check attempted an approval")
+ 
+ 
+class ProposedReadinessVenue(ConnectivityVenueSentinel):
+    """Read-only venue bound to the proposal's exact market/token identities."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.market_context_calls: list[tuple[str, str]] = []
+
+    def market_context(self, market_id: str, token_id: str) -> dict[str, object]:
+        pair = (str(market_id), str(token_id))
+        self.market_context_calls.append(pair)
+        if pair[0] != "MARKET-1" or pair[1] not in {"MARKET-1-YES", "MARKET-1-NO"}:
+            raise AssertionError(f"unexpected proposed market/token binding: {pair!r}")
+        outcome = "yes" if pair[1].endswith("-YES") else "no"
+        return {
+            "market_id": pair[0],
+            "token_id": pair[1],
+            "asset_id": pair[1],
+            "position_id": pair[1],
+            "market_version": "v2",
+            "outcome": outcome,
+            "outcome_index": 0 if outcome == "yes" else 1,
+            "identity_bindings": [
+                {
+                    "index": 0 if outcome == "yes" else 1,
+                    "outcome": outcome,
+                    "token_id": pair[1],
+                    "position_id": pair[1],
+                }
+            ],
+            "accepting_orders": True,
+            "min_order_size": "5",
+            "tick_size": "0.001",
+            "neg_risk": False,
+            "bids": [
+                {"price": "0.001" if outcome == "yes" else "0.998", "size": "100"}
+            ],
+            "asks": [
+                {"price": "0.002" if outcome == "yes" else "0.999", "size": "100"}
+            ],
+            "fee_bps": "0",
+            "allowance": self.allowance(),
+        }
 
 class RecoveryVenue:
     def __init__(self, order: dict[str, object]) -> None:
@@ -304,12 +297,12 @@ class OperatorControlTests(unittest.TestCase):
         self.addCleanup(self._production_profile.stop)
         self.db = str(Path(self.tempdir.name) / "operator.sqlite")
         self.store = AxiomStore(self.db)
+        self.addCleanup(self.store.close)
         self.control = OperatorControlPlane(self.store, system_bootstrap_enabled=True)
         self.server = DashboardServer(
             port=0,
             data=DashboardData(store=self.store, control=self.control),
         ).start()
-        self.addCleanup(self.store.close)
         self.addCleanup(self.server.stop)
     def _seed_recovery_entry(self) -> None:
         service = CanaryService(
@@ -848,6 +841,8 @@ class OperatorControlTests(unittest.TestCase):
                 "failure_codes",
                 "failure_reasons",
                 "live_execution",
+                "readiness_binding",
+                "diagnostics",
             },
         )
         self.assertFalse(connectivity["live_execution"])
@@ -3268,6 +3263,10 @@ class OperatorControlTests(unittest.TestCase):
             }
         )
         self.store.commit_portfolio_selection(selection, [member])
+        self.control.review_rolling_admission_policy(
+            policy.as_dict(),
+            actor="test-operator",
+        )
         context = {
             "selection_id": "selection-proposed",
             "policy_id": policy.policy_id,
@@ -3355,6 +3354,157 @@ class OperatorControlTests(unittest.TestCase):
             expected_market,
         )
 
+    def test_real_http_connectivity_target_publishes_fresh_proposed_readiness(self) -> None:
+        self._seed_proposed_selection()
+        selection = self.store.load_current_portfolio_selection()
+        self.assertIsInstance(selection, dict)
+        assert isinstance(selection, dict)
+        baseline = self.control._selected_market_readiness(
+            selection,
+            target_candidate_id="candidate-proposed",
+        )
+        self.assertEqual(baseline["status"], "BLOCKED")
+        self.assertEqual(baseline["diagnostics"]["account"], {})
+        self.assertEqual(baseline["diagnostics"]["market"], {})
+
+        now = datetime(2026, 1, 2, 12, tzinfo=timezone.utc)
+        credentials = _configured_credentials()
+        venue = ProposedReadinessVenue()
+        assert self.server._server is not None
+        with patch("axiom.operator.CredentialStore", return_value=credentials), patch(
+            "axiom.operator.PolymarketClobV2Venue",
+            return_value=venue,
+        ), patch("axiom.operator.utc_now", return_value=now):
+            status, result = self._post(
+                {
+                    "action": "canary.connectivity_check",
+                    "target": "candidate-proposed",
+                },
+                token=self.server._server.control_token,
+            )
+            self.assertEqual(status, 200)
+            self.assertTrue(result["ok"])
+            self.assertTrue(result["result"]["connectivity"]["ready"])
+
+            assert self.server.url is not None
+            with urlopen(self.server.url + "/api/operator", timeout=3) as response:
+                payload = json.loads(response.read())
+
+        review = payload["control_status"]["exploratory_live_review"]
+        readiness = review["readiness"]
+        self.assertEqual(readiness["status"], "READY")
+        self.assertTrue(readiness["fresh"])
+        self.assertEqual(readiness["market_id"], "MARKET-1")
+        self.assertEqual(readiness["diagnostics"]["account"]["authenticated"], True)
+        self.assertFalse(readiness["diagnostics"]["geoblock"]["blocked"])
+        self.assertFalse(readiness["diagnostics"]["geoblock"]["close_only"])
+        self.assertEqual(readiness["diagnostics"]["balance"]["status"], "OK")
+        self.assertEqual(readiness["diagnostics"]["allowance"]["status"], "OK")
+        self.assertEqual(readiness["diagnostics"]["market"]["market_id"], "MARKET-1")
+        legs = readiness["diagnostics"]["token_readiness"]
+        self.assertEqual(
+            {(leg["outcome"], leg["token_id"]) for leg in legs},
+            {("YES", "MARKET-1-YES"), ("NO", "MARKET-1-NO")},
+        )
+        leg_by_outcome = {leg["outcome"]: leg for leg in legs}
+        self.assertTrue(leg_by_outcome["YES"]["ready"])
+        self.assertTrue(leg_by_outcome["YES"]["trade_ready"])
+        self.assertTrue(leg_by_outcome["NO"]["ready"])
+        self.assertFalse(leg_by_outcome["NO"]["trade_ready"])
+        self.assertIn(
+            "VENUE_MINIMUM_EXCEEDS_CANARY_TARGET",
+            leg_by_outcome["NO"]["trade_blockers"],
+        )
+        depth = leg_by_outcome["YES"]["diagnostics"]["book"]["depth_assessment"]
+        self.assertEqual(depth["action"], "SUITABLE")
+        self.assertEqual(depth["requested_quantity"], "5")
+        self.assertEqual(depth["required_quantity"], "5")
+        self.assertEqual(depth["required_cost"], "0.010")
+        self.assertLessEqual(Decimal(depth["required_cost"]), Decimal("1.00"))
+        self.assertEqual(review["proposal_status"], "UNACTIVATED")
+        self.assertEqual(review["authorization_choices"]["status"], "UNREVIEWED")
+        self.assertTrue(review["paper_only"])
+        self.assertFalse(review["live_execution"])
+        self.assertEqual(
+            set(venue.market_context_calls),
+            {("MARKET-1", "MARKET-1-YES"), ("MARKET-1", "MARKET-1-NO")},
+        )
+        self.assertEqual(venue.order_calls, 0)
+        self.assertEqual(venue.approval_calls, 0)
+        encoded = json.dumps({"response": result, "review": review}, default=str)
+        for secret in CONNECTIVITY_SECRET_VALUES:
+            self.assertNotIn(secret, encoded)
+
+    def test_real_http_readiness_rejects_immutable_successor_and_stale_proof(self) -> None:
+        self._seed_proposed_selection()
+        now = datetime(2026, 1, 2, 12, tzinfo=timezone.utc)
+        credentials = _configured_credentials()
+        venue = ProposedReadinessVenue()
+        assert self.server._server is not None
+        with patch("axiom.operator.CredentialStore", return_value=credentials), patch(
+            "axiom.operator.PolymarketClobV2Venue",
+            return_value=venue,
+        ), patch("axiom.operator.utc_now", return_value=now):
+            status, result = self._post(
+                {
+                    "action": "canary.connectivity_check",
+                    "target": "candidate-proposed",
+                },
+                token=self.server._server.control_token,
+            )
+        self.assertEqual(status, 200)
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["result"]["connectivity"]["ready"])
+        predecessor = self.store.load_current_portfolio_selection()
+        self.assertIsInstance(predecessor, dict)
+        assert isinstance(predecessor, dict)
+        predecessor_id = predecessor["selection_id"]
+        successor = dict(predecessor)
+        successor_id = "selection-proposed-wrong-successor"
+        successor.update(
+            {
+                "selection_id": successor_id,
+                "portfolio_selection_id": successor_id,
+                "supersedes_portfolio_selection_id": predecessor_id,
+            }
+        )
+        successor.pop("selection_hash", None)
+        wrong_member = dict(successor["members"][0])
+        wrong_member["current_market_binding"] = {
+            "market_id": "MARKET-WRONG",
+            "condition_id": "MARKET-WRONG-CONDITION",
+            "token_id": "MARKET-WRONG-YES",
+            "yes_token_id": "MARKET-WRONG-YES",
+            "no_token_id": "MARKET-WRONG-NO",
+        }
+        successor["members"] = [wrong_member]
+        self.store.commit_portfolio_selection(successor, [wrong_member])
+        current = self.store.load_current_portfolio_selection()
+        self.assertEqual(current["selection_id"], successor_id)
+        self.assertNotEqual(current["selection_id"], predecessor["selection_id"])
+
+        with patch("axiom.operator.utc_now", return_value=now):
+            assert self.server.url is not None
+            with urlopen(self.server.url + "/api/operator", timeout=3) as response:
+                payload = json.loads(response.read())
+        readiness = payload["control_status"]["exploratory_live_review"]["readiness"]
+        self.assertIn(
+            "SELECTED_MARKET_READINESS_BINDING_STALE",
+            readiness["blockers"],
+        )
+
+        with patch(
+            "axiom.operator.utc_now",
+            return_value=now + timedelta(seconds=61),
+        ):
+            with urlopen(self.server.url + "/api/operator", timeout=3) as response:
+                stale_payload = json.loads(response.read())
+        stale_readiness = stale_payload["control_status"]["exploratory_live_review"]["readiness"]
+        self.assertEqual(stale_readiness["status"], "BLOCKED")
+        self.assertIn("SELECTED_MARKET_READINESS_STALE", stale_readiness["blockers"])
+        self.assertEqual(venue.order_calls, 0)
+        self.assertEqual(venue.approval_calls, 0)
+
 
     def test_real_store_selection_reason_drives_no_member_root(self) -> None:
         self._seed_proposed_selection()
@@ -3381,6 +3531,10 @@ class OperatorControlTests(unittest.TestCase):
             }
         )
         self.store.commit_portfolio_selection(selection, [])
+        self.store.set_operator_config(
+            ROLLING_EXPLORATORY_PROPOSAL_CONFIG_KEY,
+            {"selection_id": "selection-no-member-root"},
+        )
         snapshot = self.control.exploratory_live_review_snapshot()
         reason = snapshot["no_member_reason"]
         self.assertEqual(
@@ -3425,9 +3579,13 @@ class OperatorControlTests(unittest.TestCase):
         persisted_selection = self.store.load_current_portfolio_selection()
         self.assertIsNotNone(persisted_selection)
         assert persisted_selection is not None
-        self.assertEqual(persisted_selection["members"][0]["allocation"], "1.00")
+        self.assertEqual(persisted_selection["members"][0]["allocation"], "0")
         self.assertEqual(persisted_selection["members"][0]["proposed_allocation"], "1.00")
         self.assertFalse(persisted_selection["members"][0]["allocation_active"])
+        paper_review = self.control.exploratory_live_review_snapshot()
+        self.assertEqual(paper_review["members"][0]["allocation"], "1.00")
+        self.assertEqual(paper_review["members"][0]["proposed_allocation"], "1.00")
+        self.assertFalse(paper_review["members"][0]["allocation_active"])
     def test_real_store_review_confirm_exact_then_stale_binding_stays_safe(self) -> None:
         self._seed_proposed_selection()
         reviewed = self.control.review_execution_authorization(
@@ -3450,13 +3608,18 @@ class OperatorControlTests(unittest.TestCase):
             disclosure["authorization_bindings"]["selection_hash"],
             draft["selection_hash"],
         )
-        with self.assertRaisesRegex(
-            OperatorControlError,
-            "^CONNECTIVITY_NOT_READY$",
-        ):
-            self.control.confirm_exploratory_live(
-                {"confirmation": "CONFIRM EXPLORATORY LIVE"}
-            )
+        unavailable_credentials = Mock()
+        unavailable_credentials.configured.return_value = False
+        with patch(
+            "axiom.operator.CredentialStore",
+            return_value=unavailable_credentials,
+        ), patch("axiom.operator.PolymarketClobV2Venue") as venue_factory:
+            with self.assertRaises(OperatorControlError):
+                self.control.confirm_exploratory_live(
+                    {"confirmation": "CONFIRM EXPLORATORY LIVE"}
+                )
+        unavailable_credentials.configured.assert_called_with(allow_environment=False)
+        venue_factory.assert_not_called()
         self.assertEqual(
             self.store.get_operator_config("execution_authorization_review", {})["status"],
             "DRAFT",
@@ -3479,18 +3642,31 @@ class OperatorControlTests(unittest.TestCase):
             }
         )
         self.store.commit_portfolio_selection(stale, stale["members"])
-        with patch.object(
-            self.control,
-            "_selected_market_readiness",
-            return_value={"status": "READY", "blockers": []},
+        self.store.set_operator_config(
+            ROLLING_EXPLORATORY_PROPOSAL_CONFIG_KEY,
+            {
+                "selection_id": "selection-stale-after-review",
+                "selection_hash": stale.get("selection_hash", ""),
+            },
+        )
+        credentials = _configured_credentials()
+        venue = ProposedReadinessVenue()
+        with patch("axiom.operator.CredentialStore", return_value=credentials), patch(
+            "axiom.operator.PolymarketClobV2Venue",
+            return_value=venue,
         ):
-            with self.assertRaisesRegex(
-                OperatorControlError,
-                "^EXPLORATORY_LIVE_AUTHORIZATION_BINDING_STALE$",
+            with patch.object(
+                self.control,
+                "_selected_market_readiness",
+                return_value={"status": "READY", "blockers": []},
             ):
-                self.control.confirm_exploratory_live(
-                    {"confirmation": "CONFIRM EXPLORATORY LIVE"}
-                )
+                with self.assertRaisesRegex(
+                    OperatorControlError,
+                    "^EXPLORATORY_LIVE_AUTHORIZATION_BINDING_STALE$",
+                ):
+                    self.control.confirm_exploratory_live(
+                        {"confirmation": "CONFIRM EXPLORATORY LIVE"}
+                    )
         self.assertEqual(
             self.store.get_operator_config("execution_authorization_review", {})["status"],
             "DRAFT",
@@ -3529,40 +3705,26 @@ class OperatorControlTests(unittest.TestCase):
             0,
         )
 
-    def test_proposed_allocation_is_paper_before_confirm_and_active_after_restart(self) -> None:
-        context, _ = self._seed_proposed_selection()
-        before = self.store.load_current_portfolio_selection()
-        assert before is not None
-        self.assertEqual(before["members"][0]["allocation"], "0")
-        self.assertEqual(before["members"][0]["proposed_allocation"], "1.00")
-        activated = self.control._activate_reviewed_proposed_selection(
-            context=context,
-            authorization={"authorization_id": "auth-proposed"},
-            actor="test-operator",
-        )
-        self.assertIsNotNone(activated)
-        after = self.store.load_current_portfolio_selection()
-        assert after is not None
-        self.assertNotEqual(after["selection_id"], before["selection_id"])
-        self.assertEqual(after["members"][0]["allocation"], "1.00")
-        self.assertTrue(after["members"][0]["allocation_active"])
-        self.assertNotIn("proposed_allocation", after["members"][0])
-        restarted = OperatorControlPlane(self.store)
-        restarted_selection = restarted.store.load_current_portfolio_selection()
-        self.assertEqual(restarted_selection, after)
-
-    def test_proposed_allocation_commit_failure_leaves_paper_selection_unchanged(self) -> None:
+    def test_proposed_allocation_promotion_failure_leaves_paper_selection_unchanged(self) -> None:
         context, _ = self._seed_proposed_selection()
         before = self.store.load_current_portfolio_selection()
         self.assertIsNotNone(before)
+        prepared = self.control._prepare_reviewed_proposed_selection()
+        self.assertIsNotNone(prepared)
+        assert prepared is not None
+        prepared_context = dict(
+            context,
+            selection_id=prepared["selection_id"],
+            selection_hash=prepared["selection_hash"],
+        )
         with patch.object(
-            self.store,
-            "commit_portfolio_selection",
-            side_effect=RuntimeError("activation commit failed"),
+            self.control,
+            "_promote_portfolio_current_pointer",
+            side_effect=RuntimeError("activation promotion failed"),
         ):
-            with self.assertRaisesRegex(RuntimeError, "activation commit failed"):
+            with self.assertRaisesRegex(RuntimeError, "activation promotion failed"):
                 self.control._activate_reviewed_proposed_selection(
-                    context=context,
+                    context=prepared_context,
                     authorization={"authorization_id": "auth-proposed"},
                     actor="test-operator",
                 )
@@ -3607,18 +3769,18 @@ class OperatorControlTests(unittest.TestCase):
         context, _ = self._seed_proposed_selection()
         prepared = self.control._prepare_reviewed_proposed_selection()
         assert prepared is not None
-        risk_snapshot = {
-            "risk_config_id": "risk-proposed",
-            "risk_config_generation": 1,
-            "risk_config_hash": "risk-hash",
-            "global_budget": "3.00",
-            "active_obligations": "0",
-            "uncovered_obligations": "0",
-            "external_obligations": "0",
-            "available_budget": "3.00",
-            "runtime_accounting_available": True,
-            "runtime_accounting_metadata": {"available": True},
-        }
+        risk_snapshot = dict(prepared["proposed_allocation_risk_snapshot"])
+        risk_snapshot.update(
+            {
+                "global_budget": "3.00",
+                "active_obligations": "0",
+                "uncovered_obligations": "0",
+                "external_obligations": "0",
+                "available_budget": "3.00",
+                "runtime_accounting_available": True,
+                "runtime_accounting_metadata": {"available": True},
+            }
+        )
         prepared_with_risk = dict(prepared)
         prepared_with_risk["proposed_allocation_risk_snapshot"] = risk_snapshot
         prepared_with_risk["proposed_allocation_risk_digest"] = (
@@ -3631,16 +3793,8 @@ class OperatorControlTests(unittest.TestCase):
         }
         with patch.object(
             self.store,
-            "load_current_portfolio_selection",
+            "load_portfolio_selection",
             return_value=prepared_with_risk,
-        ), patch.object(
-            self.control,
-            "risk_settings_snapshot",
-            return_value={
-                "config_id": "risk-proposed",
-                "generation": 1,
-                "config_hash": "risk-hash",
-            },
         ), patch.object(
             self.store,
             "canary_risk_accounting",
@@ -3661,6 +3815,9 @@ class OperatorControlTests(unittest.TestCase):
 
     def test_prepared_activation_rollback_restores_canary_singleton_and_binding(self) -> None:
         context, _ = self._seed_proposed_selection()
+        policy_before = self.store.get_operator_config(
+            "rolling_admission_policy_active", None
+        )
         prepared = self.control._prepare_reviewed_proposed_selection()
         assert prepared is not None
         activated = self.control._activate_reviewed_proposed_selection(
@@ -3678,6 +3835,17 @@ class OperatorControlTests(unittest.TestCase):
             "canary_selection_binding_rollback", None
         )
         self.assertIsInstance(marker, dict)
+        self.assertEqual(marker["rolling_admission_policy_before"], policy_before)
+        active_policy = self.store.get_operator_config(
+            "rolling_admission_policy_active", None
+        )
+        self.assertIsInstance(active_policy, dict)
+        assert isinstance(active_policy, dict)
+        self.assertEqual(active_policy["policy_id"], "rolling-proposed")
+        self.assertEqual(
+            active_policy["risk_config_id"],
+            self.control._rolling_risk_binding()["risk_config_id"],
+        )
         self.control._restore_canary_selection_binding(
             activated["_canary_selection_binding_before"]
         )
@@ -3688,6 +3856,11 @@ class OperatorControlTests(unittest.TestCase):
         )
         self.assertIsNone(
             self.store.get_operator_config("canary_selection_binding", None)
+        )
+        self.assertTrue(self.control._reconcile_pending_canary_selection_binding())
+        self.assertEqual(
+            self.store.get_operator_config("rolling_admission_policy_active", None),
+            policy_before,
         )
 
 
@@ -4117,10 +4290,34 @@ class OperatorControlTests(unittest.TestCase):
         restarted = OperatorControlPlane(self.store)
         recovered = restarted.store.load_current_portfolio_selection()
         assert recovered is not None
-        self.assertEqual(recovered["selection_id"], prepared["selection_id"])
+        self.assertEqual(recovered["selection_id"], context["selection_id"])
         self.assertEqual(recovered["status"], "PAPER")
         self.assertTrue(recovered["paper_only"])
-        self.assertFalse(recovered["allocation_active"])
+        recovered_members = recovered.get("members", ())
+        self.assertFalse(
+            [
+                item
+                for item in recovered_members
+                if isinstance(item, dict)
+                and (
+                    item.get("allocation_active") is True
+                    or item.get("canary_armed") is True
+                )
+            ]
+        )
+        self.assertIsNone(
+            self.store.load_active_execution_authorization(
+                mode="EXPLORATORY_MICRO_CANARY",
+                now=datetime.now(timezone.utc),
+            )
+        )
+        prepared_paper = restarted.store.load_portfolio_selection(
+            prepared["selection_id"]
+        )
+        self.assertIsNotNone(prepared_paper)
+        assert prepared_paper is not None
+        self.assertEqual(prepared_paper["status"], "PAPER")
+        self.assertTrue(prepared_paper["paper_only"])
         self.assertIsNone(
             self.store.get_operator_config(
                 "canary_selection_binding_rollback", None
@@ -4690,6 +4887,11 @@ class OperatorControlTests(unittest.TestCase):
             "members": [
                 {
                     "candidate_id": "candidate-live",
+                    "status": "PAPER",
+                    "paper_only": True,
+                    "allocation_active": False,
+                    "proposed_allocation": "1.00",
+                    "operating_policy": {"mode": "EXPLORATORY_LIVE"},
                     "direction": "BUY YES",
                     "market_scope": {"mode": "EXACT_MARKETS", "market_ids": ["market-live"]},
                     "operational_setup": {
@@ -4732,6 +4934,29 @@ class OperatorControlTests(unittest.TestCase):
                         "asks": [{"price": "0.51", "size": "10"}],
                         "depth_assessment": {"action": "UNKNOWN"},
                     },
+                    "token_readiness": [
+                        {
+                            "candidate_id": "candidate-live",
+                            "market_id": "market-live",
+                            "token_id": "token-yes",
+                            "ready": True,
+                            "trade_ready": True,
+                            "diagnostics": {
+                                "market": {
+                                    "market_id": "market-live",
+                                    "token_id": "token-yes",
+                                    "accepting_orders": True,
+                                },
+                                "book": {
+                                    "min_order_size": "1",
+                                    "tick_size": "0.01",
+                                    "bids": [{"price": "0.49", "size": "10"}],
+                                    "asks": [{"price": "0.51", "size": "10"}],
+                                    "depth_assessment": {"action": "UNKNOWN"},
+                                },
+                            },
+                        }
+                    ],
                 },
             },
         )
@@ -4755,6 +4980,9 @@ class OperatorControlTests(unittest.TestCase):
         self.assertIn("SELECTED_MARKET_DEPTH_REQUIRED", blocked["blockers"])
         ready_projection = self.store.get_operator_config(CANARY_CONNECTIVITY_CONFIG_KEY, {})
         ready_projection["diagnostics"]["book"]["depth_assessment"]["action"] = "SUITABLE"
+        ready_projection["diagnostics"]["token_readiness"][0]["diagnostics"]["book"][
+            "depth_assessment"
+        ]["action"] = "SUITABLE"
         self.store.set_operator_config(CANARY_CONNECTIVITY_CONFIG_KEY, ready_projection)
         with patch.object(self.store, "load_current_market_resolution", return_value=materialized):
             ready = self.control._selected_market_readiness(selection)

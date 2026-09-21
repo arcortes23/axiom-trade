@@ -216,6 +216,18 @@ profitability-only exception never waives setup, observation, calibration,
 market, account, risk, or safety gates, and it never makes a paper result live
 evidence.
 
+For each selected member, admission also requires a fresh current-market
+observation for the exact market, the canonical `lookback=1` pair (the current
+point plus one lookback observation), and matching market, condition, and
+selected YES/NO token identities. A valid `NO_SIGNAL` result is admissible as
+the recorded signal; the system never fabricates a cheap direction. There is
+no minimum 7-day or 30-day history, full-economic simulation, or
+calibration-performance prerequisite for this exploratory admission. Adverse
+historical evidence is retained and disclosed rather than discarded. Those
+relaxed evidence-duration rules do not relax operational-setup integrity or
+the calibration, capture, and evaluator contracts: each must remain complete,
+immutable, and bound to the same strategy and market identity.
+
 ## Unactivated broad scope draft and bounded trace
 
 The operator exposes a pure read projection through
@@ -284,6 +296,14 @@ and exposure**, **3 open positions**, **5 submitted orders per day**, **100 bp
 maximum slippage**, and **$2.00 realized/equity entry-loss stops**. The
 frequently cited `$20` gross-daily / `$5` per-order values are not the active
 settings here and must not be presented as current configuration.
+
+The reviewed shared portfolio allocation of **$5.00** is independent of the
+**$1.00** all-in per-BUY commitment and the **3-position** limit. The lifetime
+entry BUY budget is the all-in **$5.00**, including fees; it is a budget of
+entry commitments, not a lifetime order-count cap. The unchanged
+`max_submitted_orders_per_day` limit is **5** submission attempts per PHT day
+across BUY and SELL.
+
 The rolling policy budget and experimental enablement are disclosed separately
 under the status `economic_policy.rolling_policy` projection. A zero global
 rolling-policy budget or disabled experimental policy does not widen, replace,
@@ -293,28 +313,36 @@ Fee sizing remains the unchanged `$1.00` all-in BUY policy with a `$0.01` fee
 reserve. For a fixed-share limit BUY, the executable bound spans the
 tick-to-legal-limit price range, including any improvement; conservative
 five-decimal rounding and fragment bounds are implementation details, not a
-separate approved limit. At quantity `q=5`, price `p=0.002`, fee rate `r=0.04`,
-and reserve `e=1`, the raw fee term is `q*p*r*e = 0.00039920`, the bounded
-fee is `0.00080`, and the displayed total is `0.01080`; five shares at
-`0.999` cost `4.995` before fees. See the official [fee
-documentation](https://docs.polymarket.com/developers/CLOB/fees),
-[place-order documentation](https://docs.polymarket.com/developers/CLOB/orders/create-order),
-and [builder-fee documentation](https://docs.polymarket.com/developers/builders/builder-fees).
+separate approved limit.
+At quantity `q=5`, price `p=0.002`, fee rate `r=0.04`, and exponent `e=1`,
+the raw fee term is `q*r*(p*(1-p))**e = 0.00039920`, the bounded fee is
+`0.00080`, and the displayed total is `0.01080`; five shares at `0.999` cost
+`4.995` before fees. See the official [fee documentation](https://docs.polymarket.com/trading/fees),
+[place-order documentation](https://docs.polymarket.com/trading/place-orders.md),
+and [builder-fee documentation](https://docs.polymarket.com/programs/builders/fees.md).
 
-`execution_authorization.review` requires an explicit purpose, a finite
-lifetime budget, a UTC expiry, and nonempty stop-rule choices. It persists the
-exact proposed selection, policy/setup binding, allocation, and selected
-market/token bindings as an unactivated `DRAFT`; it does not require an
-active authorization and does not approve or submit an order. The existing
+`execution_authorization.review` requires the exact purpose
+`commission exploratory automation and measure actual net results; profitability
+unproven`, a proposed shared allocation of `5.00`, a cumulative all-in BUY
+budget of `{"max_notional_usd":"5.00"}`, `FINAL_CONFIRMATION` expiry anchoring,
+and a duration of `86400` seconds. It persists the exact proposal, policy/setup
+binding, allocation, and selected market/token bindings as an unactivated
+`DRAFT`; a confirmation-time anchored draft has no effective expiry until final
+confirmation assigns its UTC expiry atomically. Legacy absolute UTC expiry
+remains valid. Review is paper-only: it does not require an active authorization
+and does not approve or submit an order. The existing
 `exploratory.live.review_confirm` action remains the only continuation after
 genuine readiness and explicit confirmation.
 
-
-Each authorization requires a finite lifetime budget, explicit stop rules, and
-an expiry. Missing, stale, expired, or mismatched lifetime, settings
-generation/hash, controller lease, scope, or selection bindings fail closed.
-The lifetime budget and expiry are separate from the daily BUY budget; neither
-is reset implicitly at midnight.
+The lifetime entry BUY budget and expiry are separate from the daily BUY
+budget; neither is reset implicitly at midnight. A SELL, filled or terminal
+order release, position close, or PHT reset never replenishes the lifetime
+entry budget. Only the explicitly audited cumulative-usage reset under a
+persisted `DISARMED` control can reset it. Authorization expiry blocks new
+entries, but owned SELL and authoritative reconciliation remain available
+under a fresh current controller lease, retaining the opening lineage.
+Missing, stale, expired, or mismatched lifetime, settings generation/hash,
+controller lease, scope, or selection bindings fail closed.
 
 ## Strict admission and capture checks
 
@@ -366,7 +394,9 @@ existing reviewed fences; it does not submit an order.
 disabled until explicit user confirmation through the control-wired operator
 surface. This release makes no live-order or live-fill claim; paper,
 historical, simulated, and fake-transport evidence are not execution
-evidence. The isolated runtime remains `DISARMED`.
+evidence. Any isolated HTTP proof or test authorization is limited to its
+fake-transport fixture and is not a production venue or account
+authorization. Production remains **DISARMED** and unconfirmed.
 
 ## Emergency rollback
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 import hashlib
@@ -11,6 +12,8 @@ import threading
 from typing import Mapping
 import tempfile
 import unittest
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 from unittest.mock import patch
 
 from axiom.autonomous import (
@@ -26,7 +29,7 @@ from axiom.canary import CanaryService, CredentialStore, credential_fingerprint
 from axiom.canary_positions import CanaryPositionManager, list_positions
 from axiom.canary_settings import CanarySettingsService
 from axiom.data import InMemoryPredictionProvider
-from axiom.dashboard import DashboardData
+from axiom.dashboard import DashboardData, DashboardServer
 from axiom.node import NodeConfig, ResearchNode
 from axiom.operator import OperatorControlError, OperatorControlPlane
 from axiom.rolling_portfolio import (
@@ -41,8 +44,18 @@ from axiom.backtest.prediction import (
     run_prediction_research_mode,
     run_prediction_research_mode as _run_prediction_research_mode,
 )
+from axiom.domain import (
+    InstrumentMetadata,
+    Fill,
+    MarketType,
+    OrderBookLevel,
+    OrderBookSnapshot,
+    PredictionMarketSnapshot,
+    ResolvedContract,
+    SettlementState,
+    Side,
+)
 from axiom.experiment_plan import normalize_market_scope
-from axiom.domain import Fill, MarketType, ResolvedContract, SettlementState, Side
 from axiom.portfolio import OrderRequest, Portfolio
 from axiom.storage import AxiomStore
 
@@ -58,6 +71,20 @@ class AcceptanceCredentials(CredentialStore):
             "wallet_address": "0x0000000000000000000000000000000000000001",
         }
 
+
+
+class CommissionCredentials(AcceptanceCredentials):
+    """Credential boundary that forbids environment fallback in this proof."""
+
+    def configured(self, **kwargs: object) -> bool:
+        if kwargs.get("allow_environment") is not False:
+            raise AssertionError("commission credentials must disable environment fallback")
+        return True
+
+    def load(self, **kwargs: object) -> dict[str, str]:
+        if kwargs.get("allow_environment") is not False:
+            raise AssertionError("commission credentials must disable environment fallback")
+        return super().load(**kwargs)
 
 class FakeVenue:
     """Scripted, local-only venue used by acceptance paths."""
@@ -127,6 +154,7 @@ class RollingLifecycleVenue(FakeVenue):
         super().__init__(statuses)
         self.market_id = market_id
         self._orders: dict[str, dict[str, object]] = {}
+        self.trade_timestamp = NOW
 
     def submit_limit_order(self, **kwargs: object) -> dict[str, object]:
         response = super().submit_limit_order(**kwargs)
@@ -146,6 +174,7 @@ class RollingLifecycleVenue(FakeVenue):
             "side": kwargs.get("side", "BUY"),
             "price": kwargs.get("price", "0.50"),
             "size": kwargs.get("size", "1"),
+            "timestamp": self.trade_timestamp,
         }
         return response
 
@@ -169,9 +198,99 @@ class RollingLifecycleVenue(FakeVenue):
                 "price": order["price"],
                 "fee": "0",
                 "status": "CONFIRMED",
-                "timestamp": NOW.isoformat(),
+                "timestamp": order["timestamp"].isoformat(),
             }
         ]
+
+
+class CommissionReadOnlyVenue:
+    """Read-only external boundary used by the commissioning HTTP path."""
+
+    instances: list["CommissionReadOnlyVenue"] = []
+
+    def __init__(self, **_: object) -> None:
+        self.connectivity_calls = 0
+        self.market_context_calls: list[tuple[str, str]] = []
+        self.order_calls = 0
+        self.approval_calls = 0
+        type(self).instances.append(self)
+
+    @staticmethod
+    def installed_sdk_version() -> str:
+        return "0.9.0"
+
+    @staticmethod
+    def geoblock() -> dict[str, object]:
+        return {"blocked": False, "close_only": False, "country": "ZZ", "region": "TEST"}
+
+    def connectivity_check(self) -> bool:
+        self.connectivity_calls += 1
+        return True
+
+    @staticmethod
+    def account() -> dict[str, object]:
+        return {
+            "authenticated": True,
+            "wallet_type": "fixture",
+            "credential_fingerprint": credential_fingerprint(
+                {
+                    "private_key": "acceptance-fixture",
+                    "wallet_address": "0x0000000000000000000000000000000000000001",
+                }
+            ),
+        }
+
+    @staticmethod
+    def balance() -> Decimal:
+        return Decimal("10.00")
+
+    @staticmethod
+    def allowance() -> dict[str, object]:
+        return {
+            "status": "OK",
+            "available_base_units": "100000000",
+        }
+
+    def market_context(self, market_id: str, token_id: str) -> dict[str, object]:
+        pair = (str(market_id), str(token_id))
+        self.market_context_calls.append(pair)
+        if pair[0] != "rolling-market" or pair[1] not in {"yes", "no"}:
+            raise AssertionError(f"unexpected readiness binding: {pair!r}")
+        outcome = "yes" if pair[1] == "yes" else "no"
+        return {
+            "market_id": pair[0],
+            "token_id": pair[1],
+            "asset_id": pair[1],
+            "position_id": pair[1],
+            "market_version": "v1",
+            "outcome": outcome,
+            "accepting_orders": True,
+            "min_order_size": "0.01",
+            "size_increment": "0.01",
+            "min_notional": "0.001",
+            "tick_size": "0.01",
+            "neg_risk": False,
+            "bids": [{"price": "0.49", "size": "100"}],
+            "asks": [{"price": "0.50", "size": "100"}],
+            "fee_bps": "0",
+            "allowance": self.allowance(),
+        }
+
+    def submit_limit_order(self, **_: object) -> None:
+        self.order_calls += 1
+        raise AssertionError("read-only commissioning boundary attempted an order")
+
+    def create_limit_order(self, **_: object) -> None:
+        self.order_calls += 1
+        raise AssertionError("read-only commissioning boundary created an order")
+
+    def post_order(self, *_: object, **__: object) -> None:
+        self.order_calls += 1
+        raise AssertionError("read-only commissioning boundary posted an order")
+
+    def approve(self, **_: object) -> None:
+        self.approval_calls += 1
+        raise AssertionError("read-only commissioning boundary approved an order")
 
 
 def _policy(policy_id: str = "rolling-default", **overrides: object) -> RollingAdmissionPolicy:
@@ -1832,19 +1951,34 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
         *,
         market_id: str = "rolling-market",
         exit_policy: dict[str, object] | None = None,
+        strategy_family: str = "probability_mispricing",
+        quote_price: str = "0.50",
     ) -> dict[str, object]:
+        family = str(strategy_family).strip().lower()
+        bid_price = format(Decimal(str(quote_price)) - Decimal("0.01"), "f")
+        parameters: dict[str, object] = {"threshold": 0.05}
+        probability_model = "fixed"
+        model: dict[str, object] = {"probability": 0.80}
+        if family == "momentum":
+            parameters["entry_predicate"] = {
+                "version": "absolute-move-v1",
+                "minimum_move": 0.05,
+                "units": "probability",
+                "boundary": "inclusive",
+            }
+            probability_model = "market-history"
+            model = {"model_required": False}
         strategy = {
             "version": 1,
             "market_type": "prediction",
-            "family": "probability_mispricing",
-            "parameters": {"threshold": 0.05},
+            "family": family,
+            "parameters": parameters,
             "operations": [],
-            "probability_model": "fixed",
+            "probability_model": probability_model,
             "resolution_aware": True,
             "resolution_inputs": ["expiry", "settlement"],
             "strategy_id": candidate_id,
         }
-        model = {"probability": 0.80}
         strategy_hash = "sha256:" + hashlib.sha256(
             json.dumps(strategy, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
         ).hexdigest()
@@ -1931,7 +2065,7 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
         historical_records = [
             {
                 "timestamp": NOW.isoformat(),
-                "price": "0.50",
+                "price": quote_price,
                 "source_type": "HISTORICAL",
             }
         ]
@@ -2024,24 +2158,26 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
             NOW,
             {
                 "source_type": "FORWARD_COLLECTED",
+                "provider": "polymarket",
+                "instrument": "POLYMARKET",
                 "snapshot": {
                     "market_id": market_id,
                     "timestamp": NOW.isoformat(),
-                    "yes_ask": "0.50",
+                    "yes_ask": quote_price,
                     "yes_order_book": {
-                        "asks": [{"price": "0.50", "size": "100"}],
-                        "bids": [],
+                        "asks": [{"price": quote_price, "size": "100"}],
+                        "bids": [{"price": bid_price, "size": "100"}],
                         "timestamp": NOW.isoformat(),
                         "token_id": "yes",
                     },
                     "no_order_book": {
-                        "asks": [{"price": "0.50", "size": "100"}],
-                        "bids": [],
+                        "asks": [{"price": quote_price, "size": "100"}],
+                        "bids": [{"price": bid_price, "size": "100"}],
                         "timestamp": NOW.isoformat(),
                         "token_id": "no",
                     },
                     "yes_token_id": "yes",
-                    "no_ask": "0.50",
+                    "no_ask": quote_price,
                     "no_token_id": "no",
                     "settlement": "open",
                 },
@@ -3669,6 +3805,1067 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
             self.assertEqual(stale_identity["policy_review"]["status"], "STALE")
 
 
+
+    def test_http_commission_review_confirm_real_rolling_worker_fill_and_expiry_exit(self) -> None:
+        """Traverse the isolated commissioning boundary without pre-activating authority."""
+        seed_candidate_id = "candidate-sv-commission-joined"
+        seed_strategy_version_id = "sv-commission-joined"
+        initial_quote = "0.40"
+        first_collection_at = NOW + timedelta(seconds=1)
+        commissioning_at = NOW + timedelta(seconds=61)
+        policy = _policy(
+            "rolling-default",
+            global_budget="0.00",
+        )
+        venue = RollingLifecycleVenue(
+            ("FILLED", "SETTLED"),
+            market_id="rolling-market",
+        )
+        with self._store("rolling-http-commission.sqlite3") as store:
+            self._seed_artifacts(
+                store,
+                policy,
+                (seed_strategy_version_id,),
+                evidence=[
+                    _evidence(
+                        seed_strategy_version_id,
+                        candidate_id=seed_candidate_id,
+                        days=7,
+                        actual_days=1,
+                        net_return="-1.00",
+                        reliability="0.00",
+                        completed_outcomes=0,
+                        execution_feasibility=False,
+                    )
+                ],
+            )
+            self._seed_executable_candidate(
+                store,
+                seed_candidate_id,
+                market_id=venue.market_id,
+                strategy_family="momentum",
+                quote_price=initial_quote,
+                exit_policy={
+                    "type": "fixed_holding_period",
+                    "holding_period_seconds": 86400,
+                },
+            )
+            # The proposer receives two complete observations from the real
+            # collector below.  The executable seed above intentionally remains
+            # only a candidate/artifact fixture, not a hand-shaped observation.
+
+            control = OperatorControlPlane(store)
+            # Keep every review, readiness, confirmation, and worker timestamp
+            # on the final commissioning clock, sixty seconds after the first
+            # external collection so the normal collector cadence is honored.
+            controlled_clock = lambda: commissioning_at
+            control.settings.clock = controlled_clock
+            control._canary_service.clock = controlled_clock
+            control._research_processor.clock = controlled_clock
+            discovery_book = OrderBookSnapshot(
+                first_collection_at,
+                (OrderBookLevel(0.39, 100.0),),
+                (OrderBookLevel(float(initial_quote), 100.0),),
+            )
+            discovery_market = PredictionMarketSnapshot(
+                timestamp=first_collection_at,
+                market_id=venue.market_id,
+                question="Commission fixture market",
+                yes_bid=0.39,
+                yes_ask=float(initial_quote),
+                yes_mid=0.395,
+                no_bid=0.39,
+                no_ask=float(initial_quote),
+                no_mid=0.395,
+                volume=100.0,
+                liquidity=100.0,
+                expiry=first_collection_at + timedelta(days=2),
+                settlement=SettlementState.OPEN,
+                resolution_criteria="Commission fixture resolves at expiry.",
+                source="polymarket",
+                yes_token_id="yes",
+                no_token_id="no",
+                condition_id=f"condition:{venue.market_id}",
+                slug=venue.market_id,
+                provider_timestamp=first_collection_at,
+                active=True,
+                closed=False,
+                accepting_orders=True,
+                enable_order_book=True,
+                order_book=None,
+            )
+            discovery_metadata = InstrumentMetadata(
+                symbol=venue.market_id,
+                market_type=MarketType.PREDICTION,
+                provider="polymarket",
+                market_id=venue.market_id,
+                question="Commission fixture market",
+                resolution_criteria="Commission fixture resolves at expiry.",
+                expiry=first_collection_at + timedelta(days=2),
+                condition_id=f"condition:{venue.market_id}",
+                slug=venue.market_id,
+                provider_timestamp=first_collection_at,
+                active=True,
+                closed=False,
+                accepting_orders=True,
+                enable_order_book=True,
+                min_order_size=0.01,
+                neg_risk=False,
+                order_book_available=True,
+            )
+            class CommissionDiscoveryProvider(InMemoryPredictionProvider):
+                provider_name = "polymarket"
+
+                def __init__(
+                    self,
+                    markets: list[PredictionMarketSnapshot],
+                    book: OrderBookSnapshot,
+                    metadata: InstrumentMetadata,
+                ) -> None:
+                    super().__init__(
+                        markets,
+                        order_books={markets[0].market_id: book},
+                        metadata={markets[0].market_id: metadata},
+                    )
+                    self._book_template = book
+
+                def set_observed_at(
+                    self,
+                    observed_at: datetime,
+                    *,
+                    bid: float | None = None,
+                    ask: float | None = None,
+                ) -> None:
+                    market_id = next(iter(self._markets))
+                    bids = (
+                        (OrderBookLevel(float(bid), 100.0),)
+                        if bid is not None
+                        else self._book_template.bids
+                    )
+                    asks = (
+                        (OrderBookLevel(float(ask), 100.0),)
+                        if ask is not None
+                        else self._book_template.asks
+                    )
+                    self._books[market_id] = replace(
+                        self._book_template,
+                        timestamp=observed_at,
+                        bids=bids,
+                        asks=asks,
+                        provider_timestamp=observed_at,
+                    )
+                def order_books(
+                    self,
+                    market_id: str,
+                    depth: int = 20,
+                ) -> Mapping[str, OrderBookSnapshot]:
+                    snapshot = self.market(market_id)
+                    base = self.order_book(market_id, depth=depth)
+                    if snapshot is None or base is None:
+                        return {}
+                    return {
+                        "yes": OrderBookSnapshot(
+                            base.timestamp,
+                            base.bids,
+                            base.asks,
+                            token_id=str(snapshot.yes_token_id),
+                            condition_id=str(snapshot.condition_id),
+                            min_order_size=0.01,
+                            tick_size=0.01,
+                            neg_risk=False,
+                            source="polymarket",
+                        ),
+                        "no": OrderBookSnapshot(
+                            base.timestamp,
+                            base.bids,
+                            base.asks,
+                            token_id=str(snapshot.no_token_id),
+                            condition_id=str(snapshot.condition_id),
+                            min_order_size=0.01,
+                            tick_size=0.01,
+                            neg_risk=False,
+                            source="polymarket",
+                        ),
+                    }
+
+            discovery_provider = CommissionDiscoveryProvider(
+                [discovery_market],
+                discovery_book,
+                discovery_metadata,
+            )
+            discovery_node = ResearchNode(
+                NodeConfig(
+                    str(self.path / "rolling-http-commission.sqlite3"),
+                    max_markets=1,
+                    crypto_enabled=False,
+                ),
+                provider=discovery_provider,
+                store=store,
+                clock=controlled_clock,
+                sleep=lambda _seconds: None,
+            )
+            # Populate the real persisted discovery surface before the
+            # operator constructs its fresh proposal processor. Two
+            # sequential passes provide the bounded lookback.
+            scope_draft = control._prepare_rolling_exploratory_scope_draft()
+            discovery_provider.set_observed_at(first_collection_at)
+            first_discovery_cycle = discovery_node.collector.collect_once(
+                now=first_collection_at,
+                scope_draft=scope_draft,
+            )
+            discovery_provider.set_observed_at(commissioning_at)
+            # The exact-target public request is the normal native way to
+            # poll this already-materialized market on the second pass.
+            discovery_cycle = discovery_node.collector.collect_once(
+                [venue.market_id],
+                now=commissioning_at,
+            )
+            self.assertGreaterEqual(first_discovery_cycle.markets_successful, 1)
+            self.assertGreaterEqual(first_discovery_cycle.snapshots_inserted, 1)
+            self.assertGreaterEqual(discovery_cycle.markets_successful, 1)
+            self.assertGreaterEqual(discovery_cycle.snapshots_inserted, 1)
+            limits = control.settings.snapshot(now=commissioning_at)["effective_limits"]
+            self.assertEqual(
+                {
+                    "max_all_in_buy_usd": limits["max_all_in_buy_usd"],
+                    "max_fee_reserve_usd": limits["max_fee_reserve_usd"],
+                    "max_gross_daily_buy_usd": limits["max_gross_daily_buy_usd"],
+                    "max_aggregate_open_cost_usd": limits["max_aggregate_open_cost_usd"],
+                    "max_aggregate_exposure_usd": limits["max_aggregate_exposure_usd"],
+                    "max_positions": limits["max_positions"],
+                    "max_submitted_orders_per_day": limits["max_submitted_orders_per_day"],
+                    "max_slippage_bps": limits["max_slippage_bps"],
+                    "realized_loss_entry_stop_usd": limits["realized_loss_entry_stop_usd"],
+                    "equity_loss_entry_stop_usd": limits["equity_loss_entry_stop_usd"],
+                },
+                {
+                    "max_all_in_buy_usd": "1.00",
+                    "max_fee_reserve_usd": "0.01",
+                    "max_gross_daily_buy_usd": "5.00",
+                    "max_aggregate_open_cost_usd": "5.00",
+                    "max_aggregate_exposure_usd": "5.00",
+                    "max_positions": 3,
+                    "max_submitted_orders_per_day": 5,
+                    "max_slippage_bps": 100,
+                    "realized_loss_entry_stop_usd": "2.00",
+                    "equity_loss_entry_stop_usd": "2.00",
+                },
+            )
+            self.assertEqual(str(scope_draft["status"]).upper(), "DRAFT")
+
+            # An unrelated old zero-budget row is still the current pointer.  The
+            # unpointed proposal must not become authority by fallback.
+            old_policy = _policy(
+                "old-zero-budget",
+                global_budget="0.00",
+            )
+            store.save_admission_policy(old_policy.as_dict())
+            old_selection = _selection(
+                "selection-old-zero-budget",
+                old_policy,
+                members=[],
+            )
+            old_selection.update(
+                {
+                    "global_budget": "0.00",
+                    "proposal_only": False,
+                    "selection_hash": _selection_binding_hash(old_selection),
+                }
+            )
+            store.commit_portfolio_selection(old_selection, [], make_current=True)
+            current_before = store.load_current_portfolio_selection()
+            self.assertIsNotNone(current_before)
+            assert current_before is not None
+            self.assertEqual(
+                current_before["portfolio_selection_id"],
+                "selection-old-zero-budget",
+            )
+
+            server = DashboardServer(
+                port=0,
+                data=DashboardData(
+                    store=store,
+                    control=control,
+                    settings_service=control.settings,
+                    clock=lambda: commissioning_at,
+                ),
+            ).start()
+            assert server.url is not None
+            assert server._server is not None
+            token = server._server.control_token
+
+            def post(body: dict[str, object]) -> tuple[int, dict[str, object]]:
+                request = Request(
+                    server.url + "/api/control",
+                    data=json.dumps(body).encode(),
+                    headers={
+                        "Content-Type": "application/json",
+                        "X-Axiom-Control-Token": token,
+                    },
+                    method="POST",
+                )
+                try:
+                    with urlopen(request, timeout=3) as response:
+                        return response.status, json.loads(response.read())
+                except HTTPError as error:
+                    raw = error.read()
+                    try:
+                        payload = json.loads(raw)
+                    except (TypeError, ValueError):
+                        payload = {
+                            "error": raw.decode("utf-8", errors="replace"),
+                        }
+                    return error.code, payload
+
+            def controlled_canary_service(
+                service_store: AxiomStore, **kwargs: object
+            ) -> CanaryService:
+                kwargs["clock"] = controlled_clock
+                return CanaryService(service_store, **kwargs)
+            CommissionReadOnlyVenue.instances.clear()
+            readiness_venue = CommissionReadOnlyVenue()
+
+            try:
+                review_values = {
+                    "purpose": (
+                        "commission exploratory automation and measure actual net results; "
+                        "profitability unproven"
+                    ),
+                    "shared_allocation": "5.00",
+                    "lifetime_budget": {"max_notional_usd": "5.00"},
+                    "expiry_anchor": "FINAL_CONFIRMATION",
+                    "duration_seconds": 86400,
+                    "stop_rules": {
+                        "on_any_blocker": "STOP",
+                        "halt_on_unknown_execution": True,
+                    },
+                }
+                with patch(
+                    "axiom.operator.CredentialStore",
+                    new=CommissionCredentials,
+                ), patch(
+                    "axiom.operator.PolymarketClobV2Venue",
+                    new=lambda **_: readiness_venue,
+                ), patch(
+                    "axiom.operator.utc_now",
+                    return_value=commissioning_at,
+                ), patch(
+                    "axiom.autonomous.utc_now",
+                    return_value=commissioning_at,
+                ), patch(
+                    "axiom.operator.CanaryService",
+                    new=controlled_canary_service,
+                ):
+                    status, review_response = post(
+                        {
+                            "action": "execution_authorization.review",
+                            "confirm": "REVIEW EXPLORATORY AUTHORIZATION",
+                            "payload": {"values": review_values},
+                        }
+                    )
+                self.assertEqual(status, 200, review_response)
+                self.assertTrue(review_response["ok"], review_response)
+                review_result = review_response["result"]["execution_authorization"]
+                draft = dict(review_result.get("authorization") or review_result)
+                self.assertEqual(draft["status"], "DRAFT")
+                self.assertEqual(draft["purpose"], review_values["purpose"])
+                self.assertEqual(draft["lifetime_budget"], {"max_notional_usd": "5.00"})
+                self.assertNotIn("max_orders", draft["lifetime_budget"])
+                self.assertEqual(draft["admission_mode"], "EXPLORATORY_LIVE")
+                self.assertEqual(draft["proposed_allocation_total"], "5.00")
+                self.assertEqual(draft["expiry_anchor"], "FINAL_CONFIRMATION")
+                self.assertEqual(int(draft["duration_seconds"]), 86400)
+                self.assertIsNone(draft.get("expires_at"))
+                self.assertIsNone(
+                    control.settings.load_active_execution_authorization(
+                        mode="EXPLORATORY_MICRO_CANARY",
+                        now=commissioning_at,
+                    )
+                )
+
+                # GET is a pure projection and leaves the old pointer untouched
+                # until final confirmation explicitly promotes the proposal.
+                with patch(
+                    "axiom.operator.CredentialStore",
+                    new=CommissionCredentials,
+                ), patch(
+                    "axiom.operator.PolymarketClobV2Venue",
+                    new=lambda **_: readiness_venue,
+                ), patch(
+                    "axiom.operator.utc_now",
+                    return_value=commissioning_at,
+                ), patch(
+                    "axiom.autonomous.utc_now",
+                    return_value=commissioning_at,
+                ):
+                    with urlopen(server.url + "/api/operator", timeout=3) as response:
+                        operator_before_confirm = json.loads(response.read())
+                self.assertEqual(response.status, 200)
+                operator_controls = operator_before_confirm.get("operator_controls")
+                if not isinstance(operator_controls, Mapping):
+                    operator_controls = operator_before_confirm
+                self.assertIsInstance(operator_controls, Mapping)
+                assert isinstance(operator_controls, Mapping)
+                review_snapshot = operator_controls.get("exploratory_live_review")
+                self.assertIsInstance(review_snapshot, Mapping)
+                assert isinstance(review_snapshot, Mapping)
+                review_members = review_snapshot.get("members")
+                self.assertIsInstance(review_members, list)
+                assert isinstance(review_members, list)
+                self.assertGreaterEqual(len(review_members), 1)
+                server_review_member = review_members[0]
+                self.assertIsInstance(server_review_member, Mapping)
+                assert isinstance(server_review_member, Mapping)
+                review_candidate_id = str(
+                    server_review_member.get("candidate_id") or ""
+                ).strip()
+                self.assertTrue(review_candidate_id)
+                current_after_review = store.load_current_portfolio_selection()
+                self.assertEqual(
+                    current_after_review["portfolio_selection_id"],
+                    "selection-old-zero-budget",
+                )
+                proposal_pointer = store.get_operator_config(
+                    "rolling_exploratory_proposal",
+                    None,
+                )
+                self.assertIsInstance(proposal_pointer, dict)
+                assert isinstance(proposal_pointer, dict)
+                self.assertEqual(
+                    proposal_pointer["selection_id"],
+                    draft["selection_id"],
+                )
+                self.assertEqual(
+                    proposal_pointer["selection_hash"],
+                    draft["selection_hash"],
+                )
+                self.assertEqual(proposal_pointer["draft_id"], draft["scope_draft_id"])
+                self.assertEqual(proposal_pointer["draft_hash"], draft["scope_draft_hash"])
+                self.assertEqual(
+                    operator_before_confirm["execution_authorization"]["status"],
+                    "DRAFT",
+                )
+
+                proposed_selection = store.load_portfolio_selection(
+                    str(draft["selection_id"])
+                )
+                self.assertIsNotNone(proposed_selection)
+                assert proposed_selection is not None
+                self.assertEqual(proposed_selection["admission_mode"], "EXPLORATORY_LIVE")
+                self.assertTrue(proposed_selection["paper_only"])
+                self.assertFalse(proposed_selection["allocation_active"])
+                self.assertFalse(proposed_selection["canary_armed"])
+                self.assertEqual(
+                    proposed_selection["proposed_allocation_total"],
+                    "5.00",
+                )
+                self.assertEqual(
+                    proposed_selection["selection_hash"],
+                    draft["selection_hash"],
+                )
+                self.assertEqual(
+                    proposal_pointer["proposed_allocation_total"],
+                    proposed_selection["proposed_allocation_total"],
+                )
+                self.assertEqual(
+                    proposal_pointer["risk_digest"],
+                    proposed_selection["proposed_allocation_risk_digest"],
+                )
+                settings_snapshot = control.settings.snapshot(now=commissioning_at)
+                self.assertEqual(
+                    draft["active_settings_hash"],
+                    settings_snapshot["config_hash"],
+                )
+                self.assertEqual(
+                    int(draft["active_settings_generation"]),
+                    int(settings_snapshot["generation"]),
+                )
+                risk_snapshot = proposed_selection[
+                    "proposed_allocation_risk_snapshot"
+                ]
+                self.assertIsInstance(risk_snapshot, Mapping)
+                assert isinstance(risk_snapshot, Mapping)
+                for risk_field in (
+                    "risk_config_id",
+                    "risk_config_generation",
+                    "risk_config_hash",
+                ):
+                    self.assertEqual(
+                        proposed_selection[risk_field],
+                        risk_snapshot[risk_field],
+                    )
+                proposal_members = proposed_selection["members"]
+                self.assertIsInstance(proposal_members, list)
+                proposal_member_count = len(proposal_members)
+                self.assertGreaterEqual(proposal_member_count, 1)
+                for member in proposal_members:
+                    self.assertEqual(
+                        member["direct_evidence"]["signal_outcome"],
+                        "NO_SIGNAL",
+                    )
+                momentum_members = [
+                    member
+                    for member in proposal_members
+                    if str(
+                        member.get("strategy_document", {}).get("family", "")
+                    ).strip().lower()
+                    == "momentum"
+                ]
+                self.assertEqual(len(momentum_members), 1)
+                proposed_member = momentum_members[0]
+                proposed_amounts = [
+                    Decimal(
+                        str(
+                            member.get("proposed_allocation")
+                            if member.get("proposed_allocation") not in (None, "")
+                            else member.get("allocation", "0")
+                        )
+                    )
+                    for member in proposal_members
+                ]
+                self.assertEqual(sum(proposed_amounts, Decimal("0")), Decimal("5.00"))
+                reviewed_members = [
+                    member
+                    for member in proposal_members
+                    if str(member.get("candidate_id") or "").strip()
+                    == review_candidate_id
+                ]
+                self.assertEqual(len(reviewed_members), 1)
+                reviewed_proposal_member = reviewed_members[0]
+                reviewed_member_allocation = (
+                    reviewed_proposal_member.get("proposed_allocation")
+                    if reviewed_proposal_member.get("proposed_allocation")
+                    not in (None, "")
+                    else reviewed_proposal_member.get("allocation")
+                )
+                self.assertIsNotNone(reviewed_member_allocation)
+                review_strategy_version_id = str(
+                    reviewed_proposal_member["strategy_version_id"]
+                ).strip()
+                self.assertTrue(review_strategy_version_id)
+                proposed_candidate_id = str(proposed_member["candidate_id"]).strip()
+                self.assertTrue(proposed_candidate_id)
+                candidate_id = proposed_candidate_id
+                strategy_version_id = str(
+                    proposed_member["strategy_version_id"]
+                ).strip()
+                research_trial_id = str(
+                    proposed_member["research_trial_id"]
+                ).strip()
+                self.assertTrue(strategy_version_id)
+                self.assertTrue(research_trial_id)
+
+                # This invokes the real connectivity service through HTTP while
+                # replacing only the external credential/venue boundary.
+                CommissionReadOnlyVenue.instances.clear()
+                readiness_venue = CommissionReadOnlyVenue()
+                with patch(
+                    "axiom.operator.CredentialStore",
+                    new=CommissionCredentials,
+                ), patch(
+                    "axiom.operator.PolymarketClobV2Venue",
+                    new=lambda **_: readiness_venue,
+                ), patch(
+                    "axiom.operator.utc_now",
+                    return_value=commissioning_at,
+                ), patch(
+                    "axiom.autonomous.utc_now",
+                    return_value=commissioning_at,
+                ), patch(
+                    "axiom.operator.CanaryService",
+                    new=controlled_canary_service,
+                ):
+                    status, connectivity_response = post(
+                        {
+                            "action": "canary.connectivity_check",
+                            "target": "",
+                        }
+                    )
+                self.assertEqual(status, 200, connectivity_response)
+                connectivity = connectivity_response["result"]["connectivity"]
+                self.assertEqual(connectivity["status"], "READY", connectivity)
+                self.assertTrue(connectivity["ready"], connectivity)
+                self.assertEqual(
+                    connectivity["diagnostics"]["market"]["market_id"],
+                    venue.market_id,
+                )
+                self.assertIn(
+                    connectivity["diagnostics"]["market"]["token_id"],
+                    {"yes", "no"},
+                )
+                self.assertTrue(readiness_venue.connectivity_calls)
+                self.assertEqual(readiness_venue.order_calls, 0)
+                self.assertEqual(readiness_venue.approval_calls, 0)
+                self.assertGreaterEqual(
+                    set(readiness_venue.market_context_calls),
+                    {(venue.market_id, "yes"), (venue.market_id, "no")},
+                )
+
+                # Final confirmation alone binds the 24-hour authorization and
+                # promotes the exact immutable proposal; it cannot submit an order.
+                with patch(
+                    "axiom.operator.CredentialStore",
+                    new=CommissionCredentials,
+                ), patch(
+                    "axiom.operator.PolymarketClobV2Venue",
+                    new=lambda **_: readiness_venue,
+                ), patch(
+                    "axiom.operator.utc_now",
+                    return_value=commissioning_at,
+                ), patch(
+                    "axiom.autonomous.utc_now",
+                    return_value=commissioning_at,
+                ), patch(
+                    "axiom.operator.CanaryService",
+                    new=controlled_canary_service,
+                ):
+                    status, confirm_response = post(
+                        {
+                            "action": "exploratory.live.review_confirm",
+                            "target": "",
+                            "confirm": "CONFIRM EXPLORATORY LIVE",
+                        }
+                    )
+                self.assertEqual(status, 200, confirm_response)
+                self.assertTrue(confirm_response["ok"], confirm_response)
+                self.assertTrue(confirm_response["live_execution"])
+                self.assertFalse(confirm_response["paper_only"])
+                confirmed = confirm_response["result"]["exploratory_live"]
+                self.assertEqual(confirmed["status"], "AUTONOMOUS_MICRO_LIVE")
+                self.assertEqual(
+                    store.load_current_portfolio_selection()["selection_id"],
+                    draft["selection_id"],
+                )
+                active_authorization = control.settings.load_active_execution_authorization(
+                    mode="EXPLORATORY_MICRO_CANARY",
+                    now=commissioning_at,
+                )
+                self.assertIsNotNone(active_authorization)
+                assert active_authorization is not None
+                self.assertEqual(active_authorization["status"], "ACTIVE")
+                self.assertEqual(
+                    active_authorization["mode"],
+                    "EXPLORATORY_MICRO_CANARY",
+                )
+                self.assertEqual(
+                    active_authorization["purpose"],
+                    review_values["purpose"],
+                )
+                self.assertEqual(
+                    active_authorization["lifetime_budget"],
+                    {"max_notional_usd": "5.00"},
+                )
+                self.assertNotIn("max_orders", active_authorization["lifetime_budget"])
+                self.assertEqual(
+                    active_authorization["active_settings_hash"],
+                    settings_snapshot["config_hash"],
+                )
+                self.assertEqual(
+                    int(active_authorization["active_settings_generation"]),
+                    int(settings_snapshot["generation"]),
+                )
+                activated_at = datetime.fromisoformat(
+                    str(active_authorization["activated_at"])
+                )
+                expires_at = datetime.fromisoformat(
+                    str(active_authorization["expires_at"])
+                )
+                self.assertEqual(expires_at - activated_at, timedelta(days=1))
+                self.assertEqual(
+                    active_authorization["selection_id"],
+                    proposed_selection["selection_id"],
+                )
+                self.assertEqual(
+                    active_authorization["selection_hash"],
+                    proposed_selection["selection_hash"],
+                )
+                self.assertEqual(
+                    active_authorization["scope_hash"],
+                    proposed_selection["scope_hash"],
+                )
+                self.assertEqual(
+                    active_authorization["scope_version"],
+                    proposed_selection["scope_version"],
+                )
+                self.assertEqual(
+                    proposed_selection["admission_mode"],
+                    "EXPLORATORY_LIVE",
+                )
+                self.assertEqual(
+                    proposed_selection["draft_id"],
+                    draft["scope_draft_id"],
+                )
+                self.assertEqual(
+                    proposed_selection["draft_hash"],
+                    draft["scope_draft_hash"],
+                )
+                # Reload the real control plane after HTTP final confirmation.
+                # Durable authority, selection identity, and funded member
+                # allocation must survive a fresh process object; do not
+                # reconstruct or manually clear any activation/rollback state.
+                reloaded_settings = CanarySettingsService(
+                    store,
+                    clock=controlled_clock,
+                )
+                with patch(
+                    "axiom.operator.utc_now",
+                    return_value=commissioning_at,
+                ), patch(
+                    "axiom.autonomous.utc_now",
+                    return_value=commissioning_at,
+                ), patch(
+                    "axiom.operator.CanaryService",
+                    new=controlled_canary_service,
+                ):
+                    reloaded_control = OperatorControlPlane(
+                        store,
+                        settings_service=reloaded_settings,
+                    )
+                reloaded_selection = store.load_current_portfolio_selection()
+                self.assertIsNotNone(reloaded_selection)
+                assert reloaded_selection is not None
+                self.assertEqual(
+                    reloaded_selection["selection_id"],
+                    draft["selection_id"],
+                )
+                self.assertEqual(reloaded_selection["status"], "ACTIVE")
+                self.assertTrue(reloaded_selection["allocation_active"])
+                self.assertTrue(reloaded_selection["canary_armed"])
+                reloaded_members = reloaded_selection["members"]
+                self.assertIsInstance(reloaded_members, list)
+                assert isinstance(reloaded_members, list)
+                reloaded_member = next(
+                    member
+                    for member in reloaded_members
+                    if isinstance(member, Mapping)
+                    and str(member.get("candidate_id") or "").strip()
+                    == review_candidate_id
+                )
+                self.assertEqual(
+                    reloaded_member["strategy_version_id"],
+                    review_strategy_version_id,
+                )
+                self.assertEqual(reloaded_member["status"], "ACTIVE")
+                self.assertTrue(reloaded_member["allocation_active"])
+                self.assertEqual(
+                    Decimal(str(reloaded_member["allocation"])),
+                    Decimal(str(reviewed_member_allocation)),
+                )
+                active_allocations = [
+                    Decimal(str(member.get("allocation", "0")))
+                    for member in reloaded_members
+                    if isinstance(member, Mapping)
+                    and member.get("allocation_active") is True
+                    and str(member.get("status") or "").upper() in {"ACTIVE", "REDUCE"}
+                ]
+                self.assertEqual(
+                    sum(active_allocations, Decimal("0")),
+                    Decimal("5.00"),
+                )
+                self.assertNotIn("proposed_allocation", reloaded_member)
+                reloaded_authorization = (
+                    reloaded_control.settings.load_active_execution_authorization(
+                        mode="EXPLORATORY_MICRO_CANARY",
+                        now=commissioning_at,
+                    )
+                )
+                assert reloaded_authorization is not None
+                self.assertEqual(reloaded_authorization["status"], "ACTIVE")
+                self.assertEqual(
+                    reloaded_authorization["mode"],
+                    active_authorization["mode"],
+                )
+                self.assertEqual(
+                    reloaded_authorization["purpose"],
+                    active_authorization["purpose"],
+                )
+                self.assertEqual(
+                    reloaded_authorization["selection_id"],
+                    reloaded_selection["selection_id"],
+                )
+                self.assertEqual(
+                    reloaded_authorization["selection_hash"],
+                    reloaded_selection["selection_hash"],
+                )
+                self.assertEqual(
+                    reloaded_authorization["scope_hash"],
+                    reloaded_selection["scope_hash"],
+                )
+                self.assertEqual(
+                    reloaded_authorization["scope_version"],
+                    reloaded_selection["scope_version"],
+                )
+                # Seed the worker's real CanaryService credential boundary
+                # with the approved keyring-only fake; the worker itself still
+                # constructs the production service and venue path.
+                CanaryService(
+                    store,
+                    credentials=CommissionCredentials(),
+                    clock=controlled_clock,
+                    settings=control.settings,
+                )
+                # Confirmation does not forward an order; the real rolling worker
+                # first observes a genuine NO_SIGNAL, then evaluates a positive
+                # momentum delta from a fresh same-market snapshot.
+                self.assertEqual(venue.submissions, [])
+                worker_time = [commissioning_at]
+                worker = AutonomousCanaryWorker(
+                    store,
+                    clock=lambda: worker_time[0],
+                    venue_factory=lambda: venue,
+                    allow_test_venue=True,
+                )
+                no_signal = worker.tick_rolling(now=commissioning_at)
+                self.assertEqual(no_signal["status"], "NO_SIGNAL", no_signal)
+                self.assertEqual(
+                    no_signal["decision"],
+                    "WAIT_FOR_FRESH_ROLLING_SIGNAL",
+                    no_signal,
+                )
+                self.assertEqual(no_signal["submissions"], [], no_signal)
+                evaluated_members = no_signal.get("evaluated")
+                self.assertIsInstance(evaluated_members, list)
+                assert isinstance(evaluated_members, list)
+                self.assertGreaterEqual(len(evaluated_members), 1, no_signal)
+                self.assertEqual(
+                    no_signal["evaluated_members"],
+                    len(evaluated_members),
+                    no_signal,
+                )
+                self.assertEqual(no_signal["ready_members"], 0, no_signal)
+                for evaluated_member in evaluated_members:
+                    self.assertEqual(evaluated_member["status"], "ACTIVE")
+                    self.assertIsNone(evaluated_member["signal"])
+                    evaluation = evaluated_member.get("evaluation")
+                    self.assertIsInstance(evaluation, Mapping)
+                    assert isinstance(evaluation, Mapping)
+                    self.assertEqual(
+                        evaluation["reason_code"],
+                        "ENTRY_PREDICATE_NOT_SATISFIED",
+                    )
+                    self.assertIsNone(evaluation["signal"])
+                self.assertEqual(venue.submissions, [])
+                no_signal_reservations = store.connection.execute(
+                    "SELECT COUNT(*) AS count FROM canary_risk_reservations"
+                ).fetchone()
+                self.assertIsNotNone(no_signal_reservations)
+                assert no_signal_reservations is not None
+                self.assertEqual(no_signal_reservations["count"], 0)
+                dynamic_now = commissioning_at + timedelta(seconds=61)
+                # Feed the positive quote through the same fake provider and
+                # real collector path as the initial observations.  The
+                # one-minute spacing preserves normal polling cadence.
+                discovery_provider.set_observed_at(
+                    dynamic_now,
+                    bid=0.49,
+                    ask=0.50,
+                )
+                dynamic_cycle = discovery_node.collector.collect_once(
+                    [venue.market_id],
+                    now=dynamic_now,
+                )
+                self.assertGreaterEqual(dynamic_cycle.markets_successful, 1)
+                self.assertGreaterEqual(dynamic_cycle.snapshots_inserted, 1)
+                worker_time[0] = dynamic_now
+                venue.trade_timestamp = dynamic_now
+                submitted = worker.tick_rolling(now=dynamic_now)
+                self.assertEqual(submitted["status"], "SUBMITTED", submitted)
+                self.assertEqual(submitted["decision"], "SUBMITTED", submitted)
+                self.assertIsNone(submitted["blocker"], submitted)
+                self.assertEqual(
+                    [item["side"] for item in venue.submissions],
+                    ["BUY"],
+                )
+                entry_request = venue.submissions[0]
+                external_cost = Decimal(str(entry_request["price"])) * Decimal(
+                    str(entry_request["size"])
+                )
+                reservation = store.connection.execute(
+                    """
+                    SELECT reservation_id, requested_cost, fee_reserve,
+                           filled_cost, status, execution_authorization_id,
+                           portfolio_selection_id, candidate_id,
+                           strategy_version_id, research_trial_id
+                    FROM canary_risk_reservations
+                    WHERE side='BUY'
+                    ORDER BY rowid DESC LIMIT 1
+                    """
+                ).fetchone()
+                self.assertIsNotNone(reservation)
+                assert reservation is not None
+                self.assertEqual(
+                    reservation["strategy_version_id"],
+                    strategy_version_id,
+                )
+                self.assertEqual(
+                    reservation["research_trial_id"],
+                    research_trial_id,
+                )
+                self.assertEqual(
+                    reservation["execution_authorization_id"],
+                    active_authorization["authorization_id"],
+                )
+                self.assertEqual(
+                    Decimal(str(reservation["requested_cost"])),
+                    external_cost,
+                )
+                self.assertEqual(
+                    Decimal(str(reservation["filled_cost"])),
+                    external_cost,
+                )
+                self.assertEqual(
+                    reservation["portfolio_selection_id"],
+                    draft["selection_id"],
+                )
+                self.assertEqual(reservation["candidate_id"], candidate_id)
+                fill = store.connection.execute(
+                    """
+                    SELECT quantity, price, cost, fee, execution_authorization_id,
+                           portfolio_selection_id, candidate_id,
+                           strategy_version_id, research_trial_id
+                    FROM canary_risk_fills
+                    WHERE reservation_id=?
+                    """,
+                    (reservation["reservation_id"],),
+                ).fetchone()
+                self.assertIsNotNone(fill)
+                assert fill is not None
+                fill_cost = Decimal(str(fill["cost"]))
+                fill_fee = Decimal(str(fill["fee"]))
+                all_in = fill_cost + fill_fee
+                self.assertEqual(fill_cost, external_cost)
+                self.assertEqual(fill_fee, Decimal("0"))
+                self.assertGreater(all_in, Decimal("0"))
+                self.assertLessEqual(all_in, Decimal("1.00"))
+                self.assertEqual(
+                    fill["execution_authorization_id"],
+                    active_authorization["authorization_id"],
+                )
+                self.assertEqual(fill["portfolio_selection_id"], draft["selection_id"])
+                self.assertEqual(fill["candidate_id"], candidate_id)
+                self.assertEqual(fill["strategy_version_id"], strategy_version_id)
+                self.assertEqual(fill["research_trial_id"], research_trial_id)
+                lot = store.connection.execute(
+                    """
+                    SELECT status, quantity, cost_basis, candidate_id,
+                           strategy_version_id, research_trial_id,
+                           portfolio_selection_id, execution_authorization_id
+                    FROM canary_position_lots
+                    WHERE candidate_id=?
+                    ORDER BY rowid DESC LIMIT 1
+                    """,
+                    (candidate_id,),
+                ).fetchone()
+                self.assertIsNotNone(lot)
+                assert lot is not None
+                self.assertEqual(lot["status"], "OPEN")
+                self.assertEqual(Decimal(str(lot["cost_basis"])), all_in)
+                self.assertEqual(lot["strategy_version_id"], strategy_version_id)
+                self.assertEqual(lot["research_trial_id"], research_trial_id)
+                self.assertEqual(lot["portfolio_selection_id"], draft["selection_id"])
+                self.assertEqual(
+                    lot["execution_authorization_id"],
+                    active_authorization["authorization_id"],
+                )
+                usage = control.settings.snapshot(now=dynamic_now)
+                self.assertEqual(
+                    store.load_current_portfolio_selection()["selection_id"],
+                    draft["selection_id"],
+                )
+                self.assertEqual(
+                    Decimal(str(usage["exploratory_lifetime_used_usd"])),
+                    all_in,
+                )
+                self.assertEqual(
+                    Decimal(str(usage["remaining_exploratory_lifetime_usd"])),
+                    Decimal("5.00") - all_in,
+                )
+
+                # A fresh native same-market observation is required before
+                # exercising the expiry-bound exit path.
+                discovery_provider.set_observed_at(
+                    expires_at,
+                    bid=0.49,
+                    ask=0.50,
+                )
+                expiry_cycle = discovery_node.collector.collect_once(
+                    [venue.market_id],
+                    now=expires_at,
+                )
+                self.assertGreaterEqual(expiry_cycle.markets_successful, 1)
+                self.assertGreaterEqual(expiry_cycle.snapshots_inserted, 1)
+                expired_tick = expires_at + timedelta(seconds=1)
+                worker_time[0] = expired_tick
+                venue.trade_timestamp = expired_tick
+                expired = worker.tick_rolling(now=expired_tick)
+                self.assertEqual([item["side"] for item in venue.submissions], ["BUY", "SELL"])
+                self.assertEqual(expired["submissions"], [], expired)
+                reconcile_tick = expired_tick + timedelta(seconds=1)
+                worker_time[0] = reconcile_tick
+                venue.trade_timestamp = reconcile_tick
+                reconciled = worker.tick_rolling(now=reconcile_tick)
+                self.assertEqual(
+                    [item["side"] for item in venue.submissions],
+                    ["BUY", "SELL"],
+                )
+                self.assertEqual(reconciled["submissions"], [], reconciled)
+                closed = store.connection.execute(
+                    """
+                    SELECT status FROM canary_position_lots
+                    WHERE candidate_id=? ORDER BY rowid DESC LIMIT 1
+                    """,
+                    (candidate_id,),
+                ).fetchone()
+                self.assertIsNotNone(closed)
+                assert closed is not None
+                self.assertEqual(closed["status"], "CLOSED")
+                sell = store.connection.execute(
+                    """
+                    SELECT status, settlement_status, execution_authorization_id
+                    FROM canary_position_requests
+                    WHERE position_id=(
+                        SELECT position_id FROM canary_position_lots
+                        WHERE candidate_id=? ORDER BY rowid DESC LIMIT 1
+                    ) AND side='SELL'
+                    ORDER BY rowid DESC LIMIT 1
+                    """,
+                    (candidate_id,),
+                ).fetchone()
+                self.assertIsNotNone(sell)
+                assert sell is not None
+                self.assertEqual(sell["status"], "SETTLED")
+                self.assertEqual(sell["settlement_status"], "SETTLED")
+                self.assertEqual(
+                    sell["execution_authorization_id"],
+                    active_authorization["authorization_id"],
+                )
+                post_exit_accounting = store.canary_risk_accounting(
+                    reconcile_tick,
+                    execution_authorization_id=active_authorization["authorization_id"],
+                )
+                self.assertEqual(
+                    post_exit_accounting["execution_authorization_id"],
+                    active_authorization["authorization_id"],
+                )
+                self.assertEqual(
+                    Decimal(
+                        str(post_exit_accounting["exploratory_lifetime_used_usd"])
+                    ),
+                    all_in,
+                )
+                self.assertEqual(
+                    Decimal(str(post_exit_accounting["all_in_buy_reserved_usd"])),
+                    Decimal("0"),
+                )
+                self.assertIsNone(
+                    control.settings.load_active_execution_authorization(
+                        mode="EXPLORATORY_MICRO_CANARY",
+                        now=reconcile_tick,
+                    )
+                )
+            finally:
+                server.stop()
+
     def test_actual_rolling_worker_reconciles_fill_and_paused_replaced_exit_lineage(self) -> None:
         venue = RollingLifecycleVenue(("FILLED", "SETTLED"))
         long_exit = {"type": "fixed_holding_period", "holding_period_seconds": 86400}
@@ -4011,6 +5208,7 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
                 Decimal(str(allocation["global_budget_usd"])),
                 Decimal(str(allocation["budget_cap_usd"])),
             )
+            over_cap_budget = Decimal(str(allocation["budget_cap_usd"])) + Decimal("1.00")
             with self.assertRaises(OperatorControlError) as over_cap:
                 operator.review_rolling_admission_policy(
                     _policy(
@@ -4018,7 +5216,7 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
                         version="v1",
                         config_hash="sha256:over-cap-review",
                         max_members=1,
-                        global_budget="4.00",
+                        global_budget=format(over_cap_budget, "f"),
                     ).as_dict(),
                     actor="reviewer",
                 )
@@ -5468,7 +6666,16 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
                 int(first_binding["generation"]),
             )
             second = operator.review_rolling_admission_policy({}, actor="reviewer")["draft"]
-            self.assertEqual(second["global_budget"], "2.00")
+            self.assertEqual(second["global_budget"], "5.00")
+            self.assertEqual(
+                second["allocation_review"]["budget_cap_usd"],
+                "5.00",
+            )
+            self.assertEqual(
+                second["allocation_review"]["active_per_buy_usd"],
+                "2.00",
+            )
+            self.assertEqual(second["allocation_review"]["max_open_positions"], 1)
 
             second_binding = settings.snapshot(now=NOW)
             second_settings_draft = settings.save_draft(
@@ -5481,8 +6688,28 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
                 "reviewer",
                 int(second_binding["generation"]),
             )
+            third_binding = settings.snapshot(now=NOW)
+            third_settings_draft = settings.save_draft(
+                {"max_aggregate_exposure_usd": "3.00"},
+                "reviewer",
+                expected_generation=int(third_binding["generation"]),
+            )
+            settings.activate_draft(
+                third_settings_draft["config_id"],
+                "reviewer",
+                int(third_binding["generation"]),
+            )
             third = operator.review_rolling_admission_policy({}, actor="reviewer")["draft"]
-            self.assertEqual(third["global_budget"], "1.00")
+            self.assertEqual(third["global_budget"], "3.00")
+            self.assertEqual(
+                third["allocation_review"]["budget_cap_usd"],
+                "3.00",
+            )
+            self.assertEqual(
+                third["allocation_review"]["active_per_buy_usd"],
+                "1.00",
+            )
+            self.assertEqual(third["allocation_review"]["max_open_positions"], 1)
             self.assertNotEqual(
                 (first["policy_id"], first["version"]),
                 (second["policy_id"], second["version"]),

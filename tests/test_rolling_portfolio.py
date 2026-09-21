@@ -420,6 +420,324 @@ class TestRollingPortfolio(unittest.TestCase):
         self.addCleanup(self._temporary_directory.cleanup)
         self.tmp_path = Path(self._temporary_directory.name)
 
+    def _proposal_fixture(
+        self,
+        *,
+        rows: Sequence[Mapping[str, object]],
+        bindings: Sequence[Mapping[str, object]] | None = None,
+        selection_excluded: bool | None = None,
+    ) -> tuple[AutonomousResearchProcessor, AxiomStore]:
+        store = _store(self.tmp_path)
+        self.addCleanup(store.close)
+        store.save_admission_policy(default_rolling_admission_policy().as_dict())
+        strategy_document = {
+            "version": 1,
+            "market_type": "prediction",
+            "family": "momentum",
+            "parameters": {
+                "lookback": 1,
+                "threshold": 0.05,
+                "entry_predicate": {
+                    "version": "absolute-move-v1",
+                    "minimum_move": 0.05,
+                    "units": "probability",
+                    "boundary": "inclusive",
+                },
+            },
+            "probability_model": "market-history",
+            "resolution_aware": True,
+            "resolution_inputs": ["market_history"],
+        }
+        strategy_record = _strategy(
+            "strategy-version-direct",
+            strategy_document=strategy_document,
+            research_trial_id="research-trial-direct",
+            model_document={"model_required": False},
+            market_bindings=list(
+                bindings
+                if bindings is not None
+                else (
+                    {
+                        "market_id": "market-direct",
+                        "condition_id": "condition-direct",
+                        "yes_token_id": "yes-direct",
+                        "no_token_id": "no-direct",
+                    },
+                )
+            ),
+        )
+        if selection_excluded is not None:
+            strategy_record["selection_excluded"] = selection_excluded
+        store.save_strategy_version(
+            {
+                "strategy_version_id": strategy_record["strategy_version_id"],
+                "strategy_id": strategy_record["strategy_id"],
+                "version": strategy_record["version"],
+                "code_hash": strategy_record["strategy_hash"],
+                "config_hash": strategy_record["config_hash"],
+                "strategy_document": strategy_document,
+            }
+        )
+        store.save_research_trial(
+            {
+                "research_trial_id": "research-trial-direct",
+                "strategy_version_id": "strategy-version-direct",
+                "candidate_id": strategy_record["candidate_id"],
+                "status": "PROPOSED",
+            }
+        )
+        for row in rows:
+            source_timestamp = row["source_timestamp"]
+            observed_at = row.get("observed_at", source_timestamp)
+            if isinstance(source_timestamp, str):
+                source_timestamp = datetime.fromisoformat(source_timestamp)
+            if isinstance(observed_at, str):
+                observed_at = datetime.fromisoformat(observed_at)
+            payload = dict(row)
+            market_id = str(payload["market_id"])
+            snapshot_id = str(payload["snapshot_id"])
+            store.save_polymarket_snapshot(
+                snapshot_id,
+                market_id,
+                source_timestamp,
+                observed_at,
+                payload,
+                source_type="FORWARD_COLLECTED",
+            )
+        processor = AutonomousResearchProcessor.__new__(AutonomousResearchProcessor)
+        processor.store = store
+        processor.clock = lambda: NOW
+        processor._rolling_scope_draft_documents = lambda _now: (
+            (strategy_record,),
+            {
+                "status": "MATERIALIZED",
+                "draft_id": "rolling-exploratory-scope-draft:polymarket:standard:v1",
+                "draft_hash": "sha256:" + ("d" * 64),
+                "scope_hash": "sha256:" + ("s" * 64),
+                "scope_version": "1",
+            },
+        )
+        return processor, store
+
+    def test_exploratory_proposal_uses_current_hold_and_excludes_foreign_market(self) -> None:
+        rows = [
+            {
+                "snapshot_id": f"snapshot-{index}",
+                "market_id": "market-direct",
+                "source_timestamp": NOW - timedelta(seconds=120 - index * 30),
+                "observed_at": NOW - timedelta(seconds=120 - index * 30),
+                "timestamp": (NOW - timedelta(seconds=120 - index * 30)).isoformat(),
+                "yes_mid": "0.50" if index == 0 else "0.56",
+            }
+            for index in range(4)
+        ]
+        rows.append(
+            {
+                "snapshot_id": "foreign-snapshot",
+                "market_id": "market-foreign",
+                "source_timestamp": NOW - timedelta(seconds=90),
+                "observed_at": NOW - timedelta(seconds=90),
+                "timestamp": (NOW - timedelta(seconds=90)).isoformat(),
+                "yes_mid": "0.99",
+            }
+        )
+        processor, store = self._proposal_fixture(
+            rows=rows,
+            bindings=(
+                {
+                    "market_id": "market-direct",
+                    "condition_id": "condition-direct",
+                    "yes_token_id": "yes-direct",
+                    "no_token_id": "no-direct",
+                },
+                {
+                    "market_id": "market-foreign",
+                    "condition_id": "condition-foreign",
+                    "yes_token_id": "yes-foreign",
+                    "no_token_id": "no-foreign",
+                },
+            ),
+        )
+
+        proposal = processor.prepare_exploratory_live_proposal(
+            shared_allocation="5.00",
+            now=NOW,
+        )
+
+        self.assertEqual(proposal["admission_mode"], "EXPLORATORY_LIVE")
+        self.assertEqual(
+            proposal["operating_policy"]["admission_mode"],
+            "EXPLORATORY_LIVE",
+        )
+        self.assertEqual(proposal["status"], "PROPOSED")
+        self.assertEqual(len(proposal["members"]), 1)
+        self.assertEqual(
+            Decimal(str(proposal["members"][0]["proposed_allocation"])),
+            Decimal("5"),
+        )
+        direct_evidence = proposal["members"][0]["direct_evidence"]
+        self.assertEqual(direct_evidence["signal_outcome"], "NO_SIGNAL")
+        self.assertEqual(direct_evidence["evaluated_market_id"], "market-direct")
+        self.assertEqual(direct_evidence["evaluated_input_row_count"], 2)
+        self.assertTrue(
+            all(
+                row["market_id"] == "market-direct"
+                for row in direct_evidence["evaluated_input_rows"]
+            )
+        )
+        self.assertIsNotNone(store.load_portfolio_selection(proposal["selection_id"]))
+
+    def test_exploratory_proposal_keeps_explicit_selection_exclusion(self) -> None:
+        rows = [
+            {
+                "snapshot_id": f"excluded-snapshot-{index}",
+                "market_id": "market-direct",
+                "source_timestamp": NOW - timedelta(seconds=30 - index * 30),
+                "observed_at": NOW - timedelta(seconds=30 - index * 30),
+                "timestamp": (NOW - timedelta(seconds=30 - index * 30)).isoformat(),
+                "yes_mid": "0.50",
+                "negative_economics": True,
+                "completed_outcomes": 0,
+                "coverage_seconds": 0,
+            }
+            for index in range(2)
+        ]
+        processor, store = self._proposal_fixture(
+            rows=rows,
+            selection_excluded=True,
+        )
+
+        proposal = processor.prepare_exploratory_live_proposal(
+            shared_allocation="5.00",
+            now=NOW,
+        )
+
+        self.assertEqual(proposal["status"], "BLOCKED")
+        self.assertEqual(proposal["members"], [])
+        self.assertTrue(
+            any(
+                "SELECTION_EXCLUDED" in row.get("input_deficits", ())
+                for row in proposal["measured_blockers"]
+                if isinstance(row, Mapping)
+            )
+        )
+        self.assertEqual(
+            proposal["measured_blockers"][0]["direct_evidence"]["evaluated_observations"],
+            0,
+        )
+        self.assertIsNotNone(store.load_portfolio_selection(proposal["selection_id"]))
+
+    def test_exploratory_proposal_uses_runtime_two_row_entry_boundary(self) -> None:
+        rows = [
+            {
+                "snapshot_id": f"runtime-snapshot-{index}",
+                "market_id": "market-direct",
+                "source_timestamp": NOW - timedelta(seconds=30 - index * 30),
+                "observed_at": NOW - timedelta(seconds=30 - index * 30),
+                "timestamp": (NOW - timedelta(seconds=30 - index * 30)).isoformat(),
+                "yes_mid": "0.50",
+                "version": "1",
+                "candidate_id": "candidate-strategy-version-direct",
+                "research_trial_id": "research-trial-direct",
+                "strategy_version_id": "strategy-version-direct",
+                "strategy_hash": "sha256:strategy-version-direct",
+            }
+            for index in range(2)
+        ]
+        processor, store = self._proposal_fixture(rows=rows)
+
+        proposal = processor.prepare_exploratory_live_proposal(
+            shared_allocation="5.00",
+            now=NOW,
+        )
+
+        self.assertEqual(proposal["status"], "PROPOSED")
+        self.assertEqual(len(proposal["members"]), 1)
+        self.assertEqual(proposal["members"][0]["action"], "OBSERVE")
+        direct_evidence = proposal["members"][0]["direct_evidence"]
+        self.assertEqual(direct_evidence["required_input_rows"], 2)
+        self.assertEqual(direct_evidence["available_input_rows"], 2)
+        self.assertTrue(direct_evidence["evaluator_invoked"])
+        self.assertTrue(direct_evidence["evaluator_completed"])
+        self.assertEqual(direct_evidence["signal_outcome"], "NO_SIGNAL")
+        self.assertNotIn("INSUFFICIENT_LOOKBACK", direct_evidence["input_deficits"])
+        self.assertIsNotNone(store.load_portfolio_selection(proposal["selection_id"]))
+
+    def test_exploratory_proposal_reports_short_input_without_historical_gate(self) -> None:
+        rows = [
+            {
+                "snapshot_id": f"snapshot-{index}",
+                "market_id": "market-direct",
+                "source_timestamp": NOW - timedelta(seconds=60 - index * 30),
+                "observed_at": NOW - timedelta(seconds=60 - index * 30),
+                "timestamp": (NOW - timedelta(seconds=60 - index * 30)).isoformat(),
+                "yes_mid": "0.50",
+                "version": "1",
+                "candidate_id": "candidate-strategy-version-direct",
+                "research_trial_id": "research-trial-direct",
+                "strategy_version_id": "strategy-version-direct",
+                "strategy_hash": "sha256:strategy-version-direct",
+            }
+            for index in range(1)
+        ]
+        processor, _store_value = self._proposal_fixture(rows=rows)
+
+        proposal = processor.prepare_exploratory_live_proposal(
+            shared_allocation=Decimal("5.00"),
+            now=NOW,
+        )
+
+        self.assertEqual(proposal["status"], "BLOCKED")
+        blocker_rows = proposal["measured_blockers"]
+        self.assertTrue(
+            any(
+                "INPUT_COVERAGE_INSUFFICIENT" in row.get("input_deficits", ())
+                for row in blocker_rows
+                if isinstance(row, Mapping)
+            )
+        )
+        direct_evidence = next(
+            row["direct_evidence"]
+            for row in blocker_rows
+            if isinstance(row, Mapping)
+            and isinstance(row.get("direct_evidence"), Mapping)
+        )
+        self.assertEqual(direct_evidence["required_input_rows"], 2)
+        self.assertEqual(direct_evidence["available_input_rows"], 1)
+        self.assertTrue(
+            any(
+                "INSUFFICIENT_LOOKBACK" in row.get("input_deficits", ())
+                for row in blocker_rows
+                if isinstance(row, Mapping)
+            )
+        )
+        self.assertFalse(
+            any(
+                "coverage_seconds" in row.get("input_deficits", ())
+                for row in blocker_rows
+                if isinstance(row, Mapping)
+            )
+        )
+
+    def test_exploratory_proposal_missing_binding_is_truthful_and_unfunded(self) -> None:
+        processor, store = self._proposal_fixture(rows=(), bindings=())
+
+        proposal = processor.prepare_exploratory_live_proposal(
+            shared_allocation="5.00",
+            now=NOW,
+        )
+
+        self.assertEqual(proposal["status"], "BLOCKED")
+        self.assertEqual(proposal["members"], [])
+        self.assertIsNotNone(store.load_portfolio_selection(proposal["selection_id"]))
+        self.assertTrue(
+            any(
+                "MARKET_BINDING_MISSING" in row.get("input_deficits", ())
+                for row in proposal["measured_blockers"]
+                if isinstance(row, Mapping)
+            )
+        )
+
     def test_cursor_round_robin_wrap_persists_next_tuple(self) -> None:
         items = _rolling_work_items((_strategy("sv-beta"), _strategy("sv-alpha")))
         self.assertEqual(len(items), 16)
@@ -3238,6 +3556,167 @@ class TestRollingPortfolio(unittest.TestCase):
             self.assertEqual(store.connection.execute('SELECT COUNT(*) FROM strategy_evidence_windows').fetchone()[0], 1)
             loaded = store.load_admission_policy(policy.policy_id, policy.version)
             self.assertEqual(loaded['config_hash'], policy.config_hash)
+
+    def test_real_materialization_rebinds_legacy_contract_without_overwrite(self) -> None:
+        scope = normalize_market_scope(
+            {
+                "schema_version": "1",
+                "mode": "RULE_BASED_MARKETS",
+                "instrument": "POLYMARKET",
+                "market_ids": [],
+                "categories": [],
+                "filters": {},
+                "regime_restrictions": {},
+                "provenance": "canonical",
+            }
+        )
+        market_id = "market-legacy-contract"
+        observed_at = NOW - timedelta(seconds=5)
+        tracked = {
+            "market_id": market_id,
+            "observed_at": observed_at,
+            "payload": {
+                "metadata": {
+                    "market_id": market_id,
+                    "condition_id": "condition-legacy-contract",
+                    "yes_token_id": "yes-legacy-contract",
+                    "no_token_id": "no-legacy-contract",
+                    "active": True,
+                    "closed": False,
+                    "settlement": "open",
+                    "accepting_orders": True,
+                    "enable_order_book": True,
+                    "provider": "polymarket",
+                    "source_type": "FORWARD_COLLECTED",
+                },
+                "snapshot": {
+                    "market_id": market_id,
+                    "condition_id": "condition-legacy-contract",
+                    "yes_token_id": "yes-legacy-contract",
+                    "no_token_id": "no-legacy-contract",
+                    "timestamp": observed_at.isoformat(),
+                    "observed_at": observed_at.isoformat(),
+                    "provider": "polymarket",
+                    "source_type": "FORWARD_COLLECTED",
+                    "yes_mid": "0.50",
+                    "no_mid": "0.50",
+                    "yes_bid": "0.49",
+                    "yes_ask": "0.51",
+                    "no_bid": "0.49",
+                    "no_ask": "0.51",
+                    "order_book": {
+                        "bids": [{"price": "0.49", "size": "10"}],
+                        "asks": [{"price": "0.51", "size": "10"}],
+                    },
+                    "no_order_book": {
+                        "bids": [{"price": "0.49", "size": "10"}],
+                        "asks": [{"price": "0.51", "size": "10"}],
+                    },
+                },
+            },
+        }
+        draft = {
+            "draft_id": "rolling-exploratory-scope-draft:legacy-contract",
+            "draft_hash": "sha256:" + ("d" * 64),
+            "status": "DRAFT",
+            "scope": scope.as_dict(),
+            "scope_hash": scope.scope_hash,
+            "scope_version": scope.scope_version,
+            "strategy_definitions": [
+                {
+                    "template": "momentum",
+                    "parameters": {"lookback": 1, "threshold": 0.05},
+                }
+            ],
+            "paper_only": True,
+            "live_execution": False,
+            "allocation_active": False,
+            "canary_armed": False,
+        }
+        with _store(self.tmp_path) as store:
+            store.tracked_polymarket_markets = (  # type: ignore[method-assign]
+                lambda **_kwargs: [tracked]
+            )
+            processor = AutonomousResearchProcessor.__new__(
+                AutonomousResearchProcessor
+            )
+            processor.store = store
+            first = processor._rolling_system_current_market_documents(
+                NOW, draft=draft
+            )
+            self.assertEqual(len(first), 1)
+            current = first[0]
+            current_version_id = str(current["strategy_version_id"])
+            old_version_id = "strategy-version-" + _rolling_hash(
+                {
+                    "strategy_hash": current["strategy_hash"],
+                    "candidate_id": current["candidate_id"],
+                }
+            ).removeprefix("sha256:")[:40]
+            old_trial_id = "research-trial-" + _rolling_hash(
+                {
+                    "candidate_id": current["candidate_id"],
+                    "strategy_version_id": old_version_id,
+                    "scope_hash": current["market_scope_hash"],
+                    "scope_version": current["market_scope_version"],
+                    "market_bindings": current["market_bindings"],
+                    "operational_setup_hash": current[
+                        "operational_setup_hash"
+                    ],
+                }
+            ).removeprefix("sha256:")[:40]
+            self.assertNotEqual(current_version_id, old_version_id)
+            store.save_strategy_version(
+                {
+                    "strategy_version_id": old_version_id,
+                    "strategy_id": current["strategy_id"],
+                    "version": "1",
+                    "code_hash": current["strategy_hash"],
+                    "config_hash": "config:legacy-contract",
+                    "candidate_id": current["candidate_id"],
+                    "strategy_document": current["strategy_document"],
+                    "legacy_adverse_history": {
+                        "net_result": "-3.00",
+                        "eligible": False,
+                    },
+                }
+            )
+            store.save_research_trial(
+                {
+                    "research_trial_id": old_trial_id,
+                    "strategy_version_id": old_version_id,
+                    "candidate_id": current["candidate_id"],
+                    "status": "PROPOSED",
+                    "legacy_adverse_history": {
+                        "net_result": "-3.00",
+                        "eligible": False,
+                    },
+                }
+            )
+
+            second = processor._rolling_system_current_market_documents(
+                NOW, draft=draft
+            )
+
+            self.assertEqual(
+                [item["strategy_version_id"] for item in second],
+                [current_version_id],
+            )
+            old_strategy = store.load_strategy_version(old_version_id)
+            self.assertEqual(
+                old_strategy["legacy_adverse_history"],
+                {"net_result": "-3.00", "eligible": False},
+            )
+            old_trial = store.load_research_trial(old_trial_id)
+            self.assertEqual(
+                old_trial["legacy_adverse_history"],
+                {"net_result": "-3.00", "eligible": False},
+            )
+            current_strategy = store.load_strategy_version(current_version_id)
+            self.assertEqual(
+                current_strategy["research_trial_id"],
+                second[0]["research_trial_id"],
+            )
 
     def test_v1_availability_from_payload_survives_migration_and_resave(self) -> None:
         legacy = _evidence(

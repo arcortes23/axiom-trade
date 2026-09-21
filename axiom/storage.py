@@ -2260,7 +2260,11 @@ class AxiomStore:
                 adverse_evidence_ack_json TEXT NOT NULL,
                 lifetime_budget_json TEXT NOT NULL,
                 stop_rules_json TEXT NOT NULL,
-                expires_at TEXT NOT NULL,
+                expires_at TEXT,
+                expiry_anchor TEXT NOT NULL DEFAULT 'ABSOLUTE'
+                    CHECK(expiry_anchor IN ('ABSOLUTE','FINAL_CONFIRMATION')),
+                duration_seconds INTEGER
+                    CHECK(duration_seconds IS NULL OR duration_seconds > 0),
                 scope_hash TEXT NOT NULL,
                 scope_version TEXT NOT NULL,
                 active_settings_hash TEXT NOT NULL,
@@ -2316,14 +2320,92 @@ class AxiomStore:
             );
             CREATE INDEX IF NOT EXISTS idx_canary_controller_lease_audit_time
                 ON canary_controller_lease_audit(timestamp DESC, audit_id DESC);
-            CREATE TRIGGER IF NOT EXISTS trg_canary_execution_authorization_immutable
+            """
+        )
+        self._migrate_execution_authorization_schema()
+        self._conn.executescript(
+            """
+            DROP TRIGGER IF EXISTS trg_canary_execution_authorization_immutable;
+            CREATE TRIGGER trg_canary_execution_authorization_immutable
             BEFORE UPDATE OF mode,purpose,strategy_versions_json,selection_policy_hash,
                 adverse_evidence_ack_json,lifetime_budget_json,stop_rules_json,expires_at,
-                scope_hash,scope_version,active_settings_hash,active_settings_generation,
-                selection_id,selection_hash,actor,actor_version,binding_hash,generation
+                expiry_anchor,duration_seconds,scope_hash,scope_version,active_settings_hash,
+                active_settings_generation,selection_id,selection_hash,actor,actor_version,
+                binding_hash,generation
             ON canary_execution_authorizations
+            WHEN NOT (
+                OLD.status='DRAFT' AND NEW.status='ACTIVE'
+                AND OLD.expiry_anchor='FINAL_CONFIRMATION'
+                AND NEW.expiry_anchor=OLD.expiry_anchor
+                AND OLD.expires_at IS NULL
+                AND NEW.expires_at IS NOT NULL
+                AND OLD.duration_seconds=NEW.duration_seconds
+                AND OLD.duration_seconds IS NOT NULL
+                AND OLD.activated_at IS NULL
+                AND NEW.activated_at IS NOT NULL
+                AND julianday(NEW.expires_at) IS NOT NULL
+                AND julianday(NEW.activated_at) IS NOT NULL
+                AND julianday(NEW.expires_at) =
+                    julianday(NEW.activated_at) + NEW.duration_seconds / 86400.0
+                AND OLD.mode IS NEW.mode
+                AND OLD.purpose IS NEW.purpose
+                AND OLD.strategy_versions_json IS NEW.strategy_versions_json
+                AND OLD.selection_policy_hash IS NEW.selection_policy_hash
+                AND OLD.adverse_evidence_ack_json IS NEW.adverse_evidence_ack_json
+                AND OLD.lifetime_budget_json IS NEW.lifetime_budget_json
+                AND OLD.stop_rules_json IS NEW.stop_rules_json
+                AND OLD.scope_hash IS NEW.scope_hash
+                AND OLD.scope_version IS NEW.scope_version
+                AND OLD.active_settings_hash IS NEW.active_settings_hash
+                AND OLD.active_settings_generation IS NEW.active_settings_generation
+                AND OLD.selection_id IS NEW.selection_id
+                AND OLD.selection_hash IS NEW.selection_hash
+                AND OLD.actor IS NEW.actor
+                AND OLD.actor_version IS NEW.actor_version
+                AND OLD.binding_hash IS NEW.binding_hash
+                AND OLD.generation IS NEW.generation
+            )
             BEGIN
                 SELECT RAISE(ABORT, 'execution authorization bindings are immutable');
+            END;
+            DROP TRIGGER IF EXISTS trg_canary_execution_authorization_anchor_activation;
+            CREATE TRIGGER trg_canary_execution_authorization_anchor_activation
+            BEFORE UPDATE OF status ON canary_execution_authorizations
+            WHEN OLD.status='DRAFT' AND NEW.status='ACTIVE'
+                AND OLD.expiry_anchor='FINAL_CONFIRMATION'
+                AND (NEW.expires_at IS NULL OR NEW.activated_at IS NULL)
+            BEGIN
+                SELECT RAISE(ABORT, 'confirmation-anchored authorization requires final confirmation');
+            END;
+            DROP TRIGGER IF EXISTS trg_canary_execution_authorization_activation_timestamp;
+            CREATE TRIGGER trg_canary_execution_authorization_activation_timestamp
+            BEFORE UPDATE OF activated_at ON canary_execution_authorizations
+            WHEN NOT (
+                OLD.status='DRAFT' AND NEW.status='ACTIVE'
+                AND OLD.activated_at IS NULL
+                AND NEW.activated_at IS NOT NULL
+                AND COALESCE(OLD.expiry_anchor,'') <> ''
+                AND (
+                    (
+                        OLD.expiry_anchor='ABSOLUTE'
+                        AND OLD.expires_at IS NEW.expires_at
+                        AND OLD.duration_seconds IS NEW.duration_seconds
+                    )
+                    OR (
+                        OLD.expiry_anchor='FINAL_CONFIRMATION'
+                        AND OLD.expires_at IS NULL
+                        AND NEW.expires_at IS NOT NULL
+                        AND OLD.duration_seconds IS NEW.duration_seconds
+                        AND OLD.duration_seconds IS NOT NULL
+                        AND julianday(NEW.expires_at) IS NOT NULL
+                        AND julianday(NEW.activated_at) IS NOT NULL
+                        AND julianday(NEW.expires_at) =
+                            julianday(NEW.activated_at) + NEW.duration_seconds / 86400.0
+                    )
+                )
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'execution authorization activation timestamp is immutable');
             END;
             """
         )
@@ -2335,6 +2417,182 @@ class AxiomStore:
             "CREATE INDEX IF NOT EXISTS idx_canary_submission_attempts_authorization "
             "ON canary_submission_attempts(execution_authorization_id, attempted_at)"
         )
+
+    def _migrate_execution_authorization_schema(self) -> None:
+        """Atomically migrate only the tiny authorization table.
+
+        Older databases declared ``expires_at`` NOT NULL before confirmation
+        anchored drafts existed.  The replacement preserves every immutable
+        row and hash.  An explicit transaction protects the rename/copy/drop
+        boundary, while foreign-key enforcement is temporarily suspended so
+        child clauses continue to name the canonical table during staging.
+        """
+        table = "canary_execution_authorizations"
+        staged = f"{table}_legacy_nullable_expiry"
+
+        def exists(name: str) -> bool:
+            return self._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (name,),
+            ).fetchone() is not None
+
+        table_exists = exists(table)
+        staged_exists = exists(staged)
+        source = staged if staged_exists else table
+        source_columns = {
+            str(row["name"]): row
+            for row in self._conn.execute(f"PRAGMA table_info({source})").fetchall()
+        }
+        expiry_column = source_columns.get("expires_at")
+        if expiry_column is None or not int(expiry_column["notnull"]):
+            self._conn.execute(
+                "DROP TRIGGER IF EXISTS trg_canary_execution_authorization_immutable"
+            )
+            return
+
+        started_transaction = False
+        foreign_keys_before = int(self._conn.execute("PRAGMA foreign_keys").fetchone()[0])
+        legacy_alter_before = int(
+            self._conn.execute("PRAGMA legacy_alter_table").fetchone()[0]
+        )
+        foreign_keys_toggled = False
+
+        try:
+            self._conn.execute("PRAGMA legacy_alter_table=ON")
+            if not self._conn.in_transaction:
+                if foreign_keys_before:
+                    self._conn.execute("PRAGMA foreign_keys=OFF")
+                    foreign_keys_toggled = True
+                self._conn.execute("BEGIN IMMEDIATE")
+                started_transaction = True
+        except BaseException:
+            self._conn.execute(
+                f"PRAGMA legacy_alter_table={legacy_alter_before}"
+            )
+            if foreign_keys_toggled:
+                self._conn.execute(
+                    f"PRAGMA foreign_keys={'ON' if foreign_keys_before else 'OFF'}"
+                )
+            raise
+        try:
+            # Recover a staged source left by an older interrupted migration.
+            # If both names exist, the staged table is authoritative and the
+            # incomplete canonical replacement is discarded.
+            self._conn.execute(
+                "DROP TRIGGER IF EXISTS trg_canary_execution_authorization_immutable"
+            )
+            self._conn.execute(
+                "DROP INDEX IF EXISTS idx_canary_execution_authorizations_active"
+            )
+            self._conn.execute(
+                "DROP INDEX IF EXISTS idx_canary_execution_authorizations_status"
+            )
+            if staged_exists:
+                if table_exists:
+                    self._conn.execute(f"DROP TABLE {table}")
+            else:
+                if not table_exists:
+                    raise sqlite3.OperationalError(
+                        "execution authorization migration source table is missing"
+                    )
+                source = staged
+                self._conn.execute(
+                    "PRAGMA legacy_alter_table=ON"
+                )
+                self._conn.execute(f"ALTER TABLE {table} RENAME TO {staged}")
+            self._conn.execute("PRAGMA legacy_alter_table=ON")
+            source_columns = {
+                str(row["name"]): row
+                for row in self._conn.execute(f"PRAGMA table_info({source})").fetchall()
+            }
+            if "expiry_anchor" not in source_columns:
+                self._conn.execute(
+                    f"ALTER TABLE {source} ADD COLUMN "
+                    "expiry_anchor TEXT NOT NULL DEFAULT 'ABSOLUTE'"
+                )
+            if "duration_seconds" not in source_columns:
+                self._conn.execute(
+                    f"ALTER TABLE {source} ADD COLUMN duration_seconds INTEGER"
+                )
+            self._conn.execute(
+                f"""
+                CREATE TABLE {table} (
+                    authorization_id TEXT PRIMARY KEY,
+                    status TEXT NOT NULL CHECK(status IN ('DRAFT','ACTIVE','EXPIRED','REVOKED')),
+                    generation INTEGER NOT NULL,
+                    mode TEXT NOT NULL,
+                    purpose TEXT NOT NULL,
+                    strategy_versions_json TEXT NOT NULL DEFAULT '[]',
+                    selection_policy_hash TEXT,
+                    adverse_evidence_ack_json TEXT NOT NULL,
+                    lifetime_budget_json TEXT NOT NULL,
+                    stop_rules_json TEXT NOT NULL,
+                    expires_at TEXT,
+                    expiry_anchor TEXT NOT NULL DEFAULT 'ABSOLUTE'
+                        CHECK(expiry_anchor IN ('ABSOLUTE','FINAL_CONFIRMATION')),
+                    duration_seconds INTEGER
+                        CHECK(duration_seconds IS NULL OR duration_seconds > 0),
+                    scope_hash TEXT NOT NULL,
+                    scope_version TEXT NOT NULL,
+                    active_settings_hash TEXT NOT NULL,
+                    active_settings_generation INTEGER NOT NULL,
+                    selection_id TEXT,
+                    selection_hash TEXT,
+                    actor TEXT NOT NULL,
+                    actor_version TEXT NOT NULL,
+                    binding_hash TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    activated_at TEXT,
+                    revoked_at TEXT
+                )
+                """
+            )
+            self._conn.execute(
+                f"""
+                INSERT INTO {table}(
+                    authorization_id,status,generation,mode,purpose,
+                    strategy_versions_json,selection_policy_hash,
+                    adverse_evidence_ack_json,lifetime_budget_json,stop_rules_json,
+                    expires_at,expiry_anchor,duration_seconds,scope_hash,scope_version,
+                    active_settings_hash,active_settings_generation,selection_id,
+                    selection_hash,actor,actor_version,binding_hash,created_at,
+                    updated_at,activated_at,revoked_at
+                )
+                SELECT authorization_id,status,generation,mode,purpose,
+                    strategy_versions_json,selection_policy_hash,
+                    adverse_evidence_ack_json,lifetime_budget_json,stop_rules_json,
+                    expires_at,expiry_anchor,duration_seconds,scope_hash,scope_version,
+                    active_settings_hash,active_settings_generation,selection_id,
+                    selection_hash,actor,actor_version,binding_hash,created_at,
+                    updated_at,activated_at,revoked_at
+                FROM {source}
+                """
+            )
+            self._conn.execute(f"DROP TABLE {source}")
+            self._conn.execute(
+                "CREATE UNIQUE INDEX idx_canary_execution_authorizations_active "
+                "ON canary_execution_authorizations(mode) WHERE status='ACTIVE'"
+            )
+            self._conn.execute(
+                "CREATE INDEX idx_canary_execution_authorizations_status "
+                "ON canary_execution_authorizations(status, expires_at, updated_at)"
+            )
+        except BaseException:
+            if started_transaction:
+                self._conn.rollback()
+            raise
+        else:
+            if started_transaction:
+                self._conn.commit()
+        finally:
+            self._conn.execute(
+                f"PRAGMA legacy_alter_table={legacy_alter_before}"
+            )
+            if foreign_keys_toggled:
+                self._conn.execute(
+                    f"PRAGMA foreign_keys={'ON' if foreign_keys_before else 'OFF'}"
+                )
 
     def save_canary_setting_config(
         self,
@@ -2622,7 +2880,9 @@ class AxiomStore:
         adverse_evidence_acknowledgment: Any | None = None,
         lifetime_budget: Mapping[str, Any] | Any,
         stop_rules: Mapping[str, Any],
-        expires_at: datetime,
+        expires_at: datetime | None = None,
+        expiry_anchor: str = "ABSOLUTE",
+        duration_seconds: int | None = None,
         scope_hash: str,
         scope_version: str | int,
         active_settings_hash: str | None = None,
@@ -2667,6 +2927,8 @@ class AxiomStore:
             lifetime_budget=lifetime_budget,
             stop_rules=stop_rules,
             expires_at=expires_at,
+            expiry_anchor=expiry_anchor,
+            duration_seconds=duration_seconds,
             scope_hash=scope_hash,
             scope_version=scope_version,
             active_settings_hash=(
@@ -2699,6 +2961,8 @@ class AxiomStore:
             _dump(normalized["lifetime_budget"]),
             _dump(normalized["stop_rules"]),
             normalized["expires_at"],
+            normalized["expiry_anchor"],
+            normalized["duration_seconds"],
             normalized["scope_hash"],
             normalized["scope_version"],
             normalized["active_settings_hash"],
@@ -2720,10 +2984,10 @@ class AxiomStore:
                     "authorization_id,status,generation,mode,purpose,"
                     "strategy_versions_json,selection_policy_hash,"
                     "adverse_evidence_ack_json,lifetime_budget_json,stop_rules_json,"
-                    "expires_at,scope_hash,scope_version,active_settings_hash,"
-                    "active_settings_generation,selection_id,selection_hash,actor,"
+                    "expires_at,expiry_anchor,duration_seconds,scope_hash,scope_version,"
+                    "active_settings_hash,active_settings_generation,selection_id,selection_hash,actor,"
                     "actor_version,binding_hash,created_at,updated_at,activated_at,revoked_at"
-                    ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     values,
                 )
             except sqlite3.IntegrityError as exc:
@@ -2732,7 +2996,14 @@ class AxiomStore:
                     "WHERE authorization_id=?",
                     (identifier,),
                 ).fetchone()
-                if prior is None or str(prior["binding_hash"]) != binding_hash:
+                legacy_values = dict(normalized)
+                legacy_values.pop("expiry_anchor", None)
+                legacy_values.pop("duration_seconds", None)
+                legacy_binding_hash = _execution_authorization_binding_hash(legacy_values)
+                if prior is None or str(prior["binding_hash"]) not in {
+                    binding_hash,
+                    legacy_binding_hash,
+                }:
                     raise ValueError(
                         "execution authorization draft identity conflict"
                     ) from exc
@@ -2834,6 +3105,7 @@ class AxiomStore:
         actor: str,
         *,
         expected_generation: int | None = None,
+        final_confirmation: bool = False,
         timestamp: datetime | None = None,
     ) -> dict[str, Any]:
         """Activate a reviewed draft only while its settings binding is current."""
@@ -2861,8 +3133,29 @@ class AxiomStore:
                 raise ValueError("execution authorization is not a draft")
             if expected_generation is not None and int(row["generation"]) != expected_generation:
                 raise ValueError("execution authorization generation changed")
-            if str(row["expires_at"]) <= _iso(stamp):
-                raise ValueError("execution authorization is expired")
+            expiry_anchor = str(row["expiry_anchor"] or "ABSOLUTE").strip().upper()
+            if expiry_anchor == "FINAL_CONFIRMATION":
+                if final_confirmation is not True:
+                    raise ValueError(
+                        "final_confirmation is required for confirmation-anchored authorization"
+                    )
+                if row["expires_at"] is not None or row["activated_at"] is not None:
+                    raise ValueError("confirmation-anchored authorization expiry is already bound")
+                duration_seconds = row["duration_seconds"]
+                if (
+                    isinstance(duration_seconds, bool)
+                    or duration_seconds is None
+                    or int(duration_seconds) != duration_seconds
+                    or int(duration_seconds) <= 0
+                ):
+                    raise ValueError("confirmation-anchored authorization duration is invalid")
+                finalized_expiry = stamp + timedelta(seconds=int(duration_seconds))
+            else:
+                if expiry_anchor != "ABSOLUTE":
+                    raise ValueError("unsupported authorization expiry anchor")
+                finalized_expiry = _parse_datetime(row["expires_at"])
+                if finalized_expiry is None or finalized_expiry <= stamp:
+                    raise ValueError("execution authorization is expired")
             active_settings = self._conn.execute(
                 "SELECT config_hash,generation FROM canary_setting_configs "
                 "WHERE state='ACTIVE' ORDER BY generation DESC LIMIT 1"
@@ -2883,12 +3176,26 @@ class AxiomStore:
             ).fetchone()
             if existing is not None:
                 raise ValueError("an active execution authorization already exists")
-            updated = self._conn.execute(
-                "UPDATE canary_execution_authorizations SET status='ACTIVE',"
-                "updated_at=?,activated_at=? WHERE authorization_id=? AND "
-                "status='DRAFT' AND generation=?",
-                (_iso(stamp), _iso(stamp), identifier, int(row["generation"])),
-            )
+            if expiry_anchor == "FINAL_CONFIRMATION":
+                updated = self._conn.execute(
+                    "UPDATE canary_execution_authorizations SET status='ACTIVE',"
+                    "updated_at=?,activated_at=?,expires_at=? WHERE authorization_id=? AND "
+                    "status='DRAFT' AND generation=?",
+                    (
+                        _iso(stamp),
+                        _iso(stamp),
+                        _iso(finalized_expiry),
+                        identifier,
+                        int(row["generation"]),
+                    ),
+                )
+            else:
+                updated = self._conn.execute(
+                    "UPDATE canary_execution_authorizations SET status='ACTIVE',"
+                    "updated_at=?,activated_at=? WHERE authorization_id=? AND "
+                    "status='DRAFT' AND generation=?",
+                    (_iso(stamp), _iso(stamp), identifier, int(row["generation"])),
+                )
             if int(updated.rowcount or 0) != 1:
                 raise ValueError("execution authorization changed")
             self._record_execution_authorization_audit_locked(
@@ -2900,7 +3207,11 @@ class AxiomStore:
                 generation=int(row["generation"]),
                 binding_hash=str(row["binding_hash"]),
                 timestamp=stamp,
-                detail={"settings_binding_verified": True},
+                detail={
+                    "settings_binding_verified": True,
+                    "expiry_anchor": expiry_anchor,
+                    "final_confirmation": expiry_anchor == "FINAL_CONFIRMATION",
+                },
             )
             result = self._conn.execute(
                 "SELECT * FROM canary_execution_authorizations "
@@ -3526,18 +3837,219 @@ class AxiomStore:
             return max(Decimal("0"), lot_commitment)
         return filled if status in {"FILLED", "RELEASED"} else Decimal("0")
 
+    @staticmethod
+    def _canary_exploratory_direct_proof(
+        member_payload: Mapping[str, Any],
+        *,
+        market_id: str | None,
+        token_id: str | None,
+    ) -> Mapping[str, Any]:
+        proof = member_payload.get("direct_evidence")
+        if not isinstance(proof, Mapping):
+            raise ValueError("rolling reservation direct input proof is missing")
+        market = str(market_id or "").strip()
+        token = str(token_id or "").strip()
+        if not market or not token:
+            raise ValueError("rolling reservation direct market/token binding is missing")
+        declared_markets: set[str] = set()
+        declared_tokens: dict[str, set[str]] = {}
+        declared_conditions: dict[str, set[str]] = {}
+        binding_values: list[Mapping[str, Any]] = []
+        for key in ("current_market_binding", "market_binding", "binding"):
+            value = member_payload.get(key)
+            if isinstance(value, Mapping):
+                binding_values.append(value)
+        values = member_payload.get("market_bindings")
+        if isinstance(values, (list, tuple)):
+            binding_values.extend(value for value in values if isinstance(value, Mapping))
+        for binding in binding_values:
+            binding_market = str(
+                binding.get("market_id", binding.get("id", ""))
+            ).strip()
+            if not binding_market:
+                continue
+            declared_markets.add(binding_market)
+            binding_tokens = declared_tokens.setdefault(binding_market, set())
+            for key in ("token_id", "asset_id", "yes_token_id", "no_token_id"):
+                value = binding.get(key)
+                if value not in (None, ""):
+                    binding_tokens.add(str(value).strip())
+            condition = binding.get("condition_id")
+            if condition not in (None, ""):
+                declared_conditions.setdefault(binding_market, set()).add(
+                    str(condition).strip()
+                )
+        if not declared_markets:
+            raise ValueError("rolling reservation direct market binding is missing")
+        if market not in declared_markets:
+            raise ValueError("rolling reservation direct market binding is stale")
+        target_tokens = declared_tokens.get(market, set())
+        if target_tokens and token not in target_tokens:
+            raise ValueError("rolling reservation direct token binding is stale")
+        if str(proof.get("source_class") or "").strip().upper() != "LIVE":
+            raise ValueError("rolling reservation direct input source is invalid")
+        proof_tokens: set[str] = set()
+
+        def proof_rows(name: str, *, evaluated: bool) -> list[Mapping[str, Any]]:
+            rows = proof.get(name)
+            if not isinstance(rows, (list, tuple)) or not rows or len(rows) > 128:
+                raise ValueError("rolling reservation direct input rows are invalid")
+            normalized: list[Mapping[str, Any]] = []
+            for row in rows:
+                if not isinstance(row, Mapping):
+                    raise ValueError("rolling reservation direct input row is invalid")
+                normalized.append(row)
+            count_name = (
+                "input_row_count"
+                if name == "input_rows"
+                else "evaluated_input_row_count"
+            )
+            count = proof.get(count_name)
+            if isinstance(count, bool) or not isinstance(count, int) or count != len(normalized):
+                raise ValueError("rolling reservation direct input row count is invalid")
+            digest_name = (
+                "input_manifest_digest"
+                if name == "input_rows"
+                else "evaluated_input_manifest_digest"
+            )
+            if str(proof.get(digest_name) or "").strip() != _rolling_hash(normalized):
+                raise ValueError("rolling reservation direct input digest is invalid")
+            for row in normalized:
+                row_market = str(row.get("market_id") or "").strip()
+                if not row_market or (
+                    declared_markets and row_market not in declared_markets
+                ):
+                    raise ValueError("rolling reservation direct market provenance is stale")
+                if evaluated and row_market != market:
+                    raise ValueError("rolling reservation direct evaluated market is stale")
+                row_condition = str(row.get("condition_id") or "").strip()
+                expected_conditions = declared_conditions.get(row_market, set())
+                if expected_conditions and row_condition and row_condition not in expected_conditions:
+                    raise ValueError("rolling reservation direct condition provenance is stale")
+                row_tokens = {
+                    str(row.get(field) or "").strip()
+                    for field in ("token_id", "asset_id", "yes_token_id", "no_token_id")
+                    if row.get(field) not in (None, "")
+                }
+                expected_tokens = declared_tokens.get(row_market, set())
+                if expected_tokens and row_tokens and row_tokens.isdisjoint(expected_tokens):
+                    raise ValueError("rolling reservation direct token provenance is stale")
+                if evaluated:
+                    if row_tokens and token not in row_tokens:
+                        raise ValueError("rolling reservation direct evaluated token is stale")
+                    proof_tokens.update(row_tokens)
+            return normalized
+
+        input_rows = proof_rows("input_rows", evaluated=False)
+        evaluated_rows = proof_rows("evaluated_input_rows", evaluated=True)
+        if not target_tokens and token not in proof_tokens:
+            raise ValueError("rolling reservation direct token proof is missing")
+        input_manifest_counts: dict[str, int] = {}
+        for row in input_rows:
+            key = _rolling_dump(row)
+            input_manifest_counts[key] = input_manifest_counts.get(key, 0) + 1
+        for row in evaluated_rows:
+            key = _rolling_dump(row)
+            remaining = input_manifest_counts.get(key, 0)
+            if remaining <= 0:
+                raise ValueError("rolling reservation evaluated input is not a subset")
+            input_manifest_counts[key] = remaining - 1
+        for name in ("evaluated_market_id", "same_market_id"):
+            if str(proof.get(name) or "").strip() != market:
+                raise ValueError("rolling reservation direct market proof is stale")
+        requirements = proof.get("input_requirements")
+        if not isinstance(requirements, Mapping):
+            raise ValueError("rolling reservation direct input requirements are missing")
+        required_rows = proof.get("required_input_rows")
+        available_rows = proof.get("available_input_rows")
+        if (
+            isinstance(required_rows, bool)
+            or not isinstance(required_rows, int)
+            or required_rows < 1
+            or isinstance(available_rows, bool)
+            or not isinstance(available_rows, int)
+            or available_rows < required_rows
+        ):
+            raise ValueError("rolling reservation direct input coverage is invalid")
+        same_market_input_count = sum(
+            1
+            for row in input_rows
+            if str(row.get("market_id") or "").strip() == market
+        )
+        actual_market_counts: dict[str, int] = {}
+        for row in input_rows:
+            row_market = str(row.get("market_id") or "").strip()
+            actual_market_counts[row_market] = actual_market_counts.get(row_market, 0) + 1
+        declared_market_counts = requirements.get("market_row_counts")
+        if not isinstance(declared_market_counts, Mapping):
+            raise ValueError("rolling reservation direct market counts are missing")
+        if {
+            str(key).strip(): int(value)
+            for key, value in declared_market_counts.items()
+            if isinstance(value, int) and not isinstance(value, bool)
+        } != actual_market_counts:
+            raise ValueError("rolling reservation direct market counts are stale")
+        if (
+            requirements.get("required_rows") != required_rows
+            or requirements.get("available_rows") != available_rows
+            or str(requirements.get("same_market_id") or "").strip() != market
+            or same_market_input_count != available_rows
+        ):
+            raise ValueError("rolling reservation direct input requirements are stale")
+        for name in ("total_available_input_rows", "loaded_rows", "valid_input_rows"):
+            value = proof.get(name)
+            if (
+                value is not None
+                and (
+                    isinstance(value, bool)
+                    or not isinstance(value, int)
+                    or value < 0
+                )
+            ):
+                raise ValueError("rolling reservation direct input counts are invalid")
+        deficits = proof.get("input_deficits", ())
+        if not isinstance(deficits, (list, tuple)) or any(
+            str(item).strip() for item in deficits
+        ):
+            raise ValueError("rolling reservation direct input proof is blocked")
+        if proof.get("evaluator_invoked") is not True or proof.get("evaluator_completed") is not True:
+            raise ValueError("rolling reservation direct evaluator proof is incomplete")
+        evaluated_observations = proof.get("evaluated_observations")
+        signal_count = proof.get("signal_count")
+        if (
+            isinstance(evaluated_observations, bool)
+            or not isinstance(evaluated_observations, int)
+            or evaluated_observations < 1
+            or isinstance(signal_count, bool)
+            or not isinstance(signal_count, int)
+            or signal_count < 0
+        ):
+            raise ValueError("rolling reservation direct evaluator counts are invalid")
+        if str(proof.get("signal_outcome") or "").strip().upper() not in {
+            "SIGNAL",
+            "NO_SIGNAL",
+        }:
+            raise ValueError("rolling reservation direct evaluator outcome is invalid")
+        return proof
+
     def _canary_rolling_binding_locked(
         self,
         *,
         lineage: Mapping[str, Any],
         allow_exit: bool = False,
+        market_id: str | None = None,
+        token_id: str | None = None,
+        execution_authorization_id: str | None = None,
     ) -> dict[str, Any] | None:
         """Validate an exact rolling selection/member binding.
 
         New BUY reservations must point at the current selection and a funded
-        ACTIVE member.  SELL exits may use an historical selection/member
-        lineage after rotation; exact lot ownership is authorized separately
-        by the persisted canary position request.
+        ACTIVE member.  Exploratory direct BUYs must additionally bind an
+        active execution authorization and the durable ACTIVE selection
+        projection; immutable proposal rows remain paper-only until then.
+        SELL exits may use an historical selection/member lineage after
+        rotation; exact lot ownership is authorized separately by the
+        persisted canary position request.
         """
         if not _canary_lineage_is_rolling(lineage):
             return None
@@ -3720,70 +4232,168 @@ class AxiomStore:
         requested_candidate = str(lineage.get("candidate_id") or "").strip()
         if requested_candidate and requested_candidate != member_candidate_id:
             raise ValueError("rolling reservation candidate binding is stale")
-        evidence_id = _rolling_identity_value(
-            member_identity,
-            "evidence_window_id",
-            "evidence_id",
-            "window_id",
+        exploratory_direct = (
+            selection_payload.get("proposal_only") is True
+            and str(selection_payload.get("admission_mode") or "").strip().upper()
+            == "EXPLORATORY_LIVE"
         )
-        if not evidence_id:
-            raise ValueError("rolling reservation evidence binding is missing")
-        evidence = self._conn.execute(
-            "SELECT * FROM strategy_evidence_windows WHERE evidence_window_id=?",
-            (evidence_id,),
-        ).fetchone()
-        if evidence is None or str(evidence["strategy_version_id"]) != strategy_id:
-            raise ValueError("rolling reservation evidence binding is stale")
-        evidence_payload = _load(evidence["payload_json"]) if evidence["payload_json"] else {}
-        evidence_payload = evidence_payload if isinstance(evidence_payload, Mapping) else {}
-        evidence_identity = dict(evidence)
-        evidence_identity["payload"] = evidence_payload
-        if _rolling_identity_conflict(
-            evidence_identity,
-            "research_trial_id",
-            "trial_id",
-        ) or _rolling_identity_conflict(
-            evidence_identity,
-            "candidate_id",
-            "candidate",
-            "strategy_candidate_id",
-        ) or _rolling_identity_conflict(
-            evidence_identity,
-            "source_class",
-            "source_type",
-        ) or _rolling_identity_conflict(
-            evidence_identity,
-            "evidence_digest",
-            "digest",
-        ):
-            raise ValueError("rolling reservation evidence provenance conflicts")
-        evidence_trial = _rolling_identity_value(
-            evidence_identity,
-            "research_trial_id",
-            "trial_id",
-        )
-        evidence_candidate = _rolling_identity_value(
-            evidence_identity,
-            "candidate_id",
-            "candidate",
-            "strategy_candidate_id",
-        )
-        source_class = str(evidence["source_class"] or "").strip().upper()
-        if source_class not in _ROLLING_EVIDENCE_SOURCE_CLASSES:
-            raise ValueError("rolling reservation evidence source_class is invalid")
-        expected_digest = _rolling_evidence_digest(
-            _rolling_evidence_mapping_from_row(evidence, evidence_payload)
-        )
-        if str(evidence["evidence_digest"] or "").strip() != expected_digest:
-            raise ValueError("rolling reservation evidence digest is invalid")
-        if evidence_trial != member_trial_id or evidence_candidate != member_candidate_id:
-            raise ValueError("rolling reservation evidence binding is stale")
-        member_status = str(member["status"] or "").strip().upper()
-        member_allocation = _risk_decimal(
+        if exploratory_direct:
+            self._canary_exploratory_direct_proof(
+                member_payload,
+                market_id=market_id,
+                token_id=token_id,
+            )
+        else:
+            evidence_id = _rolling_identity_value(
+                member_identity,
+                "evidence_window_id",
+                "evidence_id",
+                "window_id",
+            )
+            if not evidence_id:
+                raise ValueError("rolling reservation evidence binding is missing")
+            evidence = self._conn.execute(
+                "SELECT * FROM strategy_evidence_windows "
+                "WHERE evidence_window_id=?",
+                (evidence_id,),
+            ).fetchone()
+            if evidence is None or str(evidence["strategy_version_id"]) != strategy_id:
+                raise ValueError("rolling reservation evidence binding is stale")
+            evidence_payload = _load(evidence["payload_json"]) if evidence["payload_json"] else {}
+            evidence_payload = (
+                evidence_payload if isinstance(evidence_payload, Mapping) else {}
+            )
+            evidence_identity = dict(evidence)
+            evidence_identity["payload"] = evidence_payload
+            if _rolling_identity_conflict(
+                evidence_identity,
+                "research_trial_id",
+                "trial_id",
+            ) or _rolling_identity_conflict(
+                evidence_identity,
+                "candidate_id",
+                "candidate",
+                "strategy_candidate_id",
+            ) or _rolling_identity_conflict(
+                evidence_identity,
+                "source_class",
+                "source_type",
+            ) or _rolling_identity_conflict(
+                evidence_identity,
+                "evidence_digest",
+                "digest",
+            ):
+                raise ValueError("rolling reservation evidence provenance conflicts")
+            evidence_trial = _rolling_identity_value(
+                evidence_identity,
+                "research_trial_id",
+                "trial_id",
+            )
+            evidence_candidate = _rolling_identity_value(
+                evidence_identity,
+                "candidate_id",
+                "candidate",
+                "strategy_candidate_id",
+            )
+            source_class = str(evidence["source_class"] or "").strip().upper()
+            if source_class not in _ROLLING_EVIDENCE_SOURCE_CLASSES:
+                raise ValueError("rolling reservation evidence source_class is invalid")
+            expected_digest = _rolling_evidence_digest(
+                _rolling_evidence_mapping_from_row(evidence, evidence_payload)
+            )
+            if str(evidence["evidence_digest"] or "").strip() != expected_digest:
+                raise ValueError("rolling reservation evidence digest is invalid")
+            if evidence_trial != member_trial_id or evidence_candidate != member_candidate_id:
+                raise ValueError("rolling reservation evidence binding is stale")
+        effective_member_status = str(member["status"] or "").strip().upper()
+        effective_member_allocation = _risk_decimal(
             member["allocation"],
             name="member allocation",
             nonnegative=True,
         )
+        if not allow_exit and exploratory_direct:
+            authorization_id = str(execution_authorization_id or "").strip()
+            if not authorization_id:
+                raise ValueError("rolling reservation exploratory authorization is missing")
+            authorization = self._conn.execute(
+                "SELECT * FROM canary_execution_authorizations "
+                "WHERE authorization_id=?",
+                (authorization_id,),
+            ).fetchone()
+            authority = self._canary_authority_locked()
+            selection_hash = str(selection_payload.get("selection_hash") or "").strip()
+            if (
+                authorization is None
+                or str(authorization["status"] or "").upper() != "ACTIVE"
+                or str(authorization["mode"] or "").upper()
+                != "EXPLORATORY_MICRO_CANARY"
+                or str(authorization["selection_id"] or "").strip() != selection_id
+                or not selection_hash
+                or str(authorization["selection_hash"] or "").strip() != selection_hash
+                or str(authorization["active_settings_hash"] or "").strip()
+                != str(authority.get("config_hash") or "").strip()
+                or int(authorization["active_settings_generation"] or 0)
+                != int(authority.get("generation") or 0)
+            ):
+                raise ValueError("rolling reservation exploratory authorization is stale")
+            projected_selection = self.load_current_portfolio_selection()
+            if not isinstance(projected_selection, Mapping):
+                raise ValueError("rolling reservation active selection projection is unavailable")
+            if (
+                str(
+                    projected_selection.get("selection_id")
+                    or projected_selection.get("portfolio_selection_id")
+                    or ""
+                ).strip()
+                != selection_id
+                or str(projected_selection.get("selection_hash") or "").strip()
+                != selection_hash
+                or projected_selection.get("proposal_only") is not True
+                or str(projected_selection.get("status") or "").upper() != "ACTIVE"
+                or projected_selection.get("allocation_active") is not True
+                or projected_selection.get("canary_armed") is not True
+            ):
+                raise ValueError("rolling reservation active selection projection is stale")
+            for field, expected in (
+                ("policy_id", policy_id),
+                ("policy_version", policy_version),
+                ("risk_config_id", risk_id),
+                ("risk_config_generation", risk_generation),
+                ("risk_config_hash", risk_hash),
+            ):
+                if str(projected_selection.get(field) or "").strip() != str(expected).strip():
+                    raise ValueError("rolling reservation active selection projection is stale")
+            projected_members = projected_selection.get(
+                "members",
+                projected_selection.get("selected_members", ()),
+            )
+            projected_member = next(
+                (
+                    item
+                    for item in projected_members
+                    if isinstance(item, Mapping)
+                    and str(item.get("strategy_version_id") or "").strip() == strategy_id
+                ),
+                None,
+            ) if isinstance(projected_members, (list, tuple)) else None
+            if not isinstance(projected_member, Mapping):
+                raise ValueError("rolling reservation active member projection is unavailable")
+            if any(
+                str(projected_member.get(field) or "").strip()
+                != str(member_identity.get(field) or "").strip()
+                for field in ("strategy_version_id", "research_trial_id", "candidate_id")
+            ):
+                raise ValueError("rolling reservation active member projection is stale")
+            if projected_member.get("direct_evidence") != member_payload.get("direct_evidence"):
+                raise ValueError("rolling reservation active member projection is stale")
+            effective_member_status = str(projected_member.get("status") or "").strip().upper()
+            effective_member_allocation = _risk_decimal(
+                projected_member.get("allocation"),
+                name="member allocation",
+                nonnegative=True,
+            )
+        member_status = effective_member_status
+        member_allocation = effective_member_allocation
         if (not allow_exit and member_status != "ACTIVE") or (
             not allow_exit and member_allocation <= 0
         ):
@@ -4105,9 +4715,17 @@ class AxiomStore:
             if config_id is not None and str(config_id).strip() != bound_config_id:
                 raise ValueError("config id conflicts with reservation")
             if _canary_lineage_is_rolling(bound_lineage):
+                bound_detail = _load(reservation["detail_json"]) if reservation["detail_json"] else {}
+                bound_detail = bound_detail if isinstance(bound_detail, Mapping) else {}
+                bound_token_id = str(
+                    bound_detail.get("token_id") or bound_detail.get("asset_id") or ""
+                ).strip() or None
                 self._canary_rolling_binding_locked(
                     lineage=bound_lineage,
                     allow_exit=side_value == "SELL",
+                    market_id=str(reservation["market_id"] or "").strip() or None,
+                    token_id=bound_token_id,
+                    execution_authorization_id=bound_auth_id,
                 )
                 if requested_lineage["candidate_id"] is None:
                     requested_lineage["candidate_id"] = bound_lineage["candidate_id"]
@@ -4592,9 +5210,16 @@ class AxiomStore:
             status = str(row["status"] or "").upper()
             filled = _risk_decimal(row["filled_cost"], nonnegative=True)
             remaining = _risk_decimal(row["remaining_cost"], nonnegative=True)
-            if status in active_statuses or status == "FILLED":
-                used += filled + (remaining if status in active_statuses else Decimal("0"))
+            if status in active_statuses:
+                used += filled + remaining
                 order_ids.add(str(row["reservation_id"]))
+            elif status in _CANARY_RESERVATION_TERMINAL_STATUSES:
+                # Terminal transitions release only the unfilled commitment.
+                # Actual BUY fills (whose cost includes their fee) remain
+                # lifetime spend and cannot be replenished by release/cancel.
+                used += filled
+                if filled > 0:
+                    order_ids.add(str(row["reservation_id"]))
         attempts = self._conn.execute(
             "SELECT DISTINCT r.reservation_id "
             "FROM canary_submission_attempts a "
@@ -4834,6 +5459,15 @@ class AxiomStore:
             rolling_binding = self._canary_rolling_binding_locked(
                 lineage=lineage,
                 allow_exit=side_value == "SELL",
+                market_id=market_key,
+                token_id=(
+                    str(
+                        detail.get("token_id") or detail.get("asset_id") or ""
+                    ).strip()
+                    if isinstance(detail, Mapping)
+                    else None
+                ),
+                execution_authorization_id=auth_id,
             )
             bound_lineage = dict(lineage)
             if rolling_binding is not None:
@@ -5736,8 +6370,16 @@ class AxiomStore:
         allocation: Any | None = None,
         execution_authorization_id: str | None = None,
         authorization_id: str | None = None,
+        exclude_pending_event_id: str | None = None,
     ) -> dict[str, Any]:
-        """Return exact Decimal usage while preserving both ledger generations."""
+        """Return exact Decimal usage while preserving both ledger generations.
+
+        When ``exclude_pending_event_id`` is supplied, canonical monetary and
+        lifetime totals remain unchanged; ``blocking_buy_pending_usd`` reports
+        pending BUY cost after excluding only one exact native SUBMITTING
+        reservation with a matching ATTEMPTED submission identity.  The
+        caller owns the pre-send boundary that makes this exclusion safe.
+        """
         observed = ensure_utc(now or utc_now())
         lineage_filter = self._canary_normalize_lineage(
             {
@@ -5759,6 +6401,12 @@ class AxiomStore:
             else authorization_id
             or ""
         ).strip() or None
+        exclusion_requested = exclude_pending_event_id is not None
+        exclude_event_id = (
+            str(exclude_pending_event_id).strip()
+            if exclude_pending_event_id is not None
+            else ""
+        ) or None
         start, end = self._canary_window(observed)
         accounting_day_pht = datetime.fromisoformat(start).astimezone(
             ZoneInfo("Asia/Manila")
@@ -5804,6 +6452,8 @@ class AxiomStore:
             "exploratory_lifetime_used_usd": Decimal("0"),
             "exploratory_lifetime_orders": 0,
         }
+        if exclusion_requested:
+            result["blocking_buy_pending_usd"] = Decimal("0")
         strict_candidate_scope = lineage_filter.get("candidate_id") not in (None, "")
 
         def accounting_lineage_matches(row: sqlite3.Row | None) -> bool:
@@ -5864,10 +6514,10 @@ class AxiomStore:
                 "WHERE attempted_at>=? AND attempted_at<?",
                 (start, end),
             ).fetchall()
-            result["submitted_orders"] = len(attempt_rows)
-            reservation_rows = self._conn.execute(
+            all_reservation_rows = self._conn.execute(
                 "SELECT * FROM canary_risk_reservations"
             ).fetchall()
+            reservation_rows = list(all_reservation_rows)
             scoped_query = auth_id is not None or any(
                 value not in (None, "") for value in lineage_filter.values()
             )
@@ -5888,7 +6538,58 @@ class AxiomStore:
                     for row in attempt_rows
                     if str(row["intent_id"]) in selected_intents
                 )
+            else:
+                result["submitted_orders"] = len(attempt_rows)
             reservation_by_id = {str(row["reservation_id"]): row for row in reservation_rows}
+            excluded_pending_reservation_id: str | None = None
+            if exclusion_requested and auth_id and exclude_event_id:
+                event_rows = [
+                    row
+                    for row in all_reservation_rows
+                    if str(row["event_id"] or "").strip() == exclude_event_id
+                ]
+                if len(event_rows) == 1:
+                    candidate = event_rows[0]
+                    candidate_reservation_id = str(
+                        candidate["reservation_id"] or ""
+                    ).strip()
+                    candidate_intent = str(candidate["intent_id"] or "").strip()
+                    candidate_auth = str(
+                        candidate["execution_authorization_id"] or ""
+                    ).strip()
+                    candidate_status = str(candidate["status"] or "").upper()
+                    attempts_for_intent = (
+                        self._conn.execute(
+                            "SELECT side,status,execution_authorization_id "
+                            "FROM canary_submission_attempts "
+                            "WHERE intent_id=?",
+                            (candidate_intent,),
+                        ).fetchall()
+                        if candidate_intent
+                        else []
+                    )
+                    matching_attempt = (
+                        attempts_for_intent[0]
+                        if len(attempts_for_intent) == 1
+                        else None
+                    )
+                    if (
+                        candidate_reservation_id
+                        and candidate_reservation_id in reservation_by_id
+                        and candidate_intent
+                        and candidate_auth == auth_id
+                        and str(candidate["side"] or "").upper() == "BUY"
+                        and candidate_status == "SUBMITTING"
+                        and matching_attempt is not None
+                        and str(matching_attempt["side"] or "").upper() == "BUY"
+                        and str(matching_attempt["status"] or "").upper()
+                        == "ATTEMPTED"
+                        and str(
+                            matching_attempt["execution_authorization_id"] or ""
+                        ).strip()
+                        == auth_id
+                    ):
+                        excluded_pending_reservation_id = candidate_reservation_id
             new_event_ids = {
                 str(row["event_id"])
                 for row in reservation_rows
@@ -6126,6 +6827,7 @@ class AxiomStore:
             owned_inventory: dict[tuple[str, str], Decimal] = {}
             unknown_inventory = False
             unknown_execution = False
+            excluded_pending_amount = Decimal("0")
             for row in reservation_rows:
                 side = str(row["side"]).upper()
                 status = str(row["status"]).upper()
@@ -6178,6 +6880,10 @@ class AxiomStore:
                         result["gross_daily_buy_usd"] += outstanding
                         if status == "UNKNOWN":
                             result["buy_unknown_usd"] += outstanding
+                    if reservation_id == excluded_pending_reservation_id:
+                        excluded_pending_amount += day_unknown + (
+                            outstanding if reservation_active else Decimal("0")
+                        )
                     if provisional_cost > 0 or (status == "UNKNOWN" and outstanding > 0):
                         unknown_execution = True
                     cumulative_filled = (
@@ -6401,6 +7107,11 @@ class AxiomStore:
                     if start <= stamp_value < end:
                         result["today_realized_pnl_usd"] += pnl
                     result["realized_loss_usd"] += -pnl if pnl < 0 else Decimal("0")
+            if exclusion_requested:
+                result["blocking_buy_pending_usd"] = max(
+                    Decimal("0"),
+                    _risk_decimal(result["buy_pending_usd"]) - excluded_pending_amount,
+                )
 
             released_open_cost = Decimal("0")
             released_by_market: dict[str, Decimal] = {}
@@ -6629,6 +7340,10 @@ class AxiomStore:
             "external_flow_usd", "cumulative_buy_usd",
         ):
             result[name] = _risk_text(result[name])
+        if exclusion_requested:
+            result["blocking_buy_pending_usd"] = _risk_text(
+                result["blocking_buy_pending_usd"]
+            )
         result["exploratory_lifetime_used_usd"] = _risk_text(
             result["exploratory_lifetime_used_usd"]
         )
@@ -12343,8 +13058,25 @@ class AxiomStore:
             result["k"] = int(row["k"])
         return result
 
-    def commit_portfolio_selection(self, selection: Any, members: Iterable[Any]) -> dict[str, Any]:
+    def commit_portfolio_selection(
+        self,
+        selection: Any,
+        members: Iterable[Any],
+        *,
+        make_current: bool = True,
+    ) -> dict[str, Any]:
+        if not isinstance(make_current, bool):
+            raise ValueError("make_current must be a boolean")
         data = _rolling_mapping(selection, name="portfolio_selection")
+        proposal_only = data.get("proposal_only", False)
+        if not isinstance(proposal_only, bool):
+            raise ValueError("portfolio selection proposal_only must be boolean")
+        admission_mode = str(data.get("admission_mode") or "").strip().upper()
+        exploratory_mode = proposal_only and admission_mode == "EXPLORATORY_LIVE"
+        if proposal_only:
+            # A proposal is never made current by an ordinary commit.  The
+            # coordinated activation saga must call the explicit promotion API.
+            make_current = False
         for aliases, label in (
             (("policy_id", "admission_policy_id"), "policy"),
             (("policy_version", "version"), "policy version"),
@@ -12748,7 +13480,7 @@ class AxiomStore:
                     or trial_candidate != str(member["candidate_id"]).strip()
                 ):
                     raise ValueError("portfolio member candidate is not in research trial provenance")
-                if funded_active and member["evidence_window_id"] is None:
+                if funded_active and not exploratory_mode and member["evidence_window_id"] is None:
                     raise ValueError("funded portfolio member requires an evidence window")
                 if member["evidence_window_id"] is not None:
                     evidence = self._conn.execute(
@@ -12827,9 +13559,9 @@ class AxiomStore:
                         raise ValueError("portfolio member evidence coverage is invalid") from exc
                     if completeness > Decimal("1") or completeness != expected_completeness:
                         raise ValueError("portfolio member evidence completeness is inconsistent")
-                    if requested_window not in policy_windows:
+                    if not exploratory_mode and requested_window not in policy_windows:
                         raise ValueError("portfolio member evidence window is not required by policy")
-                    if funded_active:
+                    if funded_active and not exploratory_mode:
                         required_coverage = max(
                             policy_min_coverage,
                             Decimal(requested_window * 86400) * policy_min_ratio,
@@ -12845,11 +13577,11 @@ class AxiomStore:
                             ) < policy_min_reliability
                         ):
                             raise ValueError("portfolio member evidence is below policy minimums")
-                        if (
-                            evidence_trial != str(research_trial_id).strip()
-                            or evidence_candidate != str(member["candidate_id"]).strip()
-                        ):
-                            raise ValueError("portfolio member evidence window lineage mismatch")
+                    if funded_active and (
+                        evidence_trial != str(research_trial_id).strip()
+                        or evidence_candidate != str(member["candidate_id"]).strip()
+                    ):
+                        raise ValueError("portfolio member evidence window lineage mismatch")
             existing = self._conn.execute(
                 "SELECT * FROM portfolio_selections WHERE portfolio_selection_id=?",
                 (identifier,),
@@ -12933,18 +13665,55 @@ class AxiomStore:
                         committed_at,
                     ),
                 )
-            self._conn.execute(
-                "INSERT INTO portfolio_current_selection(pointer_id,portfolio_selection_id,committed_at) "
-                "VALUES ('current',?,?) "
-                "ON CONFLICT(pointer_id) DO UPDATE SET "
-                "portfolio_selection_id=excluded.portfolio_selection_id,committed_at=excluded.committed_at",
-                (identifier, committed_at),
-            )
+            if make_current:
+                self._conn.execute(
+                    "INSERT INTO portfolio_current_selection(pointer_id,portfolio_selection_id,committed_at) "
+                    "VALUES ('current',?,?) "
+                    "ON CONFLICT(pointer_id) DO UPDATE SET "
+                    "portfolio_selection_id=excluded.portfolio_selection_id,committed_at=excluded.committed_at",
+                    (identifier, committed_at),
+                )
             row = self._conn.execute(
                 "SELECT * FROM portfolio_selections WHERE portfolio_selection_id=?",
                 (identifier,),
             ).fetchone()
             return self._rolling_selection_record(row)
+    def load_portfolio_selection(self, selection_id: str) -> dict[str, Any] | None:
+        """Load one immutable selection record and its members by exact PK."""
+        identifier = str(selection_id or "").strip()
+        if not identifier:
+            raise ValueError("selection_id is required")
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM portfolio_selections WHERE portfolio_selection_id=?",
+                (identifier,),
+            ).fetchone()
+            if row is None:
+                return None
+            return self._rolling_selection_record(row)
+
+    def make_portfolio_selection_current(self, selection_id: str) -> dict[str, Any]:
+        """Promote an existing immutable selection through an explicit boundary."""
+        identifier = str(selection_id or "").strip()
+        if not identifier:
+            raise ValueError("selection_id is required")
+        with self.transaction(immediate=True):
+            row = self._conn.execute(
+                "SELECT * FROM portfolio_selections WHERE portfolio_selection_id=?",
+                (identifier,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("portfolio selection does not exist")
+            self._conn.execute(
+                "INSERT INTO portfolio_current_selection(pointer_id,portfolio_selection_id,committed_at) "
+                "VALUES ('current',?,?) "
+                "ON CONFLICT(pointer_id) DO UPDATE SET "
+                "portfolio_selection_id=excluded.portfolio_selection_id,"
+                "committed_at=excluded.committed_at",
+                (identifier, row["committed_at"]),
+            )
+            return self._rolling_selection_record(row)
+
 
     def load_current_portfolio_selection(self) -> dict[str, Any] | None:
         with self._lock:
@@ -12960,6 +13729,7 @@ class AxiomStore:
             else:
                 row = self._conn.execute(
                     "SELECT * FROM portfolio_selections "
+                    "WHERE COALESCE(json_extract(payload_json, '$.proposal_only'), 0) != 1 "
                     "ORDER BY committed_at DESC,rowid DESC LIMIT 1"
                 ).fetchone()
             if row is None:
@@ -12999,19 +13769,20 @@ class AxiomStore:
             }
             raw_members = projected.get("members", projected.get("selected_members", ()))
             if isinstance(raw_members, (list, tuple)):
-                projected["members"] = [
-                    {
-                        **dict(member),
-                        **(
-                            by_strategy.get(
-                                str(member.get("strategy_version_id") or "").strip(),
-                                {},
-                            )
-                        ),
-                    }
-                    for member in raw_members
-                    if isinstance(member, Mapping)
-                ]
+                projected_members: list[dict[str, Any]] = []
+                for member in raw_members:
+                    if not isinstance(member, Mapping):
+                        continue
+                    merged = dict(member)
+                    merged.update(
+                        by_strategy.get(
+                            str(member.get("strategy_version_id") or "").strip(),
+                            {},
+                        )
+                    )
+                    merged.pop("proposed_allocation", None)
+                    projected_members.append(merged)
+                projected["members"] = projected_members
         return projected
 
     def list_portfolio_selections(self, *, limit: int | None = 100) -> list[dict[str, Any]]:
@@ -21862,7 +22633,9 @@ def _normalize_execution_authorization(
     adverse_evidence_ack: Any,
     lifetime_budget: Mapping[str, Any] | Any,
     stop_rules: Mapping[str, Any],
-    expires_at: datetime,
+    expires_at: datetime | None,
+    expiry_anchor: str,
+    duration_seconds: int | None,
     scope_hash: str,
     scope_version: str | int,
     active_settings_hash: str | None,
@@ -21916,12 +22689,32 @@ def _normalize_execution_authorization(
         _dump(dict(stop_rules))
     except (TypeError, ValueError) as exc:
         raise ValueError("authorization evidence/stop rules must be JSON") from exc
-    if not isinstance(expires_at, datetime):
-        raise ValueError("expires_at must be a datetime")
+    anchor_value = str(expiry_anchor or "ABSOLUTE").strip().upper()
+    if anchor_value not in {"ABSOLUTE", "FINAL_CONFIRMATION"}:
+        raise ValueError("expiry_anchor must be ABSOLUTE or FINAL_CONFIRMATION")
     observed = ensure_utc(timestamp or utc_now())
-    expires = ensure_utc(expires_at)
-    if expires <= observed:
-        raise ValueError("expires_at must be in the future")
+    if anchor_value == "FINAL_CONFIRMATION":
+        if expires_at is not None:
+            raise ValueError("confirmation-anchored draft must not have expires_at")
+        if (
+            isinstance(duration_seconds, bool)
+            or duration_seconds is None
+            or not isinstance(duration_seconds, int)
+            or duration_seconds <= 0
+        ):
+            raise ValueError(
+                "confirmation-anchored authorization duration_seconds must be a positive integer"
+            )
+        expires_value = None
+    else:
+        if duration_seconds is not None:
+            raise ValueError("duration_seconds requires FINAL_CONFIRMATION expiry_anchor")
+        if not isinstance(expires_at, datetime):
+            raise ValueError("expires_at must be a datetime")
+        expires = ensure_utc(expires_at)
+        if expires <= observed:
+            raise ValueError("expires_at must be in the future")
+        expires_value = _iso(expires)
     scope_hash_value = _execution_authorization_text(scope_hash, name="scope_hash") or ""
     scope_version_value = _execution_authorization_text(
         scope_version,
@@ -21960,7 +22753,9 @@ def _normalize_execution_authorization(
         "adverse_evidence_ack": acknowledgement,
         "lifetime_budget": _execution_authorization_budget(lifetime_budget),
         "stop_rules": dict(stop_rules),
-        "expires_at": _iso(expires),
+        "expires_at": expires_value,
+        "expiry_anchor": anchor_value,
+        "duration_seconds": int(duration_seconds) if duration_seconds is not None else None,
         "scope_hash": scope_hash_value,
         "scope_version": scope_version_value,
         "active_settings_hash": settings_hash_value,
@@ -22005,6 +22800,10 @@ def _execution_authorization_record(row: sqlite3.Row | None) -> dict[str, Any]:
         "lifetime_budget": budget,
         "stop_rules": stop_rules,
         "expires_at": _parse_datetime(row["expires_at"]),
+        "expiry_anchor": str(row["expiry_anchor"] or "ABSOLUTE").upper(),
+        "duration_seconds": (
+            int(row["duration_seconds"]) if row["duration_seconds"] is not None else None
+        ),
         "scope_hash": row["scope_hash"],
         "scope_version": row["scope_version"],
         "active_settings_hash": row["active_settings_hash"],
