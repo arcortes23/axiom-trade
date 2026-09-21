@@ -34,13 +34,16 @@ from axiom.canary import (
     EXECUTION_FEASIBILITY_MARKET_CAP,
     PolymarketClobV2Venue,
     PRODUCTION_LIVE_EXECUTION,
+    _canary_authorization_current_selection_hash,
+    _canary_canonical_selection_hash,
     _canary_lifecycle_snapshot_hashes,
     _canary_lifecycle_evidence_class,
     _require_execution_authorization,
 )
 from axiom.cli import main
 from axiom.dashboard import DashboardData, _dashboard_html
-from axiom.storage import AxiomStore, SQLiteBusyTimeout
+from axiom.storage import AxiomStore, SQLiteBusyTimeout, _rolling_hash
+DIRECT_POLICY_HASH = hashlib.sha256(b"policy-direct-binding").hexdigest()
 
 T0=datetime(2026,1,2,12,tzinfo=timezone.utc)
 TEST_CONTROLLER_OWNER = "test-canary-controller"
@@ -5026,6 +5029,1374 @@ class CanaryTests(unittest.TestCase):
             0,
         )
 
+
+class ConfirmationAnchoredAuthorizationTests(unittest.TestCase):
+    PURPOSE = (
+        "commission exploratory automation and measure actual net results; "
+        "profitability unproven"
+    )
+    SCOPE_HASH = "confirmation-scope"
+    SCOPE_VERSION = "scope-v1"
+    SELECTION_ID = "selection-v1"
+    SELECTION_HASH = "b" * 64
+    POLICY_HASH = "a" * 64
+    OWNER = "confirmation-test-operator"
+    AUTHORIZATION_ID = "confirmation-anchored-auth"
+
+    def setUp(self):
+        self.reviewed_at = T0
+        self.confirmed_at = T0 + timedelta(hours=1)
+        self.store = AxiomStore(":memory:")
+        self.addCleanup(self.store.close)
+        self.service = CanaryService(
+            self.store,
+            credentials=FakeCredentials(),
+            clock=lambda: self.confirmed_at,
+        )
+        (
+            self.settings_id,
+            self.settings_generation,
+            self.settings_hash,
+        ) = self.service._settings_identity()
+        self.assertIsNotNone(self.settings_id)
+        self.assertIsNotNone(self.settings_generation)
+        self.assertIsNotNone(self.settings_hash)
+
+    def _draft(self, *, authorization_id=None, timestamp=None, **changes):
+        values = {
+            "authorization_id": authorization_id or self.AUTHORIZATION_ID,
+            "purpose": self.PURPOSE,
+            "reviewed_selection_policy_hash": self.POLICY_HASH,
+            "adverse_evidence_ack": True,
+            "lifetime_budget": {"max_notional_usd": "5.00"},
+            "stop_rules": {"max_loss_usd": "2.00"},
+            "expires_at": None,
+            "expiry_anchor": "FINAL_CONFIRMATION",
+            "duration_seconds": 86_400,
+            "scope_hash": self.SCOPE_HASH,
+            "scope_version": self.SCOPE_VERSION,
+            "active_settings_hash": self.settings_hash,
+            "active_settings_generation": self.settings_generation,
+            "selection_id": self.SELECTION_ID,
+            "selection_hash": self.SELECTION_HASH,
+            "actor": self.OWNER,
+            "timestamp": timestamp or self.reviewed_at,
+        }
+        values.update(changes)
+        return self.store.register_execution_authorization_draft(**values)
+
+    def _active(self, *, now):
+        return self.store.load_active_execution_authorization(
+            mode="EXPLORATORY_MICRO_CANARY",
+            purpose=self.PURPOSE,
+            now=now,
+            scope_hash=self.SCOPE_HASH,
+            scope_version=self.SCOPE_VERSION,
+            active_settings_hash=self.settings_hash,
+            active_settings_generation=self.settings_generation,
+            selection_id=self.SELECTION_ID,
+            selection_hash=self.SELECTION_HASH,
+        )
+
+    def test_confirmation_anchored_draft_has_no_authority_or_effective_expiry(self):
+        draft = self._draft()
+
+        self.assertEqual(draft["status"], "DRAFT")
+        self.assertIsNone(draft["expires_at"])
+        self.assertEqual(draft["expiry_anchor"], "FINAL_CONFIRMATION")
+        self.assertEqual(draft["duration_seconds"], 86_400)
+        self.assertIsNone(self._active(now=self.reviewed_at))
+        self.assertEqual(
+            self.store.list_execution_authorizations(
+                status="DRAFT",
+                now=self.reviewed_at,
+            )[0]["authorization_id"],
+            self.AUTHORIZATION_ID,
+        )
+
+        with self.assertRaises(ValueError):
+            self.store.activate_execution_authorization(
+                self.AUTHORIZATION_ID,
+                self.OWNER,
+                expected_generation=int(draft["generation"]),
+                timestamp=self.confirmed_at,
+            )
+
+        self.assertIsNone(self._active(now=self.confirmed_at))
+        self.assertEqual(
+            self.store.list_execution_authorizations(
+                status="DRAFT",
+                now=self.confirmed_at,
+            )[0]["status"],
+            "DRAFT",
+        )
+
+    def test_confirmation_binds_expiry_to_activation_and_cannot_be_rebound(self):
+        draft = self._draft()
+        activated = self.store.activate_execution_authorization(
+            self.AUTHORIZATION_ID,
+            self.OWNER,
+            expected_generation=int(draft["generation"]),
+            final_confirmation=True,
+            timestamp=self.confirmed_at,
+        )
+        expected_expiry = self.confirmed_at + timedelta(days=1)
+
+        self.assertEqual(activated["status"], "ACTIVE")
+        self.assertEqual(activated["activated_at"], self.confirmed_at)
+        self.assertEqual(activated["expires_at"], expected_expiry)
+        self.assertEqual(activated["expiry_anchor"], "FINAL_CONFIRMATION")
+        self.assertEqual(activated["duration_seconds"], 86_400)
+        reread = self._active(now=self.confirmed_at + timedelta(hours=23))
+        self.assertIsNotNone(reread)
+        self.assertEqual(reread["activated_at"], self.confirmed_at)
+        self.assertEqual(reread["expires_at"], expected_expiry)
+
+        with self.assertRaises(ValueError):
+            self.store.register_execution_authorization_draft(
+                authorization_id=self.AUTHORIZATION_ID,
+                purpose=self.PURPOSE,
+                reviewed_selection_policy_hash=self.POLICY_HASH,
+                adverse_evidence_ack=True,
+                lifetime_budget={"max_notional_usd": "5.00"},
+                stop_rules={"max_loss_usd": "2.00"},
+                expires_at=None,
+                expiry_anchor="FINAL_CONFIRMATION",
+                duration_seconds=2 * 86_400,
+                scope_hash=self.SCOPE_HASH,
+                scope_version=self.SCOPE_VERSION,
+                active_settings_hash=self.settings_hash,
+                active_settings_generation=self.settings_generation,
+                selection_id=self.SELECTION_ID,
+                selection_hash=self.SELECTION_HASH,
+                actor=self.OWNER,
+                timestamp=self.reviewed_at,
+            )
+        with self.assertRaises(ValueError):
+            self.store.activate_execution_authorization(
+                self.AUTHORIZATION_ID,
+                self.OWNER,
+                expected_generation=int(activated["generation"]),
+                final_confirmation=True,
+                timestamp=self.confirmed_at + timedelta(hours=23),
+            )
+        reread_after_attempt = self._active(now=self.confirmed_at + timedelta(hours=23))
+        self.assertIsNotNone(reread_after_attempt)
+        self.assertEqual(reread_after_attempt["expires_at"], expected_expiry)
+
+    def test_confirmation_anchor_timestamp_is_immutable_at_sql_boundary(self):
+        draft = self._draft()
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store.connection.execute(
+                "UPDATE canary_execution_authorizations SET activated_at=? "
+                "WHERE authorization_id=?",
+                (
+                    self.confirmed_at.isoformat(),
+                    self.AUTHORIZATION_ID,
+                ),
+            )
+        self.store.connection.rollback()
+        activated = self.store.activate_execution_authorization(
+            self.AUTHORIZATION_ID,
+            self.OWNER,
+            expected_generation=int(draft["generation"]),
+            final_confirmation=True,
+            timestamp=self.confirmed_at,
+        )
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store.connection.execute(
+                "UPDATE canary_execution_authorizations SET activated_at=? "
+                "WHERE authorization_id=?",
+                (
+                    (self.confirmed_at + timedelta(hours=2)).isoformat(),
+                    activated["authorization_id"],
+                ),
+            )
+        self.store.connection.rollback()
+        reread = self._active(now=self.confirmed_at + timedelta(hours=2))
+        self.assertIsNotNone(reread)
+        self.assertEqual(reread["activated_at"], self.confirmed_at)
+
+    def test_expiry_blocks_new_buy_without_deleting_unresolved_reservation(self):
+        draft = self._draft()
+        activated = self.store.activate_execution_authorization(
+            self.AUTHORIZATION_ID,
+            self.OWNER,
+            expected_generation=int(draft["generation"]),
+            final_confirmation=True,
+            timestamp=self.confirmed_at,
+        )
+        lease_time = self.confirmed_at + timedelta(hours=23)
+        lease = self.store.acquire_canary_controller_lease(
+            owner_id=self.OWNER,
+            lease_seconds=86_400,
+            now=lease_time,
+        )
+        # A memory-store service normally has no control singleton.  If the
+        # schema does provide one, keep this boundary fixture in the armed
+        # state without going through a venue or live execution path.
+        self.store.connection.execute(
+            "UPDATE canary_control SET state='ARMED',expires_at=?,updated_at=? "
+            "WHERE singleton=1",
+            (
+                (activated["expires_at"] + timedelta(hours=1)).isoformat(),
+                self.confirmed_at.isoformat(),
+            ),
+        )
+        self.store.connection.commit()
+        reservation_time = lease_time + timedelta(minutes=1)
+        reservation = self.store.reserve_canary_capacity(
+            intent_id="unresolved-buy",
+            reservation_id="reservation:unresolved-buy",
+            side="BUY",
+            requested_cost="0.99",
+            fee_reserve="0.01",
+            quantity="1",
+            market_id="boundary-market",
+            event_id="boundary-event",
+            execution_authorization_id=activated["authorization_id"],
+            controller_owner_id=lease["owner_id"],
+            controller_generation=int(lease["generation"]),
+            detail={"boundary": "unresolved"},
+            timestamp=reservation_time,
+        )
+        self.assertEqual(reservation["status"], "HELD")
+        self.assertEqual(reservation["remaining_cost"], "1.00")
+
+        expired_time = activated["expires_at"] + timedelta(seconds=1)
+        with self.assertRaises(ValueError):
+            self.store.reserve_canary_capacity(
+                intent_id="new-buy-after-expiry",
+                reservation_id="reservation:new-buy-after-expiry",
+                side="BUY",
+                requested_cost="0.99",
+                fee_reserve="0.01",
+                quantity="1",
+                market_id="boundary-market-2",
+                event_id="boundary-event-2",
+                execution_authorization_id=activated["authorization_id"],
+                controller_owner_id=lease["owner_id"],
+                controller_generation=int(lease["generation"]),
+                detail={"boundary": "expired"},
+                timestamp=expired_time,
+            )
+
+        replayed = self.store.reserve_canary_capacity(
+            intent_id="unresolved-buy",
+            reservation_id="reservation:unresolved-buy",
+            side="BUY",
+            requested_cost="0.99",
+            fee_reserve="0.01",
+            quantity="1",
+            market_id="boundary-market",
+            event_id="boundary-event",
+            execution_authorization_id=activated["authorization_id"],
+            controller_owner_id=lease["owner_id"],
+            controller_generation=int(lease["generation"]),
+            detail={"boundary": "unresolved"},
+            timestamp=expired_time,
+        )
+        self.assertEqual(replayed["reservation_id"], reservation["reservation_id"])
+        self.assertEqual(replayed["status"], "HELD")
+        self.assertEqual(replayed["remaining_cost"], "1.00")
+        self.assertEqual(
+            replayed["execution_authorization_id"],
+            activated["authorization_id"],
+        )
+
+
+class LegacyAuthorizationMigrationTests(unittest.TestCase):
+    def test_legacy_absolute_authorization_migration_preserves_identity_and_references(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = os.path.join(directory, "legacy-auth.sqlite")
+            connection = sqlite3.connect(database_path)
+            connection.executescript(
+                """
+                PRAGMA foreign_keys = ON;
+                CREATE TABLE canary_execution_authorizations (
+                    authorization_id TEXT PRIMARY KEY,
+                    status TEXT NOT NULL CHECK(status IN ('DRAFT','ACTIVE','EXPIRED','REVOKED')),
+                    generation INTEGER NOT NULL,
+                    mode TEXT NOT NULL,
+                    purpose TEXT NOT NULL,
+                    strategy_versions_json TEXT NOT NULL DEFAULT '[]',
+                    selection_policy_hash TEXT,
+                    adverse_evidence_ack_json TEXT NOT NULL,
+                    lifetime_budget_json TEXT NOT NULL,
+                    stop_rules_json TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    scope_hash TEXT NOT NULL,
+                    scope_version TEXT NOT NULL,
+                    active_settings_hash TEXT NOT NULL,
+                    active_settings_generation INTEGER NOT NULL,
+                    selection_id TEXT,
+                    selection_hash TEXT,
+                    actor TEXT NOT NULL,
+                    actor_version TEXT NOT NULL,
+                    binding_hash TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    activated_at TEXT,
+                    revoked_at TEXT
+                );
+                CREATE TABLE canary_risk_reservations (
+                    reservation_id TEXT PRIMARY KEY,
+                    intent_id TEXT NOT NULL UNIQUE,
+                    side TEXT NOT NULL,
+                    market_id TEXT,
+                    event_id TEXT,
+                    requested_cost TEXT NOT NULL DEFAULT '0',
+                    filled_cost TEXT NOT NULL DEFAULT '0',
+                    remaining_cost TEXT NOT NULL DEFAULT '0',
+                    fee_reserve TEXT NOT NULL DEFAULT '0',
+                    quantity TEXT NOT NULL DEFAULT '0',
+                    filled_quantity TEXT NOT NULL DEFAULT '0',
+                    status TEXT NOT NULL,
+                    config_generation INTEGER,
+                    config_hash TEXT,
+                    execution_authorization_id TEXT,
+                    created_at TEXT NOT NULL,
+                    submitted_at TEXT,
+                    updated_at TEXT NOT NULL,
+                    released_at TEXT,
+                    FOREIGN KEY(execution_authorization_id)
+                        REFERENCES canary_execution_authorizations(authorization_id)
+                );
+                """
+            )
+            expires_at = (T0 + timedelta(days=1)).isoformat()
+            connection.execute(
+                "INSERT INTO canary_execution_authorizations("
+                "authorization_id,status,generation,mode,purpose,strategy_versions_json,"
+                "selection_policy_hash,adverse_evidence_ack_json,lifetime_budget_json,"
+                "stop_rules_json,expires_at,scope_hash,scope_version,active_settings_hash,"
+                "active_settings_generation,selection_id,selection_hash,actor,actor_version,"
+                "binding_hash,created_at,updated_at,activated_at,revoked_at"
+                ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    "legacy-absolute-auth",
+                    "ACTIVE",
+                    4,
+                    "EXPLORATORY_MICRO_CANARY",
+                    "legacy migration regression",
+                    "[]",
+                    "a" * 64,
+                    '{"acknowledged":true}',
+                    '{"max_notional_usd":"5.00"}',
+                    '{"max_loss_usd":"2.00"}',
+                    expires_at,
+                    "legacy-scope",
+                    "legacy-v1",
+                    "legacy-settings",
+                    7,
+                    "legacy-selection",
+                    "b" * 64,
+                    "legacy-operator",
+                    "1",
+                    "legacy-binding-hash",
+                    T0.isoformat(),
+                    T0.isoformat(),
+                    T0.isoformat(),
+                    None,
+                ),
+            )
+            connection.execute(
+                "INSERT INTO canary_risk_reservations("
+                "reservation_id,intent_id,side,market_id,event_id,requested_cost,"
+                "filled_cost,remaining_cost,fee_reserve,quantity,filled_quantity,"
+                "status,config_generation,config_hash,execution_authorization_id,"
+                "created_at,submitted_at,updated_at,released_at"
+                ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    "legacy-reservation",
+                    "legacy-intent",
+                    "BUY",
+                    "legacy-market",
+                    "legacy-event",
+                    "1.00",
+                    "0.50",
+                    "0.50",
+                    "0.01",
+                    "2",
+                    "1",
+                    "HELD",
+                    4,
+                    "legacy-settings-hash",
+                    "legacy-absolute-auth",
+                    T0.isoformat(),
+                    None,
+                    T0.isoformat(),
+                    None,
+                ),
+            )
+            connection.commit()
+            connection.close()
+
+            store = AxiomStore(database_path)
+            try:
+                store.save_canary_setting_config(
+                    config_id="legacy-settings-config",
+                    state="ACTIVE",
+                    generation=7,
+                    config_hash="legacy-settings",
+                    values={},
+                    actor="migration-regression",
+                    timestamp=T0,
+                    activated_at=T0,
+                )
+                usable = store.load_active_execution_authorization(
+                    mode="EXPLORATORY_MICRO_CANARY",
+                    now=T0,
+                    scope_hash="legacy-scope",
+                    scope_version="legacy-v1",
+                    active_settings_hash="legacy-settings",
+                    active_settings_generation=7,
+                    selection_id="legacy-selection",
+                    selection_hash="b" * 64,
+                )
+                self.assertIsNotNone(usable)
+                self.assertEqual(usable["authorization_id"], "legacy-absolute-auth")
+                authorization = store.connection.execute(
+                    "SELECT authorization_id,binding_hash,expires_at,expiry_anchor,duration_seconds "
+                    "FROM canary_execution_authorizations WHERE authorization_id=?",
+                    ("legacy-absolute-auth",),
+                ).fetchone()
+                self.assertIsNotNone(authorization)
+                self.assertEqual(authorization["authorization_id"], "legacy-absolute-auth")
+                self.assertEqual(authorization["binding_hash"], "legacy-binding-hash")
+                self.assertEqual(authorization["expires_at"], expires_at)
+                self.assertEqual(authorization["expiry_anchor"], "ABSOLUTE")
+                self.assertIsNone(authorization["duration_seconds"])
+                reservation = store.connection.execute(
+                    "SELECT execution_authorization_id,status "
+                    "FROM canary_risk_reservations WHERE reservation_id=?",
+                    ("legacy-reservation",),
+                ).fetchone()
+                self.assertEqual(
+                    tuple(reservation),
+                    ("legacy-absolute-auth", "HELD"),
+                )
+                self.assertEqual(
+                    store.connection.execute("PRAGMA foreign_key_check").fetchall(),
+                    [],
+                )
+            finally:
+                store.close()
+
+class PortfolioSelectionPointerTests(unittest.TestCase):
+    def test_proposal_only_commit_stays_noncurrent_until_explicit_promotion(self):
+        store = AxiomStore(":memory:")
+        try:
+            store.save_admission_policy(
+                {
+                    "policy_id": "pointer-policy",
+                    "version": "v1",
+                    "config_hash": "pointer-policy-hash",
+                    "global_budget": "0",
+                    "max_members": 5,
+                }
+            )
+            selection = store.commit_portfolio_selection(
+                {
+                    "portfolio_selection_id": "proposal-only-empty",
+                    "policy_id": "pointer-policy",
+                    "policy_version": "v1",
+                    "risk_config_id": "pointer-risk",
+                    "risk_config_generation": 1,
+                    "risk_config_hash": "pointer-risk-hash",
+                    "global_budget": "0",
+                    "k": 0,
+                    "selected_at": T0,
+                    "review_due_at": T0 + timedelta(days=1),
+                    "admission_mode": "EXPLORATORY_LIVE",
+                    "proposal_only": True,
+                },
+                [],
+                make_current=False,
+            )
+            self.assertEqual(selection["portfolio_selection_id"], "proposal-only-empty")
+            self.assertIsNone(store.load_current_portfolio_selection())
+            exact = store.load_portfolio_selection("proposal-only-empty")
+            self.assertIsNotNone(exact)
+            self.assertTrue(exact["proposal_only"])
+            promoted = store.make_portfolio_selection_current("proposal-only-empty")
+            self.assertEqual(promoted["portfolio_selection_id"], "proposal-only-empty")
+            self.assertEqual(
+                store.load_current_portfolio_selection()["portfolio_selection_id"],
+                "proposal-only-empty",
+            )
+        finally:
+            store.close()
+
+class ExploratoryDirectBindingTests(unittest.TestCase):
+    def setUp(self):
+        self._production_profile = patch.dict(
+            os.environ,
+            {"AXIOM_EXECUTION_PROFILE": "production"},
+        )
+        self._production_profile.start()
+        self.addCleanup(self._production_profile.stop)
+        self.store = HealthyStore(":memory:")
+        self.service = CanaryService(
+            self.store,
+            credentials=FakeCredentials(),
+            clock=lambda: T0,
+        )
+        self._authorization_serial = 0
+        self.venue = FakeVenue()
+        self.store.save_strategy_version(
+            {
+                "strategy_version_id": "strategy-direct-binding",
+                "strategy_id": "strategy-direct-binding",
+                "version": "v1",
+                "code_hash": "strategy-code",
+                "config_hash": "strategy-config",
+                "strategy_document": {"parameters": {"lookback": 1}},
+            }
+        )
+        self.store.save_research_trial(
+            {
+                "research_trial_id": "trial-direct-binding",
+                "strategy_version_id": "strategy-direct-binding",
+                "candidate_id": "candidate-direct-binding",
+                "status": "PROPOSED",
+            }
+        )
+        self.store.save_admission_policy(
+            {
+                "policy_id": "policy-direct-binding",
+                "version": "v1",
+                "config_hash": DIRECT_POLICY_HASH,
+                "global_budget": "5.00",
+                "max_members": 3,
+            }
+        )
+        self.lease, self.authorization = _install_test_authority(
+            self.store,
+            self.service,
+            scope_hash="scope-direct-binding",
+            scope_version="1",
+            exact_strategy_versions=("strategy-direct-binding",),
+        )
+        selection = self._commit_selection(
+            "selection-direct-binding",
+            self._input_rows(),
+            self._input_rows()[:2],
+            "market-direct-a",
+        )
+        self._activate_reservation_selection(selection)
+
+    def tearDown(self):
+        self.store.close()
+
+    @staticmethod
+    def _input_rows():
+        return [
+            {
+                "market_id": "market-direct-a",
+                "snapshot_id": "direct-a-1",
+                "timestamp": (T0 - timedelta(seconds=30)).isoformat(),
+                "yes_token_id": "yes-direct-a",
+                "no_token_id": "no-direct-a",
+                "yes_mid": "0.50",
+            },
+            {
+                "market_id": "market-direct-a",
+                "snapshot_id": "direct-a-2",
+                "timestamp": T0.isoformat(),
+                "yes_token_id": "yes-direct-a",
+                "no_token_id": "no-direct-a",
+                "yes_mid": "0.51",
+            },
+            {
+                "market_id": "market-direct-b",
+                "snapshot_id": "direct-b-1",
+                "timestamp": (T0 - timedelta(seconds=30)).isoformat(),
+                "yes_token_id": "yes-direct-b",
+                "no_token_id": "no-direct-b",
+                "yes_mid": "0.60",
+            },
+            {
+                "market_id": "market-direct-b",
+                "snapshot_id": "direct-b-2",
+                "timestamp": T0.isoformat(),
+                "yes_token_id": "yes-direct-b",
+                "no_token_id": "no-direct-b",
+                "yes_mid": "0.61",
+            },
+        ]
+
+    def _direct_proof(
+        self,
+        input_rows,
+        evaluated_rows,
+        evaluated_market_id,
+    ):
+        return {
+            "source_class": "LIVE",
+            "input_rows": input_rows,
+            "input_row_count": len(input_rows),
+            "input_manifest_digest": _rolling_hash(input_rows),
+            "evaluated_market_id": evaluated_market_id,
+            "evaluated_input_rows": evaluated_rows,
+            "evaluated_input_row_count": len(evaluated_rows),
+            "evaluated_input_manifest_digest": _rolling_hash(evaluated_rows),
+            "input_requirements": {
+                "required_rows": 2,
+                "same_market_id": "market-direct-a",
+                "available_rows": 2,
+                "valid_rows": 2,
+                "total_available_rows": len(input_rows),
+                "market_row_counts": {
+                    "market-direct-a": 2,
+                    "market-direct-b": 2,
+                },
+            },
+            "required_input_rows": 2,
+            "available_input_rows": 2,
+            "same_market_id": "market-direct-a",
+            "total_available_input_rows": len(input_rows),
+            "loaded_rows": len(input_rows),
+            "valid_input_rows": 2,
+            "evaluator_invoked": True,
+            "evaluator_completed": True,
+            "evaluated_observations": 2,
+            "signal_count": 0,
+            "signal_outcome": "NO_SIGNAL",
+            "input_deficits": [],
+        }
+
+    def _member(self, direct_proof):
+        return {
+            "strategy_version_id": "strategy-direct-binding",
+            "research_trial_id": "trial-direct-binding",
+            "candidate_id": "candidate-direct-binding",
+            "allocation": "5.00",
+            "status": "ACTIVE",
+            "score": "1",
+            "reason": "EXPLORATORY_LIVE_DIRECT_INPUT",
+            "market_bindings": [
+                {
+                    "market_id": "market-direct-a",
+                    "yes_token_id": "yes-direct-a",
+                    "no_token_id": "no-direct-a",
+                },
+                {
+                    "market_id": "market-direct-b",
+                    "yes_token_id": "yes-direct-b",
+                    "no_token_id": "no-direct-b",
+                },
+            ],
+            "direct_evidence": direct_proof,
+        }
+    def _commit_selection(
+        self,
+        selection_id,
+        input_rows,
+        evaluated_rows,
+        evaluated_market_id,
+    ):
+        member = self._member(
+            self._direct_proof(input_rows, evaluated_rows, evaluated_market_id)
+        )
+        member.update(
+            {
+                "allocation": "0",
+                "proposed_allocation": "5.00",
+                "status": "PAPER",
+                "paper_only": True,
+                "allocation_active": False,
+                "canary_armed": False,
+            }
+        )
+        selection = {
+            "portfolio_selection_id": selection_id,
+            "selection_id": selection_id,
+            "policy_id": "policy-direct-binding",
+            "policy_version": "v1",
+            "policy_hash": DIRECT_POLICY_HASH,
+            "risk_config_id": "risk-direct-binding",
+            "active_risk_config_id": "risk-direct-binding",
+            "risk_config_generation": 1,
+            "active_risk_config_generation": 1,
+            "risk_config_hash": "risk-direct-binding-hash",
+            "active_risk_config_hash": "risk-direct-binding-hash",
+            "global_budget": "5.00",
+            "k": 0,
+            "selected_at": T0.isoformat(),
+            "review_due_at": (T0 + timedelta(days=1)).isoformat(),
+            "admission_mode": "EXPLORATORY_LIVE",
+            "proposal_only": True,
+            "status": "PAPER",
+            "paper_only": True,
+            "allocation_active": False,
+            "canary_armed": False,
+            "operating_policy": {"mode": "EXPLORATORY_LIVE"},
+        }
+        selection["members"] = [
+            {
+                **member,
+                "portfolio_selection_id": selection_id,
+                "evidence_window_id": None,
+                "overlap_key": "",
+            }
+        ]
+        selection["selection_hash"] = _canary_canonical_selection_hash(selection)
+        self.store.commit_portfolio_selection(
+            selection,
+            [member],
+            make_current=False,
+        )
+        return self.store.load_portfolio_selection(selection_id)
+
+    def _activate_reservation_selection(self, selection):
+        selection_id = str(
+            selection.get("selection_id")
+            or selection.get("portfolio_selection_id")
+            or ""
+        ).strip()
+        self.assertTrue(selection_id)
+        self.store.make_portfolio_selection_current(selection_id)
+        persisted = self.store.load_portfolio_selection(selection_id)
+        self.assertIsNotNone(persisted)
+        assert persisted is not None
+        self.authorization = self._bind_active_arm_authorization(persisted)
+        active_member = {
+            key: persisted["members"][0].get(key)
+            for key in (
+                "strategy_version_id",
+                "research_trial_id",
+                "candidate_id",
+                "allocation",
+            )
+        }
+        active_member.update(
+            {
+                "allocation": "5.00",
+                "status": "ACTIVE",
+                "action": "HOLD",
+                "allocation_active": True,
+                "paper_only": False,
+                "canary_armed": True,
+            }
+        )
+        self.store.set_operator_config(
+            "rolling_selection_activation",
+            {
+                "selection_id": selection_id,
+                "status": "ACTIVE",
+                "paper_only": False,
+                "allocation_active": True,
+                "canary_armed": True,
+                "k": 1,
+                "members": [active_member],
+                "allocation_activation": {
+                    "status": "ACTIVE",
+                    "authorization_id": self.authorization["authorization_id"],
+                    "prepared_selection_id": selection_id,
+                    "activated_at": T0.isoformat(),
+                },
+            },
+        )
+        return self.store.load_current_portfolio_selection()
+    def _commit_prepared_arm_selection(
+        self,
+        selection_id="selection-direct-arm",
+        *,
+        direct_proof=None,
+        admission_mode="EXPLORATORY_LIVE",
+        policy_hash=DIRECT_POLICY_HASH,
+    ):
+        member = self._member(
+            direct_proof
+            if direct_proof is not None
+            else self._direct_proof(
+                self._input_rows(),
+                self._input_rows()[:2],
+                "market-direct-a",
+            )
+        )
+        member.update(
+            {
+                "allocation": "0",
+                "proposed_allocation": "5.00",
+                "status": "PAPER",
+                "paper_only": True,
+                "allocation_active": False,
+                "canary_armed": False,
+                "operating_policy": {"mode": "EXPLORATORY_LIVE"},
+                "operational_setup": {
+                    "setup_id": "setup-direct-arm",
+                    "setup_version": "direct-arm-v1",
+                    "setup_policy": {"mode": "EXPLORATORY_LIVE"},
+                },
+                "strategy_document": {"parameters": {"lookback": 1}},
+                "strategy_hash": "strategy-code",
+                "scope": {
+                    "scope_hash": "scope-direct-binding",
+                    "scope_version": "1",
+                    "market_ids": ["market-direct-a", "market-direct-b"],
+                },
+                "scope_hash": "scope-direct-binding",
+                "scope_version": "1",
+            }
+        )
+        selection = {
+            "portfolio_selection_id": selection_id,
+            "selection_id": selection_id,
+            "policy_id": "policy-direct-binding",
+            "policy_version": "v1",
+            "policy_hash": policy_hash,
+            "risk_config_id": "risk-direct-binding",
+            "active_risk_config_id": "risk-direct-binding",
+            "risk_config_generation": 1,
+            "active_risk_config_generation": 1,
+            "risk_config_hash": "risk-direct-binding-hash",
+            "active_risk_config_hash": "risk-direct-binding-hash",
+            "global_budget": "5.00",
+            "k": 0,
+            "selected_at": T0.isoformat(),
+            "review_due_at": (T0 + timedelta(days=1)).isoformat(),
+            "admission_mode": admission_mode,
+            "proposal_only": True,
+            "status": "PAPER",
+            "paper_only": True,
+            "allocation_active": False,
+            "canary_armed": False,
+            "operating_policy": {"mode": "EXPLORATORY_LIVE"},
+        }
+        selection["members"] = [
+            {
+                **member,
+                "portfolio_selection_id": selection_id,
+                "evidence_window_id": None,
+                "overlap_key": "",
+            }
+        ]
+        selection["selection_hash"] = _canary_canonical_selection_hash(selection)
+        self.store.commit_portfolio_selection(
+            selection,
+            [member],
+            make_current=False,
+        )
+        persisted = self.store.load_portfolio_selection(selection_id)
+        self.assertIsNotNone(persisted)
+        assert persisted is not None
+        self.assertEqual(
+            _canary_authorization_current_selection_hash(persisted),
+            selection["selection_hash"],
+        )
+        return persisted
+
+    def _bind_active_arm_authorization(
+        self,
+        selection,
+        *,
+        selection_hash=None,
+        scope_hash="scope-direct-binding",
+        scope_version="1",
+        selection_policy_hash=DIRECT_POLICY_HASH,
+    ):
+        active = self.store.load_active_execution_authorization(
+            mode="EXPLORATORY_MICRO_CANARY",
+            now=T0,
+        )
+        if active is not None:
+            self.store.revoke_execution_authorization(
+                str(active["authorization_id"]),
+                "direct-arm-test",
+                expected_generation=int(active["generation"]),
+                reason="replace direct arm fixture",
+                timestamp=T0,
+            )
+        settings_id, settings_generation, settings_hash = self.service._settings_identity()
+        self.assertTrue(settings_id)
+        self.assertIsNotNone(settings_generation)
+        self.assertTrue(settings_hash)
+        selection_id = str(
+            selection.get("selection_id")
+            or selection.get("portfolio_selection_id")
+        )
+        digest = str(
+            selection_hash
+            if selection_hash is not None
+            else _canary_authorization_current_selection_hash(selection)
+        )
+        self._authorization_serial += 1
+        authorization_id = f"auth:{selection_id}:{self._authorization_serial}"
+        draft = self.store.register_execution_authorization_draft(
+            authorization_id=authorization_id,
+            mode="EXPLORATORY_MICRO_CANARY",
+            purpose="commission direct exploratory arm",
+            exact_strategy_versions=("strategy-direct-binding",),
+            reviewed_selection_policy_hash=selection_policy_hash,
+            adverse_evidence_ack={"acknowledged": True},
+            lifetime_budget={"max_notional_usd": "5.00"},
+            stop_rules={"max_loss_usd": "2.00"},
+            expires_at=T0 + timedelta(days=1),
+            scope_hash=scope_hash,
+            scope_version=scope_version,
+            active_settings_hash=str(settings_hash),
+            active_settings_generation=int(settings_generation),
+            selection_id=selection_id,
+            selection_hash=digest,
+            actor="direct-arm-test",
+            timestamp=T0,
+        )
+        return self.store.activate_execution_authorization(
+            str(draft["authorization_id"]),
+            "direct-arm-test",
+            expected_generation=int(draft["generation"]),
+            timestamp=T0,
+        )
+
+    def _arm_prepared_direct_selection(self, *, proof=None, selection_hash=None):
+        selection = self._commit_prepared_arm_selection(direct_proof=proof)
+        authorization = self._bind_active_arm_authorization(
+            selection,
+            selection_hash=selection_hash,
+        )
+        config_id, generation = self.service._settings_binding()
+        armed = self.service.arm(
+            "candidate-direct-binding",
+            venue=self.venue,
+            credentials_configured=True,
+            config_id=config_id,
+            expected_generation=generation,
+        )
+        return selection, authorization, armed
+
+    def test_direct_profile_arm_uses_active_selection_proof_without_legacy_eligibility(self):
+        selection, authorization, _ = self._arm_prepared_direct_selection()
+        self.assertEqual(authorization["status"], "ACTIVE")
+        self.assertEqual(
+            authorization["selection_id"],
+            selection["portfolio_selection_id"],
+        )
+        self.assertEqual(
+            authorization["selection_hash"],
+            selection["selection_hash"],
+        )
+        self.assertIsNone(
+            self.store.connection.execute(
+                "SELECT 1 FROM canary_eligibility WHERE candidate_id=?",
+                ("candidate-direct-binding",),
+            ).fetchone()
+        )
+        self.assertEqual(self.service.status()["micro_live_canary"], "ARMED")
+        control = self.store.connection.execute(
+            "SELECT state FROM canary_control WHERE singleton=1"
+        ).fetchone()
+        self.assertIsNotNone(control)
+        self.assertEqual(str(control["state"]).upper(), "ARMED")
+    def test_direct_profile_arm_rejects_non_exploratory_admission_mode(self):
+        selection = self._commit_prepared_arm_selection(
+            admission_mode="EVIDENCE_SELECTED",
+        )
+        self._bind_active_arm_authorization(selection)
+        config_id, generation = self.service._settings_binding()
+        with self.assertRaises(CanaryBlocked):
+            self.service.arm(
+                "candidate-direct-binding",
+                venue=self.venue,
+                credentials_configured=True,
+                config_id=config_id,
+                expected_generation=generation,
+            )
+        control = self.store.connection.execute(
+            "SELECT state FROM canary_control WHERE singleton=1"
+        ).fetchone()
+        self.assertTrue(control is None or str(control["state"]).upper() != "ARMED")
+    def test_direct_profile_arm_rejects_claimed_policy_hash_not_in_admission_policy(self):
+        claimed_policy_hash = hashlib.sha256(
+            b"claimed-policy-hash"
+        ).hexdigest()
+        selection = self._commit_prepared_arm_selection(
+            policy_hash=claimed_policy_hash,
+        )
+        self._bind_active_arm_authorization(
+            selection,
+            selection_policy_hash=claimed_policy_hash,
+        )
+        config_id, generation = self.service._settings_binding()
+        with self.assertRaises(CanaryBlocked):
+            self.service.arm(
+                "candidate-direct-binding",
+                venue=self.venue,
+                credentials_configured=True,
+                config_id=config_id,
+                expected_generation=generation,
+            )
+        control = self.store.connection.execute(
+            "SELECT state FROM canary_control WHERE singleton=1"
+        ).fetchone()
+        self.assertTrue(control is None or str(control["state"]).upper() != "ARMED")
+
+    def test_direct_profile_arm_without_active_authority_does_not_arm(self):
+        self._commit_prepared_arm_selection()
+        active = self.store.load_active_execution_authorization(
+            mode="EXPLORATORY_MICRO_CANARY",
+            now=T0,
+        )
+        self.assertIsNotNone(active)
+        assert active is not None
+        self.store.revoke_execution_authorization(
+            str(active["authorization_id"]),
+            "direct-arm-test",
+            expected_generation=int(active["generation"]),
+            reason="remove authority",
+            timestamp=T0,
+        )
+        config_id, generation = self.service._settings_binding()
+        with self.assertRaises(CanaryBlocked):
+            self.service.arm(
+                "candidate-direct-binding",
+                venue=self.venue,
+                credentials_configured=True,
+                config_id=config_id,
+                expected_generation=generation,
+            )
+        control = self.store.connection.execute(
+            "SELECT state FROM canary_control WHERE singleton=1"
+        ).fetchone()
+        self.assertTrue(control is None or str(control["state"]).upper() != "ARMED")
+
+    def test_direct_profile_arm_with_mismatched_authority_does_not_arm(self):
+        selection = self._commit_prepared_arm_selection()
+        self._bind_active_arm_authorization(
+            selection,
+            selection_hash=hashlib.sha256(
+                b"mismatched-selection-hash"
+            ).hexdigest(),
+        )
+        config_id, generation = self.service._settings_binding()
+        with self.assertRaises(CanaryBlocked):
+            self.service.arm(
+                "candidate-direct-binding",
+                venue=self.venue,
+                credentials_configured=True,
+                config_id=config_id,
+                expected_generation=generation,
+            )
+        control = self.store.connection.execute(
+            "SELECT state FROM canary_control WHERE singleton=1"
+        ).fetchone()
+        self.assertTrue(control is None or str(control["state"]).upper() != "ARMED")
+    def test_direct_profile_arm_with_mismatched_scope_authority_does_not_arm(self):
+        selection = self._commit_prepared_arm_selection()
+        self._bind_active_arm_authorization(
+            selection,
+            scope_hash="scope-other",
+        )
+        config_id, generation = self.service._settings_binding()
+        with self.assertRaises(CanaryBlocked):
+            self.service.arm(
+                "candidate-direct-binding",
+                venue=self.venue,
+                credentials_configured=True,
+                config_id=config_id,
+                expected_generation=generation,
+            )
+        control = self.store.connection.execute(
+            "SELECT state FROM canary_control WHERE singleton=1"
+        ).fetchone()
+        self.assertTrue(control is None or str(control["state"]).upper() != "ARMED")
+
+    def test_direct_profile_arm_with_mismatched_proof_does_not_arm(self):
+        bad_proof = self._direct_proof(
+            self._input_rows(),
+            self._input_rows()[2:],
+            "market-direct-a",
+        )
+        selection = self._commit_prepared_arm_selection(direct_proof=bad_proof)
+        self._bind_active_arm_authorization(selection)
+        config_id, generation = self.service._settings_binding()
+        with self.assertRaises(CanaryBlocked):
+            self.service.arm(
+                "candidate-direct-binding",
+                venue=self.venue,
+                credentials_configured=True,
+                config_id=config_id,
+                expected_generation=generation,
+            )
+        control = self.store.connection.execute(
+            "SELECT state FROM canary_control WHERE singleton=1"
+        ).fetchone()
+        self.assertTrue(control is None or str(control["state"]).upper() != "ARMED")
+
+    def _reserve(self, intent_id, selection_id="selection-direct-binding"):
+        return self.store.reserve_canary_capacity(
+            intent_id=intent_id,
+            reservation_id=f"reservation:{intent_id}",
+            side="BUY",
+            requested_cost="0.99",
+            fee_reserve="0.01",
+            quantity="1",
+            market_id="market-direct-a",
+            event_id=f"event:{intent_id}",
+            execution_authorization_id=self.authorization["authorization_id"],
+            controller_owner_id=self.lease["owner_id"],
+            controller_generation=int(self.lease["generation"]),
+            strategy_version_id="strategy-direct-binding",
+            research_trial_id="trial-direct-binding",
+            candidate_id="candidate-direct-binding",
+            portfolio_selection_id=selection_id,
+            admission_policy_id="policy-direct-binding",
+            admission_policy_version="v1",
+            risk_config_id="risk-direct-binding",
+            risk_config_generation=1,
+            risk_config_hash="risk-direct-binding-hash",
+            allocation="5.00",
+            detail={"token_id": "yes-direct-a"},
+            timestamp=T0,
+        )
+
+    def _attempt(self, intent_id):
+        return self.store.record_canary_submission_attempt(
+            attempt_id=f"attempt:{intent_id}",
+            intent_id=intent_id,
+            side="BUY",
+            attempted_at=T0,
+            execution_authorization_id=self.authorization["authorization_id"],
+            controller_owner_id=self.lease["owner_id"],
+            controller_generation=int(self.lease["generation"]),
+            strategy_version_id="strategy-direct-binding",
+            research_trial_id="trial-direct-binding",
+            candidate_id="candidate-direct-binding",
+            portfolio_selection_id="selection-direct-binding",
+            admission_policy_id="policy-direct-binding",
+            admission_policy_version="v1",
+            risk_config_id="risk-direct-binding",
+            risk_config_generation=1,
+            risk_config_hash="risk-direct-binding-hash",
+            allocation="5.00",
+            detail={"token_id": "yes-direct-a"},
+        )
+
+    def test_mixed_manifest_uses_same_market_evaluated_subset_for_buy(self):
+        reservation = self._reserve("mixed-manifest")
+        self.assertEqual(reservation["status"], "HELD")
+    def test_consumed_buy_lifetime_survives_terminal_release(self):
+        reservation = self._reserve("consumed-buy-lifetime")
+        auth_id = self.authorization["authorization_id"]
+        fill_lineage = {
+            "execution_authorization_id": auth_id,
+            "strategy_version_id": "strategy-direct-binding",
+            "research_trial_id": "trial-direct-binding",
+            "candidate_id": "candidate-direct-binding",
+            "portfolio_selection_id": "selection-direct-binding",
+            "admission_policy_id": "policy-direct-binding",
+            "admission_policy_version": "v1",
+            "risk_config_id": "risk-direct-binding",
+            "risk_config_generation": 1,
+            "risk_config_hash": "risk-direct-binding-hash",
+            "allocation": "5.00",
+        }
+        self.store.record_canary_fill(
+            fill_id="fill:consumed-buy-lifetime",
+            reservation_id=reservation["reservation_id"],
+            quantity="1",
+            price="0.98",
+            fee="0.01",
+            filled_at=T0,
+            detail={
+                "side": "BUY",
+                "token_id": "yes-direct-a",
+                "settlement_status": "CONFIRMED",
+            },
+            **fill_lineage,
+        )
+        filled = self.store.canary_risk_accounting(
+            T0,
+            execution_authorization_id=auth_id,
+        )
+        self.assertEqual(
+            Decimal(str(filled["lifetime_buy_usd"])),
+            Decimal("0.99"),
+        )
+        self.assertEqual(filled["lifetime_orders"], 1)
+        self.store.release_canary_capacity(
+            reservation["reservation_id"],
+            status="RELEASED",
+            timestamp=T0,
+            strategy_version_id=fill_lineage["strategy_version_id"],
+            research_trial_id=fill_lineage["research_trial_id"],
+            candidate_id=fill_lineage["candidate_id"],
+            portfolio_selection_id=fill_lineage["portfolio_selection_id"],
+            admission_policy_id=fill_lineage["admission_policy_id"],
+            admission_policy_version=fill_lineage["admission_policy_version"],
+            risk_config_id=fill_lineage["risk_config_id"],
+            risk_config_generation=fill_lineage["risk_config_generation"],
+            risk_config_hash=fill_lineage["risk_config_hash"],
+            allocation=fill_lineage["allocation"],
+            detail={"owned_sell_settled": True},
+        )
+        released = self.store.canary_risk_accounting(
+            T0,
+            execution_authorization_id=auth_id,
+        )
+        self.assertEqual(
+            Decimal(str(released["lifetime_buy_usd"])),
+            Decimal("0.99"),
+        )
+        self.assertEqual(released["lifetime_orders"], 1)
+
+    def test_partial_buy_lifetime_survives_terminal_cancellation(self):
+        auth_id = self.authorization["authorization_id"]
+        fill_lineage = {
+            "execution_authorization_id": auth_id,
+            "strategy_version_id": "strategy-direct-binding",
+            "research_trial_id": "trial-direct-binding",
+            "candidate_id": "candidate-direct-binding",
+            "portfolio_selection_id": "selection-direct-binding",
+            "admission_policy_id": "policy-direct-binding",
+            "admission_policy_version": "v1",
+            "risk_config_id": "risk-direct-binding",
+            "risk_config_generation": 1,
+            "risk_config_hash": "risk-direct-binding-hash",
+            "allocation": "5.00",
+        }
+        partial = self._reserve("partial-buy-lifetime")
+        self.store.record_canary_fill(
+            fill_id="fill:partial-buy-lifetime",
+            reservation_id=partial["reservation_id"],
+            quantity="0.5",
+            price="0.98",
+            fee="0.01",
+            filled_at=T0,
+            detail={
+                "side": "BUY",
+                "token_id": "yes-direct-a",
+                "settlement_status": "CONFIRMED",
+            },
+            **fill_lineage,
+        )
+        self.store.release_canary_capacity(
+            partial["reservation_id"],
+            status="CANCELLED",
+            timestamp=T0,
+            strategy_version_id=fill_lineage["strategy_version_id"],
+            research_trial_id=fill_lineage["research_trial_id"],
+            candidate_id=fill_lineage["candidate_id"],
+            portfolio_selection_id=fill_lineage["portfolio_selection_id"],
+            admission_policy_id=fill_lineage["admission_policy_id"],
+            admission_policy_version=fill_lineage["admission_policy_version"],
+            risk_config_id=fill_lineage["risk_config_id"],
+            risk_config_generation=fill_lineage["risk_config_generation"],
+            risk_config_hash=fill_lineage["risk_config_hash"],
+            allocation=fill_lineage["allocation"],
+            detail={"partial_cancel": True},
+        )
+        partial_row = self.store.connection.execute(
+            "SELECT status,filled_cost FROM canary_risk_reservations "
+            "WHERE reservation_id=?",
+            (partial["reservation_id"],),
+        ).fetchone()
+        self.assertIsNotNone(partial_row)
+        assert partial_row is not None
+        self.assertEqual(partial_row["status"], "CANCELLED")
+        self.assertEqual(
+            Decimal(str(partial_row["filled_cost"])),
+            Decimal("0.50"),
+        )
+        terminal_usage = self.store.canary_risk_accounting(
+            T0,
+            execution_authorization_id=auth_id,
+        )
+        self.assertEqual(
+            Decimal(str(terminal_usage["lifetime_buy_usd"])),
+            Decimal("0.50"),
+        )
+        self.assertEqual(terminal_usage["lifetime_orders"], 1)
+    def test_pending_blocker_excludes_only_exact_current_unsent_entry(self):
+        own = self._reserve("pending-own")
+        other = self._reserve("pending-other")
+        self._attempt("pending-own")
+        self._attempt("pending-other")
+        auth_id = self.authorization["authorization_id"]
+        raw = self.store.canary_risk_accounting(
+            T0,
+            execution_authorization_id=auth_id,
+        )
+        self.assertEqual(raw["buy_pending_usd"], "2.00")
+        excluded = self.store.canary_risk_accounting(
+            T0,
+            execution_authorization_id=auth_id,
+            exclude_pending_event_id=own["event_id"],
+        )
+        self.assertEqual(excluded["buy_pending_usd"], raw["buy_pending_usd"])
+        self.assertEqual(excluded["blocking_buy_pending_usd"], "1.00")
+        unknown = self.store.canary_risk_accounting(
+            T0,
+            execution_authorization_id=auth_id,
+            exclude_pending_event_id="event:missing-pending",
+        )
+        self.assertEqual(unknown["blocking_buy_pending_usd"], "2.00")
+
+
+    def test_unconfirmed_proposal_cannot_reserve_even_with_bound_auth(self):
+        selection = self._commit_selection(
+            "selection-unconfirmed-reservation",
+            self._input_rows(),
+            self._input_rows()[:2],
+            "market-direct-a",
+        )
+        self.store.make_portfolio_selection_current(
+            selection["portfolio_selection_id"]
+        )
+        self.authorization = self._bind_active_arm_authorization(selection)
+        with self.assertRaises(ValueError):
+            self._reserve(
+                "unconfirmed-proposal",
+                "selection-unconfirmed-reservation",
+            )
+
+
+    def test_foreign_or_token_mismatched_evaluated_proof_blocks_reserve_and_submit(self):
+        rows = self._input_rows()
+        foreign = self._commit_selection(
+            "selection-foreign-evaluated",
+            rows,
+            rows[2:],
+            "market-direct-a",
+        )
+        self._activate_reservation_selection(foreign)
+        with self.assertRaises(ValueError):
+            self._reserve("foreign-evaluated", "selection-foreign-evaluated")
+
+        mismatched_rows = [dict(row) for row in rows]
+        mismatched_rows[0]["yes_token_id"] = "wrong-token"
+        mismatched_rows[1]["yes_token_id"] = "wrong-token"
+        token_mismatch = self._commit_selection(
+            "selection-token-mismatch",
+            mismatched_rows,
+            mismatched_rows[:2],
+            "market-direct-a",
+        )
+        self._activate_reservation_selection(token_mismatch)
+        with self.assertRaises(ValueError):
+            self._reserve("token-mismatch", "selection-token-mismatch")
+
+        base = self.store.load_portfolio_selection("selection-direct-binding")
+        self.assertIsNotNone(base)
+        assert base is not None
+        self._activate_reservation_selection(base)
+        valid = self._reserve("submit-proof")
+        corrupted = dict(self._member(
+            self._direct_proof(rows, rows[2:], "market-direct-a")
+        ))
+        self.store.connection.execute(
+            "UPDATE portfolio_selection_members SET payload_json=? "
+            "WHERE portfolio_selection_id=? AND strategy_version_id=?",
+            (
+                json.dumps(corrupted, sort_keys=True, separators=(",", ":")),
+                "selection-direct-binding",
+                "strategy-direct-binding",
+            ),
+        )
+        self.store.connection.commit()
+        with self.assertRaises(ValueError):
+            self._attempt(valid["intent_id"])
 
 class CanarySignalTests(unittest.TestCase):
     def setUp(self):

@@ -326,6 +326,7 @@ class CandidateCanaryRanker:
     def _candidate_records(self) -> list[Mapping[str, Any]]:
         records = self.store.load_candidate_lifecycle(limit=10000)
         return [item for item in records if isinstance(item, Mapping)] if isinstance(records, list) else []
+
     def eligible_scan_rows(
         self,
         *,

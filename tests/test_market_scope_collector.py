@@ -565,6 +565,52 @@ class MarketScopeCollectorTests(unittest.TestCase):
         self.assertEqual(len(store.resolutions), 1)
         self.assertEqual(store.resolutions[0].status, MATCHED)
 
+    def test_selected_rolling_rule_scope_handoff_reaches_resolver(self) -> None:
+        selected = market("rolling-rule-open", category="politics")
+        policy = scope("RULE_BASED_MARKETS", category="politics")
+        normalized = normalize_market_scope(policy)
+        payload = {
+            "candidate_id": "rolling-rule-candidate",
+            "market_scope_hash": normalized.scope_hash,
+            "market_scope_version": normalized.scope_version,
+            "experiment_plan": {"market_scope": policy},
+        }
+        provider = _PagedProvider(
+            (selected,),
+            ({"snapshots": (selected,), "next_cursor": None},),
+            tag_ids={"politics": 7},
+        )
+        store = _SelectedRollingScopeStore(
+            "rolling-rule-candidate",
+            "rolling-rule-strategy",
+            payload,
+            status="IDEA",
+        )
+        proof = resolve_market_scope(
+            "rolling-rule-candidate",
+            payload,
+            [PolymarketCollector._scope_market_record(selected, T0, provider)],
+            resolved_at=T0,
+        )
+        self.assertEqual(proof.status, MATCHED)
+        store.resolutions.append(proof)
+
+        refresh_at = T0 + timedelta(seconds=61)
+        cycle = self._collector(provider, store, ()).collect_once(now=refresh_at)
+
+        self.assertEqual(list(cycle.candidate_bound_scheduled), ["rolling-rule-open"])
+        self.assertEqual(list(cycle.discovery_scheduled), [])
+        self.assertGreaterEqual(len(store.resolutions), 2)
+        latest = store.resolutions[-1]
+        self.assertEqual(latest.status, MATCHED)
+        self.assertEqual(latest.resolved_at, refresh_at)
+        self.assertEqual(latest.scope_hash, normalized.scope_hash)
+        self.assertEqual(latest.scope_version, normalized.scope_version)
+        self.assertEqual(
+            [(item.market_id, item.yes_token_id, item.no_token_id) for item in latest.matched_markets],
+            [("rolling-rule-open", "yes-rolling-rule-open", "no-rolling-rule-open")],
+        )
+
     def test_selected_rolling_exact_scope_direct_lookup_persists_closed_and_no_orders_exclusions(self) -> None:
         closed = replace(
             market(

@@ -383,6 +383,17 @@ def _normalize_lineage(
         else:
             value = None
         result[field] = value
+    for field in _EXPLORATORY_BINDING_FIELDS:
+        value = values.get(field)
+        if field == "operating_policy" and isinstance(value, Mapping):
+            value = dict(value)
+        elif value not in (None, ""):
+            value = str(value).strip()
+        else:
+            value = None
+        result[field] = value
+    if values.get("direct_profile") is True:
+        result["direct_profile"] = True
     return result
 
 
@@ -2677,11 +2688,19 @@ def _canary_authorization_selection_policy_hash(
             value = source.get(name)
             if value not in (None, ""):
                 text = str(value).strip()
+                match = re.fullmatch(r"sha256:([0-9a-fA-F]{64})", text)
+                if match:
+                    text = match.group(1)
                 if text:
                     values.add(text)
     if len(values) > 1:
         raise CanaryBlocked("EXECUTION_AUTHORIZATION_POLICY_CHANGED")
-    return next(iter(values), None)
+    value = next(iter(values), None)
+    if value is not None:
+        match = re.fullmatch(r"sha256:([0-9a-fA-F]{64})", value)
+        if match:
+            return match.group(1)
+    return value
 
 
 def _canary_authorization_binding_fence(
@@ -2700,6 +2719,7 @@ def _canary_authorization_binding_fence(
     side: str | None = None,
     selection_fence: bool = True,
     is_exit: bool = False,
+    exclude_pending_event_id: str | None = None,
 ) -> None:
     exact_raw = auth.get(
         "exact_strategy_versions",
@@ -2886,10 +2906,15 @@ def _canary_authorization_binding_fence(
     if not callable(accounting_loader):
         raise CanaryBlocked("EXECUTION_AUTHORIZATION_USAGE_UNAVAILABLE")
     try:
-        usage = accounting_loader(
-            now=now,
-            execution_authorization_id=actual_id,
-        )
+        accounting_kwargs: dict[str, Any] = {
+            "now": now,
+            "execution_authorization_id": actual_id,
+        }
+        if exclude_pending_event_id not in (None, ""):
+            accounting_kwargs["exclude_pending_event_id"] = str(
+                exclude_pending_event_id
+            ).strip()
+        usage = accounting_loader(**accounting_kwargs)
     except Exception as exc:
         raise CanaryBlocked("EXECUTION_AUTHORIZATION_USAGE_UNAVAILABLE") from exc
     if not isinstance(usage, Mapping) or usage.get("_canonical_error"):
@@ -2924,7 +2949,7 @@ def _canary_authorization_binding_fence(
         ),
         field="reserved_exit_capacity_usd",
     )
-    used = max(used + pending + unknown + reserved_exit, reserved)
+    # Canonical lifetime usage already includes active BUY commitments exactly once.
     orders = usage.get("exploratory_lifetime_orders", usage.get("submitted_orders", 0))
     try:
         orders_value = int(orders)
@@ -2949,8 +2974,12 @@ def _canary_authorization_binding_fence(
         "blockers",
         usage.get("entry_blockers", usage.get("entry_block_reasons", ())),
     )
+    blocking_pending = _canary_authorization_decimal(
+        usage.get("blocking_buy_pending_usd", pending),
+        field="blocking_buy_pending_usd",
+    )
     has_blockers = (
-        pending > 0
+        blocking_pending > 0
         or unknown > 0
         or usage.get("risk_breaker") not in (None, "", False, 0)
         or (
@@ -3014,6 +3043,7 @@ def _require_execution_authorization(
     now: datetime,
     requested_cost: Any = Decimal("0"),
     fee_reserve: Any = Decimal("0"),
+    exclude_pending_event_id: str | None = None,
 ) -> dict[str, Any]:
     binding = dict(lineage or {})
     policy_source: dict[str, Any] = {}
@@ -3088,13 +3118,20 @@ def _require_execution_authorization(
         or (signal or {}).get("portfolio_selection_id")
         or ""
     ).strip() or None
+    signal_evidence = signal.get("evidence") if isinstance(signal, Mapping) else {}
     selection_hash = str(
         binding.get("selection_hash")
         or (signal or {}).get("selection_hash")
+        or (
+            signal_evidence.get("selection_hash")
+            if isinstance(signal_evidence, Mapping)
+            else ""
+        )
         or ""
     ).strip() or None
-    # Exact strategy scope is trusted only from validated lineage.  A raw
-    # legacy signal field is descriptive evidence, not authorization scope.
+    # Direct exploratory signals retain exact member identity in their
+    # persisted signal columns even though they intentionally remain outside
+    # historical rolling-lineage evidence.
     strategy = str(binding.get("strategy_version_id") or "").strip() or None
     if rolling and (not selection_id or not selection_hash) and not is_exit:
         raise CanaryBlocked("EVIDENCE_SELECTION_REQUIRED")
@@ -3212,14 +3249,6 @@ def _require_execution_authorization(
                         continue
                     if str(record.get("mode") or mode).strip().upper() != mode:
                         continue
-                    record_status = str(record.get("status") or "").upper()
-                    record_expiry = parse_timestamp(record.get("expires_at"))
-                    if record_status == "EXPIRED" or (
-                        record_expiry is not None
-                        and now >= record_expiry
-                        and record_status != "REVOKED"
-                    ):
-                        raise CanaryBlocked("EXECUTION_AUTHORIZATION_EXPIRED")
                     auth = record
                     break
             except (TypeError, ValueError, RuntimeError):
@@ -3344,6 +3373,7 @@ def _require_execution_authorization(
             or (context or {}).get("side")
             or ""
         ).strip() or None,
+        exclude_pending_event_id=exclude_pending_event_id,
         selection_fence=not is_exit,
     )
     result = dict(auth)
@@ -7338,6 +7368,373 @@ class CanaryService:
 
     def _eligibility_is_bound(self, candidate_id: str, eligibility: Mapping[str, Any] | None) -> bool:
         return _canary_eligibility_is_bound(self.store, candidate_id, eligibility)
+    def _exploratory_direct_profile_selected(self, candidate_id: str) -> bool:
+        """Identify the authorized direct profile before consulting legacy rows."""
+        identifier = str(candidate_id or "").strip()
+        if not identifier:
+            return False
+        active_authorization: Mapping[str, Any] | None = None
+        try:
+            _, settings_generation, settings_hash = self._settings_identity()
+            authorization_loader = getattr(
+                self.store, "load_active_execution_authorization", None
+            )
+            selection_loader = getattr(self.store, "load_portfolio_selection", None)
+            if (
+                callable(authorization_loader)
+                and callable(selection_loader)
+                and settings_generation is not None
+                and settings_hash
+            ):
+                active_authorization = authorization_loader(
+                    mode="EXPLORATORY_MICRO_CANARY",
+                    now=ensure_utc(self.clock()),
+                    active_settings_hash=settings_hash,
+                    active_settings_generation=settings_generation,
+                )
+                if isinstance(active_authorization, Mapping):
+                    selection_id = str(
+                        active_authorization.get("selection_id") or ""
+                    ).strip()
+                    if not selection_id:
+                        return False
+                    selection = selection_loader(selection_id)
+                    return (
+                        isinstance(selection, Mapping)
+                        and str(selection.get("admission_mode") or "")
+                        .strip()
+                        .upper()
+                        == "EXPLORATORY_LIVE"
+                    )
+        except (AttributeError, TypeError, ValueError, RuntimeError, sqlite3.Error):
+            if active_authorization is not None:
+                return False
+        current_loader = getattr(
+            self.store, "load_current_portfolio_selection", None
+        )
+        if not callable(current_loader):
+            return False
+        try:
+            selection = current_loader()
+        except (AttributeError, TypeError, ValueError, RuntimeError, sqlite3.Error):
+            return False
+        return (
+            isinstance(selection, Mapping)
+            and str(selection.get("admission_mode") or "").strip().upper()
+            == "EXPLORATORY_LIVE"
+        )
+    def _exploratory_direct_authorization_binding(
+        self,
+        candidate_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, Any] | None:
+        """Return the exact durable exploratory proof, without legacy eligibility."""
+        identifier = str(candidate_id or "").strip()
+        if not identifier:
+            return None
+        try:
+            settings_id, settings_generation, settings_hash = self._settings_identity()
+            loader = getattr(self.store, "load_active_execution_authorization", None)
+            selection_loader = getattr(self.store, "load_portfolio_selection", None)
+            proof_validator = getattr(
+                self.store, "_canary_exploratory_direct_proof", None
+            )
+            if (
+                not callable(loader)
+                or not callable(selection_loader)
+                or not callable(proof_validator)
+                or not settings_id
+                or settings_generation < 1
+                or not settings_hash
+            ):
+                return None
+            observed = ensure_utc(now or self.clock())
+            authorization = loader(
+                mode="EXPLORATORY_MICRO_CANARY",
+                now=observed,
+                active_settings_hash=settings_hash,
+                active_settings_generation=settings_generation,
+            )
+        except (AttributeError, TypeError, ValueError, RuntimeError, sqlite3.Error):
+            return None
+        if not isinstance(authorization, Mapping):
+            return None
+        if (
+            str(authorization.get("status") or "").strip().upper() != "ACTIVE"
+            or str(authorization.get("mode") or "").strip().upper()
+            != "EXPLORATORY_MICRO_CANARY"
+            or str(authorization.get("active_settings_hash") or "").strip()
+            != str(settings_hash).strip()
+        ):
+            return None
+        try:
+            if int(authorization.get("active_settings_generation") or 0) != int(
+                settings_generation
+            ):
+                return None
+        except (TypeError, ValueError, OverflowError):
+            return None
+        selection_id = str(authorization.get("selection_id") or "").strip()
+        selection_hash = str(authorization.get("selection_hash") or "").strip()
+        if not selection_id or not selection_hash:
+            return None
+        try:
+            selection = selection_loader(selection_id)
+        except (AttributeError, TypeError, ValueError, RuntimeError, sqlite3.Error):
+            return None
+        if not isinstance(selection, Mapping):
+            return None
+        if str(selection.get("selection_hash") or "").strip() != selection_hash:
+            return None
+        try:
+            if _canary_canonical_selection_hash(selection) != selection_hash:
+                return None
+        except CanaryBlocked:
+            return None
+        if selection.get("proposal_only") is not True:
+            return None
+        if (
+            str(selection.get("admission_mode") or "").strip().upper()
+            != "EXPLORATORY_LIVE"
+        ):
+            return None
+        policy_values = [
+            selection.get("operating_policy"),
+            selection.get("exploratory_policy"),
+            selection.get("policy"),
+        ]
+        policy_modes = [
+            str(
+                policy.get("mode")
+                or policy.get("admission_mode")
+                or policy.get("operating_policy")
+                or ""
+            ).strip().upper()
+            for policy in policy_values
+            if isinstance(policy, Mapping)
+            and str(
+                policy.get("mode")
+                or policy.get("admission_mode")
+                or policy.get("operating_policy")
+                or ""
+            ).strip()
+        ]
+        if not policy_modes or any(
+            mode != "EXPLORATORY_LIVE" for mode in policy_modes
+        ):
+            return None
+        raw_members = selection.get("members", selection.get("selected_members", ()))
+        if not isinstance(raw_members, (list, tuple)):
+            return None
+        raw_auth_versions = authorization.get(
+            "exact_strategy_versions",
+            authorization.get("strategy_versions", ()),
+        )
+        if isinstance(raw_auth_versions, str):
+            raw_auth_versions = (raw_auth_versions,)
+        auth_versions = {
+            str(value).strip()
+            for value in (raw_auth_versions or ())
+            if str(value).strip()
+        }
+        try:
+            selection_policy_identity = self._rolling_policy_identity_aliases(
+                selection
+            )
+            claimed_policy_hash = _canary_authorization_selection_policy_hash(
+                selection
+            )
+        except CanaryBlocked:
+            return None
+        policy_id = selection_policy_identity["policy_id"]
+        policy_version = selection_policy_identity["version"]
+        if not policy_id or not policy_version or not claimed_policy_hash:
+            return None
+        policy_loader = getattr(self.store, "load_admission_policy", None)
+        if not callable(policy_loader):
+            return None
+        try:
+            persisted_policy = policy_loader(policy_id, policy_version)
+        except (AttributeError, TypeError, ValueError, RuntimeError, sqlite3.Error):
+            return None
+        if not isinstance(persisted_policy, Mapping):
+            return None
+        try:
+            persisted_identity = self._rolling_policy_identity_aliases(
+                persisted_policy
+            )
+        except CanaryBlocked:
+            return None
+
+        def _normalize_policy_hash(value: Any) -> str:
+            text = str(value or "").strip()
+            match = re.fullmatch(r"sha256:([0-9a-fA-F]{64})", text)
+            return (match.group(1) if match else text).lower()
+
+        persisted_policy_hash = _normalize_policy_hash(
+            persisted_identity["config_hash"]
+        )
+        claimed_policy_hash = _normalize_policy_hash(claimed_policy_hash)
+        if (
+            persisted_identity["policy_id"] != policy_id
+            or persisted_identity["version"] != policy_version
+            or not persisted_policy_hash
+            or claimed_policy_hash != persisted_policy_hash
+        ):
+            return None
+        authorized_policy_hash = _normalize_policy_hash(
+            authorization.get("selection_policy_hash")
+            or authorization.get("reviewed_selection_policy_hash")
+        )
+        if not authorized_policy_hash or authorized_policy_hash != persisted_policy_hash:
+            return None
+        def _scope_identity(
+            source: Mapping[str, Any],
+            primary: str,
+            alias: str,
+        ) -> str:
+            primary_value = str(source.get(primary) or "").strip()
+            alias_value = str(source.get(alias) or "").strip()
+            if primary_value and alias_value and primary_value != alias_value:
+                return ""
+            return primary_value or alias_value
+
+        authorization_scope_hash = str(
+            authorization.get("scope_hash") or ""
+        ).strip()
+        authorization_scope_version = str(
+            authorization.get("scope_version") or ""
+        ).strip()
+        if not authorization_scope_hash or not authorization_scope_version:
+            return None
+        for member in raw_members:
+            if not isinstance(member, Mapping):
+                continue
+            if str(member.get("candidate_id") or "").strip() != identifier:
+                continue
+            if not _canary_selection_member_is_proposed(member):
+                continue
+            strategy_version = str(member.get("strategy_version_id") or "").strip()
+            if not strategy_version or strategy_version not in auth_versions:
+                continue
+            proof = member.get("direct_evidence")
+            if not isinstance(proof, Mapping):
+                continue
+            market_id = str(proof.get("evaluated_market_id") or "").strip()
+            if not market_id:
+                continue
+            member_scope_hash = _scope_identity(
+                member, "scope_hash", "market_scope_hash"
+            )
+            member_scope_version = _scope_identity(
+                member, "scope_version", "market_scope_version"
+            )
+            if (
+                not member_scope_hash
+                or not member_scope_version
+                or member_scope_hash != authorization_scope_hash
+                or member_scope_version != authorization_scope_version
+            ):
+                continue
+            selection_scope_hash = _scope_identity(
+                selection, "scope_hash", "market_scope_hash"
+            )
+            selection_scope_version = _scope_identity(
+                selection, "scope_version", "market_scope_version"
+            )
+            if (
+                (
+                    selection.get("scope_hash")
+                    and selection.get("market_scope_hash")
+                    and str(selection.get("scope_hash")).strip()
+                    != str(selection.get("market_scope_hash")).strip()
+                )
+                or (
+                    selection.get("scope_version")
+                    and selection.get("market_scope_version")
+                    and str(selection.get("scope_version")).strip()
+                    != str(selection.get("market_scope_version")).strip()
+                )
+            ):
+                continue
+            if (
+                (selection_scope_hash and selection_scope_hash != member_scope_hash)
+                or (
+                    selection_scope_version
+                    and selection_scope_version != member_scope_version
+                )
+            ):
+                continue
+            tokens: set[str] = set()
+            rows = proof.get("evaluated_input_rows")
+            if isinstance(rows, (list, tuple)):
+                for row in rows:
+                    if not isinstance(row, Mapping):
+                        continue
+                    tokens.update(
+                        str(row.get(name)).strip()
+                        for name in (
+                            "token_id",
+                            "asset_id",
+                            "yes_token_id",
+                            "no_token_id",
+                        )
+                        if row.get(name) not in (None, "")
+                    )
+            for binding_name in (
+                "current_market_binding",
+                "market_binding",
+                "binding",
+            ):
+                binding = member.get(binding_name)
+                if isinstance(binding, Mapping):
+                    tokens.update(
+                        str(binding.get(name)).strip()
+                        for name in (
+                            "token_id",
+                            "asset_id",
+                            "yes_token_id",
+                            "no_token_id",
+                        )
+                        if binding.get(name) not in (None, "")
+                    )
+            bindings = member.get("market_bindings")
+            if isinstance(bindings, (list, tuple)):
+                for binding in bindings:
+                    if not isinstance(binding, Mapping):
+                        continue
+                    if str(binding.get("market_id") or "").strip() != market_id:
+                        continue
+                    tokens.update(
+                        str(binding.get(name)).strip()
+                        for name in (
+                            "token_id",
+                            "asset_id",
+                            "yes_token_id",
+                            "no_token_id",
+                        )
+                        if binding.get(name) not in (None, "")
+                    )
+            for token_id in sorted(tokens):
+                try:
+                    validated_proof = proof_validator(
+                        member,
+                        market_id=market_id,
+                        token_id=token_id,
+                    )
+                except (TypeError, ValueError, RuntimeError):
+                    continue
+                if isinstance(validated_proof, Mapping):
+                    return {
+                        "authorization": dict(authorization),
+                        "selection": dict(selection),
+                        "member": dict(member),
+                        "market_id": market_id,
+                        "token_id": token_id,
+                        "direct_evidence": dict(validated_proof),
+                    }
+        return None
     @staticmethod
     def _minimum_sample_check_passed(payload: Mapping[str, Any]) -> bool:
         evidence = payload.get("minimum_sample_check")
@@ -7736,6 +8133,7 @@ class CanaryService:
         *,
         require_active: bool = False,
         side: str | None = None,
+        direct_profile: bool = False,
         strategy_version_id: Any = None,
         research_trial_id: Any = None,
         portfolio_selection_id: Any = None,
@@ -7823,14 +8221,23 @@ class CanaryService:
             or candidate_id != member_candidate
         ):
             raise CanaryBlocked("ROLLING_LINEAGE_CONFLICT")
-        explicit.update(
-            self._validate_rolling_evidence(
-                {
-                    **explicit,
-                    "candidate_id": candidate_id,
-                }
+        if direct_profile:
+            if (
+                str(current.get("admission_mode") or "").strip().upper()
+                != "EXPLORATORY_LIVE"
+                or not isinstance(member.get("direct_evidence"), Mapping)
+            ):
+                raise CanaryBlocked("EXPLORATORY_DIRECT_PROOF_INVALID")
+            explicit["direct_profile"] = True
+        else:
+            explicit.update(
+                self._validate_rolling_evidence(
+                    {
+                        **explicit,
+                        "candidate_id": candidate_id,
+                    }
+                )
             )
-        )
         try:
             trial_row = self.store.connection.execute(
                 "SELECT strategy_version_id FROM research_trials "
@@ -7889,10 +8296,33 @@ class CanaryService:
             == "exploratory-live-v1"
         )
         exploratory = exploratory or exploratory_live
+        def _canonical_setup_hash(*sources: Mapping[str, Any]) -> Any:
+            observed: Any = None
+            observed_encoded: str | None = None
+            for source in sources:
+                if not isinstance(source, Mapping):
+                    continue
+                for alias in ("operational_setup_hash", "setup_hash"):
+                    value = source.get(alias)
+                    if value in (None, ""):
+                        continue
+                    try:
+                        encoded = json.dumps(
+                            value, sort_keys=True, separators=(",", ":"), default=str
+                        )
+                    except (TypeError, ValueError):
+                        raise CanaryBlocked("EXPLORATORY_SETUP_BINDING_INVALID") from None
+                    if observed_encoded is not None and encoded != observed_encoded:
+                        raise CanaryBlocked("EXPLORATORY_SETUP_BINDING_CHANGED")
+                    if observed_encoded is None:
+                        observed = value
+                        observed_encoded = encoded
+            return observed
+
         for field in _EXPLORATORY_BINDING_FIELDS:
             supplied_value = values.get(field)
-            if supplied_value in (None, "") and field in {"operational_setup_hash", "setup_hash"}:
-                supplied_value = values.get("setup_hash") or values.get("operational_setup_hash")
+            if field in {"operational_setup_hash", "setup_hash"}:
+                supplied_value = _canonical_setup_hash(values)
             elif supplied_value in (None, "") and field == "operating_policy":
                 supplied_value = values.get("exploratory_policy") or values.get("setup_policy")
             elif supplied_value in (None, "") and field == "policy_id":
@@ -7904,16 +8334,12 @@ class CanaryService:
                     values.get("selection_policy_hash")
                     or values.get("admission_policy_hash")
                 )
-            member_value = member.get(field)
-            if member_value in (None, ""):
-                member_value = member_setup.get(field)
-            if field in {"operational_setup_hash", "setup_hash"} and member_value in (
-                None,
-                "",
-            ):
-                member_value = member_setup.get("operational_setup_hash") or member_setup.get(
-                    "setup_hash"
-                )
+            if field in {"operational_setup_hash", "setup_hash"}:
+                member_value = _canonical_setup_hash(member, member_setup)
+            else:
+                member_value = member.get(field)
+                if member_value in (None, ""):
+                    member_value = member_setup.get(field)
             if field == "policy_id" and member_value in (None, ""):
                 member_value = member.get("admission_policy_id", current.get("policy_id"))
             elif field == "policy_version" and member_value in (None, ""):
@@ -7927,8 +8353,10 @@ class CanaryService:
                 )
             elif field in {"scope_hash", "scope_version"} and member_value in (None, ""):
                 member_value = current.get(field)
-            if exploratory_live and field in _EXPLORATORY_REQUIRED_BINDING_FIELDS and (
-                member_value in (None, "")
+            if (
+                exploratory_live
+                and field in _EXPLORATORY_REQUIRED_BINDING_FIELDS
+                and member_value in (None, "")
             ):
                 raise CanaryBlocked("EXPLORATORY_SETUP_BINDING_REQUIRED")
             if exploratory_live and supplied_value in (None, "") and member_value not in (
@@ -8064,11 +8492,18 @@ class CanaryService:
             ):
                 if signal_values.get(field) in (None, ""):
                     signal_values[field] = signal_evidence.get(field)
+            if signal_evidence.get("direct_profile") is True:
+                signal_values["direct_profile"] = True
         stored_type = str(signal_values.get("lineage_type") or "").strip().upper()
         # Do not infer rolling identity from optional propagated columns.  Only
         # a signal explicitly marked ROLLING_PORTFOLIO enters rolling fences.
         stored_rolling = stored_type == _ROLLING_LINEAGE_TYPE
         context_values = _lineage_mapping(rolling_context)
+        persisted_direct_profile = signal_values.get("direct_profile") is True
+        context_direct_profile = context_values.get("direct_profile") is True
+        if context_direct_profile and not persisted_direct_profile:
+            raise CanaryBlocked("ROLLING_LINEAGE_CONFLICT")
+        direct_profile = persisted_direct_profile
         context_type = str(context_values.get("lineage_type") or "").strip().upper()
         context_has_lineage = context_type == _ROLLING_LINEAGE_TYPE
         if not stored_rolling:
@@ -8088,7 +8523,11 @@ class CanaryService:
             context_values,
             lineage_type=_ROLLING_LINEAGE_TYPE,
         )
-        required = (*_ROLLING_LINEAGE_FIELDS, *_ROLLING_EVIDENCE_FIELDS)
+        required = (
+            _ROLLING_LINEAGE_FIELDS
+            if direct_profile
+            else (*_ROLLING_LINEAGE_FIELDS, *_ROLLING_EVIDENCE_FIELDS)
+        )
         if any(
             persisted.get(field) in (None, "")
             or supplied.get(field) in (None, "")
@@ -8159,6 +8598,7 @@ class CanaryService:
                 "candidate_id": candidate_id,
             },
             require_active=str(side).strip().upper() == "BUY",
+            direct_profile=direct_profile,
             side=side,
             execution_authorization_mode=context_values.get(
                 "execution_authorization_mode"
@@ -8834,89 +9274,105 @@ class CanaryService:
                 if expected_integrity != control["integrity_hash"]:
                     raise CanaryBlocked("CANARY_CONTROL_CORRUPT")
 
-                lifecycle = self.store.load_candidate_lifecycle(identifier)
-                if (
-                    not isinstance(lifecycle, Mapping)
-                    or str(lifecycle.get("stage") or "") not in _CANARY_ELIGIBLE_STAGES
-                ):
-                    raise CanaryBlocked("CANDIDATE_NOT_CANARY_ELIGIBLE")
-                eligibility = connection.execute(
-                    "SELECT candidate_id,frozen_hash,evidence_json "
-                    "FROM canary_eligibility WHERE candidate_id=?",
-                    (identifier,),
-                ).fetchone()
-                binding = self._eligibility_binding_result(
+                direct = self._exploratory_direct_authorization_binding(
                     identifier,
-                    eligibility,
-                    record=lifecycle,
-                    verify_attestation=False,
+                    now=now,
                 )
-                if not binding.get("bound") or binding.get("reevaluation_required"):
-                    raise CanaryBlocked("CANDIDATE_NOT_CANARY_ELIGIBLE")
-                validation = self.validate_eligibility(
-                    identifier,
-                    _record=lifecycle,
-                    _verify_attestation=False,
-                )
-                if not validation.get("eligible"):
-                    raise CanaryBlocked("CANDIDATE_RESEARCH_GATES_INCOMPLETE")
-                payload = self._merged_lifecycle_payload(lifecycle)
-                if not isinstance(payload, Mapping):
-                    raise CanaryBlocked("CANDIDATE_FROZEN_BINDING_INVALID")
-                quality = evaluate_prediction_data_quality(
-                    self.store,
-                    payload if isinstance(payload, Mapping) else {},
-                    verify_attestation=False,
-                )
-                expected_ranking_hash = _canary_ranking_snapshot_hash(
-                    identifier,
-                    str(lifecycle.get("stage") or ""),
-                    payload if isinstance(payload, Mapping) else {},
-                    qualification_hash=str(binding.get("qualification_hash") or ""),
-                    quality=quality,
-                )
-                ranking = connection.execute(
-                    "SELECT candidate_id,ranking_run_id,ranking_timestamp,rank,total_score,"
-                    "qualification_hash,ranking_snapshot_hash,cluster_representative,reason "
-                    "FROM canary_rankings WHERE candidate_id=?",
-                    (identifier,),
-                ).fetchone()
-                if ranking is None:
-                    raise CanaryBlocked("AUTONOMOUS_RANKING_NOT_CURRENT")
-                try:
-                    ranking_timestamp = parse_timestamp(ranking["ranking_timestamp"])
-                    ranking_score = float(ranking["total_score"])
-                    ranking_rank = int(ranking["rank"])
-                except (TypeError, ValueError, OverflowError):
-                    ranking_timestamp = None
-                    ranking_score = float("nan")
-                    ranking_rank = None
-                try:
-                    ranking_representative = int(ranking["cluster_representative"])
-                except (TypeError, ValueError, OverflowError):
-                    ranking_representative = None
-                rank_zero_follower = (
-                    ranking_rank == 0
-                    and ranking_representative == 0
-                    and str(ranking["reason"] or "").strip()
-                    == "DIVERSITY_CLUSTER_NON_REPRESENTATIVE"
-                )
-                if (
-                    str(ranking["candidate_id"] or "").strip() != identifier
-                    or str(ranking["ranking_run_id"] or "").strip() != run_id
-                    or ranking_timestamp is None
-                    or ranking_timestamp > now
-                    or (now - ranking_timestamp).total_seconds()
-                    > CANARY_READINESS_SNAPSHOT_MAX_AGE_SECONDS
-                    or ranking_rank is None
-                    or ranking_rank < 0
-                    or (ranking_rank == 0 and not rank_zero_follower)
-                    or not math.isfinite(ranking_score)
-                    or not binding.get("qualification_hash")
-                    or ranking["qualification_hash"] != binding.get("qualification_hash")
-                    or ranking["ranking_snapshot_hash"] != expected_ranking_hash
-                ):
-                    raise CanaryBlocked("AUTONOMOUS_RANKING_NOT_CURRENT")
+                if direct is None and self._exploratory_direct_profile_selected(identifier):
+                    raise CanaryBlocked(
+                        "EXPLORATORY_DIRECT_AUTHORIZATION_REQUIRED"
+                    )
+                if direct is not None:
+                    lifecycle = None
+                    binding = self._direct_candidate_signal_binding(
+                        direct,
+                        candidate_id=identifier,
+                    )
+                    payload = binding["payload"]
+                else:
+                    lifecycle = self.store.load_candidate_lifecycle(identifier)
+                    if (
+                        not isinstance(lifecycle, Mapping)
+                        or str(lifecycle.get("stage") or "") not in _CANARY_ELIGIBLE_STAGES
+                    ):
+                        raise CanaryBlocked("CANDIDATE_NOT_CANARY_ELIGIBLE")
+                    eligibility = connection.execute(
+                        "SELECT candidate_id,frozen_hash,evidence_json "
+                        "FROM canary_eligibility WHERE candidate_id=?",
+                        (identifier,),
+                    ).fetchone()
+                    binding = self._eligibility_binding_result(
+                        identifier,
+                        eligibility,
+                        record=lifecycle,
+                        verify_attestation=False,
+                    )
+                    if not binding.get("bound") or binding.get("reevaluation_required"):
+                        raise CanaryBlocked("CANDIDATE_NOT_CANARY_ELIGIBLE")
+                    validation = self.validate_eligibility(
+                        identifier,
+                        _record=lifecycle,
+                        _verify_attestation=False,
+                    )
+                    if not validation.get("eligible"):
+                        raise CanaryBlocked("CANDIDATE_RESEARCH_GATES_INCOMPLETE")
+                    payload = self._merged_lifecycle_payload(lifecycle)
+                    if not isinstance(payload, Mapping):
+                        raise CanaryBlocked("CANDIDATE_FROZEN_BINDING_INVALID")
+                    quality = evaluate_prediction_data_quality(
+                        self.store,
+                        payload if isinstance(payload, Mapping) else {},
+                        verify_attestation=False,
+                    )
+                    expected_ranking_hash = _canary_ranking_snapshot_hash(
+                        identifier,
+                        str(lifecycle.get("stage") or ""),
+                        payload if isinstance(payload, Mapping) else {},
+                        qualification_hash=str(binding.get("qualification_hash") or ""),
+                        quality=quality,
+                    )
+                    ranking = connection.execute(
+                        "SELECT candidate_id,ranking_run_id,ranking_timestamp,rank,total_score,"
+                        "qualification_hash,ranking_snapshot_hash,cluster_representative,reason "
+                        "FROM canary_rankings WHERE candidate_id=?",
+                        (identifier,),
+                    ).fetchone()
+                    if ranking is None:
+                        raise CanaryBlocked("AUTONOMOUS_RANKING_NOT_CURRENT")
+                    try:
+                        ranking_timestamp = parse_timestamp(ranking["ranking_timestamp"])
+                        ranking_score = float(ranking["total_score"])
+                        ranking_rank = int(ranking["rank"])
+                    except (TypeError, ValueError, OverflowError):
+                        ranking_timestamp = None
+                        ranking_score = float("nan")
+                        ranking_rank = None
+                    try:
+                        ranking_representative = int(ranking["cluster_representative"])
+                    except (TypeError, ValueError, OverflowError):
+                        ranking_representative = None
+                    rank_zero_follower = (
+                        ranking_rank == 0
+                        and ranking_representative == 0
+                        and str(ranking["reason"] or "").strip()
+                        == "DIVERSITY_CLUSTER_NON_REPRESENTATIVE"
+                    )
+                    if (
+                        str(ranking["candidate_id"] or "").strip() != identifier
+                        or str(ranking["ranking_run_id"] or "").strip() != run_id
+                        or ranking_timestamp is None
+                        or ranking_timestamp > now
+                        or (now - ranking_timestamp).total_seconds()
+                        > CANARY_READINESS_SNAPSHOT_MAX_AGE_SECONDS
+                        or ranking_rank is None
+                        or ranking_rank < 0
+                        or (ranking_rank == 0 and not rank_zero_follower)
+                        or not math.isfinite(ranking_score)
+                        or not binding.get("qualification_hash")
+                        or ranking["qualification_hash"] != binding.get("qualification_hash")
+                        or ranking["ranking_snapshot_hash"] != expected_ranking_hash
+                    ):
+                        raise CanaryBlocked("AUTONOMOUS_RANKING_NOT_CURRENT")
 
                 signal = connection.execute(
                     "SELECT * FROM canary_signals WHERE signal_id=?",
@@ -8932,16 +9388,35 @@ class CanaryService:
                     signal_evidence = json.loads(signal["evidence_json"] or "{}")
                 except (TypeError, ValueError, json.JSONDecodeError):
                     signal_evidence = None
-                frozen_hash = self._lifecycle_frozen_hash(lifecycle)
+                frozen_hash = (
+                    binding.get("frozen_hash")
+                    if direct is not None
+                    else self._lifecycle_frozen_hash(lifecycle)
+                )
+                expected_strategy_hash = (
+                    binding.get("strategy_hash")
+                    if direct is not None
+                    else payload.get("strategy_hash")
+                )
+                expected_model_hash = (
+                    binding.get("model_hash")
+                    if direct is not None
+                    else payload.get("model_hash")
+                )
+                expected_config_hash = (
+                    binding.get("config_hash")
+                    if direct is not None
+                    else payload.get("config_hash")
+                )
                 if (
                     str(signal["candidate_id"] or "").strip() != identifier
                     or str(signal["status"] or "").upper() != "READY"
                     or signal_expires is None
                     or signal_expires <= now
                     or signal["frozen_hash"] != frozen_hash
-                    or signal["strategy_hash"] != payload.get("strategy_hash")
-                    or signal["model_hash"] != payload.get("model_hash")
-                    or signal["config_hash"] != payload.get("config_hash")
+                    or signal["strategy_hash"] != expected_strategy_hash
+                    or signal["model_hash"] != expected_model_hash
+                    or signal["config_hash"] != expected_config_hash
                     or not isinstance(signal_evidence, Mapping)
                     or signal_evidence.get("current_execution_evidence") != CURRENT_ORDER_BOOK
                 ):
@@ -8982,12 +9457,156 @@ class CanaryService:
             "control_generation": control_generation,
         }
 
+    def _direct_candidate_signal_binding(
+        self,
+        direct: Mapping[str, Any],
+        *,
+        candidate_id: str,
+    ) -> dict[str, Any]:
+        member = direct.get("member")
+        selection = direct.get("selection")
+        proof = direct.get("direct_evidence")
+        authorization = direct.get("authorization")
+        if not all(
+            isinstance(value, Mapping)
+            for value in (member, selection, proof, authorization)
+        ):
+            raise CanaryBlocked("CANDIDATE_FROZEN_BINDING_INVALID")
+        payload = dict(member)
+        member_scope = member.get("scope")
+        if isinstance(member_scope, Mapping):
+            payload.setdefault("market_scope", dict(member_scope))
+        for name in (
+            "scope_hash",
+            "scope_version",
+            "market_scope_hash",
+            "market_scope_version",
+            "draft_id",
+            "draft_hash",
+        ):
+            if payload.get(name) in (None, "") and selection.get(name) not in (None, ""):
+                payload[name] = selection.get(name)
+        scope_resolution = _canary_current_scope_resolution(
+            self.store,
+            candidate_id,
+            payload,
+            now=ensure_utc(self.clock()),
+        )
+        if not scope_resolution.get("bound"):
+            raise CanaryBlocked(
+                str(
+                    scope_resolution.get("reason_code")
+                    or "SCOPE_RESOLUTION_MISSING"
+                )
+            )
+        strategy_document = member.get("strategy_document")
+        if not isinstance(strategy_document, Mapping):
+            raise CanaryBlocked("CANDIDATE_EXECUTABLE_DOCUMENTS_UNAVAILABLE")
+        try:
+            from .strategy import load_strategy
+
+            strategy = load_strategy(strategy_document)
+        except Exception as exc:
+            raise CanaryBlocked("CANDIDATE_EXECUTABLE_DOCUMENTS_INVALID") from exc
+        if strategy.market_type.value != "prediction":
+            raise CanaryBlocked("CANARY_MARKET_TYPE_UNSUPPORTED")
+        model_document = member.get("model_document")
+        model_required = _canary_strategy_requires_model(strategy)
+        if model_required:
+            raise CanaryBlocked("CANDIDATE_EXECUTABLE_DOCUMENTS_UNAVAILABLE")
+        model_document = dict(_CANARY_MODEL_FREE_DOCUMENT)
+        model_hash = self._document_hash(model_document)
+        strategy_hash = str(member.get("strategy_hash") or "").strip()
+        if not strategy_hash:
+            strategy_hash = self._document_hash(strategy_document) or ""
+        config_hash = str(member.get("config_hash") or "").strip()
+        if not config_hash:
+            config_hash = self._document_hash(
+                {
+                    "operational_setup": member.get("operational_setup"),
+                    "market_scope": member.get("scope"),
+                    "selection_id": selection.get("selection_id")
+                    or selection.get("portfolio_selection_id"),
+                }
+            ) or ""
+        frozen_hash = self._document_hash(
+            {
+                "authorization_id": authorization.get("authorization_id"),
+                "selection_id": selection.get("selection_id")
+                or selection.get("portfolio_selection_id"),
+                "selection_hash": authorization.get("selection_hash"),
+                "candidate_id": candidate_id,
+                "strategy_version_id": member.get("strategy_version_id"),
+                "direct_evidence": proof,
+                "strategy_hash": strategy_hash,
+                "config_hash": config_hash,
+            }
+        )
+        qualification_hash = self._document_hash(
+            {
+                "selection_hash": authorization.get("selection_hash"),
+                "candidate_id": candidate_id,
+                "strategy_version_id": member.get("strategy_version_id"),
+                "direct_evidence": proof,
+            }
+        )
+        raw_auth_versions = authorization.get(
+            "exact_strategy_versions",
+            authorization.get("strategy_versions", ()),
+        )
+        if isinstance(raw_auth_versions, str):
+            raw_auth_versions = (raw_auth_versions,)
+        direct_lineage = {
+            "strategy_version_id": member.get("strategy_version_id"),
+            "research_trial_id": member.get("research_trial_id"),
+            "portfolio_selection_id": selection.get("selection_id")
+            or selection.get("portfolio_selection_id"),
+            "selection_hash": authorization.get("selection_hash"),
+            "execution_authorization_mode": authorization.get("mode"),
+            "execution_authorization_id": authorization.get("authorization_id"),
+            "execution_authorization_generation": authorization.get("generation"),
+            "execution_authorization_strategy_versions": list(raw_auth_versions or ()),
+        }
+        return {
+            "candidate_id": candidate_id,
+            "lifecycle": None,
+            "payload": payload,
+            "qualification_hash": qualification_hash,
+            "plan_hash": _canary_scope_binding(payload).get("plan_hash"),
+            "frozen_hash": frozen_hash,
+            "strategy_hash": strategy_hash,
+            "model_hash": model_hash,
+            "config_hash": config_hash,
+            "strategy": strategy,
+            "model_document": model_document,
+            "forward_test": None,
+            "forward_config": {},
+            "data_quality": {"source": "EXPLORATORY_LIVE_DIRECT_PROOF"},
+            "risk_limits": {},
+            "scope_resolution": scope_resolution,
+            "scope_hash": scope_resolution.get("scope_hash"),
+            "scope_version": scope_resolution.get("scope_version"),
+            "strategy_version_id": member.get("strategy_version_id"),
+            "direct_lineage": direct_lineage,
+        }
+
 
     def _candidate_signal_binding(self, candidate_id: str) -> dict[str, Any]:
         """Load the candidate's immutable executable documents and binding."""
         identifier = str(candidate_id).strip()
         if not identifier:
             raise CanaryBlocked("CANDIDATE_NOT_CANARY_ELIGIBLE")
+        direct = self._exploratory_direct_authorization_binding(
+            identifier,
+            now=ensure_utc(self.clock()),
+        )
+        if direct is not None:
+            return self._direct_candidate_signal_binding(
+                direct,
+                candidate_id=identifier,
+            )
+        if self._exploratory_direct_profile_selected(identifier):
+            raise CanaryBlocked("EXPLORATORY_DIRECT_AUTHORIZATION_REQUIRED")
         lifecycle = self.store.load_candidate_lifecycle(identifier)
         if not isinstance(lifecycle, Mapping) or lifecycle.get("stage") not in _CANARY_ELIGIBLE_STAGES:
             raise CanaryBlocked("CANDIDATE_NOT_CANARY_ELIGIBLE")
@@ -9618,6 +10237,15 @@ class CanaryService:
                                 if lineage.get(field) not in (None, "")
                             }
                         )
+                        if lineage.get("direct_profile") is True:
+                            evidence["direct_profile"] = True
+                            evidence.update(
+                                {
+                                    field: lineage.get(field)
+                                    for field in _EXPLORATORY_BINDING_FIELDS
+                                    if lineage.get(field) not in (None, "")
+                                }
+                            )
                     self.store.connection.execute(
                         "INSERT INTO canary_signals("
                         "signal_id,candidate_id,frozen_hash,strategy_hash,model_hash,config_hash,"
@@ -9678,10 +10306,96 @@ class CanaryService:
         if not identifier:
             identifier = str(candidate_id)
         evaluated_at = now.isoformat()
+        direct = self._exploratory_direct_authorization_binding(
+            identifier,
+            now=now,
+        )
+        if direct is None and self._exploratory_direct_profile_selected(identifier):
+            raise CanaryBlocked("EXPLORATORY_DIRECT_AUTHORIZATION_REQUIRED")
+        direct_binding = (
+            self._direct_candidate_signal_binding(
+                direct,
+                candidate_id=identifier,
+            )
+            if direct is not None
+            else None
+        )
         lineage_source = _lineage_mapping(rolling_context)
         lineage_source["candidate_id"] = identifier
+        if direct_binding is not None:
+            direct_member = direct.get("member")
+            direct_selection = direct.get("selection")
+            direct_member = direct_member if isinstance(direct_member, Mapping) else {}
+            direct_selection = (
+                direct_selection if isinstance(direct_selection, Mapping) else {}
+            )
+            direct_lineage = direct_binding.get("direct_lineage")
+            if isinstance(direct_lineage, Mapping):
+                lineage_source.update(direct_lineage)
+            lineage_source.update(
+                {
+                    "lineage_type": _ROLLING_LINEAGE_TYPE,
+                    "strategy_version_id": direct_member.get("strategy_version_id"),
+                    "research_trial_id": direct_member.get("research_trial_id"),
+                    "portfolio_selection_id": direct_selection.get(
+                        "portfolio_selection_id",
+                        direct_selection.get("selection_id"),
+                    ),
+                    "admission_policy_id": direct_selection.get("policy_id"),
+                    "admission_policy_version": direct_selection.get(
+                        "policy_version"
+                    ),
+                    "policy_id": direct_selection.get("policy_id"),
+                    "policy_version": direct_selection.get("policy_version"),
+                    "policy_hash": _canary_authorization_selection_policy_hash(
+                        direct_selection
+                    ),
+                    "operating_policy": direct_member.get(
+                        "operating_policy",
+                        direct_selection.get("operating_policy"),
+                    ),
+                    "setup_id": direct_member.get(
+                        "setup_id",
+                        (
+                            direct_member.get("operational_setup", {}).get("setup_id")
+                            if isinstance(
+                                direct_member.get("operational_setup"), Mapping
+                            )
+                            else None
+                        ),
+                    ),
+                    "setup_version": direct_member.get(
+                        "setup_version",
+                        (
+                            direct_member.get("operational_setup", {}).get(
+                                "setup_version"
+                            )
+                            if isinstance(
+                                direct_member.get("operational_setup"), Mapping
+                            )
+                            else None
+                        ),
+                    ),
+                    "scope_hash": direct_binding.get("scope_hash"),
+                    "scope_version": direct_binding.get("scope_version"),
+                    "risk_config_id": direct_selection.get(
+                        "active_risk_config_id",
+                        direct_selection.get("risk_config_id"),
+                    ),
+                    "risk_config_generation": direct_selection.get(
+                        "active_risk_config_generation",
+                        direct_selection.get("risk_config_generation"),
+                    ),
+                    "risk_config_hash": direct_selection.get(
+                        "active_risk_config_hash",
+                        direct_selection.get("risk_config_hash"),
+                    ),
+                    "direct_profile": True,
+                }
+            )
         lineage = self._rolling_lineage(
             lineage_source,
+            direct_profile=direct_binding is not None,
             strategy_version_id=strategy_version_id,
             research_trial_id=research_trial_id,
             portfolio_selection_id=portfolio_selection_id,
@@ -9691,6 +10405,8 @@ class CanaryService:
             risk_config_generation=risk_config_generation,
             risk_config_hash=risk_config_hash,
         )
+        if direct_binding is not None:
+            lineage["direct_profile"] = True
         cycle = str(cycle_id).strip() if cycle_id is not None else None
 
         def finish(
@@ -9701,6 +10417,11 @@ class CanaryService:
             required_health: Mapping[str, Any] | None = None,
             evidence: Mapping[str, Any] | None = None,
         ) -> dict[str, Any]:
+            evaluation_evidence = (
+                dict(evidence) if isinstance(evidence, Mapping) else {}
+            )
+            if direct_binding is not None:
+                evaluation_evidence["direct_profile"] = True
             result = {
                 "candidate_id": identifier,
                 "cycle_id": cycle,
@@ -9711,13 +10432,17 @@ class CanaryService:
                 "required_health": (
                     dict(required_health) if isinstance(required_health, Mapping) else {}
                 ),
-                "evidence": dict(evidence) if isinstance(evidence, Mapping) else {},
+                "evidence": evaluation_evidence,
                 "lineage": lineage,
             }
             return self._persist_signal_evaluation(result)
 
-        lifecycle = self.store.load_candidate_lifecycle(identifier)
-        lifecycle_payload = self._merged_lifecycle_payload(lifecycle)
+        if direct_binding is not None:
+            lifecycle = None
+            lifecycle_payload = direct_binding["payload"]
+        else:
+            lifecycle = self.store.load_candidate_lifecycle(identifier)
+            lifecycle_payload = self._merged_lifecycle_payload(lifecycle)
         scope_binding = _canary_scope_binding(lifecycle_payload)
         scope_resolution = _canary_current_scope_resolution(
             self.store,
@@ -12116,42 +12841,55 @@ class CanaryService:
             limits = limits or CanaryLimits(
                 target_notional_usd=Decimal(target_notional_usd)
             )
-            record = self.store.load_candidate_lifecycle(str(candidate_id))
-            eligible = connection.execute(
-                "SELECT candidate_id,frozen_hash,evidence_json "
-                "FROM canary_eligibility WHERE candidate_id=?",
-                (candidate_id,),
-            ).fetchone()
-            binding = self._eligibility_binding_result(
-                str(candidate_id),
-                eligible,
-                record=record,
-                verify_attestation=False,
-            )
-            if not binding.get("bound"):
-                raise CanaryBlocked("CANDIDATE_NOT_CANARY_ELIGIBLE")
-            if binding.get("reevaluation_required"):
-                self.mark_eligible(str(candidate_id))
+            direct_binding = None
+            if self._exploratory_direct_profile_selected(str(candidate_id)):
+                direct_binding = self._exploratory_direct_authorization_binding(
+                    str(candidate_id),
+                    now=now,
+                )
+                if direct_binding is None:
+                    raise CanaryBlocked("CANDIDATE_NOT_CANARY_ELIGIBLE")
+            else:
+                record = self.store.load_candidate_lifecycle(str(candidate_id))
                 eligible = connection.execute(
                     "SELECT candidate_id,frozen_hash,evidence_json "
                     "FROM canary_eligibility WHERE candidate_id=?",
                     (candidate_id,),
                 ).fetchone()
-                record = self.store.load_candidate_lifecycle(str(candidate_id))
                 binding = self._eligibility_binding_result(
                     str(candidate_id),
                     eligible,
                     record=record,
                     verify_attestation=False,
                 )
-                if not binding.get("bound") or binding.get("reevaluation_required"):
+                if binding.get("bound"):
+                    if binding.get("reevaluation_required"):
+                        self.mark_eligible(str(candidate_id))
+                        eligible = connection.execute(
+                            "SELECT candidate_id,frozen_hash,evidence_json "
+                            "FROM canary_eligibility WHERE candidate_id=?",
+                            (candidate_id,),
+                        ).fetchone()
+                        record = self.store.load_candidate_lifecycle(str(candidate_id))
+                        binding = self._eligibility_binding_result(
+                            str(candidate_id),
+                            eligible,
+                            record=record,
+                            verify_attestation=False,
+                        )
+                        if (
+                            not binding.get("bound")
+                            or binding.get("reevaluation_required")
+                        ):
+                            raise CanaryBlocked("CANDIDATE_NOT_CANARY_ELIGIBLE")
+                    if not self.validate_eligibility(
+                        str(candidate_id),
+                        _record=record,
+                        _verify_attestation=False,
+                    ).get("eligible"):
+                        raise CanaryBlocked("CANDIDATE_RESEARCH_GATES_INCOMPLETE")
+                else:
                     raise CanaryBlocked("CANDIDATE_NOT_CANARY_ELIGIBLE")
-            if not self.validate_eligibility(
-                str(candidate_id),
-                _record=record,
-                _verify_attestation=False,
-            ).get("eligible"):
-                raise CanaryBlocked("CANDIDATE_RESEARCH_GATES_INCOMPLETE")
             health = self.store.polymarket_health(now=now)
             if str(health.get("grade", "F")).upper() not in {"A", "B"}:
                 raise CanaryBlocked("COLLECTOR_DEGRADED")
@@ -12336,6 +13074,41 @@ class CanaryService:
             }
 
         selection_run_id = text_value(selection.get("ranking_run_id"))
+        direct_binding = self._exploratory_direct_authorization_binding(
+            current_id,
+            now=ensure_utc(self.clock()),
+        )
+        if direct_binding is not None:
+            authorization = direct_binding.get("authorization")
+            selection_record = direct_binding.get("selection")
+            expected_run = (
+                "portfolio:"
+                + str(selection_record.get("selection_id") or selection_record.get("portfolio_selection_id") or "").strip()
+                if isinstance(selection_record, Mapping)
+                else ""
+            )
+            if (
+                isinstance(authorization, Mapping)
+                and expected_run
+                and selection_run_id == expected_run
+            ):
+                return {
+                    "selection_status": "CURRENT",
+                    "selection_valid": True,
+                    "selection_invalidation_reason": None,
+                    "selected_candidate": current_id,
+                    "last_selected_candidate": historical_id,
+                }
+        elif self._exploratory_direct_profile_selected(current_id):
+            return {
+                "selection_status": "STALE",
+                "selection_valid": False,
+                "selection_invalidation_reason": (
+                    "EXPLORATORY_DIRECT_AUTHORIZATION_REQUIRED"
+                ),
+                "selected_candidate": None,
+                "last_selected_candidate": historical_id,
+            }
         selection_timestamp = text_value(selection.get("ranking_timestamp"))
         selection_selected_at = text_value(selection.get("selected_at"))
         selection_qualification_hash = text_value(
@@ -13026,23 +13799,32 @@ class CanaryService:
                 limits,
             )
             candidate = str(data.get("candidate_id") or "")
-            eligible = _optional_fetchone(
-                "SELECT candidate_id,frozen_hash,evidence_json "
-                "FROM canary_eligibility WHERE candidate_id=?",
-                (candidate,),
-            )
-            lifecycle = self.store.load_candidate_lifecycle(candidate)
-            bound = self._eligibility_binding_result(
-                candidate,
-                eligible,
-                record=lifecycle,
-                verify_attestation=False,
-            ).get("bound")
-            gates_pass = self.validate_eligibility(
-                candidate,
-                _record=lifecycle,
-                _verify_attestation=False,
-            ).get("eligible")
+            direct_profile = self._exploratory_direct_profile_selected(candidate)
+            if direct_profile:
+                direct_binding = self._exploratory_direct_authorization_binding(
+                    candidate,
+                    now=now,
+                )
+                bound = isinstance(direct_binding, Mapping)
+                gates_pass = bound
+            else:
+                eligible = _optional_fetchone(
+                    "SELECT candidate_id,frozen_hash,evidence_json "
+                    "FROM canary_eligibility WHERE candidate_id=?",
+                    (candidate,),
+                )
+                lifecycle = self.store.load_candidate_lifecycle(candidate)
+                bound = self._eligibility_binding_result(
+                    candidate,
+                    eligible,
+                    record=lifecycle,
+                    verify_attestation=False,
+                ).get("bound")
+                gates_pass = self.validate_eligibility(
+                    candidate,
+                    _record=lifecycle,
+                    _verify_attestation=False,
+                ).get("eligible")
             if not bound or not gates_pass or expected != data.get("integrity_hash"):
                 state = "KILLED"
             elif not data.get("expires_at"):
@@ -13409,6 +14191,7 @@ class CanaryService:
                             diagnostics["market"] = {
                                 key: context[key]
                                 for key in (
+                                    "market_id",
                                     "market_version",
                                     "outcome",
                                     "token_id",
@@ -13437,6 +14220,10 @@ class CanaryService:
                                     )
                                 )
                             )
+                            rules = parse_polymarket_rules(context)
+                            diagnostics["book"]["rules"] = rules.to_dict()
+                            diagnostics["book"]["trade_ready"] = False
+                            diagnostics["book"]["trade_blockers"] = []
                             parameters = _canary_buy_order_parameters(
                                 context,
                                 target_notional=target,
@@ -13452,11 +14239,38 @@ class CanaryService:
                             diagnostics["book"]["depth_assessment"] = parameters[
                                 "depth"
                             ].to_dict()
+                            diagnostics["book"]["trade_ready"] = True
                             if diagnostics["balance"].get("status") == "OK":
                                 if available < target + parameters["estimated_fees"]:
                                     failures.append("INSUFFICIENT_BALANCE")
                         except CanaryBlocked as exc:
-                            failures.append(str(exc))
+                            reason = str(exc).strip().upper()
+                            trade_feasibility = {
+                                "VENUE_MINIMUM_EXCEEDS_CANARY_TARGET",
+                                "SLIPPAGE_LIMIT",
+                                "CANARY_INSUFFICIENT_DEPTH",
+                            }
+                            book_diagnostics = diagnostics.get("book")
+                            market_diagnostics = diagnostics.get("market")
+                            operational_structure = (
+                                isinstance(book_diagnostics, Mapping)
+                                and isinstance(book_diagnostics.get("rules"), Mapping)
+                                and isinstance(book_diagnostics.get("bids"), list)
+                                and bool(book_diagnostics.get("bids"))
+                                and isinstance(book_diagnostics.get("asks"), list)
+                                and bool(book_diagnostics.get("asks"))
+                                and isinstance(market_diagnostics, Mapping)
+                                and market_diagnostics.get("accepting_orders") is True
+                            )
+                            if (
+                                _connectivity_only
+                                and reason in trade_feasibility
+                                and operational_structure
+                            ):
+                                book_diagnostics["trade_ready"] = False
+                                book_diagnostics["trade_blockers"] = [reason]
+                            else:
+                                failures.append(reason)
                         except Exception:
                             failures.append("MARKET_CONNECTIVITY_FAILED")
                     elif market_id or token_id:
@@ -13909,68 +14723,95 @@ class CanaryService:
                     block("CANARY_SIGNAL_NO_LONGER_VALID")
             if required_status.upper() == "READY":
                 return signal
-            lifecycle = self.store.load_candidate_lifecycle(
-                str(signal.get("candidate_id") or "")
+            candidate_identifier = str(signal.get("candidate_id") or "")
+            direct_profile = (
+                signal_evidence.get("direct_profile") is True
+                or (submission_lineage or {}).get("direct_profile") is True
             )
-            payload = self._merged_lifecycle_payload(lifecycle)
-            if not isinstance(payload, Mapping):
-                block("CANDIDATE_FROZEN_BINDING_INVALID")
-            validation = self.validate_eligibility(
-                str(signal.get("candidate_id") or ""),
-                _record=lifecycle,
-            )
-            validation_checks = validation.get("checks", ())
-            authorization_mode = str(
-                (submission_lineage or {}).get(
-                    "execution_authorization_mode",
-                    (
-                        execution_authorization.get("execution_authorization_mode")
-                        if isinstance(execution_authorization, Mapping)
-                        else ""
-                    ),
-                )
-                or ""
-            ).strip().upper()
-            exploratory_authorized = authorization_mode == "EXPLORATORY_MICRO_CANARY"
-            exploratory_only_failures = {
-                "Historical backtest",
-                "Validation",
-                "Robustness",
-                "Minimum samples and trades",
-            }
-            failed_checks = {
-                str(item.get("name") or "")
-                for item in validation_checks
-                if isinstance(item, Mapping) and item.get("passed") is not True
-            }
-            if not validation.get("eligible") and not (
-                exploratory_authorized
-                and failed_checks
-                and failed_checks <= exploratory_only_failures
-            ):
-                block(
-                    str(
-                        validation.get("reason_code")
-                        or "CANDIDATE_RESEARCH_GATES_INCOMPLETE"
+            if direct_profile:
+                if not self._exploratory_direct_profile_selected(candidate_identifier):
+                    block("EXPLORATORY_DIRECT_AUTHORIZATION_REQUIRED")
+                try:
+                    direct_binding = self._candidate_signal_binding(candidate_identifier)
+                except CanaryBlocked as exc:
+                    block(str(exc))
+                if not isinstance(direct_binding, Mapping):
+                    block("EXPLORATORY_DIRECT_AUTHORIZATION_REQUIRED")
+                payload = direct_binding.get("payload")
+                if not isinstance(payload, Mapping):
+                    block("CANDIDATE_FROZEN_BINDING_INVALID")
+                if any(
+                    str(direct_binding.get(name) or "").strip()
+                    != str(signal.get(name) or "").strip()
+                    for name in (
+                        "frozen_hash",
+                        "strategy_hash",
+                        "model_hash",
+                        "config_hash",
                     )
+                ):
+                    block("CANDIDATE_LIFECYCLE_CHANGED")
+            else:
+                lifecycle = self.store.load_candidate_lifecycle(candidate_identifier)
+                payload = self._merged_lifecycle_payload(lifecycle)
+                if not isinstance(payload, Mapping):
+                    block("CANDIDATE_FROZEN_BINDING_INVALID")
+                validation = self.validate_eligibility(
+                    candidate_identifier,
+                    _record=lifecycle,
                 )
-            if any(
-                str(payload.get(name) or "").strip()
-                != str(signal.get(name) or "").strip()
-                for name in (
-                    "frozen_hash",
-                    "strategy_hash",
-                    "model_hash",
-                    "config_hash",
-                )
-            ):
-                block("CANDIDATE_LIFECYCLE_CHANGED")
-            validation_binding = validation.get("binding")
-            if (
-                not isinstance(validation_binding, Mapping)
-                or not validation_binding.get("bound")
-            ):
-                block("CANDIDATE_FROZEN_BINDING_INVALID")
+                validation_checks = validation.get("checks", ())
+                authorization_mode = str(
+                    (submission_lineage or {}).get(
+                        "execution_authorization_mode",
+                        (
+                            execution_authorization.get("execution_authorization_mode")
+                            if isinstance(execution_authorization, Mapping)
+                            else ""
+                        ),
+                    )
+                    or ""
+                ).strip().upper()
+                exploratory_authorized = authorization_mode == "EXPLORATORY_MICRO_CANARY"
+                exploratory_only_failures = {
+                    "Historical backtest",
+                    "Validation",
+                    "Robustness",
+                    "Minimum samples and trades",
+                }
+                failed_checks = {
+                    str(item.get("name") or "")
+                    for item in validation_checks
+                    if isinstance(item, Mapping) and item.get("passed") is not True
+                }
+                if not validation.get("eligible") and not (
+                    exploratory_authorized
+                    and failed_checks
+                    and failed_checks <= exploratory_only_failures
+                ):
+                    block(
+                        str(
+                            validation.get("reason_code")
+                            or "CANDIDATE_RESEARCH_GATES_INCOMPLETE"
+                        )
+                    )
+                if any(
+                    str(payload.get(name) or "").strip()
+                    != str(signal.get(name) or "").strip()
+                    for name in (
+                        "frozen_hash",
+                        "strategy_hash",
+                        "model_hash",
+                        "config_hash",
+                    )
+                ):
+                    block("CANDIDATE_LIFECYCLE_CHANGED")
+                validation_binding = validation.get("binding")
+                if (
+                    not isinstance(validation_binding, Mapping)
+                    or not validation_binding.get("bound")
+                ):
+                    block("CANDIDATE_FROZEN_BINDING_INVALID")
             scope = _canary_current_scope_resolution(
                 self.store,
                 str(signal.get("candidate_id") or ""),
@@ -14059,6 +14900,11 @@ class CanaryService:
                     now=ensure_utc(self.clock()),
                     requested_cost=notional,
                     fee_reserve=estimated_fees,
+                    exclude_pending_event_id=(
+                        event_id
+                        if not network_send_started and not submission_cancelled.is_set()
+                        else None
+                    ),
                 )
                 _final_venue_identity_fence(
                     self,
@@ -15040,6 +15886,12 @@ class CanaryService:
                             lineage=submission_lineage,
                             context=authority_context,
                             now=ensure_utc(self.clock()),
+                            exclude_pending_event_id=(
+                                event_id
+                                if not network_send_started
+                                and not submission_cancelled.is_set()
+                                else None
+                            ),
                         )
                     except CanaryBlocked as exc:
                         reason = str(exc)

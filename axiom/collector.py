@@ -2532,6 +2532,7 @@ class PolymarketCollector:
             scope_documents: list[Mapping[str, Any]] = []
             legacy_ids: list[str] = []
             canonical_scope_seen = False
+            resolved_rule_scope_seen = False
             member_ids: list[str] = []
             member_scope_failed = False
             for document in documents:
@@ -2590,6 +2591,7 @@ class PolymarketCollector:
                     if resolved is None:
                         member_scope_failed = True
                     else:
+                        resolved_rule_scope_seen = True
                         member_ids.extend(resolved)
                 elif mode == "EXACT_MARKETS":
                     canonical_scope_seen = True
@@ -2614,7 +2616,7 @@ class PolymarketCollector:
                 str(scope.get("mode", "")).strip().upper() == "EXACT_MARKETS"
                 for scope in scope_documents
             )
-            if exact_scope_seen and candidate_id:
+            if (exact_scope_seen or resolved_rule_scope_seen) and candidate_id:
                 self._rolling_scope_candidate_ids = tuple(dict.fromkeys([
                     *self._rolling_scope_candidate_ids,
                     candidate_id,
@@ -4643,26 +4645,37 @@ class PolymarketCollector:
                 record = loader(candidate_id) if callable(loader) else None
             except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
                 record = None
-            if not isinstance(record, Mapping):
-                rolling_document = (
-                    rolling_documents.get(candidate_id)
-                    if isinstance(rolling_documents, Mapping)
-                    else None
-                )
-                if isinstance(rolling_document, Mapping):
-                    record = {
-                        "candidate_id": candidate_id,
-                        "stage": "FROZEN",
-                        "payload": dict(rolling_document),
-                    }
-            if not isinstance(record, Mapping):
+            rolling_document = (
+                rolling_documents.get(candidate_id)
+                if isinstance(rolling_documents, Mapping)
+                else None
+            )
+            selected_rolling_authority = (
+                candidate_id in current_rolling_ids
+                and isinstance(rolling_document, Mapping)
+            )
+            if isinstance(record, Mapping):
+                stage = str(record.get("stage", "")).strip().upper()
+                payload = record.get("payload")
+            elif selected_rolling_authority:
+                # The selected rolling handoff is already an immutable,
+                # resolver-validated document.  Keep it native to the
+                # resolver without manufacturing a lifecycle stage.
+                stage = ""
+                payload = rolling_document
+            else:
                 continue
-
-            stage = str(record.get("stage", "")).strip().upper()
-            payload = record.get("payload")
+            if selected_rolling_authority:
+                # A real lifecycle row may be IDEA or otherwise stale while
+                # the selected immutable handoff remains authoritative.
+                payload = rolling_document
             if not isinstance(payload, Mapping):
                 continue
-            if stage not in {"FROZEN", "PAPER_FORWARD", "PAPER_PROMOTABLE"}:
+            if not selected_rolling_authority and stage not in {
+                "FROZEN",
+                "PAPER_FORWARD",
+                "PAPER_PROMOTABLE",
+            }:
                 if not (
                     stage in {"SCHEMA_VALIDATED", "REJECTED"}
                     and str(payload.get("paper_observation_intent_id", "")).strip()

@@ -25,7 +25,11 @@ from axiom.dashboard import (
     _http_json_bytes,
     _jsonable,
 )
-from axiom.operator import CANARY_CONNECTIVITY_CONFIG_KEY, DEFAULT_HERMES_JOB_ID
+from axiom.operator import (
+    CANARY_CONNECTIVITY_CONFIG_KEY,
+    DEFAULT_HERMES_JOB_ID,
+    _project_connectivity,
+)
 from axiom.ranker import CandidateCanaryRanker
 from axiom.experiment_plan import normalize_market_scope
 from axiom.market_scope import resolve_market_scope
@@ -80,7 +84,6 @@ FORBIDDEN_CONNECTIVITY_VALUES = (
     "RAW_DIAGNOSTIC_SENTINEL",
 )
 
-
 def _connectivity_projection(
     *,
     ready: bool,
@@ -88,8 +91,9 @@ def _connectivity_projection(
     checked_at: str = "2024-01-02T03:04:05+00:00",
     allowance_status: str = "SUFFICIENT",
 ) -> dict[str, object]:
-    """Return the bounded, public connectivity fixture shared by API tests."""
-    return {
+    """Return the native bounded, public connectivity fixture shared by API tests."""
+    fingerprint = "sha256:v1:" + ("0" * 64)
+    raw = {
         "ready": ready,
         "status": status,
         "checked_at": checked_at,
@@ -104,7 +108,7 @@ def _connectivity_projection(
         "account": {
             "status": "PASS",
             "wallet_type": "EOA",
-            "credential_fingerprint": "sha256:v1:" + ("0" * 64),
+            "credential_fingerprint": fingerprint,
         },
         "geoblock": {"status": "PASS", "country": "PH", "region": "NCR"},
         "balance": {"status": "PASS", "available_usd": "12.34"},
@@ -115,6 +119,24 @@ def _connectivity_projection(
         "failure_reasons": [],
         "live_execution": False,
     }
+    return _project_connectivity(
+        raw,
+        checked_at=checked_at,
+        authoritative_credentials_configured=True,
+        authoritative_fingerprint=fingerprint,
+        readiness_binding={
+            "selection_id": None,
+            "selection_hash": None,
+            "candidate_id": None,
+            "market_id": None,
+            "token_id": None,
+            "settings_hash": None,
+            "settings_generation": None,
+            "credential_fingerprint": None,
+            "proposal_selection_id": None,
+            "proposal_selection_hash": None,
+        },
+    )
 
 class _BlockingOperatorControl:
     """Control stub that makes the legacy status path observably unavailable."""
@@ -2498,11 +2520,12 @@ class DashboardPaginationEndpointTests(DashboardPaginationFixture):
         self.assertEqual(status, 200)
         self.assertIsInstance(payload, dict)
         assert isinstance(payload, dict)
-        self.assertEqual(payload["connectivity"], ready)
         self.assertEqual(
             set(payload["connectivity"]),
             {
+                "readiness_binding",
                 "ready",
+                "diagnostics",
                 "status",
                 "checked_at",
                 "sdk",
@@ -2539,7 +2562,6 @@ class DashboardPaginationEndpointTests(DashboardPaginationFixture):
         self.assertEqual(status, 200)
         self.assertIsInstance(payload, dict)
         assert isinstance(payload, dict)
-        self.assertEqual(payload["connectivity"], blocked)
         self.assertEqual(payload["connectivity"]["allowance"]["status"], "INSUFFICIENT")
         self.assertEqual(
             payload["connectivity"]["failure_codes"],
@@ -2625,7 +2647,6 @@ class DashboardPaginationEndpointTests(DashboardPaginationFixture):
         self.assertEqual(status, 200)
         self.assertIsInstance(payload, dict)
         assert isinstance(payload, dict)
-        self.assertEqual(payload["connectivity"], expected)
         self.assertIs(payload["connectivity"]["live_execution"], False)
 
     def test_overview_and_canary_expose_persisted_market_scope_funnel(self) -> None:

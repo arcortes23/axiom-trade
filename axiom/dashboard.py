@@ -28,8 +28,10 @@ from .operator import (
     CANARY_CONNECTIVITY_CONFIG_KEY,
     OperatorControlError,
     OperatorControlPlane,
-    _public_draft_member_bindings,
+    _connectivity_safe_diagnostics,
+    _authorization_public_projection,
     _public_setup_bindings,
+    _public_draft_member_bindings,
     _rolling_policy_identity,
     _safe_value,
     _stored_connectivity_projection,
@@ -516,6 +518,15 @@ def _http_bound_value(
                 # These are already bounded public components; do not spend
                 # the root envelope depth before their typed leaf projection.
                 child_depth = depth
+            if str(child_key) in {"readiness", "connectivity", "token_readiness"}:
+                # These are bounded typed readiness projections; restart their
+                # finite envelope so exact leg quote leaves remain visible.
+                child_depth = 0
+            if (
+                key in {"readiness", "connectivity"}
+                and str(child_key) == "diagnostics"
+            ):
+                child_depth = 0
             result[str(child_key)] = _http_bound_value(
                 child,
                 depth=child_depth,
@@ -613,10 +624,12 @@ _HTTP_PUBLIC_SECTION_FIELDS: dict[str, tuple[str, ...]] = {
         "status", "authorization_id", "id", "generation", "mode", "purpose",
         "exact_strategy_versions", "strategy_version_ids", "reviewed_selection_policy_hash",
         "selection_policy_hash", "selection_id", "selection_hash", "adverse_evidence_ack",
-        "lifetime_budget", "stop_rules", "expires_at", "controller_lease",
-        "scope", "scope_hash", "scope_version", "scope_draft_id", "scope_draft_hash",
+        "lifetime_budget", "shared_allocation", "expiry_anchor", "duration_seconds",
+        "expires_at", "stop_rules", "admission_mode", "proposal_only", "controller_lease",
+        "scope_hash", "scope_version", "scope_draft_id", "scope_draft_hash",
         "scope_draft_version", "active_scope_hash", "active_scope_version",
-        "frozen_scope_hash", "frozen_scope_version", "active_settings_hash",
+        "frozen_scope_hash", "frozen_scope_version",
+        "active_settings_hash",
         "active_settings_generation", "policy_id", "policy_version", "policy_hash",
         "setup_bindings", "draft_member_bindings", "proposed_allocation_total",
         "proposed_allocation_risk_digest", "active", "draft", "identity",
@@ -628,20 +641,22 @@ _HTTP_PUBLIC_SECTION_FIELDS: dict[str, tuple[str, ...]] = {
         "policy", "review", "selected_setups", "entry_predicate", "direction", "sizing",
         "exit", "lookback", "adverse_evidence", "members", "limits", "limit_blockers",
         "readiness", "authorization", "authorization_choices", "authorization_bindings",
-        "lifetime_budget", "expires_at", "stop_rules", "accounting", "paper_only",
-        "live_execution",
+        "shared_allocation", "lifetime_budget", "expiry_anchor", "duration_seconds",
+        "expires_at", "stop_rules", "accounting", "paper_only", "live_execution",
     ),
     "proposal": (
         "status", "selection_id", "selection_hash", "policy_id", "policy_version",
         "policy_hash", "scope_draft_id", "scope_draft_version", "scope_draft_hash",
         "proposed_allocation_total", "proposed_allocation_risk_digest", "members",
+        "proposal_only",
     ),
     "no_member_reason": (
         "code", "selection_status", "selection_id", "k", "global_budget",
         "selection_reasons", "actionable_reasons",
     ),
     "authorization_choices": (
-        "purpose", "lifetime_budget", "expires_at", "stop_rules", "status", "approved",
+        "purpose", "shared_allocation", "lifetime_budget", "expiry_anchor",
+        "duration_seconds", "expires_at", "stop_rules", "status", "approved",
     ),
     "selected_setups": (
         "strategy_version_id", "candidate_id", "setup_id", "setup_version", "setup_hash",
@@ -683,7 +698,10 @@ _HTTP_PUBLIC_SECTION_FIELDS: dict[str, tuple[str, ...]] = {
     "readiness": (
         "status", "fresh", "checked_at", "market_id", "token_id", "diagnostics", "blockers",
     ),
-    "diagnostics": ("account", "geoblock", "balance", "allowance", "market", "book"),
+    "diagnostics": (
+        "account", "geoblock", "balance", "allowance", "market", "book",
+        "token_readiness",
+    ),
     "accounting": (
         "buy_pending_usd", "buy_unknown_usd", "all_in_buy_reserved_usd",
         "reserved_exit_capacity", "proposed_allocation_total",
@@ -9467,10 +9485,16 @@ class DashboardData:
                 "status": status,
                 "mode": mode,
                 "generation": generation,
-                "active": _safe_value(active) if active is not None else None,
-                "authorization": _safe_value(authorization)
-                if isinstance(authorization, Mapping)
-                else None,
+                "active": (
+                    _authorization_public_projection(active)
+                    if active is not None
+                    else None
+                ),
+                "authorization": (
+                    _authorization_public_projection(authorization)
+                    if isinstance(authorization, Mapping)
+                    else None
+                ),
                 "authorization_id": str(authorization_id).strip() if authorization_id else None,
                 "rolling_exploratory_scope_draft": (
                     _safe_value(rolling_scope_draft)
@@ -9483,7 +9507,11 @@ class DashboardData:
                     else None
                 ),
                 "controller_lease": _safe_value(lease),
-                "draft": _safe_value(draft) if draft is not None else None,
+                "draft": (
+                    _authorization_public_projection(draft)
+                    if draft is not None
+                    else None
+                ),
                 "identity": _safe_value(identity),
                 "instance": _safe_value(identity),
                 "economic_policy": {
@@ -9518,13 +9546,13 @@ class DashboardData:
 
     def _operator_controls_projection(self, value: Any) -> Any:
         """Bound controls while preserving the already-public nested review scope."""
-        projected = _safe_value(value)
+        projected = _connectivity_safe_diagnostics(value)
         if not isinstance(value, Mapping) or not isinstance(projected, Mapping):
             return projected
         raw_review = value.get("exploratory_live_review")
         if not isinstance(raw_review, Mapping):
             return projected
-        review = _safe_value(raw_review)
+        review = _connectivity_safe_diagnostics(raw_review)
         raw_scope = raw_review.get("scope")
         if isinstance(review, Mapping) and isinstance(raw_scope, Mapping):
             scope = _safe_value(raw_scope)
@@ -9539,10 +9567,14 @@ class DashboardData:
                         scope[section_name] = section_projection
                 review = dict(review)
                 review["scope"] = scope
+        raw_readiness = raw_review.get("readiness")
+        if isinstance(review, Mapping) and isinstance(raw_readiness, Mapping):
+            review = dict(review)
+            review["readiness"] = _connectivity_safe_diagnostics(raw_readiness)
         if isinstance(review, Mapping) and isinstance(raw_review.get("authorization_bindings"), Mapping):
             raw_bindings = raw_review["authorization_bindings"]
             bindings: dict[str, Any] = {
-                key: _safe_value(raw_bindings[key])
+                key: _connectivity_safe_diagnostics(raw_bindings[key])
                 for key in (
                     "selection_id",
                     "selection_hash",
@@ -9566,11 +9598,7 @@ class DashboardData:
             review["authorization_bindings"] = bindings
         raw_authorization = raw_review.get("authorization")
         if isinstance(review, Mapping) and isinstance(raw_authorization, Mapping):
-            authorization = dict(
-                review.get("authorization")
-                if isinstance(review.get("authorization"), Mapping)
-                else {}
-            )
+            authorization = _authorization_public_projection(raw_authorization)
             authorization_fields = (
                 "status",
                 "authorization_id",
@@ -9608,15 +9636,12 @@ class DashboardData:
             )
             for key in authorization_fields:
                 if key in raw_authorization:
-                    authorization[key] = _safe_value(raw_authorization[key])
+                    authorization[key] = _connectivity_safe_diagnostics(raw_authorization[key])
             for nested_key in ("active", "draft", "authorization"):
                 nested = raw_authorization.get(nested_key)
                 if not isinstance(nested, Mapping):
                     continue
-                nested_projection: dict[str, Any] = {}
-                for key in authorization_fields:
-                    if key in nested:
-                        nested_projection[key] = _safe_value(nested[key])
+                nested_projection = _authorization_public_projection(nested)
                 if "setup_bindings" in nested:
                     nested_projection["setup_bindings"] = _public_setup_bindings(
                         nested.get("setup_bindings")
@@ -10537,7 +10562,7 @@ def _dashboard_html(
     <section id="view-rolling-portfolio" class="view"><article class="panel"><div class="section-title"><h2>Rolling Portfolio</h2><span id="rolling-status" class="badge warn">paper-only · no live execution</span></div><div id="rolling-action-result" class="page-note"></div><div id="rolling-summary"></div><div id="rolling-policy-controls"></div><div id="rolling-members" class="scroll"></div><div id="rolling-reasons"></div><div id="rolling-jobs"></div><p class="page-note">Rolling membership is append-only and each displayed member is bound to its persisted strategy, research trial, candidate, and exact evidence window. Missing lineage remains non-executable. Policy/allocation review is a non-active draft; activation is separate, deliberate, and remains paper-only.</p></article></section>
     <section id="view-canary" class="view"><article class="panel" style="border-color:var(--red)"><div class="section-title"><h2>REAL CANARY MONEY</h2><span class="badge bad">PRODUCTION LIVE TRADING: DISABLED</span></div><div id="canary-action-result" class="page-note"></div><div id="canary-readiness-snapshot"></div><div id="canary-controls"></div><div id="risk-settings"></div><div id="canary-connectivity"></div><div id="canary-summary"></div><div id="canary-trades" class="scroll"></div><p class="notice">Autonomous canary is independent from paper research. No secrets are stored or displayed. It remains prediction-only, bounded by active settings, and killable from this console.</p></article></section>
     <article id="canary-recovery-form" class="panel"><div class="section-title"><h2>UNKNOWN ENTRY RECOVERY</h2><span class="badge warn">READ-ONLY · PRODUCTION PROFILE</span></div><p class="page-note">Attach only an operator-supplied canonical exchange order ID. This does not post, retry, activate, or release an entry.</p><div class="three-col"><label>Event ID<input id="canary-recovery-event" autocomplete="off"></label><label>Signal ID<input id="canary-recovery-signal" autocomplete="off"></label><label>Canonical exchange order ID<input id="canary-recovery-order" autocomplete="off"></label></div><label>Exact confirmation<input id="canary-recovery-confirm" placeholder="RECOVER UNKNOWN ENTRY" autocomplete="off"></label><p class="page-note"><button id="canary-recovery-submit" class="link">Recover and reconcile</button> <span id="canary-recovery-result"></span></p></article>
-    <article id="execution-authorization-panel" class="panel" style="border-color:var(--amber)"><div class="section-title"><h2>EXPLORATORY MICRO-CANARY AUTHORIZATION</h2><span class="badge warn">REVIEWED · DISARMED BY DEFAULT</span></div><div id="execution-auth-state" class="page-note">Loading authorization state…</div><pre id="execution-auth-details" class="scroll"></pre><div class="three-col"><label>Purpose<input id="execution-auth-purpose" placeholder="Operator-chosen purpose" maxlength="120" autocomplete="off"></label><label>Lifetime budget (USD)<input id="execution-auth-budget" placeholder="Required" inputmode="decimal" maxlength="16"></label><label>Expires at (UTC)<input id="execution-auth-expires" placeholder="2026-01-01T00:00:00Z" maxlength="32" autocomplete="off"></label></div><label>Stop rules (JSON)<input id="execution-auth-stop-rules" placeholder='{"on_any_blocker":"STOP","halt_on_unknown_execution":true}' maxlength="512" autocomplete="off"></label><label class="page-note"><input id="execution-auth-adverse-evidence" type="checkbox"> I acknowledge the adverse evidence; this review remains paper-only and disarmed.</label><p class="page-note">Review binds the current evidence-selected strategy versions, selection policy, risk settings, scope, and stop rules. Purpose, budget, expiration, and stop rules are operator choices; nothing is silently filled or approved.</p><p><button id="execution-auth-review" class="link">Review exploratory authorization</button> <button id="execution-auth-activate" class="link">Activate reviewed authorization</button> <button id="execution-auth-revoke" class="link">Revoke active authorization</button> <span id="execution-auth-result"></span></p></article>
+    <article id="execution-authorization-panel" class="panel" style="border-color:var(--amber)"><div class="section-title"><h2>EXPLORATORY MICRO-CANARY AUTHORIZATION</h2><span class="badge warn">REVIEWED · DISARMED BY DEFAULT</span></div><div id="execution-auth-state" class="page-note">Loading authorization state…</div><pre id="execution-auth-details" class="scroll"></pre><div class="three-col"><label>Purpose<input id="execution-auth-purpose" value="commission exploratory automation and measure actual net results; profitability unproven" maxlength="120" autocomplete="off"></label><label>Shared allocation (USD)<input id="execution-auth-shared-allocation" value="5.00" inputmode="decimal" maxlength="16" readonly></label><label>Cumulative all-in BUY budget (USD)<input id="execution-auth-budget" value="5.00" inputmode="decimal" maxlength="16" readonly></label></div><p class="page-note"><strong>Expiry:</strong> 24 hours from final confirmation; UTC assigned atomically on confirmation. No fixed review-time UTC expiry is presented.</p><label>Stop rules (JSON)<input id="execution-auth-stop-rules" value='{"on_any_blocker":"STOP","halt_on_unknown_execution":true}' maxlength="512" autocomplete="off"></label><label class="page-note"><input id="execution-auth-adverse-evidence" type="checkbox"> I acknowledge the adverse evidence; this review remains paper-only and disarmed.</label><p class="page-note">Review binds the exact proposed exploratory selection, policy/setup/evidence identities, risk settings, scope, and stop rules. Shared allocation and cumulative lifetime budget are distinct; existing per-order, daily, exposure, position, submission, slippage, and loss limits remain unchanged.</p><p><button id="execution-auth-review" class="link">Review exploratory authorization</button> <button id="execution-auth-activate" class="link">Activate reviewed authorization</button> <button id="execution-auth-revoke" class="link">Revoke active authorization</button> <span id="execution-auth-result"></span></p></article>
     <article id="exploratory-live-review-panel" class="panel" style="border-color:var(--red)"><div class="section-title"><h2>EXPLORATORY LIVE FINAL REVIEW</h2><span class="badge bad">PROFITABILITY UNPROVEN · DISARMED BY DEFAULT</span></div><p class="page-note">One confirmation coordinates the existing reviewed authorization, bounded allocation, arm, and autonomous-enable fences. It never submits an order.</p><div id="exploratory-live-review" class="scroll">Loading final review…</div><label>Exact confirmation<input id="exploratory-live-confirm" placeholder="CONFIRM EXPLORATORY LIVE" autocomplete="off"></label><button id="exploratory-live-confirm-action" type="button">Review and confirm EXPLORATORY LIVE</button><div id="exploratory-live-result" class="page-note"></div></article>
     <p class="page-note"><strong>Unactivated broad scope draft:</strong> canonical RULE_BASED_MARKETS / POLYMARKET with all categories, standard binary prediction markets only. COMBO, unsupported/non-binary/closed/not-accepting/no-book/stale/insufficient-liquidity-or-depth/invalid-token-or-setup/data/evaluation failures remain excluded; the active operating scope and each selected member's frozen scope are shown separately. Discovery and evaluation stay paper-only; no scope activation or order submission is available here.</p>
     <p class="page-note">Review disclosure: setup entry predicate/direction/sizing/exit/lookback · bounded scope and ≤3 members · $1 all-in, $0.01 fee reserve, $5 gross daily, $5 aggregate exposure and independent open-cost · 3 positions · 5 submissions/day · $2 realized/equity stops · 100bp slippage · authoritative pending/UNKNOWN usage and reserved exit capacity · explicit finite lifetime budget and expiration · stop rules · trusted account/geoblock/balance/allowance · selected-market book/minimum/depth readiness. Optional 20 submissions/day remains reviewed-only and is never auto-set.</p>
@@ -11318,12 +11343,12 @@ def _dashboard_html(
     function renderExecutionAuthorization(value) {
       const payload=value&&typeof value==="object"?value:{}, legacyAuth=payload.execution_authorization&&typeof payload.execution_authorization==="object"?payload.execution_authorization:{}, review=payload.exploratory_live_review&&typeof payload.exploratory_live_review==="object"?payload.exploratory_live_review:{}, reviewedAuthorization=review.authorization&&typeof review.authorization==="object"?review.authorization:null, auth=reviewedAuthorization?Object.assign({},legacyAuth,reviewedAuthorization):legacyAuth, active=auth.active&&typeof auth.active==="object"?auth.active:null, draft=auth.draft&&typeof auth.draft==="object"?auth.draft:null, row=active||draft||auth.authorization||{}, status=String(auth.status||row.status||"DISABLED").toUpperCase(), id=row.authorization_id||row.id||"", activeId=active?.authorization_id||active?.id||"", draftId=draft?.authorization_id||draft?.id||"", generationValue=row.generation??auth.generation, generation=Number.isInteger(Number(generationValue))&&Number(generationValue)>0?Number(generationValue):null;
       const adverseEvidence=row.adverse_evidence_ack, adverseEvidenceRequired=Object.prototype.hasOwnProperty.call(row,"adverse_evidence_ack_required")?row.adverse_evidence_ack_required!==false:!(adverseEvidence&&typeof adverseEvidence==="object"&&adverseEvidence.required===false), adverseEvidenceAcknowledged=adverseEvidence===true||adverseEvidence?.acknowledged===true||adverseEvidence?.accepted===true;
-      const details={status,authorization_id:id,generation,mode:row.mode||auth.mode||"EXPLORATORY_MICRO_CANARY",purpose:row.purpose||"—",strategy_versions:row.exact_strategy_versions||row.strategy_version_ids||"—",selection_policy_hash:row.reviewed_selection_policy_hash||row.selection_policy_hash||"—",selection_id:row.selection_id||"—",selection_hash:row.selection_hash||"—",adverse_evidence_ack:!adverseEvidenceRequired?"NOT REQUIRED":adverseEvidenceAcknowledged?"ACKNOWLEDGED":"NOT ACKNOWLEDGED",adverse_evidence_ack_required:adverseEvidenceRequired,lifetime_budget:row.lifetime_budget||"—",stop_rules:row.stop_rules||"—",expires_at:row.expires_at||"—",scope_hash:row.scope_hash||"—",scope_version:row.scope_version||"—",scope_draft_id:row.scope_draft_id||payload.scope_draft?.draft_id||"—",scope_draft_hash:row.scope_draft_hash||payload.scope_draft?.draft_hash||"—",scope_draft_version:row.scope_draft_version||payload.scope_draft?.scope_version||"—",supported_market_types:row.supported_market_types||payload.scope_draft?.supported_market_types||"—",category_restriction:row.category_restriction||payload.scope_draft?.category_restriction||"—",scope_exclusions:row.scope_exclusions||payload.scope_draft?.exclusions||"—",active_scope_hash:row.active_scope_hash||"—",active_scope_version:row.active_scope_version||"—",frozen_scope_hash:row.frozen_scope_hash||"—",frozen_scope_version:row.frozen_scope_version||"—",active_settings_hash:row.active_settings_hash||"—",active_settings_generation:row.active_settings_generation||"—"};
+      const details={status,authorization_id:id,generation,mode:row.mode||auth.mode||"EXPLORATORY_MICRO_CANARY",admission_mode:row.admission_mode||auth.admission_mode||"EXPLORATORY_LIVE",proposal_only:row.proposal_only!==false,purpose:row.purpose||"—",strategy_versions:row.exact_strategy_versions||row.strategy_version_ids||"—",selection_policy_hash:row.reviewed_selection_policy_hash||row.selection_policy_hash||"—",selection_id:row.selection_id||"—",selection_hash:row.selection_hash||"—",adverse_evidence_ack:!adverseEvidenceRequired?"NOT REQUIRED":adverseEvidenceAcknowledged?"ACKNOWLEDGED":"NOT ACKNOWLEDGED",adverse_evidence_ack_required:adverseEvidenceRequired,shared_allocation:row.shared_allocation||review.shared_allocation||"—",lifetime_budget:row.lifetime_budget||review.lifetime_budget||"—",expiry_anchor:row.expiry_anchor||review.expiry_anchor||"—",duration_seconds:row.duration_seconds??review.duration_seconds??"—",stop_rules:row.stop_rules||"—",expires_at:row.expires_at||"UTC assigned on final confirmation",scope_hash:row.scope_hash||"—",scope_version:row.scope_version||"—",scope_draft_id:row.scope_draft_id||payload.scope_draft?.draft_id||"—",scope_draft_hash:row.scope_draft_hash||payload.scope_draft?.draft_hash||"—",scope_draft_version:row.scope_draft_version||payload.scope_draft?.scope_version||"—",supported_market_types:row.supported_market_types||payload.scope_draft?.supported_market_types||"—",category_restriction:row.category_restriction||payload.scope_draft?.category_restriction||"—",scope_exclusions:row.scope_exclusions||payload.scope_draft?.exclusions||"—",active_scope_hash:row.active_scope_hash||"—",active_scope_version:row.active_scope_version||"—",frozen_scope_hash:row.frozen_scope_hash||"—",frozen_scope_version:row.frozen_scope_version||"—",active_settings_hash:row.active_settings_hash||"—",active_settings_generation:row.active_settings_generation||"—"};
       details.instance=payload.identity||payload.instance||auth.identity||"—";
       details.operator_mode=payload.mode||auth.operator_mode||"observing";
       details.economic_policy=payload.economic_policy||auth.economic_policy||"—";
       const state=$("execution-auth-state"), out=$("execution-auth-details"), activate=$("execution-auth-activate"), revoke=$("execution-auth-revoke");
-      if(state)state.textContent=`${status} · ${status==="ACTIVE"?"reviewed authorization is present; live route remains separately disarmed":"no active exploratory authorization"}${id?` · record ${id}`:""}`;
+      if(state)state.textContent=`${status} · ${status==="ACTIVE"?"reviewed authorization is active":"no active exploratory authorization"}${id?` · record ${id}`:""}`;
       if(out)out.textContent=JSON.stringify(details,null,2);
       if(activate)activate.disabled=!(draft&&String(draft.status||"").toUpperCase()==="DRAFT"&&draftId);
       if(revoke)revoke.disabled=!(active&&String(active.status||"").toUpperCase()==="ACTIVE"&&activeId);
@@ -11346,12 +11371,12 @@ def _dashboard_html(
       const button=event.target.closest?.("#execution-auth-review,#execution-auth-activate,#execution-auth-revoke"); if(!button)return;
       const result=$("execution-auth-result"), current=renderExecutionAuthorization(lastGood.controls||lastGood.canary||lastGood.overview||{}), action=button.id;
       if(action==="execution-auth-review"){
-        const purpose=$("execution-auth-purpose")?.value.trim()||"", budget=$("execution-auth-budget")?.value.trim()||"", expires=$("execution-auth-expires")?.value.trim()||"", stopText=$("execution-auth-stop-rules")?.value.trim()||"", adverseEvidence=$("execution-auth-adverse-evidence")?.checked===true;
-        if(!purpose||!budget||!expires||!stopText){if(result)result.textContent="Review blocked: purpose, lifetime budget, expiration, and stop rules are required";return;}
+        const purpose=$("execution-auth-purpose")?.value.trim()||"commission exploratory automation and measure actual net results; profitability unproven", shared=$("execution-auth-shared-allocation")?.value.trim()||"5.00", budget=$("execution-auth-budget")?.value.trim()||"5.00", stopText=$("execution-auth-stop-rules")?.value.trim()||"", adverseEvidence=$("execution-auth-adverse-evidence")?.checked===true;
+        if(!purpose||!shared||!budget||!stopText){if(result)result.textContent="Review blocked: purpose, shared allocation, lifetime budget, and stop rules are required";return;}
         let stopRules;
         try { stopRules=JSON.parse(stopText); } catch(error) { if(result)result.textContent="Review blocked: stop rules must be valid JSON"; return; }
         if(!stopRules||typeof stopRules!=="object"||Array.isArray(stopRules)||!Object.keys(stopRules).length){if(result)result.textContent="Review blocked: stop rules must be a non-empty JSON object";return;}
-        const values={purpose,lifetime_budget:budget,expires_at:expires,stop_rules:stopRules};
+        const values={purpose,shared_allocation:shared,lifetime_budget:{max_notional_usd:budget},expiry_anchor:"FINAL_CONFIRMATION",duration_seconds:86400,stop_rules:stopRules};
         if(adverseEvidence)values.adverse_evidence_ack=true;
         const response=await controlPost("execution_authorization.review","", "REVIEW EXPLORATORY AUTHORIZATION",{values});
         if(result)result.textContent=response.ok?"Review saved as DRAFT · paper-only":"Review blocked: "+(response.reason||"CONTROL_FAILED");

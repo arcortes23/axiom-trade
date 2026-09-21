@@ -28,6 +28,7 @@ from axiom.operator import (
     CANARY_CONNECTIVITY_CONFIG_KEY,
     HermesOperatorAdapter,
     OperatorControlPlane,
+    _project_connectivity,
 )
 from axiom.ranker import CandidateCanaryRanker
 from axiom.storage import AxiomStore
@@ -39,10 +40,9 @@ from axiom.collector import PolymarketCollector
 
 T0 = datetime(2026, 1, 2, 12, tzinfo=timezone.utc)
 
-
 def connectivity_projection(*, ready: bool, failure_codes: list[str] | None = None) -> dict[str, object]:
     codes = list(failure_codes or ([] if ready else ["CANARY_ALLOWANCE_INSUFFICIENT"]))
-    return {
+    raw = {
         "ready": ready,
         "status": "READY" if ready else "BLOCKED",
         "checked_at": datetime.now(timezone.utc).isoformat(),
@@ -70,18 +70,26 @@ def connectivity_projection(*, ready: bool, failure_codes: list[str] | None = No
         "market": {"status": "SKIPPED"},
         "order_book": {"status": "SKIPPED"},
         "failure_codes": codes,
-        "failure_reasons": (
-            []
-            if ready
-            else [
-                {
-                    "code": codes[0],
-                    "reason": "Current allowance is below the active canary requirement.",
-                }
-            ]
-        ),
         "live_execution": False,
     }
+    return _project_connectivity(
+        raw,
+        checked_at=raw["checked_at"],
+        authoritative_credentials_configured=True,
+        authoritative_fingerprint=raw["account"]["credential_fingerprint"],
+        readiness_binding={
+            "selection_id": None,
+            "selection_hash": None,
+            "candidate_id": None,
+            "market_id": None,
+            "token_id": None,
+            "settings_hash": None,
+            "settings_generation": None,
+            "credential_fingerprint": None,
+            "proposal_selection_id": None,
+            "proposal_selection_hash": None,
+        },
+    )
 
 
 class HealthyStore(AxiomStore):
