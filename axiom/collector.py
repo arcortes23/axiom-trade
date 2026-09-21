@@ -1470,7 +1470,10 @@ class PolymarketCollector:
                 *draft_pending_queue,
                 *all_planned_ids[planned_limit:],
             ]))[:_MAX_CYCLE_CONTINUATION_IDS]
-        if isinstance(self._scope_draft_preview, Mapping):
+        if (
+            isinstance(self._scope_draft_preview, Mapping)
+            or self._rolling_background_discovery_enabled
+        ):
             self._draft_market_request_limit = (
                 request_budget_remaining // planned_limit
                 if request_budget_remaining is not None and planned_limit > 0
@@ -6056,12 +6059,20 @@ class PolymarketCollector:
         )
         if (
             request_limit is None
-            and isinstance(self._scope_draft_preview, Mapping)
             and provider_pool == "collection"
+            and self._draft_market_request_limit is not None
         ):
             request_limit = self._draft_market_request_limit
         if request_limit is None and self._rolling_background_discovery_enabled:
-            request_limit = _ROLLING_BOOTSTRAP_REQUEST_BUDGET
+            request_limit = (
+                max(
+                    0,
+                    _ROLLING_BOOTSTRAP_REQUEST_BUDGET
+                    - _ROLLING_BOOTSTRAP_MARKET_REQUEST_RESERVE,
+                )
+                if provider_pool in {"scope", "scope_direct"}
+                else _ROLLING_BOOTSTRAP_REQUEST_BUDGET
+            )
         return request_limit
 
     def _draft_precollection_request_limit(
@@ -6070,8 +6081,9 @@ class PolymarketCollector:
         *,
         provider_pool: str | None = None,
     ) -> int | None:
-        """Keep draft preparation bounded while reserving one capture window."""
-        if not isinstance(self._scope_draft_preview, Mapping):
+        """Bound precollection work while reserving one capture window."""
+        draft_active = isinstance(self._scope_draft_preview, Mapping)
+        if not draft_active and not self._rolling_background_discovery_enabled:
             return None
         if provider_pool in {"scope", "scope_direct"}:
             return max(
@@ -6094,7 +6106,7 @@ class PolymarketCollector:
     ) -> bool:
         """Allow exact lookups their independent phase share without overrunning collection."""
         if counters is not None:
-            request_limit = self._draft_precollection_request_limit(
+            request_limit = self._provider_request_limit(
                 provider_pool="scope_direct",
             )
             if (
@@ -9324,7 +9336,7 @@ class PolymarketCollector:
         counters: dict[str, Any],
     ) -> Any:
         """Run one exact operation on a fresh clone for every attempt."""
-        request_limit = self._draft_precollection_request_limit(
+        request_limit = self._provider_request_limit(
             provider_pool="scope_direct",
         )
         last_error: Exception | None = None
