@@ -18,7 +18,12 @@ from types import SimpleNamespace
 from axiom import node as node_module
 from axiom.autonomous import AutonomousResearchProcessor
 from axiom.collector import _validated_scope_draft
-from axiom.canary import CanaryBlocked, CanaryService, CredentialStore, credential_fingerprint
+from axiom.canary import (
+    CanaryBlocked,
+    CanaryService,
+    CredentialStore,
+    credential_fingerprint,
+)
 from axiom.canary_positions import RECOVERY_ACTION, RECOVERY_ATTACHED, RECOVERY_CONFIRMATION
 from axiom.dashboard import DashboardData, DashboardServer, _DashboardHandler
 from axiom.operator import (
@@ -3397,6 +3402,9 @@ class OperatorControlTests(unittest.TestCase):
         self.assertEqual(snapshot["members"][0]["allocation"], "1.00")
         self.assertEqual(snapshot["members"][0]["proposed_allocation"], "1.00")
         self.assertFalse(snapshot["members"][0]["allocation_active"])
+        self.assertEqual(snapshot["authorization_choices"]["shared_allocation"], "1.00")
+        self.assertEqual(snapshot["shared_allocation"], "1.00")
+        self.assertTrue(snapshot["session_setup"]["required"])
         self.assertIsNotNone(snapshot["proposal"]["proposed_allocation_total"])
         self.assertIsNotNone(snapshot["proposal"]["proposed_allocation_risk_digest"])
         self.assertNotIn(
@@ -3414,6 +3422,7 @@ class OperatorControlTests(unittest.TestCase):
                 now=datetime.now(timezone.utc),
             )
         )
+
     def test_real_http_draft_review_preserves_public_market_bindings(self) -> None:
         self._seed_proposed_selection()
         assert self.server._server is not None

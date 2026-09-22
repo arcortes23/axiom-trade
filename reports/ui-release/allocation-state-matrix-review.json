@@ -1,0 +1,89 @@
+{
+  "report": "allocation-state-matrix-review",
+  "scope": "Synthetic bounded fixture only; no production, database, store, venue, credential, or real-money operation.",
+  "source_freeze": {
+    "app_js_sha256": "02a49ac7c8c119253ee92b4c1c6440147fef2455c239b919b3ba6bd1657399ee",
+    "fixture_server_sha256": "adc7ab0e9a10bea25bff3fc11c71a05f971994515ae8aaf8f82e9f442d8193e3",
+    "operator_backend_sha256": "6072a631f4be1d44af5a03644ac050d0c9938376b8c9aafd9ad438d18789e32a",
+    "dashboard_backend_sha256": "dbbbe99caf821e8d7d684e4568bab2298e8c0fb4aaf701087519fc6bae92762d",
+    "fixture_url": "http://127.0.0.1:54245",
+    "admin_url": "http://127.0.0.1:54246",
+    "fixture_banner": "FIXTURE · synthetic bounded projection",
+    "backend_execution": "not_native_backend_execution",
+    "backend_hashes_note": "Historical frozen hashes recorded for boundary provenance only; native backend proof was not executed in this client slice."
+  },
+  "matrix": {
+    "prepared": {
+      "status": "pass",
+      "evidence": "Final frozen client showed $5.00, two proposed members with $2.50 each, 24 hours from final confirmation, and enabled review.",
+      "screenshot": "reports/ui-release/allocation-state-final02-prepared.png"
+    },
+    "legacy_missingfield": {
+      "status": "pass",
+      "evidence": "Final frozen client retained $5.00 and two $2.50 proposed members without the obsolete Missing: shared allocation banner.",
+      "screenshot": "reports/ui-release/allocation-state-final02-legacy.png"
+    },
+    "positive_proposed_zero_active": {
+      "status": "pass",
+      "evidence": "Fresh projection kept proposal total 5.00 and proposed member allocations 2.50/2.50 while active authorization projection was 0.00 and execution authorization status was REVOKED.",
+      "screenshot": "reports/ui-release/allocation-state-final02-zero-active.png"
+    },
+    "no_proposal_setup": {
+      "status": "pass",
+      "evidence": "Explicit setup action was exploratory.live.prepare with confirmation PREPARE EXPLORATORY SESSION, payload {}, and fixture response authority_changed false. Fresh projection after setup contained proposal total 5.00, two 2.50 members, 86400 seconds, FINAL_CONFIRMATION, lifetime max_notional_usd 5.00, and the exact purpose. The old Missing: shared allocation/proposed members banner was absent.",
+      "screenshot": "reports/ui-release/allocation-state-final02-setup.png",
+      "note": "Synthetic no_proposal setup bindings expose identifiers before readable setup detail; the dialog truthfully displayed the generic incomplete-terms notice for those fixture fields. This is not attributed to native backend metadata and is kept separate from the obsolete allocation/proposal banner check."
+    },
+    "poll": {
+      "status": "pass",
+      "evidence": "$5.00, two proposed allocations, and FINAL_CONFIRMATION expiry remained visible after polling scenario refresh.",
+      "screenshot": "reports/ui-release/allocation-state-final02-poll.png"
+    },
+    "reload": {
+      "status": "pass",
+      "evidence": "$5.00, two proposed allocations, and FINAL_CONFIRMATION expiry remained visible after reload scenario refresh.",
+      "screenshot": "reports/ui-release/allocation-state-final02-reload.png"
+    },
+    "payload": {
+      "status": "pass",
+      "evidence": "Synthetic execution_authorization.review completed with exact confirmation REVIEW EXPLORATORY AUTHORIZATION, shared_allocation 5.00, proposed_allocation_total 5.00, risk digest sha256:fixture-risk-digest, lifetime max_notional_usd 5.00, expiry FINAL_CONFIRMATION, duration_seconds 86400, selection_id fixture-selection-aurora, and the exact purpose. No final confirmation was sent.",
+      "screenshot": "reports/ui-release/allocation-state-final02-payload.png"
+    },
+    "stale_binding": {
+      "status": "pass",
+      "evidence": "Changing the synthetic terms while the review dialog was open produced Terms changed while this review was open, refreshed current terms, and sent no control action (fixture action total remained 0).",
+      "screenshot": "reports/ui-release/allocation-state-final02-stale-fence.png"
+    },
+    "adverse_required": {
+      "status": "pass",
+      "evidence": "Adverse-required scenario rendered a required unchecked acknowledgement; the checked submission recorded adverse_evidence_ack true in the synthetic review payload. No submission was made while unchecked.",
+      "screenshot_required": "reports/ui-release/allocation-state-final02-adverse-required.png",
+      "screenshot_checked": "reports/ui-release/allocation-state-final02-adverse-checked.png"
+    },
+    "cancel": {
+      "status": "pass",
+      "evidence": "Opening and cancelling the review dialog left no dialog open and fixture action stats at total 0/completed 0.",
+      "screenshot": "reports/ui-release/allocation-state-final02-cancel-open.png"
+    },
+    "ambiguous": {
+      "status": "pass",
+      "evidence": "Synthetic uncertain review returned RUNNING/OUTCOME_UNCERTAIN. The dialog displayed unresolved outcome/do not submit again, disabled the submit control, and fixture action total remained 1 with no replay.",
+      "screenshot": "reports/ui-release/allocation-state-final02-ambiguous.png"
+    }
+  },
+  "historical_reproduction": {
+    "status": "resolved_in_final02_not_current",
+    "evidence": "Earlier fcb/42 diagnostics showed an obsolete Missing: shared allocation/proposed members banner after no-proposal setup. Those screenshots remain historical and are not attributed to the final frozen client.",
+    "screenshots": [
+      "reports/ui-release/allocation-state-no-proposal-review.png",
+      "reports/ui-release/allocation-state-no-proposal-after-setup.png"
+    ],
+    "source_label": "fcb diagnostic source (full hash intentionally not asserted here)"
+  },
+  "boundaries": {
+    "native_backend_metadata": "Not used as synthetic fixture evidence; native commissioning is independently verified by the owning slice.",
+    "final_confirmation": "Not sent; no activation, order, venue, or real-money operation was attempted.",
+    "source_edits": "None"
+  },
+  "result": "No client blocker found in the final frozen app matrix."
+}

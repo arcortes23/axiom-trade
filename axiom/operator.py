@@ -121,6 +121,7 @@ _ALLOWED_ACTIONS = frozenset(
         "admission_policy.review",
         "admission_policy.activate",
         "execution_authorization.review",
+        "exploratory.live.prepare",
         "execution_authorization.activate",
         "execution_authorization.revoke",
         "exploratory.authorization.review",
@@ -191,6 +192,7 @@ _CONFIRMATIONS = {
     "admission_policy.review": "REVIEW ROLLING ADMISSION POLICY",
     "admission_policy.activate": "ACTIVATE ROLLING ADMISSION POLICY",
 }
+_CONFIRMATIONS["exploratory.live.prepare"] = "PREPARE EXPLORATORY SESSION"
 _CONFIRMATIONS["exploratory.live.review_confirm"] = "CONFIRM EXPLORATORY LIVE"
 _CONFIRMATIONS.update(
     {
@@ -3602,7 +3604,7 @@ class OperatorControlPlane:
         )
         if (
             latest is not None
-            and latest_status in {"DRAFT", "EXPIRED", "REVOKED"}
+            and latest_status in {"ACTIVE", "DRAFT", "EXPIRED", "REVOKED"}
             and isinstance(draft, Mapping)
         ):
             # Rehydrate a durable terminal record from its matching review
@@ -3622,6 +3624,12 @@ class OperatorControlPlane:
             if durable_id and cached_id and durable_id == cached_id and immutable_bindings_match:
                 merged = dict(latest)
                 for key in (
+                    "purpose",
+                    "lifetime_budget",
+                    "shared_allocation",
+                    "stop_rules",
+                    "expiry_anchor",
+                    "duration_seconds",
                     "scope_draft_id",
                     "scope_draft_hash",
                     "scope_draft_version",
@@ -3647,6 +3655,14 @@ class OperatorControlPlane:
                     if merged.get(key) in (None, "", [], {}):
                         merged[key] = draft.get(key)
                 latest = merged
+                if (
+                    isinstance(active, Mapping)
+                    and str(
+                        active.get("authorization_id") or active.get("id") or ""
+                    ).strip()
+                    == durable_id
+                ):
+                    active = merged
                 draft = merged
 
         draft_status = (
@@ -3722,6 +3738,221 @@ class OperatorControlPlane:
             "paper_only": True,
             "live_execution": False,
         }
+    
+    @staticmethod
+    def _current_proposed_allocation(
+        selection: Mapping[str, Any] | None,
+    ) -> Any | None:
+        """Return the positive amount bound to the current proposal only."""
+        if not isinstance(selection, Mapping):
+            return None
+        status = str(
+            selection.get("status") or selection.get("selection_status") or ""
+        ).strip().upper()
+        if status in {
+            "REVOKED",
+            "EXPIRED",
+            "STALE",
+            "INVALID",
+            "UNKNOWN",
+            "NONE",
+            "UNAVAILABLE",
+        }:
+            return None
+        declared = selection.get("proposed_allocation_total")
+        amount = _rolling_decimal(declared)
+        if amount is None or amount <= 0:
+            return None
+        members = selection.get("members", selection.get("selected_members", ()))
+        if not isinstance(members, (list, tuple)):
+            return None
+        if not any(
+            isinstance(member, Mapping)
+            and _canary_selection_member_is_proposed(member)
+            and (
+                _rolling_decimal(member.get("proposed_allocation")) or Decimal("0")
+            )
+            > 0
+            for member in members
+        ):
+            return None
+        return declared
+
+    @classmethod
+    def _prepared_proposed_allocation(
+        cls,
+        selection: Mapping[str, Any] | None,
+    ) -> Any | None:
+        """Return the proposal amount only when its immutable pointer is prepared."""
+        if not isinstance(selection, Mapping):
+            return None
+        activation = selection.get("allocation_activation")
+        if (
+            not isinstance(activation, Mapping)
+            or str(activation.get("status") or "").strip().upper() != "PREPARED"
+        ):
+            return None
+        return cls._current_proposed_allocation(selection)
+
+
+    @staticmethod
+    def _session_setup_metadata(
+        proposed_allocation: Any | None,
+        *,
+        blockers: list[str] | None = None,
+    ) -> dict[str, Any]:
+        usable_fixed_allocation = (
+            _rolling_decimal(proposed_allocation) == Decimal("5.00")
+        )
+        metadata: dict[str, Any] = {
+            "supported": True,
+            "required": not usable_fixed_allocation,
+            "action": "exploratory.live.prepare",
+            "confirmation": "PREPARE EXPLORATORY SESSION",
+            "fixed_allocation": True,
+            "shared_allocation": "5.00",
+            "lifetime_budget": {"max_notional_usd": "5.00"},
+            "expiry_anchor": "FINAL_CONFIRMATION",
+            "duration_seconds": 86400,
+            "proposal_only": True,
+        }
+        if blockers:
+            metadata["blockers"] = list(dict.fromkeys(str(item) for item in blockers))
+        return metadata
+
+    @staticmethod
+    def _fixed_exploratory_review_terms() -> dict[str, Any]:
+        return {
+            "purpose": (
+                "commission exploratory automation and measure actual net results; "
+                "profitability unproven"
+            ),
+            "lifetime_budget": {"max_notional_usd": "5.00"},
+            "expiry_anchor": "FINAL_CONFIRMATION",
+            "duration_seconds": 86400,
+            "stop_rules": {
+                "on_any_blocker": "STOP",
+                "halt_on_unknown_execution": True,
+            },
+        }
+
+    def exploratory_live_review_choices(
+        self,
+        *,
+        selection: Mapping[str, Any] | None = None,
+        authorization: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Project fixed commissioning choices without running a full review."""
+        if selection is None:
+            selection = self._load_pointed_review_selection()
+        if not isinstance(selection, Mapping):
+            selection = {}
+        if authorization is None:
+            authorization_snapshot = self.execution_authorization_snapshot(
+                bounded=False
+            )
+            authorization = authorization_snapshot.get("authorization")
+        authorization = authorization if isinstance(authorization, Mapping) else {}
+        proposed = self._current_proposed_allocation(selection)
+        status = str(authorization.get("status") or "").strip().upper()
+        purpose = authorization.get("purpose")
+        lifetime = authorization.get(
+            "lifetime_budget", authorization.get("lifetime_budget_json")
+        )
+        expires_at = authorization.get("expires_at")
+        anchor = str(authorization.get("expiry_anchor") or "").strip().upper()
+        duration = authorization.get("duration_seconds")
+        stops = authorization.get("stop_rules", authorization.get("stop_rules_json"))
+        if proposed not in (None, "") and status in {"REVOKED", "EXPIRED"}:
+            expires_at = None
+            if anchor != "FINAL_CONFIRMATION":
+                anchor = ""
+                duration = None
+        prepared_fixed = (
+            self._prepared_proposed_allocation(selection) not in (None, "")
+            and _rolling_decimal(
+                self._prepared_proposed_allocation(selection)
+            ) == Decimal("5.00")
+        )
+        fixed_terms = (
+            self._fixed_exploratory_review_terms()
+            if prepared_fixed and status not in {"DRAFT", "ACTIVE"}
+            else {}
+        )
+        if fixed_terms:
+            purpose = fixed_terms["purpose"]
+            lifetime = fixed_terms["lifetime_budget"]
+            anchor = fixed_terms["expiry_anchor"]
+            duration = fixed_terms["duration_seconds"]
+            expires_at = None
+            stops = fixed_terms["stop_rules"]
+        return {
+            "purpose": purpose,
+            "shared_allocation": proposed,
+            "lifetime_budget": _safe_value(lifetime),
+            "expiry_anchor": anchor or "ABSOLUTE",
+            "duration_seconds": duration,
+            "expires_at": expires_at,
+            "stop_rules": _safe_value(stops),
+        }
+
+    def exploratory_live_session_setup(self) -> dict[str, Any]:
+        """Return the native fixed-term, non-activating setup contract."""
+        blockers: list[str] = []
+        try:
+            selection = self._load_pointed_review_selection()
+        except OperatorControlError as exc:
+            selection = {}
+            blockers.append(str(exc.code))
+        prepared_allocation = self._prepared_proposed_allocation(selection)
+        return self._session_setup_metadata(
+            prepared_allocation,
+            blockers=blockers or None,
+        )
+
+    def prepare_exploratory_live_session(
+        self,
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Prepare one immutable fixed-5 paper proposal without authority."""
+        current = self._load_pointed_review_selection()
+        current_allocation = self._prepared_proposed_allocation(current)
+        if (
+            current_allocation not in (None, "")
+            and _rolling_decimal(current_allocation) == Decimal("5.00")
+        ):
+            prepared = current
+        else:
+            prepared = self._prepare_explicit_exploratory_proposal(
+                shared_allocation="5.00",
+                now=now or utc_now(),
+            )
+            prepared = self._prepare_reviewed_proposed_selection(prepared)
+        activation = (
+            prepared.get("allocation_activation")
+            if isinstance(prepared, Mapping)
+            else None
+        )
+        if (
+            not isinstance(prepared, Mapping)
+            or not isinstance(activation, Mapping)
+            or str(activation.get("status") or "").upper() != "PREPARED"
+        ):
+            raise OperatorControlError(
+                "EXPLORATORY_LIVE_PROPOSAL_PREPARATION_FAILED"
+            )
+        proposed_allocation = self._current_proposed_allocation(prepared)
+        if _rolling_decimal(proposed_allocation) != Decimal("5.00"):
+            raise OperatorControlError("EXPLORATORY_LIVE_PROPOSAL_INVALID")
+        return {
+            "status": "PREPARED",
+            "proposal": _safe_value(prepared),
+            "session_setup": self._session_setup_metadata(proposed_allocation),
+            "paper_only": True,
+            "live_execution": False,
+        }
+
 
     def _prepare_explicit_exploratory_proposal(
         self, *, shared_allocation: str, now: datetime
@@ -3810,10 +4041,18 @@ class OperatorControlPlane:
                 "commission exploratory automation and measure actual net results; profitability unproven"
             ):
                 raise OperatorControlError("EXPLORATORY_LIVE_PURPOSE_INVALID")
-            proposal_selection = self._prepare_explicit_exploratory_proposal(
-                shared_allocation=shared_allocation,
-                now=utc_now(),
-            )
+            current_selection = self._load_pointed_review_selection()
+            current_allocation = self._prepared_proposed_allocation(current_selection)
+            if (
+                current_allocation not in (None, "")
+                and _rolling_decimal(current_allocation) == Decimal(shared_allocation)
+            ):
+                proposal_selection = current_selection
+            else:
+                proposal_selection = self._prepare_explicit_exploratory_proposal(
+                    shared_allocation=shared_allocation,
+                    now=utc_now(),
+                )
         selection_for_prep = (
             proposal_selection
             if isinstance(proposal_selection, Mapping)
@@ -4428,6 +4667,22 @@ class OperatorControlPlane:
         loader = getattr(self.store, "load_current_portfolio_selection", None)
         current = loader() if callable(loader) else None
         return dict(current) if isinstance(current, Mapping) else {}
+    def _load_pointed_review_selection(self) -> Mapping[str, Any]:
+        """Read only the explicitly bound exploratory proposal pointer."""
+        getter = getattr(self.store, "get_operator_config", None)
+        pointer = (
+            getter(ROLLING_EXPLORATORY_PROPOSAL_CONFIG_KEY, None)
+            if callable(getter)
+            else None
+        )
+        if not isinstance(pointer, Mapping):
+            return {}
+        selection_id = str(
+            pointer.get("selection_id")
+            or pointer.get("portfolio_selection_id")
+            or ""
+        ).strip()
+        return self._load_review_selection() if selection_id else {}
     def _readiness_market_requests(
         self,
         selection: Mapping[str, Any],
@@ -6243,20 +6498,23 @@ class OperatorControlPlane:
         authorization_snapshot = self.execution_authorization_snapshot(bounded=False)
         authorization = authorization_snapshot.get("authorization")
         authorization = authorization if isinstance(authorization, Mapping) else {}
-        persisted_purpose = authorization.get("purpose")
-        persisted_lifetime = authorization.get(
-            "lifetime_budget", authorization.get("lifetime_budget_json")
+        review_choices = self.exploratory_live_review_choices(
+            selection=selection,
+            authorization=authorization,
         )
-        persisted_expiry = authorization.get("expires_at")
-        persisted_anchor = str(authorization.get("expiry_anchor") or "").strip().upper()
-        persisted_duration = authorization.get("duration_seconds")
+        proposed_shared_allocation = review_choices.get("shared_allocation")
+        persisted_purpose = review_choices.get("purpose")
+        persisted_lifetime = review_choices.get("lifetime_budget")
+        persisted_expiry = review_choices.get("expires_at")
+        persisted_anchor = str(
+            review_choices.get("expiry_anchor") or ""
+        ).strip().upper()
+        persisted_duration = review_choices.get("duration_seconds")
+        persisted_stops = review_choices.get("stop_rules")
         anchored_terms_valid = (
             persisted_anchor == "FINAL_CONFIRMATION"
             and str(persisted_duration) == "86400"
             and persisted_expiry in (None, "")
-        )
-        persisted_stops = authorization.get(
-            "stop_rules", authorization.get("stop_rules_json")
         )
         settings_snapshot = self.risk_settings_snapshot()
         authorization_blockers: list[str] = []
@@ -6396,9 +6654,11 @@ class OperatorControlPlane:
                 ),
             },
             "authorization_choices": {
-                "purpose": authorization.get("purpose"),
-                "shared_allocation": authorization.get(
-                    "shared_allocation", selection.get("proposed_allocation_total")
+                "purpose": persisted_purpose,
+                "shared_allocation": (
+                    proposed_shared_allocation
+                    if proposed_shared_allocation not in (None, "")
+                    else authorization.get("shared_allocation")
                 ),
                 "lifetime_budget": _safe_value(persisted_lifetime),
                 "expiry_anchor": persisted_anchor or "ABSOLUTE",
@@ -6409,8 +6669,13 @@ class OperatorControlPlane:
                 "approved": str(authorization.get("status") or "").upper()
                 in {"ACTIVE"},
             },
-            "shared_allocation": authorization.get(
-                "shared_allocation", selection.get("proposed_allocation_total")
+            "shared_allocation": (
+                proposed_shared_allocation
+                if proposed_shared_allocation not in (None, "")
+                else authorization.get("shared_allocation")
+            ),
+            "session_setup": self._session_setup_metadata(
+                self._prepared_proposed_allocation(selection)
             ),
             "lifetime_budget": _safe_value(persisted_lifetime),
             "expiry_anchor": persisted_anchor or "ABSOLUTE",
@@ -9923,6 +10188,9 @@ class OperatorControlPlane:
                     "active": {},
                     "frozen": {},
                 },
+                "session_setup": self._session_setup_metadata(
+                    None, blockers=[code]
+                ),
                 "blockers": [code],
                 "paper_only": True,
                 "live_execution": False,
@@ -10438,6 +10706,16 @@ class OperatorControlPlane:
                         action_payload["expected_risk_config_generation"],
                         "ROLLING_RISK_GENERATION_REQUIRED",
                     )
+            elif action_value == "exploratory.live.prepare":
+                if action_payload:
+                    raise OperatorControlError(
+                        "UNSUPPORTED_EXPLORATORY_LIVE_PREPARE_FIELDS"
+                    )
+                if target_value:
+                    raise OperatorControlError(
+                        "UNSUPPORTED_EXPLORATORY_LIVE_PREPARE_FIELDS"
+                    )
+                target_value = "exploratory-live-prepare"
             elif action_value == "execution_authorization.review":
                 allowed = {"values", "actor"}
                 if set(action_payload) - allowed:
@@ -10620,6 +10898,10 @@ class OperatorControlPlane:
                         actor=action_payload.get("actor", "operator"),
                         expected_generation=action_payload.get("expected_generation"),
                     )
+                }
+            elif action_value == "exploratory.live.prepare":
+                result = {
+                    "exploratory_live": self.prepare_exploratory_live_session()
                 }
             elif action_value == "execution_authorization.review":
                 result = {

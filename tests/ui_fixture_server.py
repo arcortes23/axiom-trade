@@ -26,6 +26,11 @@ from axiom.dashboard import DashboardData, DashboardServer, _ENDPOINTS, _V2_ENDP
 FIXTURE_TIME = "2034-02-03T04:05:06+00:00"
 SCENARIOS = (
     "prepared",
+    "legacy_missingfield",
+    "no_proposal",
+    "positive_proposed_zero_active",
+    "poll",
+    "reload",
     "stale",
     "changed",
     "missingaccount",
@@ -511,16 +516,33 @@ def _base_data(now: datetime | None = None) -> dict[str, Any]:
             "exclusions": deepcopy(scope_draft["exclusions"]),
         }
         proposal_member = {
-            "allocation": "0.73",
+            "allocation": "2.50",
             "allocation_active": False,
             "candidate_id": "fixture-candidate-aurora",
-            "proposed_allocation": "0.73",
+            "proposed_allocation": "2.50",
             "setup_binding": setup_binding,
             "setup_name": setup_binding["setup_name"],
             "status": "SELECTED",
             "strategy_name": setup_binding["strategy_name"],
             "strategy_version_id": "fixture-strategy-v1",
         }
+        proposal_member_two = deepcopy(proposal_member)
+        proposal_member_two.update({
+            "allocation": "2.50",
+            "candidate_id": "fixture-candidate-borealis",
+            "proposed_allocation": "2.50",
+            "setup_name": "Borealis threshold study",
+            "strategy_name": "Borealis threshold study",
+        })
+        setup_binding_two = deepcopy(setup_binding)
+        setup_binding_two.update({
+            "candidate_id": "fixture-candidate-borealis",
+            "setup_id": "fixture-setup-borealis",
+            "setup_name": "Borealis threshold study",
+            "name": "Borealis threshold study",
+            "strategy_name": "Borealis threshold study",
+        })
+        proposal_member_two["setup_binding"] = setup_binding_two
         proposal = {
             "status": "REVIEW_REQUIRED",
             "selection_id": "fixture-selection-aurora",
@@ -531,11 +553,11 @@ def _base_data(now: datetime | None = None) -> dict[str, Any]:
             "scope_draft_id": scope_draft["draft_id"],
             "scope_draft_version": scope_draft["scope_version"],
             "scope_draft_hash": scope_draft["draft_hash"],
-            "proposed_allocation_total": "0.73",
+            "proposed_allocation_total": "5.00",
             "proposed_allocation_risk_digest": "sha256:fixture-risk-digest",
-            "members": [proposal_member],
-            "selected_setups": [deepcopy(setup_binding)],
-            "setup_bindings": [deepcopy(setup_binding)],
+            "members": [proposal_member, proposal_member_two],
+            "selected_setups": [deepcopy(setup_binding), deepcopy(setup_binding_two)],
+            "setup_bindings": [deepcopy(setup_binding), deepcopy(setup_binding_two)],
         }
         auth_draft = {
             "active_settings_generation": 2,
@@ -680,6 +702,18 @@ def _base_data(now: datetime | None = None) -> dict[str, Any]:
             "stop_rules": auth_draft["stop_rules"],
             "adverse_evidence_ack_required": False,
         }
+        session_setup = {
+            "supported": True,
+            "required": False,
+            "action": "exploratory.live.prepare",
+            "confirmation": "PREPARE EXPLORATORY SESSION",
+            "fixed_allocation": True,
+            "shared_allocation": "5.00",
+            "lifetime_budget": {"max_notional_usd": "5.00"},
+            "expiry_anchor": "FINAL_CONFIRMATION",
+            "duration_seconds": 86400,
+            "proposal_only": True,
+        }
         review = {
             "status": "REVIEW_REQUIRED",
             "proposal_status": "REVIEW_REQUIRED",
@@ -690,9 +724,10 @@ def _base_data(now: datetime | None = None) -> dict[str, Any]:
             "choices": choices,
             "authorization_choices": choices,
             "authorization_bindings": {"selection_id": proposal["selection_id"], "selection_hash": proposal["selection_hash"], "policy_id": proposal["policy_id"], "policy_version": proposal["policy_version"], "policy_hash": proposal["policy_hash"], "scope_draft_id": scope_draft["draft_id"], "scope_draft_hash": scope_draft["draft_hash"], "scope_draft_version": scope_draft["scope_version"]},
-            "members": [proposal_member],
-            "selected_setups": [setup_binding],
-            "setup_bindings": [setup_binding],
+            "session_setup": session_setup,
+            "members": [proposal_member, proposal_member_two],
+            "selected_setups": [setup_binding, setup_binding_two],
+            "setup_bindings": [setup_binding, setup_binding_two],
             "entry_predicate": {"status": "ELIGIBLE", "expression": "fixture_entry_predicate_v1"},
             "direction": {"allowed": ["BUY"], "selected": "BUY"},
             "sizing": {"mode": "FIXED_NOTIONAL", "target_notional_usd": "0.42"},
@@ -958,6 +993,41 @@ class FixtureControl:
                         review["adverse_evidence_acknowledged"] = True
         self._sync_projection()
         return deepcopy(authorization) if isinstance(authorization, dict) else {}
+    def _prepare_projection(self) -> dict[str, Any]:
+        projection = self.projection if isinstance(self.projection, dict) else {}
+        canary = projection.get("canary") if isinstance(projection.get("canary"), dict) else {}
+        controls = canary.get("operator_controls") if isinstance(canary.get("operator_controls"), dict) else {}
+        review = controls.get("exploratory_live_review") if isinstance(controls.get("exploratory_live_review"), dict) else {}
+        authorization = canary.get("execution_authorization") if isinstance(canary.get("execution_authorization"), dict) else {}
+        draft = authorization.get("draft") if isinstance(authorization.get("draft"), dict) else {}
+        proposal = review.get("proposal") if isinstance(review.get("proposal"), dict) else {}
+        members = review.get("members") if isinstance(review.get("members"), list) else []
+        if not members:
+            members = [
+                {"allocation": "2.50", "allocation_active": False, "candidate_id": "fixture-candidate-aurora", "proposed_allocation": "2.50", "status": "SELECTED", "strategy_name": "Aurora threshold study", "strategy_version_id": "fixture-strategy-v1"},
+                {"allocation": "2.50", "allocation_active": False, "candidate_id": "fixture-candidate-borealis", "proposed_allocation": "2.50", "status": "SELECTED", "strategy_name": "Borealis threshold study", "strategy_version_id": "fixture-strategy-v1"},
+            ]
+        setup_bindings = review.get("setup_bindings") if isinstance(review.get("setup_bindings"), list) else []
+        if not setup_bindings:
+            setup_bindings = [{"candidate_id": member["candidate_id"], "setup_id": f"fixture-setup-{index}", "setup_name": member.get("strategy_name", "Fixture setup"), "strategy_version_id": member.get("strategy_version_id", "fixture-strategy-v1")} for index, member in enumerate(members, 1)]
+        proposal.update({"status": "REVIEW_REQUIRED", "proposed_allocation_total": "5.00", "proposed_allocation_risk_digest": "sha256:fixture-risk-digest", "members": deepcopy(members), "selected_setups": deepcopy(setup_bindings), "setup_bindings": deepcopy(setup_bindings)})
+        review.update({"status": "REVIEW_REQUIRED", "proposal_status": "REVIEW_REQUIRED", "proposal": proposal, "members": deepcopy(members), "selected_setups": deepcopy(setup_bindings), "setup_bindings": deepcopy(setup_bindings), "shared_allocation": "5.00", "blockers": []})
+        choices = review.get("choices")
+        if isinstance(choices, dict):
+            choices["shared_allocation"] = "5.00"
+        authorization_choices = review.get("authorization_choices")
+        if isinstance(authorization_choices, dict):
+            authorization_choices["shared_allocation"] = "5.00"
+        draft["shared_allocation"] = "5.00"
+        draft.setdefault("lifetime_budget", {"max_notional_usd": "5.00"})
+        authorization["draft"] = draft
+        authorization["status"] = "REVOKED"
+        authorization["active"] = None
+        setup = review.get("session_setup")
+        if isinstance(setup, dict):
+            setup["required"] = False
+        self._sync_projection()
+        return {"proposal": deepcopy(proposal), "members": deepcopy(members), "proposal_only": True, "authority_changed": False}
 
     def _refresh_connectivity(self) -> dict[str, Any]:
         projection = self.projection if isinstance(self.projection, dict) else {}
@@ -1091,7 +1161,13 @@ class FixtureControl:
         if success:
             name = str(record.get("action") or "")
             payload = record.get("payload") if isinstance(record.get("payload"), Mapping) else {}
-            if name == "execution_authorization.review":
+            if name == "exploratory.live.prepare":
+                if str(record.get("confirm") or "").strip() != "PREPARE EXPLORATORY SESSION" or payload:
+                    success = False
+                    result["reason"] = "FIXTURE_PREPARE_ACTION_INVALID"
+                else:
+                    result["result"] = self._prepare_projection()
+            elif name == "execution_authorization.review":
                 projection = self.projection if isinstance(self.projection, dict) else {}
                 canary = projection.get("canary") if isinstance(projection.get("canary"), dict) else {}
                 controls = canary.get("operator_controls")
@@ -1182,7 +1258,7 @@ class FixtureControl:
             if self.delay_ms > 0:
                 import time
                 time.sleep(self.delay_ms / 1000)
-            uncertain = self.uncertain_next or self.scenario in {"network_failure", "unknown_order"}
+            uncertain = self.uncertain_next or self.scenario in {"network_failure", "unknown_order", "poll"}
             self.uncertain_next = False
             if uncertain:
                 result = {"ok": False, "fixture": True, "action_id": action_id, "status": "RUNNING", "action_status": "RUNNING", "reason": "OUTCOME_UNCERTAIN", "result": {"resolution_required": True}}
@@ -1201,6 +1277,12 @@ class FixtureControl:
             elif name in {"risk.settings.activate_draft", "canary.settings.activate_draft"}:
                 ok, reason, activation = self._activate_risk_draft(request)
                 result = {"ok": ok, "fixture": True, "action_id": action_id, "status": "COMPLETE" if ok else "FAILED", "reason": reason, "result": activation}
+            elif name == "exploratory.live.prepare":
+                if str(confirm or "").strip() != "PREPARE EXPLORATORY SESSION" or request:
+                    result = {"ok": False, "fixture": True, "action_id": action_id, "status": "FAILED", "reason": "FIXTURE_PREPARE_ACTION_INVALID", "result": {}}
+                else:
+                    prepared = self._prepare_projection()
+                    result = {"ok": True, "fixture": True, "action_id": action_id, "status": "COMPLETE", "reason": "FIXTURE_EXPLORATORY_SESSION_PREPARED", "result": prepared}
             elif name == "execution_authorization.review":
                 values = request.get("values")
                 if not isinstance(values, Mapping):
@@ -2182,6 +2264,75 @@ def _apply_scenario(data: dict[str, Any], scenario: str, now: datetime | None = 
             draft["status"] = "DRAFT"
         canary["control_state"] = "DISARMED"
         canary["readiness"]["status"] = "CURRENT"
+    elif scenario == "legacy_missingfield":
+        review = canary["operator_controls"].get("exploratory_live_review")
+        draft = authorization.get("draft")
+        if isinstance(review, dict):
+            review.pop("shared_allocation", None)
+            choices = review.get("choices")
+            if isinstance(choices, dict):
+                choices.pop("shared_allocation", None)
+            review_choices = review.get("authorization_choices")
+            if isinstance(review_choices, dict):
+                review_choices.pop("shared_allocation", None)
+            setup = review.get("session_setup")
+            if isinstance(setup, dict):
+                setup["required"] = False
+        authorization_view = review.get("authorization")
+        if isinstance(authorization_view, dict):
+            authorization_view.pop("shared_allocation", None)
+        if isinstance(draft, dict):
+            draft.pop("shared_allocation", None)
+        canary["control_state"] = "DISARMED"
+    elif scenario == "no_proposal":
+        review = canary["operator_controls"].get("exploratory_live_review")
+        draft = authorization.get("draft")
+        if isinstance(review, dict):
+            review["proposal"] = {"status": "UNAVAILABLE", "members": []}
+            review.update({"status": "REVIEW_REQUIRED", "proposal_status": "UNAVAILABLE", "members": [], "selected_setups": [], "setup_bindings": [], "blockers": ["PROPOSAL_REQUIRED"]})
+            review.pop("shared_allocation", None)
+            choices = review.get("choices")
+            if isinstance(choices, dict):
+                choices.pop("shared_allocation", None)
+            review_choices = review.get("authorization_choices")
+            if isinstance(review_choices, dict):
+                review_choices.pop("shared_allocation", None)
+            setup = review.get("session_setup")
+            if isinstance(setup, dict):
+                setup["required"] = True
+        authorization_view = review.get("authorization")
+        if isinstance(authorization_view, dict):
+            authorization_view.pop("shared_allocation", None)
+        if isinstance(draft, dict):
+            draft.pop("shared_allocation", None)
+        canary["control_state"] = "DISARMED"
+    elif scenario == "positive_proposed_zero_active":
+        review = canary["operator_controls"].get("exploratory_live_review")
+        draft = authorization.get("draft")
+        if isinstance(review, dict):
+            review.pop("shared_allocation", None)
+            choices = review.get("choices")
+            if isinstance(choices, dict):
+                choices.pop("shared_allocation", None)
+            review_choices = review.get("authorization_choices")
+            if isinstance(review_choices, dict):
+                review_choices.pop("shared_allocation", None)
+        authorization_view = review.get("authorization")
+        if isinstance(authorization_view, dict):
+            authorization_view.pop("shared_allocation", None)
+        if isinstance(draft, dict):
+            draft.pop("shared_allocation", None)
+        active = deepcopy(draft) if isinstance(draft, Mapping) else {}
+        active.update({"status": "ACTIVE", "active": True, "allocation_active": True, "shared_allocation": "0.00", "proposed_allocation_total": "0.00"})
+        authorization["active"] = active
+        authorization["status"] = "REVOKED"
+        canary["control_state"] = "DISARMED"
+    elif scenario in {"poll", "reload"}:
+        authorization.update({"status": "REVOKED", "active": None})
+        draft = authorization.get("draft")
+        if isinstance(draft, dict):
+            draft["status"] = "DRAFT"
+        canary["control_state"] = "DISARMED"
     elif scenario == "stale":
         canary["readiness"].update({"status": "STALE", "checked_at": (stamp - timedelta(seconds=120)).isoformat()})
         canary["readiness_snapshot_status"] = "STALE"

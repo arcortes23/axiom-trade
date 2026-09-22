@@ -1,0 +1,140 @@
+{
+  "schema": "axiom.ui.release.allocation-before.v1",
+  "review": "before-reproduction",
+  "source": {
+    "revision": "1285eb74fc8d995781235dd77b3c114d0d80dbc2",
+    "ui_root": "C:\\Users\\User\\projects\\axiom-ui",
+    "captured_ui_state_file": "C:\\Users\\User\\.omp\\agent\\sessions\\-projects-axiom\\2026-09-10T09-29-23-148Z_01a08aa6-81cc-7720-8e98-296666c0152d\\local\\axiom-ui-allocation-current-sanitized.json",
+    "captured_at": "2026-09-22T01:10:34.965675+00:00",
+    "archive_dir": "C:\\Users\\User\\AppData\\Local\\Temp\\axiom-ui-allocation-before-1285",
+    "archive_assets": [
+      {
+        "path": "C:\\Users\\User\\AppData\\Local\\Temp\\axiom-ui-allocation-before-1285\\app.js",
+        "sha256": "1ad5c9a207bd3626ab36b548378e9f9fe7f6af6f05f2742cfab9dcfeedd30054",
+        "bytes": 155058
+      },
+      {
+        "path": "C:\\Users\\User\\AppData\\Local\\Temp\\axiom-ui-allocation-before-1285\\pages.js",
+        "sha256": "45d35a60d3b519327bf168e41602a30b61f587229f2cabbc463b660e0bf5f36f",
+        "bytes": 85022
+      },
+      {
+        "path": "C:\\Users\\User\\AppData\\Local\\Temp\\axiom-ui-allocation-before-1285\\styles.css",
+        "sha256": "d17b131ab2e7c96e590e4200fc5ff9e1ef1a7adcd6ce901426a45c84c6a7468e",
+        "bytes": 13982
+      },
+      {
+        "path": "C:\\Users\\User\\AppData\\Local\\Temp\\axiom-ui-allocation-before-1285\\index.html",
+        "sha256": "e399e436093aee12636d77d5c21ff1a3942d1880801c083432cf5f4ab7e0a226",
+        "bytes": 6015
+      },
+      {
+        "path": "C:\\Users\\User\\AppData\\Local\\Temp\\axiom-ui-allocation-before-1285\\manifest.json",
+        "sha256": "5e3c9ebd087fe02655c38e1a0fbdb4ea62aa6421152579cb12daa014ef22d622",
+        "bytes": 622
+      }
+    ]
+  },
+  "replay": {
+    "scope": "loopback-only immutable browser asset replay; no production endpoint or database",
+    "base_url": "http://127.0.0.1:54480",
+    "ui_state_endpoint": {
+      "path": "/api/ui-state",
+      "http_status": 200,
+      "exact_captured_ui_state": true,
+      "schema": "ui-state.v1"
+    },
+    "execution_authorization_status": "REVOKED",
+    "control_state": "DISARMED",
+    "live_execution": false,
+    "paper_only": true,
+    "proposal": {
+      "status": "PAPER",
+      "proposed_allocation_total": "5.00",
+      "member_count": 2,
+      "member_allocations": [
+        "2.5",
+        "2.5"
+      ],
+      "member_identifiers": [
+        "SYNTHETIC-0012",
+        "SYNTHETIC-0013",
+        "SYNTHETIC-0018",
+        "SYNTHETIC-0019"
+      ]
+    },
+    "shared_allocation_field": {
+      "key": "shared_allocation",
+      "present_in_captured_ui_state": false,
+      "key_paths_found": [],
+      "native_choices_present": false,
+      "native_proposal_present": false,
+      "native_authorization_present": false
+    },
+    "ancillary_endpoints": [
+      {
+        "path": "/api/v2/canary",
+        "http_status": 200,
+        "scope": "minimal isolated status canary; live_execution false; no allocation terms"
+      },
+      {
+        "path": "/api/v2/rolling-portfolio",
+        "scope": "minimal isolated empty portfolio fixture; shared allocation omitted"
+      },
+      {
+        "path": "/api/operator",
+        "scope": "browser route guard aborts; no request permitted"
+      }
+    ]
+  },
+  "browser": {
+    "engine": "isolated headless Chrome",
+    "profile": "C:/Users/User/AppData/Local/Temp/axiom-allocation-before-profile",
+    "route": "/?view=home",
+    "dialog": "Exploratory live authorization",
+    "dialog_open": true,
+    "missing_shared_allocation_visible": true,
+    "missing_text": "Missing: shared allocation.",
+    "visible_home_session_budget": "$5.00",
+    "visible_home_member_count": 2,
+    "review_member_cards": 2,
+    "visible_review_member_allocations": [
+      "$2.50",
+      "$2.50"
+    ],
+    "source_proposal_total": "$5.00",
+    "proposal_total_label_visible": false,
+    "api_resources": [
+      "/api/ui-state",
+      "/api/v2/canary",
+      "/api/ui-state",
+      "/api/v2/canary"
+    ],
+    "control_post_requests": 0,
+    "operator_requests": 0,
+    "console_messages": [],
+    "horizontal_overflow": false
+  },
+  "privacy": {
+    "screenshot": "C:\\Users\\User\\projects\\axiom-ui\\reports\\ui-release\\allocation-start-before-review.png",
+    "screenshot_sha256": "edce208f68f5ca1c1033295e13873b3dac5cfbc0f13789c1a6e8dc5dba77ea66",
+    "screenshot_bytes": 78176,
+    "synthetic_identifiers_only": true,
+    "identifiers_in_replay": [
+      "SYNTHETIC-0012",
+      "SYNTHETIC-0013",
+      "SYNTHETIC-0018",
+      "SYNTHETIC-0019"
+    ],
+    "non_synthetic_identifiers": [],
+    "secret_or_credential_markers_detected": false
+  },
+  "finding": {
+    "title": "Display shared allocation in the client review",
+    "body": "The immutable 1285 browser replay preserves a PAPER proposal total of 5.00 with two proposed members allocated 2.5 each, while the client review reports “Missing: shared allocation” because the captured native choices, proposal, and authorization projections contain no shared_allocation field. This is a BEFORE reproduction only; no control request was sent."
+  },
+  "artifacts": [
+    "C:\\Users\\User\\projects\\axiom-ui\\reports\\ui-release\\allocation-start-before-review.png",
+    "C:\\Users\\User\\projects\\axiom-ui\\reports\\ui-release\\allocation-start-before-evidence.json"
+  ]
+}

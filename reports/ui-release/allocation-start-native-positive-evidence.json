@@ -1,0 +1,522 @@
+{
+  "schema": "axiom.ui.release.allocation-after.v1",
+  "review": "final native-browser acceptance after canonical-session-terms follow-up",
+  "source": {
+    "revision": "1285eb74fc8d995781235dd77b3c114d0d80dbc2",
+    "ui_hashes": {
+      "axiom/dashboard.py": "dbbbe99caf821e8d7d684e4568bab2298e8c0fb4aaf701087519fc6bae92762d",
+      "axiom/operator.py": "01a498fca50190b0a1435cf8486bc0af942f708411ef9a8f67a49596ae1c5720",
+      "axiom/ui/app.js": "02a49ac7c8c119253ee92b4c1c6440147fef2455c239b919b3ba6bd1657399ee",
+      "tests/test_rolling_portfolio_acceptance.py": "ee82b3524177b7482a9f8de31d2116d8907a6f8fe55cec4a0b3e94d56700b279",
+      "tests/ui_fixture_server.py": "adc7ab0e9a10bea25bff3fc11c71a05f971994515ae8aaf8f82e9f442d8193e3"
+    },
+    "archive_dir": "C:\\Users\\User\\AppData\\Local\\Temp\\axiom-ui-allocation-after-final",
+    "archive_assets": [
+      {
+        "path": "C:\\Users\\User\\AppData\\Local\\Temp\\axiom-ui-allocation-after-final\\app.js",
+        "sha256": "02a49ac7c8c119253ee92b4c1c6440147fef2455c239b919b3ba6bd1657399ee",
+        "bytes": 172176
+      },
+      {
+        "path": "C:\\Users\\User\\AppData\\Local\\Temp\\axiom-ui-allocation-after-final\\pages.js",
+        "sha256": "45d35a60d3b519327bf168e41602a30b61f587229f2cabbc463b660e0bf5f36f",
+        "bytes": 85022
+      },
+      {
+        "path": "C:\\Users\\User\\AppData\\Local\\Temp\\axiom-ui-allocation-after-final\\styles.css",
+        "sha256": "d17b131ab2e7c96e590e4200fc5ff9e1ef1a7adcd6ce901426a45c84c6a7468e",
+        "bytes": 13982
+      },
+      {
+        "path": "C:\\Users\\User\\AppData\\Local\\Temp\\axiom-ui-allocation-after-final\\index.html",
+        "sha256": "e399e436093aee12636d77d5c21ff1a3942d1880801c083432cf5f4ab7e0a226",
+        "bytes": 6015
+      },
+      {
+        "path": "C:\\Users\\User\\AppData\\Local\\Temp\\axiom-ui-allocation-after-final\\manifest.json",
+        "sha256": "5e3c9ebd087fe02655c38e1a0fbdb4ea62aa6421152579cb12daa014ef22d622",
+        "bytes": 622
+      }
+    ],
+    "status": "measured against final frozen operator 01a498fc, dashboard dbbbe99, app 02a49ac, and acceptance test ee82b35"
+  },
+  "browser_replay": {
+    "scope": "loopback-only replay of sanitized captured current response with the repaired bounded projection; no production endpoint, database, credential, venue, or control service",
+    "base_url": "http://127.0.0.1:51108",
+    "route": "/?view=home",
+    "assets_are_frozen": true,
+    "response_source": "captured sanitized ui-state subtree plus only repaired narrow current-proposal choices/session_setup fields derived from the existing proposed 5.00 selection",
+    "dialog_open": true,
+    "missing_shared_allocation_visible": false,
+    "missing_banner_text_present": false,
+    "total_label_visible": true,
+    "total_value": "$5.00",
+    "lifetime_entry_spending": "$5.00 lifetime entry spending",
+    "daily_buying": "$5.00",
+    "maximum_buy": "$1.00",
+    "expiry": "24 hours from final confirmation",
+    "proposed_member_cards": 2,
+    "proposed_member_allocations": [
+      "$2.50",
+      "$2.50"
+    ],
+    "identifiers": [
+      "SYNTHETIC-0012",
+      "SYNTHETIC-0013",
+      "SYNTHETIC-0018",
+      "SYNTHETIC-0019"
+    ],
+    "review_start_button_disabled": false,
+    "api_resources": [
+      "/api/ui-state",
+      "/api/v2/canary",
+      "/api/ui-state",
+      "/api/v2/canary",
+      "/api/ui-state",
+      "/api/v2/canary",
+      "/api/ui-state",
+      "/api/v2/canary",
+      "/api/ui-state",
+      "/api/v2/canary"
+    ],
+    "post_resources": [],
+    "operator_requests": 0,
+    "console_messages": [],
+    "horizontal_overflow": false,
+    "real_marker_detected": false,
+    "api_get_count": 10
+  },
+  "native_isolated_acceptance": {
+    "scope": "real AxiomStore SQLite, real OperatorControlPlane and DashboardServer/control paths; only external CredentialStore/Polymarket venue/transport boundaries replaced with CommissionCredentials and CommissionReadOnlyVenue",
+    "command": "python -m unittest tests.test_rolling_portfolio_acceptance.RollingPortfolioAcceptanceTests.test_http_commission_review_confirm_real_rolling_worker_fill_and_expiry_exit",
+    "result": "PASS",
+    "tests_run": 1,
+    "source_test_method": "test_http_commission_review_confirm_real_rolling_worker_fill_and_expiry_exit",
+    "eligible_seed": "rolling-http-commission.sqlite3 setup from the passing commissioning fixture: _policy(rolling-default, global_budget=0.00), _seed_artifacts with sv-commission-joined, _seed_executable_candidate, real scope draft, two CommissionDiscoveryProvider.collect_once passes at first_collection_at and commissioning_at",
+    "prepare": {
+      "action": "exploratory.live.prepare",
+      "confirmation": "PREPARE EXPLORATORY SESSION",
+      "payload": {},
+      "status": "PREPARED",
+      "proposal_total": "5.00",
+      "allocation_activation_status": "PREPARED",
+      "active_authorization_before_confirm": null,
+      "session_setup_required": false,
+      "choices": {
+        "purpose": "commission exploratory automation and measure actual net results; profitability unproven",
+        "lifetime_budget": {
+          "max_notional_usd": "5.00"
+        },
+        "shared_allocation": "5.00",
+        "expiry_anchor": "FINAL_CONFIRMATION",
+        "duration_seconds": 86400,
+        "stop_rules": {
+          "on_any_blocker": "STOP",
+          "halt_on_unknown_execution": true
+        }
+      }
+    },
+    "prepare_repeat": {
+      "same_pointer": true,
+      "same_prepared_selection": true,
+      "no_authority_granted": true
+    },
+    "precedence_guard": {
+      "unrelated_old_zero_budget_current_pointer_did_not_override_prepared_proposal": true
+    },
+    "review_and_final": {
+      "review_action": "execution_authorization.review",
+      "review_status": "DRAFT",
+      "final_action": "exploratory.live.review_confirm",
+      "final_status": "AUTONOMOUS_MICRO_LIVE",
+      "live_execution": true,
+      "paper_only": false,
+      "persisted_authorization_status": "ACTIVE",
+      "persisted_selection_status": "ACTIVE",
+      "persisted_allocation_active": true,
+      "persisted_canary_armed": true,
+      "allocation_total": "5.00",
+      "active_member_allocation_total": "5.00",
+      "expires_minus_activated": "P1D",
+      "expiry_anchor": "FINAL_CONFIRMATION",
+      "duration_seconds": 86400,
+      "fresh_control_reload_preserved_selection_and_authorization": true
+    },
+    "external_boundary": {
+      "credentials": "CommissionCredentials (synthetic fixed key only, no environment fallback)",
+      "venue": "CommissionReadOnlyVenue",
+      "connectivity_ready": true,
+      "order_calls_before_and_at_final_confirmation": 0,
+      "approval_calls_before_and_at_final_confirmation": 0,
+      "network_or_process_access": "none"
+    },
+    "stop_boundary": "Acceptance evidence stops at final confirmation/reload assertions before the test’s later worker/order-cycle section; no production action was sent.",
+    "status": "measured-pass-final-source-freeze",
+    "browser_harness_evidence": "reports/ui-release/allocation-start-native-browser-evidence.json"
+  },
+  "privacy": {
+    "synthetic_identifiers_only": true,
+    "non_synthetic_identifiers": [],
+    "secret_or_credential_markers_detected": false,
+    "screenshots": [
+      {
+        "path": "C:\\Users\\User\\projects\\axiom-ui\\reports\\ui-release\\allocation-start-after-review.png",
+        "sha256": "c9fc367f430a7e8f073657950cf0b6c8a3818d731c2849fc52ed99183545645e",
+        "bytes": 24612
+      },
+      {
+        "path": "C:\\Users\\User\\projects\\axiom-ui\\reports\\ui-release\\allocation-start-after-total.png",
+        "sha256": "08969ad80668497e86d287853149c5495be66530c2f4c9b1a1a0d679c410e21d",
+        "bytes": 22873
+      },
+      {
+        "path": "C:\\Users\\User\\projects\\axiom-ui\\reports\\ui-release\\allocation-start-after-members.png",
+        "sha256": "50fda199fc81fbedd3d4033bb7e48768c9344ee2a13123fd76175b0782888ef5",
+        "bytes": 23114
+      },
+      {
+        "path": "C:\\Users\\User\\projects\\axiom-ui\\reports\\ui-release\\allocation-start-native-missing.png",
+        "sha256": "367f59bb65cee15f306542d8bfd47c501cf21e55b62cc2bf2eeb7b43bbf7e6c0",
+        "bytes": 23802
+      },
+      {
+        "path": "C:\\Users\\User\\projects\\axiom-ui\\reports\\ui-release\\allocation-start-native-prepared.png",
+        "sha256": "1e82500cc9ffb5298affc8d6391f2ad3bc3b1415eb3b68f955239ac7d60dc858",
+        "bytes": 22784
+      },
+      {
+        "path": "C:\\Users\\User\\projects\\axiom-ui\\reports\\ui-release\\allocation-start-native-reviewed.png",
+        "sha256": "40fb2b6811b82fa6d3abc398837308bf4bad147b017a98860a32796fd427bbdb",
+        "bytes": 26831
+      },
+      {
+        "path": "C:\\Users\\User\\projects\\axiom-ui\\reports\\ui-release\\allocation-start-native-final.png",
+        "sha256": "1ea9ede12158d95095e0a77361d288ba48a0a4ce5319e29aa3a24b1df4eb91d7",
+        "bytes": 27379
+      },
+      {
+        "path": "C:\\Users\\User\\projects\\axiom-ui\\reports\\ui-release\\allocation-start-native-active-home.png",
+        "sha256": "c6c18c3f7796e31a941792a4fdac9eba3b4a7046b60c1927ce54e81c6588f0f4",
+        "bytes": 35452
+      }
+    ],
+    "native_browser_evidence": "reports/ui-release/allocation-start-native-browser-evidence.json"
+  },
+  "artifacts": {
+    "before_screenshot": "C:\\Users\\User\\projects\\axiom-ui\\reports\\ui-release\\allocation-start-before-review.png",
+    "before_evidence": "C:\\Users\\User\\projects\\axiom-ui\\reports\\ui-release\\allocation-start-before-evidence.json",
+    "after_screenshots": [
+      "C:\\Users\\User\\projects\\axiom-ui\\reports\\ui-release\\allocation-start-after-review.png",
+      "C:\\Users\\User\\projects\\axiom-ui\\reports\\ui-release\\allocation-start-after-total.png",
+      "C:\\Users\\User\\projects\\axiom-ui\\reports\\ui-release\\allocation-start-after-members.png"
+    ],
+    "native_browser_evidence": "reports/ui-release/allocation-start-native-browser-evidence.json",
+    "native_screenshots": [
+      "C:\\Users\\User\\projects\\axiom-ui\\reports\\ui-release\\allocation-start-native-missing.png",
+      "C:\\Users\\User\\projects\\axiom-ui\\reports\\ui-release\\allocation-start-native-prepared.png",
+      "C:\\Users\\User\\projects\\axiom-ui\\reports\\ui-release\\allocation-start-native-reviewed.png",
+      "C:\\Users\\User\\projects\\axiom-ui\\reports\\ui-release\\allocation-start-native-final.png",
+      "C:\\Users\\User\\projects\\axiom-ui\\reports\\ui-release\\allocation-start-native-active-home.png"
+    ]
+  },
+  "finding": "Final isolated browser acceptance passed against the frozen source: native DashboardServer/control flow prepared the 5.00 proposal, rendered lifetime/shared/daily/max-buy/expiry terms and two 2.50 members, required both exact confirmation phrases, persisted ACTIVE authorization/allocation/canary state with one-day expiry, and made zero order or approval calls before the worker boundary. No production endpoint, database, credential, venue, or worker cycle was used.",
+  "native_browser": {
+    "schema": "axiom.ui.release.allocation-native-browser.v1",
+    "status": "native-browser-pass-stop-before-worker",
+    "scope": "real temp AxiomStore/DashboardServer/OperatorControlPlane; fake CommissionCredentials and CommissionReadOnlyVenue only; no production DB/API/process",
+    "server_url": "http://127.0.0.1:53346",
+    "prepare_http": {
+      "action": "exploratory.live.prepare",
+      "confirmation": "PREPARE EXPLORATORY SESSION",
+      "payload": {},
+      "calls": 2,
+      "result": {
+        "ok": true,
+        "action": "exploratory.live.prepare",
+        "target": "exploratory-live-prepare",
+        "action_id": "operator-action:7386c661d6054e508610504be115e0a6",
+        "action_status": "COMPLETE",
+        "result": {
+          "exploratory_live": {
+            "status": "PREPARED",
+            "proposal": {
+              "active_risk_config_generation": 1,
+              "active_risk_config_hash": "066dbfbb8da9e75d3697d05f794d80fd8b74fe07813e74b79b94f494be82acfe",
+              "active_risk_config_id": "cfg-default-066dbfbb8da9e75d",
+              "admission_mode": "EXPLORATORY_LIVE",
+              "allocation_activation": {
+                "predecessor_selection_id": "<truncated>",
+                "prepared_at": "<truncated>",
+                "proposal_digest": "<truncated>",
+                "status": "<truncated>"
+              },
+              "allocation_active": false,
+              "canary_armed": false,
+              "committed_at": "2026-09-22T02:47:07.865574+00:00",
+              "draft_hash": "sha256:0ccde396e403bafcbd2968e5e967bd648d65ec088221c705de3aba8b0a8e167e",
+              "draft_id": "rolling-exploratory-scope-draft:polymarket:standard:v1",
+              "global_budget": "5.00",
+              "k": 0,
+              "live_execution": false,
+              "measured_blockers": [],
+              "members": [
+                "<truncated>",
+                "<truncated>"
+              ],
+              "operating_policy": {
+                "admission_mode": "<truncated>",
+                "allocation_active": "<truncated>",
+                "canary_armed": "<truncated>",
+                "config_hash": "<truncated>",
+                "cooldown_seconds": "<truncated>",
+                "discovery": "<truncated>",
+                "experimental_allocation_enabled": "<truncated>",
+                "formula_version": "<truncated>",
+                "global_budget": "<truncated>",
+                "live_execution": "<truncated>",
+                "max_k": "<truncated>",
+                "max_members": "<truncated>",
+                "member_requirements": "<truncated>",
+                "min_score": "<truncated>",
+                "minimum_evidence": "<truncated>",
+                "minimum_evidence_overrides": "<truncated>",
+                "mode": "<truncated>",
+                "paper_only": "<truncated>",
+                "policy_hash": "<truncated>",
+                "policy_id": "<truncated>",
+                "policy_version": "<truncated>",
+                "pool_cap": "<truncated>",
+                "proposal_only": "<truncated>",
+                "replacement_margin": "<truncated>",
+                "requested_window_days": "<truncated>",
+                "review_interval_days": "<truncated>",
+                "score_formula": "<truncated>",
+                "score_formula_config": "<truncated>",
+                "shared_allocation": "<truncated>",
+                "target_members": "<truncated>",
+                "version": "<truncated>",
+                "weights": "<truncated>"
+              },
+              "paper_only": true,
+              "policy_config": {
+                "admission_mode": "<truncated>",
+                "allocation_active": "<truncated>",
+                "canary_armed": "<truncated>",
+                "config_hash": "<truncated>",
+                "cooldown_seconds": "<truncated>",
+                "discovery": "<truncated>",
+                "experimental_allocation_enabled": "<truncated>",
+                "formula_version": "<truncated>",
+                "global_budget": "<truncated>",
+                "live_execution": "<truncated>",
+                "max_k": "<truncated>",
+                "max_members": "<truncated>",
+                "member_requirements": "<truncated>",
+                "min_score": "<truncated>",
+                "minimum_evidence": "<truncated>",
+                "minimum_evidence_overrides": "<truncated>",
+                "mode": "<truncated>",
+                "paper_only": "<truncated>",
+                "policy_hash": "<truncated>",
+                "policy_id": "<truncated>",
+                "policy_version": "<truncated>",
+                "pool_cap": "<truncated>",
+                "proposal_only": "<truncated>",
+                "replacement_margin": "<truncated>",
+                "requested_window_days": "<truncated>",
+                "review_interval_days": "<truncated>",
+                "score_formula": "<truncated>",
+                "score_formula_config": "<truncated>",
+                "shared_allocation": "<truncated>",
+                "target_members": "<truncated>",
+                "version": "<truncated>",
+                "weights": "<truncated>"
+              },
+              "policy_hash": "sha256:9413f6bf0503fe52d72f675179d996630ece688710f8e945347db9d0f92c063e",
+              "policy_id": "polymarket-exploratory-live",
+              "policy_version": "exploratory-live-v1",
+              "portfolio_selection_id": "rolling-selection-prepared-9dc1042825fb2770e5859ec6d83a9984e0d8c386",
+              "proposal_only": true,
+              "proposed_allocation_risk_digest": "171bdc2705bac465a1f46faaa73b014ddc57e610e2e9f189c81f28a2f85a65c2",
+              "proposed_allocation_risk_snapshot": {
+                "active_global_budget": "<truncated>",
+                "active_obligations": "<truncated>",
+                "allocation_envelope": "<truncated>",
+                "available_budget": "<truncated>",
+                "external_obligations": "<truncated>",
+                "global_budget": "<truncated>",
+                "per_buy_cap_unchanged": "<truncated>",
+                "proposed_shared_allocation": "<truncated>",
+                "risk_config_generation": "<truncated>",
+                "risk_config_hash": "<truncated>",
+                "risk_config_id": "<truncated>",
+                "runtime_accounting_available": "<truncated>",
+                "runtime_accounting_blockers": "<truncated>",
+                "uncovered_obligations": "<truncated>"
+              },
+              "proposed_allocation_total": "5.00",
+              "reasons": [
+                "<truncated>"
+              ],
+              "review_due_at": "2026-02-01T12:01:01+00:00",
+              "risk_config_generation": 1,
+              "risk_config_hash": "066dbfbb8da9e75d3697d05f794d80fd8b74fe07813e74b79b94f494be82acfe",
+              "risk_config_id": "cfg-default-066dbfbb8da9e75d",
+              "scope_hash": "sha256:d8fa4bdf73da8dff8e45696127d4815d9aad04b78605971d0f4d12fdf08dd0b9"
+            },
+            "session_setup": {
+              "supported": true,
+              "required": false,
+              "action": "exploratory.live.prepare",
+              "confirmation": "PREPARE EXPLORATORY SESSION",
+              "fixed_allocation": true,
+              "shared_allocation": "5.00",
+              "lifetime_budget": {
+                "max_notional_usd": "<truncated>"
+              },
+              "expiry_anchor": "FINAL_CONFIRMATION",
+              "duration_seconds": 86400,
+              "proposal_only": true
+            },
+            "paper_only": true,
+            "live_execution": false
+          }
+        },
+        "paper_only": true,
+        "live_execution": false
+      }
+    },
+    "persisted_after_browser_final": {
+      "pointer": {
+        "admission_mode": "EXPLORATORY_LIVE",
+        "draft_hash": "sha256:0ccde396e403bafcbd2968e5e967bd648d65ec088221c705de3aba8b0a8e167e",
+        "draft_id": "rolling-exploratory-scope-draft:polymarket:standard:v1",
+        "policy_hash": "sha256:9413f6bf0503fe52d72f675179d996630ece688710f8e945347db9d0f92c063e",
+        "policy_id": "polymarket-exploratory-live",
+        "proposal_only": true,
+        "proposed_allocation_total": "5.00",
+        "risk_digest": "171bdc2705bac465a1f46faaa73b014ddc57e610e2e9f189c81f28a2f85a65c2",
+        "scope_hash": "sha256:d8fa4bdf73da8dff8e45696127d4815d9aad04b78605971d0f4d12fdf08dd0b9",
+        "scope_version": "1",
+        "selection_hash": "bb503e70081227a70fd0d7628204d88b6b0c643561a24c233b1dd8b76a4463eb",
+        "selection_id": "rolling-selection-prepared-9dc1042825fb2770e5859ec6d83a9984e0d8c386",
+        "updated_at": "2026-01-31T12:01:01+00:00"
+      },
+      "selection_id": "rolling-selection-prepared-9dc1042825fb2770e5859ec6d83a9984e0d8c386",
+      "selection_status": "ACTIVE",
+      "allocation_active": true,
+      "canary_armed": true,
+      "proposed_allocation_total": "5.00",
+      "active_authorization_status": "ACTIVE",
+      "active_authorization_mode": "EXPLORATORY_MICRO_CANARY",
+      "active_lifetime_budget": {
+        "max_notional_usd": "5.00"
+      },
+      "active_activated_at": "2026-01-31 12:01:01+00:00",
+      "active_expires_at": "2026-02-01 12:01:01+00:00",
+      "expiry_seconds": 86400.0
+    },
+    "external_boundaries": {
+      "venue_instances": 2,
+      "connectivity_calls": 3,
+      "order_calls": 0,
+      "approval_calls": 0
+    },
+    "stop_boundary": "Stopped immediately after browser final confirmation and persisted-state inspection; no worker tick/order cycle was run by this harness.",
+    "server_token_exposed": false,
+    "source": {
+      "revision": "1285eb74fc8d995781235dd77b3c114d0d80dbc2",
+      "operator_sha256": "01a498fca50190b0a1435cf8486bc0af942f708411ef9a8f67a49596ae1c5720",
+      "dashboard_sha256": "dbbbe99caf821e8d7d684e4568bab2298e8c0fb4aaf701087519fc6bae92762d",
+      "app_sha256": "02a49ac7c8c119253ee92b4c1c6440147fef2455c239b919b3ba6bd1657399ee",
+      "acceptance_test_sha256": "ee82b3524177b7482a9f8de31d2116d8907a6f8fe55cec4a0b3e94d56700b279"
+    },
+    "browser": {
+      "engine": "isolated headless Chrome",
+      "route": "/?view=home",
+      "native_url": "http://127.0.0.1:53346",
+      "missing_setup_visible": true,
+      "missing_copy_visible": "Missing: purpose, shared allocation, lifetime budget, stop rules, expiry anchor, duration, proposed members.",
+      "setup_button_clicked": true,
+      "prepared_terms_visible": {
+        "total_allocated": "$5.00",
+        "lifetime_entry_spending": "$5.00 lifetime entry spending",
+        "daily_buying": "$5.00",
+        "maximum_buy": "$1.00",
+        "expiry": "24 hours from final confirmation",
+        "member_count": 2,
+        "member_allocations": [
+          "$2.50",
+          "$2.50"
+        ]
+      },
+      "review_phrase_submitted": true,
+      "final_phrase_submitted": true,
+      "final_active_copy_visible": true,
+      "resources": [
+        "/api/ui-state",
+        "/api/v2/canary",
+        "/api/ui-state",
+        "/api/control-token",
+        "POST /api/control",
+        "/api/ui-state",
+        "/api/v2/canary",
+        "/api/ui-state",
+        "/api/v2/canary",
+        "/api/ui-state",
+        "POST /api/control",
+        "/api/ui-state",
+        "/api/v2/canary",
+        "/api/ui-state",
+        "/api/v2/canary",
+        "/api/ui-state",
+        "POST /api/control",
+        "/api/ui-state",
+        "/api/ui-state",
+        "/api/v2/canary"
+      ],
+      "all_http_statuses": 200,
+      "control_posts": 3,
+      "console_messages": [],
+      "production_requests": 0,
+      "horizontal_overflow": false,
+      "active_home_copy_visible": true
+    },
+    "screenshots": [
+      {
+        "path": "C:\\Users\\User\\projects\\axiom-ui\\reports\\ui-release\\allocation-start-native-missing.png",
+        "sha256": "367f59bb65cee15f306542d8bfd47c501cf21e55b62cc2bf2eeb7b43bbf7e6c0",
+        "bytes": 23802
+      },
+      {
+        "path": "C:\\Users\\User\\projects\\axiom-ui\\reports\\ui-release\\allocation-start-native-prepared.png",
+        "sha256": "1e82500cc9ffb5298affc8d6391f2ad3bc3b1415eb3b68f955239ac7d60dc858",
+        "bytes": 22784
+      },
+      {
+        "path": "C:\\Users\\User\\projects\\axiom-ui\\reports\\ui-release\\allocation-start-native-reviewed.png",
+        "sha256": "40fb2b6811b82fa6d3abc398837308bf4bad147b017a98860a32796fd427bbdb",
+        "bytes": 26831
+      },
+      {
+        "path": "C:\\Users\\User\\projects\\axiom-ui\\reports\\ui-release\\allocation-start-native-final.png",
+        "sha256": "1ea9ede12158d95095e0a77361d288ba48a0a4ce5319e29aa3a24b1df4eb91d7",
+        "bytes": 27379
+      },
+      {
+        "path": "C:\\Users\\User\\projects\\axiom-ui\\reports\\ui-release\\allocation-start-native-active-home.png",
+        "sha256": "c6c18c3f7796e31a941792a4fdac9eba3b4a7046b60c1927ce54e81c6588f0f4",
+        "bytes": 35452
+      }
+    ],
+    "privacy": {
+      "browser_data_is_fixture_only": true,
+      "local_fixture_identifiers_are_not_production_identity": true,
+      "non_synthetic_or_production_identifiers": [],
+      "credentials_in_browser_or_report": false,
+      "secret_markers_detected": false
+    },
+    "projection_summary": "reports/ui-release/native-post-final-projections-summary.json"
+  },
+  "get_only_followup": "reports/ui-release/allocation-start-native-followup-get-only.json"
+}

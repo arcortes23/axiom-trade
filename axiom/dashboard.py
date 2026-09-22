@@ -20,7 +20,12 @@ from pathlib import Path
 import secrets
 import sqlite3
 from . import canary as canary_module
-from .canary import CanaryService, _canary_eligibility_is_bound, _canary_has_last_good
+from .canary import (
+    CanaryService,
+    _canary_eligibility_is_bound,
+    _canary_has_last_good,
+    _canary_selection_member_is_proposed,
+)
 from .canary_settings import CanarySettingsService
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
@@ -41,6 +46,15 @@ from .operator import (
 
 _CLIENT_DISCONNECT_ERRORS = (BrokenPipeError, ConnectionAbortedError, ConnectionResetError)
 _LOGGER = logging.getLogger(__name__)
+
+def _positive_decimal(value: Any) -> Decimal | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        parsed = Decimal(str(value).strip())
+    except (ArithmeticError, TypeError, ValueError):
+        return None
+    return parsed if parsed.is_finite() and parsed > 0 else None
 
 from .director import research_summary
 from .domain import ensure_utc, parse_timestamp, to_record
@@ -665,7 +679,13 @@ _HTTP_PUBLIC_SECTION_FIELDS: dict[str, tuple[str, ...]] = {
         "exit", "lookback", "adverse_evidence", "members", "limits", "limit_blockers",
         "readiness", "authorization", "authorization_choices", "authorization_bindings",
         "shared_allocation", "lifetime_budget", "expiry_anchor", "duration_seconds",
-        "expires_at", "stop_rules", "accounting", "paper_only", "live_execution",
+        "expires_at", "stop_rules", "session_setup", "accounting", "paper_only",
+        "live_execution",
+    ),
+    "session_setup": (
+        "supported", "required", "action", "confirmation", "fixed_allocation",
+        "shared_allocation", "lifetime_budget", "expiry_anchor", "duration_seconds",
+        "proposal_only", "reason", "blockers",
     ),
     "proposal": (
         "status", "selection_id", "selection_hash", "policy_id", "policy_version",
@@ -10360,8 +10380,9 @@ class DashboardData:
             merged_review.update(current_review)
             configured_controls = dict(configured_controls) if isinstance(configured_controls, Mapping) else {}
             configured_controls["exploratory_live_review"] = merged_review
-        # The canonical exploratory proposal is the immutable selection pointed
-        # to by rolling_exploratory_proposal, not rolling_portfolio.active_rows.
+        proposal_selection = None
+        proposal_shared_allocation: Any | None = None
+        proposal_hash_valid = False
         proposal_pointer = get_config("rolling_exploratory_proposal", None) if callable(get_config) else None
         proposal_pointer = proposal_pointer if isinstance(proposal_pointer, Mapping) else {}
         proposal_selection_id = str(
@@ -10373,15 +10394,52 @@ class DashboardData:
         proposal_hash_valid = False
         if proposal_selection_id and self.store is not None:
             try:
-                candidate_selection = self.store.load_portfolio_selection(proposal_selection_id)
+                candidate_selection = self.store.load_portfolio_selection(
+                    proposal_selection_id
+                )
             except Exception:
                 candidate_selection = None
             if isinstance(candidate_selection, Mapping):
                 expected_hash = str(proposal_pointer.get("selection_hash") or "").strip()
                 actual_hash = str(candidate_selection.get("selection_hash") or "").strip()
-                proposal_hash_valid = bool(expected_hash and actual_hash and expected_hash == actual_hash)
+                proposal_hash_valid = bool(
+                    expected_hash and actual_hash and expected_hash == actual_hash
+                )
                 if proposal_hash_valid:
                     proposal_selection = candidate_selection
+                    proposed_status = str(
+                        proposal_selection.get("status")
+                        or proposal_selection.get("selection_status")
+                        or ""
+                    ).strip().upper()
+                    declared_total = proposal_selection.get(
+                        "proposed_allocation_total"
+                    )
+                    proposal_members_raw = proposal_selection.get(
+                        "members", proposal_selection.get("selected_members", ())
+                    )
+                    if (
+                        proposed_status
+                        not in {
+                            "REVOKED",
+                            "EXPIRED",
+                            "STALE",
+                            "INVALID",
+                            "UNKNOWN",
+                            "NONE",
+                            "UNAVAILABLE",
+                        }
+                        and _positive_decimal(declared_total) is not None
+                        and isinstance(proposal_members_raw, (list, tuple))
+                        and any(
+                            isinstance(member, Mapping)
+                            and _canary_selection_member_is_proposed(member)
+                            and _positive_decimal(member.get("proposed_allocation"))
+                            is not None
+                            for member in proposal_members_raw
+                        )
+                    ):
+                        proposal_shared_allocation = declared_total
             setup_fields = (
                 "name", "strategy_name", "setup_name", "family", "experiment_family",
                 "candidate_id", "research_trial_id", "allocation", "proposed_allocation",
@@ -10543,6 +10601,25 @@ class DashboardData:
             }
             existing_review = configured_controls.get("exploratory_live_review") if isinstance(configured_controls, Mapping) else {}
             existing_review = existing_review if isinstance(existing_review, Mapping) else {}
+            if proposal_shared_allocation not in (None, ""):
+                proposal_review["shared_allocation"] = proposal_shared_allocation
+                proposal_review["authorization_choices"] = {
+                    "shared_allocation": proposal_shared_allocation
+                }
+                for alias in ("choices", "authorization_choices"):
+                    existing_choices = existing_review.get(alias)
+                    if isinstance(existing_choices, Mapping):
+                        merged_choices = dict(existing_choices)
+                        merged_choices["shared_allocation"] = proposal_shared_allocation
+                        proposal_review[alias] = merged_choices
+            setup_method = getattr(self.control, "exploratory_live_session_setup", None)
+            if callable(setup_method):
+                try:
+                    setup_metadata = setup_method()
+                except Exception:
+                    setup_metadata = None
+                if isinstance(setup_metadata, Mapping):
+                    proposal_review["session_setup"] = _safe_value(setup_metadata)
             for field in ("selected_setups", "adverse_evidence", "limits", "affordability", "readiness", "blockers", "scope", "setup_bindings"):
                 if proposal_review.get(field) in (None, "", [], {}):
                     proposal_review[field] = _bounded_value(existing_review.get(field))
@@ -10590,6 +10667,74 @@ class DashboardData:
                 review.setdefault("choices", choices)
                 configured_controls = dict(configured_controls) if isinstance(configured_controls, Mapping) else {}
                 configured_controls["exploratory_live_review"] = review
+        review = configured_controls.get("exploratory_live_review") if isinstance(configured_controls, Mapping) else {}
+        review = dict(review) if isinstance(review, Mapping) else {}
+        if proposal_shared_allocation not in (None, "") and self.control is not None:
+            native_choices_method = getattr(
+                self.control,
+                "exploratory_live_review_choices",
+                None,
+            )
+            if callable(native_choices_method):
+                try:
+                    native_choices = native_choices_method()
+                except Exception:
+                    native_choices = None
+                if isinstance(native_choices, Mapping):
+                    for field in (
+                        "purpose",
+                        "lifetime_budget",
+                        "expiry_anchor",
+                        "duration_seconds",
+                        "expires_at",
+                        "stop_rules",
+                    ):
+                        if field in native_choices:
+                            review[field] = _safe_value(native_choices[field])
+                    for alias in ("authorization_choices", "choices"):
+                        if alias == "authorization_choices" or alias in review:
+                            current_choices = review.get(alias)
+                            current_choices = (
+                                dict(current_choices)
+                                if isinstance(current_choices, Mapping)
+                                else {}
+                            )
+                            current_choices.update(
+                                {
+                                    key: _safe_value(value)
+                                    for key, value in native_choices.items()
+                                    if key
+                                    in {
+                                        "purpose",
+                                        "shared_allocation",
+                                        "lifetime_budget",
+                                        "expiry_anchor",
+                                        "duration_seconds",
+                                        "expires_at",
+                                        "stop_rules",
+                                    }
+                                }
+                            )
+                            review[alias] = current_choices
+        setup_method = getattr(self.control, "exploratory_live_session_setup", None)
+        if callable(setup_method):
+            try:
+                setup_metadata = setup_method()
+            except Exception:
+                setup_metadata = None
+            if isinstance(setup_metadata, Mapping):
+                review["session_setup"] = _safe_value(setup_metadata)
+        if proposal_shared_allocation not in (None, ""):
+            review["shared_allocation"] = proposal_shared_allocation
+            for alias in ("authorization_choices", "choices"):
+                if alias == "authorization_choices" or alias in review:
+                    choices = review.get(alias)
+                    choices = dict(choices) if isinstance(choices, Mapping) else {}
+                    choices["shared_allocation"] = proposal_shared_allocation
+                    review[alias] = choices
+        if review:
+            configured_controls = dict(configured_controls) if isinstance(configured_controls, Mapping) else {}
+            configured_controls["exploratory_live_review"] = review
         return {
             "schema": "ui-state.v1",
             "operator_controls": configured_controls,
@@ -10619,6 +10764,9 @@ class DashboardData:
         if not isinstance(raw_review, Mapping):
             return projected
         review = _connectivity_safe_diagnostics(raw_review)
+        if isinstance(review, Mapping) and "blockers" in raw_review:
+            review = dict(review)
+            review["blockers"] = _safe_value(raw_review.get("blockers"))
         raw_scope = raw_review.get("scope")
         if isinstance(review, Mapping) and isinstance(raw_scope, Mapping):
             scope = _safe_value(raw_scope)
@@ -10633,6 +10781,27 @@ class DashboardData:
                         scope[section_name] = section_projection
                 review = dict(review)
                 review["scope"] = scope
+        raw_setup = raw_review.get("session_setup")
+        if isinstance(raw_setup, Mapping) and isinstance(review, Mapping):
+            review = dict(review)
+            review["session_setup"] = {
+                key: _safe_value(raw_setup.get(key))
+                for key in (
+                    "supported",
+                    "required",
+                    "action",
+                    "confirmation",
+                    "fixed_allocation",
+                    "shared_allocation",
+                    "lifetime_budget",
+                    "expiry_anchor",
+                    "duration_seconds",
+                    "proposal_only",
+                    "reason",
+                    "blockers",
+                )
+                if key in raw_setup
+            }
         raw_readiness = raw_review.get("readiness")
         if isinstance(review, Mapping) and isinstance(raw_readiness, Mapping):
             review = dict(review)
@@ -10697,6 +10866,9 @@ class DashboardData:
                 "selection_hash",
                 "adverse_evidence_ack",
                 "lifetime_budget",
+                "shared_allocation",
+                "expiry_anchor",
+                "duration_seconds",
                 "stop_rules",
                 "expires_at",
                 "scope_hash",
@@ -11955,6 +12127,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             *rolling_activate_actions,
             *execution_authorization_actions,
             *exploratory_live_actions,
+            "exploratory.live.prepare",
         }
         if action_payload and action_name not in payload_actions:
             self._send(400, {"error": "action does not accept a payload"})

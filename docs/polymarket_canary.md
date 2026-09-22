@@ -364,6 +364,33 @@ under a fresh current controller lease, retaining the opening lineage.
 Missing, stale, expired, or mismatched lifetime, settings generation/hash,
 controller lease, scope, or selection bindings fail closed.
 
+### Shared allocation correction and preparation
+
+The review surface displays the native current proposed allocation, not an
+active allocation or a client-reconstructed sum. A valid current proposal
+therefore remains authoritative even when a legacy authorization projection
+omits `shared_allocation` or reports a zero `allocation_active` value. The
+review preserves the native proposed total and each proposed member split
+through refresh and reload; terminal `REVOKED` or `EXPIRED` authorization
+records are not revived as a current draft.
+
+When the bounded native projection reports no usable current proposal/value,
+the same review dialog may expose **Set up session**. This explicit,
+non-activating preparation uses the fixed **$5.00** total, creates only a
+native proposal, and accepts no amount, member ID, JSON, or settings input.
+Preparation sends `exploratory.live.prepare` with the exact confirmation
+`PREPARE EXPLORATORY SESSION` and an empty payload. After completion the UI
+reloads the native proposal and shows its exact member split and terms before
+the normal `REVIEW EXPLORATORY AUTHORIZATION` stage.
+
+The disclosure keeps total allocation, lifetime entry spending, daily buying,
+and maximum buy as separate limits. The commissioning lifetime is **24 hours
+from final confirmation** (`FINAL_CONFIRMATION`, `86400` seconds); it does not
+reuse a terminal authorization's absolute expiry. Preparation grants no
+authority, records no acknowledgement, and never auto-replays an uncertain
+request. The fixture scenarios are synthetic UI evidence only; they do not
+prove the native backend or production venue path.
+
 ## Strict admission and capture checks
 
 Before any order-capable action, the reviewed authorization must be bound to
@@ -382,6 +409,7 @@ The gate rechecks, fail-closed and independently:
   exact portfolio selection, risk reservation, and authorization expiry.
 
 The final POST fence repeats account, geoblock, market, token, allowance, and
+
 depth checks immediately before the irreversible request. Close-only mode
 blocks BUY and permits only an otherwise valid managed SELL. Accepted,
 partial, timeout, or unknown responses remain durable intents until
@@ -488,9 +516,14 @@ bounded Binance projections and control/action handlers; this typed
 Browser captures and pure adapter tests use `tests/ui_fixture_server.py`.
 Fixtures are loopback-only, carry a visible `FIXTURE` label, use synthetic
 identifiers and values, and route through the existing DashboardServer host and
-CSRF checks. They include prepared, stale, changed, missing-account, missing-auth,
-armed-without-permission, no-members, unaffordable, network-failure, no-signal,
-open-position, partial-fill, UNKNOWN, expired, revoked, missing, and empty scenarios.
+CSRF checks. They include prepared, legacy-missing-field, no-proposal,
+positive-proposed-zero-active, poll, reload, stale, changed, missing-account,
+missing-auth, armed-without-permission, no-members, unaffordable,
+network-failure, no-signal, open-position, partial-fill, UNKNOWN, expired,
+revoked, missing, and empty scenarios. The prepared review uses a synthetic
+$5.00 proposal split across two $2.50 members; this fixture evidence is not
+native backend or production proof.
+
 Fixture actions are recorded only as synthetic IDs/status/history; they never authenticate a venue,
 submit an order, read credentials, or alter a production database. The loopback-only
 fixture admin URL (printed as `FIXTURE_ADMIN`) can switch scenarios, delay or drop

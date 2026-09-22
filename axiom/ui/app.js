@@ -718,25 +718,79 @@ async function loadRoute({ force = false } = {}) {
   appState.timer = setTimeout(() => loadRoute(), pollMs);
 }
 
+const REVIEW_TERMINAL_STATES = new Set(["REVOKED", "EXPIRED", "CANCELLED", "UNAVAILABLE", "STALE"]);
+function reviewObject(value) { return value && typeof value === "object" && !Array.isArray(value) ? value : null; }
+function reviewRecordStatus(value) { return upper(pick([value], ["status", "state", "authorization_state", "proposal_status", "binding_status", "freshness_status", "readiness_status", "permission"])); }
+function reviewCurrent(value) {
+  const record = reviewObject(value);
+  if (!record || !Object.keys(record).length || REVIEW_TERMINAL_STATES.has(reviewRecordStatus(record))) return false;
+  const readiness = upper(pick([record.readiness, record.readiness_snapshot], ["status", "state", "readiness_status"]));
+  return !REVIEW_TERMINAL_STATES.has(readiness);
+}
+function positiveAllocation(value) {
+  if (value === null || value === undefined || value === "") return false;
+  const numeric = Number(String(value).replace(/[$,]/g, ""));
+  return Number.isFinite(numeric) && numeric > 0;
+}
+function mergeReviewRecords(candidates) {
+  const merged = {};
+  for (const candidate of candidates) {
+    if (!reviewCurrent(candidate)) continue;
+    for (const [key, value] of Object.entries(candidate)) if (!present(merged[key])) merged[key] = value;
+  }
+  return merged;
+}
 function reviewProjection(state = appState) {
   const operator = state.data?.operator || {};
   const canary = state.data?.canary || {};
-  const controls = operator.operator_controls?.exploratory_live_review || canary.operator_controls?.exploratory_live_review || {};
-  const execution = operator.execution_authorization || canary.execution_authorization || {};
-  const authorization = execution.draft || execution.authorization || execution.active || {};
-  const choices = controls.choices || controls.authorization_choices || authorization.choices || authorization || {};
-  return { operator, canary, controls, execution, authorization, choices };
+  const controlSources = [operator.operator_controls?.exploratory_live_review, canary.operator_controls?.exploratory_live_review];
+  const executionSources = [operator.execution_authorization, canary.execution_authorization];
+  const controls = mergeReviewRecords(controlSources);
+  const execution = mergeReviewRecords(executionSources);
+  const authorizationSources = [
+    ...executionSources.flatMap(record => [record?.draft, record?.authorization, record?.active]),
+    ...controlSources.flatMap(record => [record?.authorization, record?.draft, record?.active]),
+  ];
+  const authorization = mergeReviewRecords(authorizationSources);
+  const choices = mergeReviewRecords([
+    ...controlSources.flatMap(record => [record?.choices, record?.authorization_choices]),
+    ...authorizationSources.flatMap(record => [record?.choices]),
+    authorization,
+  ]);
+  const source = { operator, canary, controls, execution, authorization, choices, controlSources, executionSources, authorizationSources };
+  source.proposal = reviewProposal(source);
+  return source;
+}
+function reviewProposal(source = reviewProjection()) {
+  const { controls, authorization, execution } = source;
+  const candidates = [
+    ...(source.controlSources || []),
+    ...(source.executionSources || []),
+    ...(source.authorizationSources || []),
+    controls,
+    authorization,
+    execution,
+  ].flatMap(record => [record?.current_proposal, record?.proposal, record?.proposed, record]);
+  return candidates.find(candidate => {
+    if (!reviewCurrent(candidate)) return false;
+    const total = pick([candidate], ["proposed_allocation_total", "shared_allocation"]);
+    const members = Array.isArray(candidate.members) ? candidate.members : [];
+    return positiveAllocation(total) || members.some(member => reviewObject(member) && member.allocation_active !== true && positiveAllocation(pick([member], ["proposed_allocation", "allocation"])));
+  }) || {};
 }
 function reviewValues(source = reviewProjection()) {
   const { controls, authorization, choices } = source;
+  const proposal = source.proposal || reviewProposal(source);
   const values = {};
   const bindings = {};
   for (const key of ["scope_hash", "scope_version", "scope_draft_id", "scope_draft_hash", "scope_draft_version", "selection_id", "selection_hash", "active_settings_hash", "active_settings_generation", "proposed_allocation_total", "proposed_allocation_risk_digest"]) {
-    const value = pick([controls, authorization], [key]);
+    const value = pick([proposal, controls, authorization], [key]);
     if (value !== null) bindings[key] = value;
   }
   const purpose = pick([choices, authorization, controls], ["purpose"]);
-  const sharedAllocation = pick([choices, authorization, controls], ["shared_allocation"]);
+  const proposedTotal = pick([proposal, controls, authorization], ["proposed_allocation_total"]);
+  const explicitSharedAllocation = pick([choices, authorization, controls], ["shared_allocation"]);
+  const sharedAllocation = positiveAllocation(proposedTotal) ? proposedTotal : explicitSharedAllocation;
   const lifetimeBudget = pick([choices, authorization, controls], ["lifetime_budget"]);
   const stopRules = pick([choices, authorization, controls], ["stop_rules"]);
   const expiryAnchor = pick([choices, authorization, controls], ["expiry_anchor", "expiry_anchor_type"]);
@@ -775,6 +829,7 @@ function reviewFingerprintValue(value, depth = 0) {
 }
 function reviewFingerprint(source = reviewProjection()) {
   const { execution, authorization, controls, choices } = source;
+  const proposal = source.proposal || reviewProposal(source);
   const terms = {};
   for (const key of [
     "purpose",
@@ -804,11 +859,13 @@ function reviewFingerprint(source = reviewProjection()) {
     "draft_member_bindings",
     "setup_bindings",
   ]) {
-    const value = pick([choices, authorization, controls, execution], [key]);
+    const value = key === "shared_allocation"
+      ? reviewValues(source).values.shared_allocation
+      : pick([proposal, choices, authorization, controls, execution], [key]);
     if (value !== null && value !== undefined) terms[key] = reviewFingerprintValue(value);
   }
   const members = reviewFingerprintValue(reviewMembers(source));
-  const setups = reviewFingerprintValue(pick([controls, authorization], ["selected_setups", "setup_bindings"]));
+  const setups = reviewFingerprintValue(pick([controls, authorization, proposal], ["selected_setups", "setup_bindings"]));
   const adverse = reviewFingerprintValue(pick([controls, authorization], ["adverse_evidence", "evidence", "adverse_evidence_ack"]));
   return JSON.stringify({
     status: execution.status || authorization.status || controls.status,
@@ -824,13 +881,19 @@ function reviewFingerprint(source = reviewProjection()) {
 }
 function reviewMembers(source = reviewProjection()) {
   const { controls, authorization, execution } = source;
+  const proposal = source.proposal || reviewProposal(source);
   const candidates = [
+    proposal.members,
+    ...(source.controlSources || []).flatMap(record => [record?.proposal?.members, record?.current_proposal?.members]),
+    ...(source.authorizationSources || []).flatMap(record => [record?.proposal?.members, record?.current_proposal?.members]),
     controls.members,
-    controls.proposal?.members,
-    authorization.proposal?.members,
-    execution.proposal?.members,
+    authorization.members,
+    execution.members,
   ];
-  return candidates.find(value => Array.isArray(value) && value.length) || [];
+  return candidates.find(value => Array.isArray(value) && value.length && value.some(member => {
+    if (!reviewObject(member)) return false;
+    return member.allocation_active !== true || positiveAllocation(pick([member], ["proposed_allocation"]));
+  })) || [];
 }
 const REVIEW_LIMIT_LABELS = Object.freeze({
   target_notional_usd: ["Maximum all-in buy", "USD per buy"],
@@ -974,12 +1037,41 @@ function reviewBlockersMarkup(value) {
     return `<li><strong>${esc(reviewText(code))}</strong><span class="muted"> — ${esc(explanation)}</span></li>`;
   }).join("")}</ul>`;
 }
+function reviewLimits(source = reviewProjection()) {
+  const raw = pick([
+    source.controls,
+    source.operator?.risk_settings,
+    source.canary?.risk_settings,
+    source.choices,
+    source.authorization,
+  ], ["limits", "risk_limits", "caps", "effective_limits", "active_limits"]);
+  if (!raw || typeof raw !== "object") return {};
+  return raw.effective_limits || raw.active_limits || raw;
+}
+function reviewSessionSetup(source = reviewProjection()) {
+  const setup = pick([source.controls, source.operator?.operator_controls, source.canary?.operator_controls], ["session_setup"]);
+  return setup && typeof setup === "object" ? setup : {};
+}
+function reviewSetupRequired(source = reviewProjection()) {
+  const setup = reviewSessionSetup(source);
+  return setup.supported === true && setup.required === true;
+}
+function reviewSetupMarkup(source = reviewProjection()) {
+  if (!reviewSetupRequired(source)) return "";
+  const setup = reviewSessionSetup(source);
+  const total = pick([setup], ["shared_allocation"]);
+  const lifetime = pick([setup], ["lifetime_budget"]);
+  const anchor = pick([setup], ["expiry_anchor"]);
+  const duration = pick([setup], ["duration_seconds"]);
+  return `<section class="notice notice-info" data-review-setup><h3>Set up session</h3><p>This commissioning route uses a fixed ${esc(money(total))} total allocation and creates only a proposal. It does not authorize, activate, or submit an order.</p><dl class="detail-grid">${kv("Fixed total allocation", `<strong>${esc(money(total))}</strong>`)}${kv("Lifetime entry spending", reviewValueMarkup("Lifetime entry spending", lifetime))}${kv("Expiry", `<strong>${esc(anchor === "FINAL_CONFIRMATION" && Number(duration) === 86400 ? "24 hours from final confirmation" : reviewText(anchor))}</strong>`)}</dl><div class="actions"><button class="button button-secondary" type="button" data-review-prepare>Set up session</button></div><p id="review-setup-result" role="status"></p></section>`;
+}
 function reviewValueMarkup(label, value) {
   if (label === "Mode" && (typeof value === "string" || typeof value === "number")) return `<strong>${esc(reviewText(value))}</strong>${technical({ code: value }, "Mode code")}`;
   if (/^Duration/.test(label)) return reviewScalarMarkup(label, value);
-  if (label === "Lifetime budget") {
+  if (label === "Lifetime budget" || label === "Lifetime entry spending" || label === "Total allocated across all strategies" || label === "Daily buying" || label === "Maximum buy") {
     const amount = value && typeof value === "object" ? pick([value], ["max_notional_usd", "amount"]) : value;
-    return amount === null || amount === undefined || amount === "" ? `<span class="muted">Unknown (not provided)</span>` : `<strong>${esc(money(amount))}</strong><span class="muted"> lifetime budget</span>`;
+    const suffix = label === "Lifetime budget" || label === "Lifetime entry spending" ? " lifetime entry spending" : "";
+    return amount === null || amount === undefined || amount === "" ? `<span class="muted">Unknown (not provided)</span>` : `<strong>${esc(money(amount))}</strong>${suffix ? `<span class="muted">${suffix}</span>` : ""}`;
   }
   if (label === "Scope") return reviewScopeMarkup(value);
   if (/Proposed setups/i.test(label)) return reviewSetupsMarkup(value);
@@ -998,30 +1090,35 @@ function reviewValueMarkup(label, value) {
 }
 function reviewRows(source = reviewProjection()) {
   const { controls, execution, authorization, choices } = source;
+  const proposal = source.proposal || reviewProposal(source);
+  const values = reviewValues(source).values;
+  const limits = reviewLimits(source);
   const { missing } = reviewValues(source);
+  const anchor = pick([choices, authorization, controls], ["expiry_anchor", "expiry_anchor_type"]);
+  const duration = pick([choices, authorization, controls], ["duration_seconds"]);
+  const expiry = anchor === "FINAL_CONFIRMATION" && Number(duration) === 86400 ? "24 hours from final confirmation" : anchor;
   const rows = [
     ["Purpose", pick([choices, authorization, controls], ["purpose"])],
-    ["Shared allocation", pick([choices, authorization, controls], ["shared_allocation"])],
-    ["Lifetime budget", pick([choices, authorization, controls], ["lifetime_budget"])],
+    ["Total allocated across all strategies", values.shared_allocation],
+    ["Lifetime entry spending", pick([choices, authorization, controls], ["lifetime_budget"])],
+    ["Daily buying", pick([limits], ["max_gross_daily_buy_usd", "gross_daily_buy_usd"])],
+    ["Maximum buy", pick([limits], ["max_all_in_buy_usd", "max_buy_usd"])],
     ["Mode", pick([choices, authorization, controls], ["mode"])],
-    ["Scope", pick([controls, authorization], ["scope", "market_scope"])],
-    ["Proposed allocation total", pick([controls, authorization], ["proposed_allocation_total"])],
+    ["Scope", pick([controls, authorization, proposal], ["scope", "market_scope"])],
     ["Stop rules", pick([choices, authorization, controls], ["stop_rules"])],
-    ["Duration", pick([choices, authorization, controls], ["duration_seconds"])],
-    ["Expiry anchor", pick([choices, authorization, controls], ["expiry_anchor", "expiry_anchor_type"])],
-    ["Expires at", pick([choices, authorization, controls], ["expires_at"])],
+    ["Expiry", expiry],
     ["Authorization status", pick([execution, authorization, controls], ["status", "permission"])],
     ["Exact current proposed members", reviewMembers(source)],
-    ["Proposed setups", pick([controls, authorization], ["selected_setups", "setup_bindings"])],
-    ["Risk limits", pick([controls, choices, authorization], ["limits", "risk_limits", "caps"])],
+    ["Proposed setups", pick([controls, authorization, proposal], ["selected_setups", "setup_bindings"])],
+    ["Risk limits", pick([controls, choices, authorization], ["limits", "risk_limits", "caps"]) || limits],
     ["Per-outcome affordability", pick([controls, choices, authorization], ["affordability", "outcome_limits", "per_outcome"])],
     ["Adverse evidence", pick([controls, authorization], ["adverse_evidence", "evidence", "adverse_evidence_ack"])],
     ["Readiness", pick([controls], ["readiness"])],
     ["Blockers", pick([controls], ["blockers", "no_member_reason"])],
-    ["Bindings and hashes", pick([controls, authorization], ["authorization_bindings", "draft_member_bindings", "setup_bindings", "scope_hash", "selection_hash"])],
+    ["Bindings and hashes", pick([controls, authorization, proposal], ["authorization_bindings", "draft_member_bindings", "setup_bindings", "scope_hash", "selection_hash"])],
     ["Missing prerequisites", missing.length ? missing.join(", ") : null],
   ];
-  const always = new Set(["Lifetime budget", "Scope", "Exact current proposed members", "Proposed setups", "Risk limits", "Per-outcome affordability"]);
+  const always = new Set(["Lifetime entry spending", "Daily buying", "Maximum buy", "Scope", "Exact current proposed members", "Proposed setups", "Risk limits", "Per-outcome affordability"]);
   return rows.filter(([label, value]) => always.has(label) || (value !== null && value !== undefined && value !== "")).map(([label, value]) => kv(label, reviewValueMarkup(label, value))).join("");
 }
 function closeReviewDialog() {
@@ -1096,6 +1193,15 @@ function setReviewFinalStage(form) {
 function markReviewCommitted(form) {
   form.querySelectorAll("[data-review-cancel]").forEach(button => { button.textContent = "Close"; button.setAttribute("aria-label", "Close"); });
 }
+function resetReviewForPreparedTerms(form) {
+  form.dataset.reviewedFingerprint = "";
+  const authorization = form.querySelector("#review-authorization-confirmation");
+  if (authorization) { authorization.value = ""; authorization.disabled = false; }
+  const final = form.querySelector("#review-confirmation");
+  if (final) { final.value = ""; final.disabled = true; }
+  const adverse = form.querySelector("#review-adverse");
+  if (adverse) { adverse.checked = false; adverse.disabled = form.dataset.adverseRequired !== "true"; }
+}
 function reviewDialog() {
   const existing = document.querySelector("#review-dialog");
   if (existing?.open) return;
@@ -1104,12 +1210,26 @@ function reviewDialog() {
   const { adverseRequired, missing } = reviewValues(source);
   const dialog = document.createElement("dialog");
   dialog.id = "review-dialog";
-  dialog.innerHTML = `<form method="dialog" class="dialog-card" id="review-form" data-stage="authorization"><div class="section-heading"><div><p class="eyebrow" id="review-stage-label">Readable review · Step 1</p><h2>Exploratory live authorization</h2><p class="muted" id="review-stage-copy">This first step records that the exact current terms were reviewed. It does not activate anything.</p></div><button class="button button-quiet" type="button" data-review-cancel>Cancel</button></div><p class="notice notice-warn" id="review-stage-notice"><strong id="review-stage-notice-title">No activation at this step.</strong><span id="review-stage-notice-copy">Read the purpose, scope, budget, duration, and stop rules before continuing.</span></p>${missing.length ? `<p class="notice notice-warn"><strong>Review blocked until terms are complete.</strong><span>Missing: ${esc(missing.join(", "))}.</span></p>` : ""}<dl class="detail-grid">${reviewRows(source) || kv("Current terms", "Not available")}</dl><div data-review-adverse>${adverseRequired ? `<label class="checkbox-field"><input id="review-adverse" type="checkbox" required><span>I acknowledge the adverse evidence and limits shown above.</span></label>` : ""}</div><div data-review-authorization-fields><label class="field"><span>Type REVIEW EXPLORATORY AUTHORIZATION</span><input id="review-authorization-confirmation" autocomplete="off" aria-label="Type REVIEW EXPLORATORY AUTHORIZATION" required></label><div id="review-result" role="status"></div><div class="actions"><button class="button button-primary" type="submit" data-review-submit>Start authorization review</button><button class="button button-quiet" type="button" data-review-cancel>Cancel</button></div></div><div data-review-final-fields hidden><label class="field"><span>Type CONFIRM EXPLORATORY LIVE</span><input id="review-confirmation" autocomplete="off" aria-label="Type CONFIRM EXPLORATORY LIVE"></label><div class="actions"><button class="button button-primary" type="submit" data-review-submit>Confirm Exploratory Live</button><button class="button button-quiet" type="button" data-review-cancel>Cancel</button></div></div></form>`;
+  dialog.innerHTML = `<form method="dialog" class="dialog-card" id="review-form" data-stage="authorization"><div class="section-heading"><div><p class="eyebrow" id="review-stage-label">Readable review · Step 1</p><h2>Exploratory live authorization</h2><p class="muted" id="review-stage-copy">This first step records that the exact current terms were reviewed. It does not activate anything.</p></div><button class="button button-quiet" type="button" data-review-cancel>Cancel</button></div><p class="notice notice-warn" id="review-stage-notice"><strong id="review-stage-notice-title">No activation at this step.</strong><span id="review-stage-notice-copy">Read the purpose, scope, budget, duration, and stop rules before continuing.</span></p>${missing.length ? `<p class="notice notice-warn"><strong>Review blocked until terms are complete.</strong><span>Missing: ${esc(missing.join(", "))}.</span></p>` : ""}<div data-review-setup-container>${reviewSetupMarkup(source)}</div><dl class="detail-grid">${reviewRows(source) || kv("Current terms", "Not available")}</dl><div data-review-adverse>${adverseRequired ? `<label class="checkbox-field"><input id="review-adverse" type="checkbox" required><span>I acknowledge the adverse evidence and limits shown above.</span></label>` : ""}</div><div data-review-authorization-fields><label class="field"><span>Type REVIEW EXPLORATORY AUTHORIZATION</span><input id="review-authorization-confirmation" autocomplete="off" aria-label="Type REVIEW EXPLORATORY AUTHORIZATION" required></label><div id="review-result" role="status"></div><div class="actions"><button class="button button-primary" type="submit" data-review-submit>Start authorization review</button><button class="button button-quiet" type="button" data-review-cancel>Cancel</button></div></div><div data-review-final-fields hidden><label class="field"><span>Type CONFIRM EXPLORATORY LIVE</span><input id="review-confirmation" autocomplete="off" aria-label="Type CONFIRM EXPLORATORY LIVE"></label><div class="actions"><button class="button button-primary" type="submit" data-review-submit>Confirm Exploratory Live</button><button class="button button-quiet" type="button" data-review-cancel>Cancel</button></div></div></form>`;
   document.body.appendChild(dialog);
+  const termsGrid = Array.from(dialog.querySelectorAll("dl.detail-grid")).find(node => !node.closest("[data-review-setup]"));
+  termsGrid?.setAttribute("data-review-terms", "");
+  let missingNotice = Array.from(dialog.querySelectorAll(".notice.notice-warn")).find(node => node.querySelector("strong")?.textContent.trim() === "Review blocked until terms are complete.");
+  if (!missingNotice) {
+    missingNotice = document.createElement("p");
+    missingNotice.className = "notice notice-warn";
+    missingNotice.innerHTML = "<strong>Review blocked until terms are complete.</strong><span></span>";
+    dialog.querySelector("#review-stage-notice")?.after(missingNotice);
+  }
+  missingNotice.setAttribute("data-review-missing", "");
+  const missingText = missingNotice.querySelector("span");
+  if (missingText) missingText.textContent = missing.length ? `Missing: ${missing.join(", ")}.` : "";
+  missingNotice.hidden = !missing.length;
   dialog.dataset.reviewFingerprint = reviewFingerprint(source);
   const form = dialog.querySelector("#review-form");
   const finalPending = storedPendingAction();
   const reviewPending = storedReviewAction();
+  const preparePending = storedPrepareAction();
   if (form) {
     form.dataset.adverseRequired = String(adverseRequired);
     setReviewStage(form, "authorization");
@@ -1128,15 +1248,23 @@ function reviewDialog() {
     else if (form.dataset.stage === "final") finalReview(form);
     else reviewAuthorization(form);
   });
-  dialog.addEventListener("click", event => { if (event.target.closest("[data-review-cancel]")) { event.preventDefault(); closeReviewDialog(); } });
+  dialog.addEventListener("click", event => {
+    if (event.target.closest("[data-review-cancel]")) { event.preventDefault(); closeReviewDialog(); return; }
+    if (event.target.closest("[data-review-prepare]")) { event.preventDefault(); prepareExploratorySession(form); }
+  });
   dialog.addEventListener("cancel", event => { event.preventDefault(); closeReviewDialog(); });
   dialog.showModal();
-  if (reviewPending && form) {
+  if (preparePending && form) {
+    showPendingOutcome(form, preparePending, "A prior session setup has no terminal outcome yet. Check its read-only status before trying again.");
+    form.querySelector("#review-setup-result button")?.focus({ preventScroll: true });
+  } else if (reviewPending && form) {
     showPendingOutcome(form, reviewPending, "A prior authorization review has no terminal outcome yet. Check its read-only status before starting another review.");
     form.querySelector("#review-result button")?.focus({ preventScroll: true });
   } else if (finalPending && form) {
     showPendingOutcome(form, finalPending, "A prior final confirmation has no terminal outcome yet. Check its read-only status before starting another review.");
     form.querySelector("#review-result button")?.focus({ preventScroll: true });
+  } else if (reviewSetupRequired(source)) {
+    dialog.querySelector("[data-review-prepare]")?.focus({ preventScroll: true });
   } else {
     dialog.querySelector("#review-authorization-confirmation")?.focus({ preventScroll: true });
   }
@@ -1256,6 +1384,36 @@ function clearPendingActionIf(pending) {
   clearPendingAction();
   return true;
 }
+const PREPARE_PENDING_ACTION_KEY = "axiom.ui.pending-prepare-action.v1";
+function storedPrepareAction() {
+  try {
+    const value = JSON.parse(sessionStorage.getItem(PREPARE_PENDING_ACTION_KEY) || "null");
+    const normalized = normalizedActionRecord(value, "exploratory.live.prepare");
+    return normalized.action === "exploratory.live.prepare" && value && typeof value === "object" ? normalized : null;
+  } catch { return null; }
+}
+function savePendingPrepare(actionId, baseline) {
+  try {
+    const normalized = normalizedActionRecord(baseline, "exploratory.live.prepare");
+    sessionStorage.setItem(PREPARE_PENDING_ACTION_KEY, JSON.stringify({ action: "exploratory.live.prepare", action_id: actionId ? String(actionId) : "", started_at: normalized.started_at || Date.now(), action_ids: boundedActionIds(normalized.action_ids) }));
+  } catch {}
+}
+function clearPendingPrepare() {
+  try { sessionStorage.removeItem(PREPARE_PENDING_ACTION_KEY); } catch {}
+}
+function savePendingPrepareIfSafe(actionId, baseline) {
+  const candidate = normalizedActionRecord({ ...baseline, action: "exploratory.live.prepare", action_id: actionId ? String(actionId) : "" }, "exploratory.live.prepare");
+  const current = storedPrepareAction();
+  if (current && !sameActionCorrelation(current, candidate)) return false;
+  savePendingPrepare(actionId, baseline);
+  return true;
+}
+function clearPendingPrepareIf(pending) {
+  const current = storedPrepareAction();
+  if (!current || !sameActionCorrelation(current, pending)) return false;
+  clearPendingPrepare();
+  return true;
+}
 function savePendingReviewIfSafe(actionId, baseline) {
   const candidate = normalizedActionRecord({ ...baseline, action: "execution_authorization.review", action_id: actionId ? String(actionId) : "" }, "execution_authorization.review");
   const current = storedReviewAction();
@@ -1276,6 +1434,28 @@ function actionResponseStatus(value) {
   const source = value && typeof value === "object" ? value : {};
   return upper(source.status || source.action_status || source.result?.status || source.result?.action_status || source.action?.status || source.action?.action_status);
 }
+function updateReviewTerms(form, fresh) {
+  const freshValues = reviewValues(fresh);
+  const detailGrid = form.querySelector("[data-review-terms]");
+  if (detailGrid) {
+    detailGrid.innerHTML = reviewRows(fresh) || kv("Current terms", "Not available");
+    detailGrid.scrollTop = 0;
+  }
+  const setupContainer = form.querySelector("[data-review-setup-container]");
+  if (setupContainer) setupContainer.innerHTML = reviewSetupMarkup(fresh);
+  const missingNotice = form.querySelector("[data-review-missing]");
+  if (missingNotice) {
+    const missingText = missingNotice.querySelector("span");
+    if (missingText) missingText.textContent = freshValues.missing.length ? `Missing: ${freshValues.missing.join(", ")}.` : "";
+    missingNotice.hidden = !freshValues.missing.length;
+  }
+  const dialogNode = form.closest("dialog");
+  if (dialogNode) {
+    dialogNode.scrollTop = 0;
+    dialogNode.dataset.reviewFingerprint = reviewFingerprint(fresh);
+  }
+  return freshValues;
+}
 async function readFreshReviewTerms(form, result) {
   let fresh;
   try {
@@ -1285,17 +1465,10 @@ async function readFreshReviewTerms(form, result) {
     result.textContent = "Authorization review completed, but current terms could not be read. Check again before continuing.";
     return false;
   }
-  const detailGrid = form.querySelector("dl.detail-grid");
-  if (detailGrid) {
-    detailGrid.innerHTML = reviewRows(fresh) || kv("Current terms", "Not available");
-    detailGrid.scrollTop = 0;
-  }
-  const dialogNode = form.closest("dialog");
-  if (dialogNode) dialogNode.scrollTop = 0;
-  const { missing } = reviewValues(fresh);
-  if (missing.length) {
+  const freshValues = updateReviewTerms(form, fresh);
+  if (freshValues.missing.length) {
     form.dataset.reviewedFingerprint = "";
-    result.textContent = `Authorization review completed, but current terms are incomplete: missing ${missing.join(", ")}.`;
+    result.textContent = `Authorization review completed, but current terms are incomplete: missing ${freshValues.missing.join(", ")}.`;
     return false;
   }
   form.dataset.reviewedFingerprint = reviewFingerprint(fresh);
@@ -1304,15 +1477,121 @@ async function readFreshReviewTerms(form, result) {
   form.querySelector("#review-confirmation")?.focus({ preventScroll: true });
   return true;
 }
+async function prepareExploratorySession(form) {
+  if (appState.actionPending) return;
+  const button = form.querySelector("[data-review-prepare]");
+  const result = form.querySelector("#review-setup-result") || form.querySelector("#review-result");
+  const setupTotal = pick([reviewSessionSetup()], ["shared_allocation"]);
+  const priorPending = storedPrepareAction();
+  if (priorPending) {
+    showPendingOutcome(form, priorPending, "A prior session setup has no terminal outcome yet. Check its read-only status before trying again.");
+    return;
+  }
+  const version = ++appState.actionVersion;
+  appState.actionPending = true;
+  let baseline = null;
+  let dispatched = false;
+  if (button) { button.disabled = true; button.textContent = "Setting up session…"; }
+  if (result) result.textContent = `Pending. The fixed ${money(setupTotal)} proposal is being prepared; do not submit again.`;
+  try {
+    baseline = await captureActionBaseline("exploratory.live.prepare");
+    if (!reviewFormCurrent(form, version)) return;
+    const token = await ensureControlToken();
+    if (!reviewFormCurrent(form, version)) return;
+    if (!savePendingPrepareIfSafe("", baseline)) return;
+    dispatched = true;
+    const { response, body } = await controlFetch("/api/control", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Axiom-Control-Token": token },
+      body: JSON.stringify({ action: "exploratory.live.prepare", confirm: "PREPARE EXPLORATORY SESSION", payload: {} }),
+      cache: "no-store",
+    });
+    if (version !== appState.actionVersion) return;
+    const actionId = body.action_id || body.action?.action_id || body.result?.action_id || "";
+    const pendingRecord = { action: "exploratory.live.prepare", action_id: actionId, started_at: baseline.started_at, action_ids: baseline.action_ids };
+    const status = actionResponseStatus(body);
+    if (status === "FAILED") {
+      clearPendingPrepareIf(pendingRecord);
+      if (button) { button.disabled = false; button.textContent = "Set up session"; }
+      if (result) result.textContent = `Session setup outcome: ${body.reason || body.error || status}. Enter Set up session again for an explicit retry.`;
+      return;
+    }
+    if (savePendingPrepareIfSafe(actionId, baseline)) {
+      const terminal = status === "COMPLETE" && response.ok && body.ok === true
+        ? body
+        : await pollActionStatus(actionId, "exploratory.live.prepare", baseline);
+      if (!terminal) {
+        showPendingOutcome(form, pendingRecord, "The session setup outcome is still unresolved. Do not submit again.", version);
+        return;
+      }
+      if (!reviewFormCurrent(form, version)) {
+        clearPendingPrepareIf(pendingRecord);
+        return;
+      }
+      clearPendingPrepareIf(pendingRecord);
+      if (upper(terminal.status) === "FAILED") {
+        if (button) { button.disabled = false; button.textContent = "Set up session"; }
+        if (result) result.textContent = `Session setup outcome: ${terminal.reason || terminal.status}. Enter Set up session again for an explicit retry.`;
+        return;
+      }
+      clearPendingReview();
+      clearPendingAction();
+      resetReviewForPreparedTerms(form);
+      setReviewStage(form, "authorization");
+      const freshResult = await refreshPreparedReviewTerms(form, result);
+      if (!freshResult) {
+        if (button) { button.disabled = false; button.textContent = "Set up session"; }
+        return;
+      }
+      if (button) { button.disabled = false; button.textContent = "Set up session"; }
+      if (result) result.textContent = "Session proposal prepared. Review the exact current allocation and terms before authorization.";
+      form.querySelector("#review-authorization-confirmation")?.focus({ preventScroll: true });
+    }
+  } catch (error) {
+    if (!dispatched) {
+      clearPendingPrepare();
+      if (button) { button.disabled = false; button.textContent = "Set up session"; }
+      if (result) result.textContent = `Session setup unavailable: ${error?.message || "current terms unavailable"}. No control action was sent.`;
+      return;
+    }
+    const pendingAfterError = storedPrepareAction() || { action: "exploratory.live.prepare", action_id: "", started_at: baseline?.started_at || Date.now(), action_ids: baseline?.action_ids || [] };
+    if (!savePendingPrepareIfSafe(pendingAfterError.action_id || "", pendingAfterError)) return;
+    showPendingOutcome(form, pendingAfterError, "The session setup outcome is unresolved. Check its read-only status; no retry was sent.", version);
+  } finally {
+    if (version === appState.actionVersion) appState.actionPending = false;
+  }
+}
+async function refreshPreparedReviewTerms(form, result) {
+  try {
+    const [operator, canary] = await Promise.all([requestJson("/api/ui-state"), requestJson("/api/v2/canary")]);
+    const fresh = reviewProjection({ data: { operator, canary } });
+    const values = updateReviewTerms(form, fresh);
+    const dialogNode = form.closest("dialog");
+    if (dialogNode) dialogNode.dataset.reviewFingerprint = reviewFingerprint(fresh);
+    if (values.missing.length) {
+      if (result) result.textContent = `Session proposal prepared, but current terms are incomplete: missing ${values.missing.join(", ")}.`;
+      return false;
+    }
+    return true;
+  } catch {
+    if (result) result.textContent = "Session setup completed, but current terms could not be read. Check again before continuing.";
+    return false;
+  }
+}
 function showPendingOutcome(form, pending, message, version = appState.actionVersion) {
   const authorizationPending = pending.action === "execution_authorization.review";
+  const preparePending = pending.action === "exploratory.live.prepare";
   const current = () => reviewFormCurrent(form, version);
   if (!current()) return;
-  const result = form.querySelector("#review-result");
-  const button = authorizationPending
-    ? form.querySelector("[data-review-authorization-fields] [data-review-submit]")
-    : form.querySelector("[data-review-final-fields] [data-review-submit]");
-  const confirmation = authorizationPending ? form.querySelector("#review-authorization-confirmation") : form.querySelector("#review-confirmation");
+  const result = preparePending
+    ? (form.querySelector("#review-setup-result") || form.querySelector("#review-result"))
+    : form.querySelector("#review-result");
+  const button = preparePending
+    ? (form.querySelector("[data-review-prepare]") || form.querySelector("[data-review-authorization-fields] [data-review-submit]"))
+    : authorizationPending
+      ? form.querySelector("[data-review-authorization-fields] [data-review-submit]")
+      : form.querySelector("[data-review-final-fields] [data-review-submit]");
+  const confirmation = preparePending ? form.querySelector("#review-authorization-confirmation") : authorizationPending ? form.querySelector("#review-authorization-confirmation") : form.querySelector("#review-confirmation");
   if (button) { button.disabled = true; button.textContent = "Outcome unresolved"; }
   if (confirmation) { confirmation.value = ""; confirmation.disabled = true; }
   if (authorizationPending) {
@@ -1334,6 +1613,30 @@ function showPendingOutcome(form, pending, message, version = appState.actionVer
         check.disabled = false;
         check.textContent = "Check read-only outcome";
       }
+      return;
+    }
+    if (preparePending) {
+      clearPendingPrepareIf(pending);
+      if (!current()) return;
+      if (upper(status.status) === "FAILED") {
+        if (button) { button.disabled = false; button.textContent = "Set up session"; }
+        result.textContent = `Session setup outcome: ${status.reason || status.status}. Enter Set up session again for an explicit retry.`;
+        return;
+      }
+      clearPendingReview();
+      clearPendingAction();
+      resetReviewForPreparedTerms(form);
+      setReviewStage(form, "authorization");
+      const refreshed = await refreshPreparedReviewTerms(form, result);
+      if (!current()) return;
+      if (!refreshed) {
+        check.disabled = false;
+        check.textContent = "Check read-only outcome";
+        result.append(document.createTextNode(" "), check);
+        return;
+      }
+      if (button) { button.disabled = false; button.textContent = "Set up session"; }
+      result.textContent = "Session proposal prepared. Review the exact current allocation and terms before authorization.";
       return;
     }
     if (authorizationPending) {
@@ -1418,13 +1721,7 @@ async function reviewAuthorization(form) {
     const dialogNode = form.closest("dialog");
     const freshFingerprint = reviewFingerprint(fresh);
     const initialFingerprint = dialogNode?.dataset.reviewFingerprint || "";
-    const freshValues = reviewValues(fresh);
-    const detailGrid = form.querySelector("dl.detail-grid");
-    if (detailGrid) {
-      detailGrid.innerHTML = reviewRows(fresh) || kv("Current terms", "Not available");
-      detailGrid.scrollTop = 0;
-    }
-    if (dialogNode) dialogNode.scrollTop = 0;
+    const freshValues = updateReviewTerms(form, fresh);
     if (initialFingerprint && initialFingerprint !== freshFingerprint) {
       if (dialogNode) dialogNode.dataset.reviewFingerprint = freshFingerprint;
       adverseRequired = freshValues.adverseRequired;
@@ -1616,19 +1913,14 @@ async function finalReview(form) {
     const [operator, canary] = await Promise.all([requestJson("/api/ui-state"), requestJson("/api/v2/canary")]);
     if (!reviewFormCurrent(form, version)) return;
     const fresh = reviewProjection({ data: { operator, canary } });
-    const detailGrid = form.querySelector("dl.detail-grid");
-    if (detailGrid) {
-      detailGrid.innerHTML = reviewRows(fresh) || kv("Current terms", "Not available");
-      detailGrid.scrollTop = 0;
-    }
+    const freshFingerprint = reviewFingerprint(fresh);
+    const freshValues = updateReviewTerms(form, fresh);
     const dialogNode = form.closest("dialog");
-    if (dialogNode) dialogNode.scrollTop = 0;
-    if (initialFingerprint && initialFingerprint !== reviewFingerprint(fresh)) {
+    if (initialFingerprint && initialFingerprint !== freshFingerprint) {
       const finalConfirmation = form.querySelector("#review-confirmation");
       if (finalConfirmation) finalConfirmation.value = "";
       const adverse = form.querySelector("#review-adverse");
       if (adverse) adverse.checked = false;
-      const freshValues = reviewValues(fresh);
       form.dataset.adverseRequired = String(freshValues.adverseRequired);
       ensureReviewAdverseField(form, freshValues.adverseRequired);
       form.dataset.reviewedFingerprint = "";

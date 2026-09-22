@@ -31,7 +31,11 @@ from axiom.canary_settings import CanarySettingsService
 from axiom.data import InMemoryPredictionProvider
 from axiom.dashboard import DashboardData, DashboardServer
 from axiom.node import NodeConfig, ResearchNode
-from axiom.operator import OperatorControlError, OperatorControlPlane
+from axiom.operator import (
+    OperatorControlError,
+    OperatorControlPlane,
+    ROLLING_EXPLORATORY_PROPOSAL_CONFIG_KEY,
+)
 from axiom.rolling_portfolio import (
     RollingAdmissionPolicy,
     RollingEvidence,
@@ -4131,6 +4135,149 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
                 },
             )
             self.assertEqual(str(scope_draft["status"]).upper(), "DRAFT")
+
+            prepare_before = store.get_operator_config(
+                ROLLING_EXPLORATORY_PROPOSAL_CONFIG_KEY,
+                {},
+            )
+            with patch(
+                "axiom.operator.utc_now",
+                return_value=commissioning_at,
+            ), patch(
+                "axiom.autonomous.utc_now",
+                return_value=commissioning_at,
+            ):
+                prepare_response = control.execute(
+                    "exploratory.live.prepare",
+                    confirm="PREPARE EXPLORATORY SESSION",
+                    payload={},
+                )
+            self.assertTrue(prepare_response["ok"], prepare_response)
+            prepare_result = prepare_response["result"]["exploratory_live"]
+            self.assertEqual(prepare_result["status"], "PREPARED")
+            prepare_pointer = store.get_operator_config(
+                ROLLING_EXPLORATORY_PROPOSAL_CONFIG_KEY,
+                {},
+            )
+            self.assertNotEqual(prepare_pointer, prepare_before)
+            prepared_selection_id = str(prepare_pointer["selection_id"])
+            prepared_selection = store.load_portfolio_selection(
+                prepared_selection_id
+            )
+            self.assertIsInstance(prepared_selection, dict)
+            assert isinstance(prepared_selection, dict)
+            self.assertEqual(
+                prepared_selection["allocation_activation"]["status"],
+                "PREPARED",
+            )
+            self.assertEqual(
+                prepared_selection["proposed_allocation_total"],
+                "5.00",
+            )
+            self.assertIsNone(
+                store.load_active_execution_authorization(
+                    mode="EXPLORATORY_MICRO_CANARY",
+                    now=commissioning_at,
+                )
+            )
+            prepared_review = control.exploratory_live_review_snapshot()
+            prepared_choices = prepared_review["authorization_choices"]
+            self.assertEqual(
+                prepared_choices["purpose"],
+                "commission exploratory automation and measure actual net results; profitability unproven",
+            )
+            self.assertEqual(
+                prepared_choices["lifetime_budget"],
+                {"max_notional_usd": "5.00"},
+            )
+            self.assertEqual(prepared_choices["expiry_anchor"], "FINAL_CONFIRMATION")
+            self.assertEqual(int(prepared_choices["duration_seconds"]), 86400)
+            self.assertEqual(
+                prepared_choices["stop_rules"],
+                {
+                    "on_any_blocker": "STOP",
+                    "halt_on_unknown_execution": True,
+                },
+            )
+            self.assertEqual(prepared_choices["shared_allocation"], "5.00")
+            self.assertFalse(prepared_review["session_setup"]["required"])
+            ui_projection = DashboardData(
+                store=store,
+                control=control,
+                settings_service=control.settings,
+                clock=lambda: commissioning_at,
+            ).ui_state_data()
+            ui_choices = ui_projection["operator_controls"][
+                "exploratory_live_review"
+            ]["authorization_choices"]
+            self.assertEqual(ui_choices["purpose"], prepared_choices["purpose"])
+            self.assertEqual(
+                ui_choices["lifetime_budget"],
+                {"max_notional_usd": "5.00"},
+            )
+            self.assertEqual(
+                ui_choices["expiry_anchor"],
+                "FINAL_CONFIRMATION",
+            )
+            self.assertEqual(int(ui_choices["duration_seconds"]), 86400)
+            self.assertEqual(
+                ui_choices["stop_rules"],
+                prepared_choices["stop_rules"],
+            )
+            store.set_operator_config(
+                "execution_authorization_review",
+                {
+                    "authorization_id": "legacy-terminal",
+                    "status": "REVOKED",
+                    "purpose": "legacy terminal purpose",
+                    "lifetime_budget": {"max_notional_usd": "1.00"},
+                    "expires_at": (
+                        commissioning_at - timedelta(days=1)
+                    ).isoformat(),
+                    "expiry_anchor": "ABSOLUTE",
+                    "duration_seconds": None,
+                    "stop_rules": {"on_any_blocker": "LEGACY"},
+                },
+            )
+            terminal_review = control.exploratory_live_review_snapshot()
+            terminal_choices = terminal_review["authorization_choices"]
+            self.assertEqual(terminal_choices["purpose"], prepared_choices["purpose"])
+            self.assertEqual(
+                terminal_choices["lifetime_budget"],
+                {"max_notional_usd": "5.00"},
+            )
+            self.assertEqual(
+                terminal_choices["expiry_anchor"],
+                "FINAL_CONFIRMATION",
+            )
+            self.assertEqual(int(terminal_choices["duration_seconds"]), 86400)
+            self.assertEqual(
+                terminal_choices["stop_rules"],
+                prepared_choices["stop_rules"],
+            )
+            self.assertEqual(terminal_choices["shared_allocation"], "5.00")
+            self.assertEqual(terminal_choices["status"], "REVOKED")
+
+            with patch(
+                "axiom.operator.utc_now",
+                return_value=commissioning_at,
+            ), patch(
+                "axiom.autonomous.utc_now",
+                return_value=commissioning_at,
+            ):
+                prepare_repeat = control.execute(
+                    "exploratory.live.prepare",
+                    confirm="PREPARE EXPLORATORY SESSION",
+                    payload={},
+                )
+            self.assertTrue(prepare_repeat["ok"], prepare_repeat)
+            self.assertEqual(
+                store.get_operator_config(
+                    ROLLING_EXPLORATORY_PROPOSAL_CONFIG_KEY,
+                    {},
+                ),
+                prepare_pointer,
+            )
 
             # An unrelated old zero-budget row is still the current pointer.  The
             # unpointed proposal must not become authority by fallback.

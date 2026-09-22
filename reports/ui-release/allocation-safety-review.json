@@ -1,0 +1,73 @@
+{
+  "reviewer": "UiSafetyReview",
+  "overall_correctness": "correct",
+  "explanation": "Final exact source freeze review found no remaining safety or integration defects. The previously identified missing client helpers, unbound prepare allocation, stale post-prepare terms/banner, absent clean-state fixed review choices, and terminal authorization term reuse were all corrected before the final frozen hashes; canonical prepared-5 choices now preserve fixed purpose, lifetime, stop rules, FINAL_CONFIRMATION/86400, and no authority or consent.",
+  "confidence": 0.98,
+  "worktree": "C:/Users/User/projects/axiom-ui",
+  "base_revision": "1285eb74fc8d995781235dd77b3c114d0d80dbc2",
+  "source_freeze": "C:/Users/User/.omp/agent/sessions/-projects-axiom/2026-09-10T09-29-23-148Z_01a08aa6-81cc-7720-8e98-296666c0152d/local/axiom-ui-allocation-source-freeze.json",
+  "source_hashes": {
+    "axiom/dashboard.py": "dbbbe99caf821e8d7d684e4568bab2298e8c0fb4aaf701087519fc6bae92762d",
+    "axiom/operator.py": "01a498fca50190b0a1435cf8486bc0af942f708411ef9a8f67a49596ae1c5720",
+    "axiom/ui/app.js": "02a49ac7c8c119253ee92b4c1c6440147fef2455c239b919b3ba6bd1657399ee",
+    "tests/test_operator_control.py": "861f623f02ab0eb279099a8810745334dafcb7be4b62d1124e5ba224f8ef4a43",
+    "tests/test_rolling_portfolio_acceptance.py": "ee82b3524177b7482a9f8de31d2116d8907a6f8fe55cec4a0b3e94d56700b279",
+    "tests/ui_fixture_server.py": "adc7ab0e9a10bea25bff3fc11c71a05f971994515ae8aaf8f82e9f442d8193e3",
+    "docs/polymarket_canary.md": "9441f0831959d79c1c6c9372a3ce99badd94b8372894e3cccdcb9b7dfa972e8a"
+  },
+  "protected_live_hashes": {
+    "axiom/dashboard.py": "215b024248d9b88b057ecd79387884db496c368689cdf743eaf7f22c6aea2db9",
+    "axiom/operator.py": "f1e4ef2e15cc9c415fdce33cfb73142905c20ca182d5b6281ece385b068d8483",
+    "axiom/autonomous.py": "7cf881ffe041098af3978e52cf53470d639e937de4761086b0461cf5a73b9d7c",
+    "axiom/storage.py": "8d779dc63260a4eb4e989299b54fe067edc5e999bf6d5322bc13471a0a1edfc8",
+    "axiom/ui/app.js": "1ad5c9a207bd3626ab36b548378e9f9fe7f6af6f05f2742cfab9dcfeedd30054",
+    "axiom/ui/pages.js": "45d35a60d3b519327bf168e41602a30b61f587229f2cabbc463b660e0bf5f36f",
+    "axiom/ui/styles.css": "d17b131ab2e7c96e590e4200fc5ff9e1ef1a7adcd6ce901426a45c84c6a7468e"
+  },
+  "resolved_findings": [
+    {
+      "id": "missing-action-helpers",
+      "status": "resolved",
+      "evidence": "axiom/ui/app.js restores terminalAction and actionResponseStatus before all callers."
+    },
+    {
+      "id": "unbound-proposed-allocation",
+      "status": "resolved",
+      "evidence": "axiom/operator.py binds proposed_allocation from the prepared selection before validation and response construction."
+    },
+    {
+      "id": "stale-post-prepare-terms",
+      "status": "resolved",
+      "evidence": "axiom/ui/app.js marks the main terms grid and updates it from fresh GET data after prepare."
+    },
+    {
+      "id": "stale-missing-banner",
+      "status": "resolved",
+      "evidence": "axiom/ui/app.js updates and hides data-review-missing from fresh reviewValues."
+    },
+    {
+      "id": "clean-state-fixed-choices",
+      "status": "resolved",
+      "evidence": "axiom/operator.py exploratory_live_review_choices and dashboard bounded projection provide canonical fixed terms after verified prepared5."
+    },
+    {
+      "id": "terminal-term-reuse",
+      "status": "resolved",
+      "evidence": "axiom/operator.py replaces all review terms and clears expires_at for prepared5 when authorization is non-DRAFT/non-ACTIVE."
+    }
+  ],
+  "safety_invariants": [
+    "prepare is explicit exploratory.live.prepare with exact confirmation and empty payload",
+    "prepare returns paper-only PREPARED state and does not activate authority, persist consent, or submit orders",
+    "prepared proposal pointer/hash/member bindings remain immutable and repeated prepare reuses the same prepared row",
+    "terminal authorization expiry, purpose, lifetime, stop rules, approval, acknowledgment, and bindings are not reused for a new prepared5 review",
+    "bounded ui-state reads canonical fixed choices without invoking the full review snapshot",
+    "client consumes POST only for terminal status and reloads authoritative bounded terms",
+    "protected LIVE hashes remain unchanged"
+  ],
+  "evidence": [
+    "C:/Users/User/.omp/agent/sessions/-projects-axiom/2026-09-10T09-29-23-148Z_01a08aa6-81cc-7720-8e98-296666c0152d/local/axiom-ui-allocation-source-freeze.json",
+    "C:/Users/User/.omp/agent/sessions/-projects-axiom/2026-09-10T09-29-23-148Z_01a08aa6-81cc-7720-8e98-296666c0152d/local/axiom-ui-allocation-gates.json"
+  ],
+  "findings": []
+}

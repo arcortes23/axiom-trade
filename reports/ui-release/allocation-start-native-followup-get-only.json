@@ -1,0 +1,72 @@
+{
+  "schema": "axiom.ui.release.native-followup-get-only.v1",
+  "status": "pass-warning-not-reproduced-and-get-only-stable",
+  "scope": "same real temporary DashboardServer/OperatorControlPlane fixture; synthetic CommissionCredentials and CommissionReadOnlyVenue only; loopback browser only",
+  "source_paths": {
+    "warning_branch": "axiom/ui/app.js:242-250",
+    "request_parser": "axiom/ui/app.js:589-617",
+    "load_route_errors": "axiom/ui/app.js:679-696",
+    "server_ui_state": "axiom/dashboard.py:10216-10594",
+    "server_get_dispatch": "axiom/dashboard.py:11529-11531"
+  },
+  "post_final_before_reload": {
+    "active_copy_visible": true,
+    "operator_unavailable_warning_visible": false,
+    "exact_warning_value_captured": false,
+    "next_action_copy": "The recorded check is older than 60 seconds.",
+    "fetch_wrapper_count": 16,
+    "fetch_failures": [],
+    "fetch_non_200": [],
+    "console_messages": [],
+    "control_posts_before_reload": 2,
+    "control_post_actions_before_reload": [
+      "execution_authorization.review",
+      "exploratory.live.review_confirm"
+    ],
+    "all_observed_statuses": 200
+  },
+  "fresh_reload": {
+    "operation": "one browser reload followed by 1400ms poll settle",
+    "control_posts_after_reload": 0,
+    "get_requests_after_reload": [
+      "/api/ui-state",
+      "/api/v2/canary"
+    ],
+    "network_statuses_after_reload": [
+      200,
+      200
+    ],
+    "active_copy_visible": true,
+    "operator_unavailable_warning_visible": false,
+    "refresh_checks_copy_visible": true,
+    "dom_flags": {
+      "active": true,
+      "unavailable": false,
+      "refresh": true
+    },
+    "console_messages": []
+  },
+  "screenshot": {
+    "path": "reports/ui-release/allocation-start-native-followup-reload.png",
+    "sha256": "c01468d5d00ea46aa2d1b53cea8d63b57c77b481cae8d3b83e0c6805f22dcbcc",
+    "bytes": 28107
+  },
+  "boundary": {
+    "dashboard_server": "real temporary loopback",
+    "operator_control_plane": "real",
+    "credentials": "fake CommissionCredentials only",
+    "venue": "fake CommissionReadOnlyVenue only",
+    "worker_tick_run": false,
+    "order_calls": 0,
+    "approval_calls": 0,
+    "production_requests": 0
+  },
+  "conclusion": "The active authorization remained ACTIVE across the final state and one fresh GET-only reload. The earlier operator-unavailable branch was not reproduced in this bounded repeat before reload and remained absent after reload; no fetch rejection, non-200 response, console error, control POST, worker tick, order, or approval occurred during the reload.",
+  "prior_observation": {
+    "source": "reports/ui-release/allocation-start-native-active-home.png",
+    "warning_visible": true,
+    "exact_rendered_text": "Current authority is unavailable; review actions are disabled until it is refreshed.",
+    "prior_fetch_failure_value_captured": false,
+    "classification_scope": "preserved observation only; no patch-introduced finding because branch is unchanged in git diff"
+  }
+}
